@@ -5,7 +5,7 @@ use std::{collections::VecDeque, fmt::Write, io};
 use crate::pane::Pane;
 
 enum DeliveryStatus {
-    Queued,
+    Queued(String),
     Injected,
     Failed(String),
 }
@@ -39,12 +39,18 @@ impl Mailroom {
         target: &mut Pane,
         body: String,
     ) -> (u64, io::Result<()>) {
-        let id = self.queue(from, target.title().to_owned(), body);
+        let id = self.queue(from, target.title().to_owned(), body, "awaiting injection");
         let result = self.inject(id, target);
         (id, result)
     }
 
-    pub(crate) fn queue(&mut self, from: String, to: String, body: String) -> u64 {
+    pub(crate) fn queue(
+        &mut self,
+        from: String,
+        to: String,
+        body: String,
+        reason: impl Into<String>,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         self.envelopes.push_back(Envelope {
@@ -52,7 +58,7 @@ impl Mailroom {
             from,
             to,
             body,
-            status: DeliveryStatus::Queued,
+            status: DeliveryStatus::Queued(reason.into()),
         });
         while self.envelopes.len() > self.capacity {
             self.envelopes.pop_front();
@@ -88,7 +94,7 @@ impl Mailroom {
         let mut summary = String::new();
         for envelope in self.envelopes.iter().rev() {
             let status = match &envelope.status {
-                DeliveryStatus::Queued => "QUEUED".to_owned(),
+                DeliveryStatus::Queued(reason) => format!("QUEUED: {reason}"),
                 DeliveryStatus::Injected => "INJECTED".to_owned(),
                 DeliveryStatus::Failed(error) => format!("FAILED: {error}"),
             };
@@ -115,17 +121,17 @@ mod tests {
     #[test]
     fn mailroom_keeps_a_bounded_honest_history() {
         let mut mailroom = Mailroom::new(2);
-        let first = mailroom.queue("A".into(), "B".into(), "one".into());
+        let first = mailroom.queue("A".into(), "B".into(), "one".into(), "waiting");
         mailroom.set_status(first, DeliveryStatus::Injected);
-        let second = mailroom.queue("B".into(), "A".into(), "two".into());
-        let third = mailroom.queue("A".into(), "B".into(), "three".into());
+        let second = mailroom.queue("B".into(), "A".into(), "two".into(), "waiting");
+        let third = mailroom.queue("A".into(), "B".into(), "three".into(), "waiting");
         mailroom.set_status(third, DeliveryStatus::Failed("offline".into()));
 
         assert_eq!(mailroom.len(), 2);
         let summary = mailroom.summary();
         assert!(!summary.contains("#0001"));
         assert!(summary.contains("#0002"));
-        assert!(summary.contains("QUEUED"));
+        assert!(summary.contains("QUEUED: waiting"));
         assert!(summary.contains("#0003"));
         assert!(summary.contains("FAILED: offline"));
         assert_eq!(second, 2);

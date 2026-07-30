@@ -23,6 +23,7 @@ use crate::pane::GuestEnvironment;
 const MAX_WIRE_BYTES: usize = 8 * 1024;
 const MAX_BODY_BYTES: usize = 4 * 1024;
 const MAX_ID_BYTES: usize = 128;
+const MAX_LABEL_BYTES: usize = 64;
 const MAX_HOPS: u8 = 8;
 const MAX_MESSAGES_PER_SECOND: usize = 5;
 const EVENT_QUEUE_CAPACITY: usize = 100;
@@ -34,6 +35,10 @@ struct WireEnvelope {
     id: String,
     to: usize,
     body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
     #[serde(default)]
     hop: u8,
 }
@@ -72,6 +77,8 @@ pub(crate) struct DoorbellEnvelope {
     pub(crate) from: usize,
     pub(crate) to: usize,
     pub(crate) body: String,
+    pub(crate) task: Option<String>,
+    pub(crate) role: Option<String>,
     reply: SyncSender<WireResponse>,
 }
 
@@ -202,6 +209,8 @@ fn listener_loop(
                                         from,
                                         to: request.to - 1,
                                         body: request.body,
+                                        task: request.task,
+                                        role: request.role,
                                         reply,
                                     };
                                     match events.try_send(event) {
@@ -268,6 +277,8 @@ fn validate_request(
     if request.id.is_empty() || request.id.len() > MAX_ID_BYTES {
         return Err("message id must contain 1..=128 bytes".to_owned());
     }
+    validate_label("task", request.task.as_deref())?;
+    validate_label("role", request.role.as_deref())?;
     if request.hop > MAX_HOPS {
         return Err("message exceeded hop limit".to_owned());
     }
@@ -287,6 +298,19 @@ fn validate_request(
     Ok(from)
 }
 
+fn validate_label(name: &str, value: Option<&str>) -> Result<(), String> {
+    if let Some(value) = value
+        && (value.is_empty()
+            || value.len() > MAX_LABEL_BYTES
+            || value.chars().any(|character| character.is_control()))
+    {
+        return Err(format!(
+            "{name} must contain 1..={MAX_LABEL_BYTES} bytes without control characters"
+        ));
+    }
+    Ok(())
+}
+
 fn remember_id(id: String, seen: &mut HashSet<String>, order: &mut VecDeque<String>) {
     seen.insert(id.clone());
     order.push_back(id);
@@ -303,16 +327,72 @@ fn write_response(stream: &mut UnixStream, response: &WireResponse) -> io::Resul
     stream.flush()
 }
 
-pub(crate) fn send_command() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = env::args().skip(2);
-    let target: usize = args
+struct SendArgs {
+    target: usize,
+    task: Option<String>,
+    role: Option<String>,
+    body: String,
+}
+
+const SEND_USAGE: &str = "usage: crowded send ROOM [--task ID] [--role ROLE] [--] MESSAGE";
+
+fn parse_send_args(args: impl IntoIterator<Item = String>) -> Result<SendArgs, String> {
+    let mut args = args.into_iter();
+    let target = args
         .next()
-        .ok_or("usage: crowded send ROOM MESSAGE")?
-        .parse()?;
-    let body = args.collect::<Vec<_>>().join(" ");
-    if body.is_empty() {
-        return Err("usage: crowded send ROOM MESSAGE".into());
+        .ok_or_else(|| SEND_USAGE.to_owned())?
+        .parse()
+        .map_err(|_| SEND_USAGE.to_owned())?;
+    let mut task = None;
+    let mut role = None;
+    let mut body = Vec::new();
+
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--task" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--task requires an ID".to_owned())?;
+                if task.replace(value).is_some() {
+                    return Err("--task may appear only once".to_owned());
+                }
+            }
+            "--role" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--role requires a role".to_owned())?;
+                if role.replace(value).is_some() {
+                    return Err("--role may appear only once".to_owned());
+                }
+            }
+            "--" => {
+                body.extend(args);
+                break;
+            }
+            _ => {
+                body.push(argument);
+                body.extend(args);
+                break;
+            }
+        }
     }
+
+    let body = body.join(" ");
+    if body.is_empty() {
+        return Err(SEND_USAGE.to_owned());
+    }
+    validate_label("task", task.as_deref())?;
+    validate_label("role", role.as_deref())?;
+    Ok(SendArgs {
+        target,
+        task,
+        role,
+        body,
+    })
+}
+
+pub(crate) fn send_command() -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_send_args(env::args().skip(2))?;
 
     let path = env::var_os("CROWDED_SOCKET").ok_or("CROWDED_SOCKET is not set")?;
     let token = env::var("CROWDED_TOKEN").map_err(|_| "CROWDED_TOKEN is not set")?;
@@ -321,8 +401,10 @@ pub(crate) fn send_command() -> Result<(), Box<dyn std::error::Error>> {
     let request = WireEnvelope {
         token,
         id: format!("{room}-{}-{now}", process::id()),
-        to: target,
-        body,
+        to: args.target,
+        body: args.body,
+        task: args.task,
+        role: args.role,
         hop: 0,
     };
 
@@ -355,6 +437,8 @@ mod tests {
             id: "message-1".to_owned(),
             to: 2,
             body: "hello".to_owned(),
+            task: None,
+            role: None,
             hop: 0,
         };
         assert_eq!(validate_request(&request, &tokens, 2, &mut recent), Ok(0));
@@ -362,6 +446,51 @@ mod tests {
         assert_eq!(
             validate_request(&request, &tokens, 2, &mut recent),
             Err("message exceeded hop limit".to_owned())
+        );
+    }
+
+    #[test]
+    fn send_arguments_support_temporary_task_roles_and_plain_messages() {
+        let hatted = parse_send_args(
+            [
+                "2",
+                "--task",
+                "parser-fix",
+                "--role",
+                "reviewer",
+                "inspect",
+                "this",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(hatted.target, 2);
+        assert_eq!(hatted.task.as_deref(), Some("parser-fix"));
+        assert_eq!(hatted.role.as_deref(), Some("reviewer"));
+        assert_eq!(hatted.body, "inspect this");
+
+        let plain =
+            parse_send_args(["1", "hello", "--role", "is text"].map(str::to_owned)).unwrap();
+        assert_eq!(plain.role, None);
+        assert_eq!(plain.body, "hello --role is text");
+    }
+
+    #[test]
+    fn request_validation_rejects_control_characters_in_hats() {
+        let tokens = vec!["left".to_owned(), "right".to_owned()];
+        let mut recent = vec![VecDeque::new(), VecDeque::new()];
+        let request = WireEnvelope {
+            token: "left".to_owned(),
+            id: "message-1".to_owned(),
+            to: 2,
+            body: "hello".to_owned(),
+            task: Some("bad\ntask".to_owned()),
+            role: None,
+            hop: 0,
+        };
+        assert_eq!(
+            validate_request(&request, &tokens, 2, &mut recent),
+            Err("task must contain 1..=64 bytes without control characters".to_owned())
         );
     }
 

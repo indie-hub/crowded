@@ -7,6 +7,49 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-30
+
+### Added
+
+- Live room rosters in guest introductions.
+- `F4` reintroduction for the focused room.
+
+## [0.8.0] - 2026-07-30
+
+### Added
+
+- Any number of explicitly configured rooms, arranged in an automatic grid.
+
+### Changed
+
+- House rules now advertise the complete room-number range.
+
+## [0.7.0] - 2026-07-30
+
+### Added
+
+- Optional `--task ID` and `--role ROLE` Doorbell metadata for temporary,
+  per-message agent hats.
+- Task and requested-role context in receiving prompts and Mailroom entries.
+
+### Changed
+
+- House rules now teach agents to reuse task IDs in replies and clarify that
+  requested roles never become permanent room state.
+
+## [0.6.0] - 2026-07-30
+
+### Added
+
+- A visible 20-message automatic-delivery fuse that pauses the room before a
+  slow agent-to-agent loop can consume an unbounded amount of model usage.
+- An explicit F3 fuse reset that resumes queued delivery within a fresh budget.
+
+### Changed
+
+- Mailroom queue entries now record whether delivery was manually paused or
+  stopped by the fuse.
+
 ## [0.5.1] - 2026-07-30
 
 ### Fixed

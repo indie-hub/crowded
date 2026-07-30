@@ -116,31 +116,33 @@ impl RoomSpec {
     }
 }
 
-pub(crate) fn room_specs() -> io::Result<[RoomSpec; 2]> {
+pub(crate) fn room_specs() -> io::Result<Vec<RoomSpec>> {
     let guests: Vec<_> = env::args_os().skip(1).collect();
-    match guests.as_slice() {
-        [] => {
-            let shell = env::var_os("SHELL").unwrap_or_else(|| {
-                if cfg!(windows) {
-                    "cmd.exe".into()
-                } else {
-                    "/bin/sh".into()
-                }
-            });
-            Ok([
-                RoomSpec::new(shell.clone(), Transport::Shell, 1),
-                RoomSpec::new(shell, Transport::Shell, 2),
-            ])
-        }
-        [left, right] => Ok([
-            RoomSpec::parse(left.clone(), 1)?,
-            RoomSpec::parse(right.clone(), 2)?,
-        ]),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: crowded [shell:PROGRAM|raw:PROGRAM] [shell:PROGRAM|raw:PROGRAM]",
-        )),
+    if guests.is_empty() {
+        let shell = env::var_os("SHELL").unwrap_or_else(|| {
+            if cfg!(windows) {
+                "cmd.exe".into()
+            } else {
+                "/bin/sh".into()
+            }
+        });
+        return Ok(vec![
+            RoomSpec::new(shell.clone(), Transport::Shell, 1),
+            RoomSpec::new(shell, Transport::Shell, 2),
+        ]);
     }
+    if guests.len() < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "usage: crowded GUEST GUEST [GUEST ...]; a guest is shell:PROGRAM or raw:PROGRAM",
+        ));
+    }
+
+    guests
+        .into_iter()
+        .enumerate()
+        .map(|(index, guest)| RoomSpec::parse(guest, index + 1))
+        .collect()
 }
 
 const RAW_SUBMIT_DELAY: Duration = Duration::from_millis(150);
