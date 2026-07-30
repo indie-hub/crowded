@@ -7,6 +7,116 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-30
+
+### Added
+
+- `crowded plugin preview|enable|disable` for explicit, reversible activation
+  of installed plugins' vendor-native components.
+- Native hook adapters for Claude and Codex, plus project-local OpenCode plugin
+  and command links.
+
+### Changed
+
+- Room Pulse and plugin hooks now coexist through per-handler ownership instead
+  of requiring Crowded to own an entire hook section.
+- Removing a plugin first disables its enabled vendor adapters.
+
+### Fixed
+
+- Shared skills use OpenCode's project-local `.opencode/skills/` discovery path.
+
+### Security
+
+- Adapter previews show the exact executable hook commands before opt-in.
+- Crowded records every inserted hook handler and symbolic link, refuses to
+  replace existing paths, and removes only entries it owns.
+
+## [0.14.1] - 2026-07-30
+
+### Fixed
+
+- Skills-only installation accepts native `.codex-plugin/plugin.json` and
+  `.claude-plugin/plugin.json` manifests and reports missing manifests or skill
+  directories explicitly.
+
+## [0.14.0] - 2026-07-30
+
+### Added
+
+- `crowded plugin add|list|remove` for reversible, project-local installation
+  of skills-only plugins from Git sources.
+- Shared skill discovery through `.agents/skills/` for Codex and OpenCode and
+  `.claude/skills/` for Claude, backed by one pinned local plugin checkout.
+
+### Security
+
+- Plugin manifests, skill names, frontmatter, Git references, symlinks, and
+  destination ownership are validated before installation or removal.
+- Downloaded executable hooks, MCP servers, and vendor-native plugin code are
+  not installed by the initial skills-only slice.
+
+## [0.13.0] - 2026-07-30
+
+### Added
+
+- A Room Pulse sidebar showing the latest lifecycle state reported by each
+  agent without collecting prompts, commands, or tool output.
+- Authenticated `crowded pulse` events and project-local Claude, Codex, and
+  OpenCode hook adapters.
+
+### Changed
+
+- Shared Toolbox synchronizes native pulse hooks even when no shared MCP is
+  declared.
+
+## [0.12.0] - 2026-07-30
+
+### Added
+
+- `crowded toolbox preview|sync|remove` for reversible project-local Claude,
+  Codex, and OpenCode MCP configuration.
+- Private toolbox state that tracks and safely removes Crowded-managed
+  configuration.
+
+### Changed
+
+- Synced projects load their native MCP files instead of receiving ephemeral
+  command-line or environment adapters.
+- `shell` transport identifies terminal-only rooms, which Shared Toolbox skips;
+  `raw` rooms continue to require a supported native agent adapter.
+
+### Fixed
+
+- PTY guests now receive Crowded's launch directory explicitly; `portable-pty`
+  otherwise defaults commands without a configured `cwd` to the user's home.
+- OpenCode may add schema metadata or reformat `opencode.json` without forcing
+  a toolbox remove-and-sync cycle.
+- OpenCode introductions and peer messages now wait for its visible normal-mode
+  idle prompt; automated delivery allows only one in-flight message per room.
+- Terminal-only rooms skip the agent introduction and accept peer messages as
+  soon as their shell is ready.
+
+## [0.11.0] - 2026-07-30
+
+### Added
+
+- Shared stdio MCP declarations in `crowded.toml`.
+- Ephemeral Claude, Codex, and OpenCode launch adapters that merge shared MCPs
+  with each guest's normal configuration.
+
+## [0.10.0] - 2026-07-30
+
+### Added
+
+- Local `crowded.toml` room profiles with names, commands, arguments,
+  transports, and optional working-directory overrides.
+
+### Changed
+
+- Command-line room specifications override `crowded.toml`; rooms without a
+  configured `cwd` inherit Crowded's launch directory.
+
 ## [0.9.0] - 2026-07-30
 
 ### Added

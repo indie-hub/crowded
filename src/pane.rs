@@ -4,7 +4,7 @@ use std::{
     env,
     ffi::OsString,
     io::{self, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc,
     thread,
     time::Duration,
@@ -13,6 +13,8 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tui_term::vt100::{Parser, Screen};
+
+use crate::config::{RoomSpec, Transport};
 
 fn key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     // Crossterm gives us structured key events; a PTY understands only bytes.
@@ -57,92 +59,29 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\"'\"'"))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum Transport {
-    Shell,
-    Raw,
-}
-
-#[derive(Clone)]
-pub(crate) struct RoomSpec {
-    title: String,
-    program: OsString,
-    transport: Transport,
-}
-
-impl RoomSpec {
-    fn new(program: OsString, transport: Transport, room_number: usize) -> Self {
-        let guest = Path::new(program.as_os_str())
-            .file_name()
-            .unwrap_or(program.as_os_str())
-            .to_string_lossy();
-        Self {
-            title: format!("{guest} · {room_number}"),
-            program,
-            transport,
-        }
-    }
-
-    fn parse(value: OsString, room_number: usize) -> io::Result<Self> {
-        let value = value.into_string().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "guest spec must be valid UTF-8",
-            )
-        })?;
-        let (kind, program) = value.split_once(':').ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "guest must be shell:PROGRAM or raw:PROGRAM",
-            )
-        })?;
-        if program.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "guest program cannot be empty",
-            ));
-        }
-        let transport = match kind {
-            "shell" => Transport::Shell,
-            "raw" => Transport::Raw,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "guest kind must be shell or raw",
-                ));
-            }
-        };
-        Ok(Self::new(program.into(), transport, room_number))
-    }
-}
-
-pub(crate) fn room_specs() -> io::Result<Vec<RoomSpec>> {
-    let guests: Vec<_> = env::args_os().skip(1).collect();
-    if guests.is_empty() {
-        let shell = env::var_os("SHELL").unwrap_or_else(|| {
-            if cfg!(windows) {
-                "cmd.exe".into()
-            } else {
-                "/bin/sh".into()
-            }
-        });
-        return Ok(vec![
-            RoomSpec::new(shell.clone(), Transport::Shell, 1),
-            RoomSpec::new(shell, Transport::Shell, 2),
-        ]);
-    }
-    if guests.len() < 2 {
+fn working_directory(configured: Option<&Path>) -> io::Result<PathBuf> {
+    let launch_directory = env::current_dir()?;
+    let directory = match configured {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => launch_directory.join(path),
+        None => launch_directory,
+    };
+    if !directory.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: crowded GUEST GUEST [GUEST ...]; a guest is shell:PROGRAM or raw:PROGRAM",
+            format!(
+                "room working directory does not exist: {}",
+                directory.display()
+            ),
         ));
     }
+    Ok(directory)
+}
 
-    guests
-        .into_iter()
-        .enumerate()
-        .map(|(index, guest)| RoomSpec::parse(guest, index + 1))
-        .collect()
+fn opencode_input_ready(screen: &str) -> bool {
+    (screen.contains("Ask anything") || screen.contains("ctrl+p commands"))
+        && !screen.contains("esc interrupt")
+        && !screen.contains("exit shell mode")
 }
 
 const RAW_SUBMIT_DELAY: Duration = Duration::from_millis(150);
@@ -234,6 +173,15 @@ impl Pane {
         // A PTY has two ends: the child receives the slave; we keep the master.
         let pty = native_pty_system().openpty(size)?;
         let mut command = CommandBuilder::new(spec.program.clone());
+        command.args(&spec.args);
+        // portable-pty defaults an omitted cwd to HOME rather than inheriting
+        // Crowded's directory, so the project directory must be explicit.
+        let cwd = working_directory(spec.cwd.as_deref())?;
+        command.cwd(&cwd);
+        command.env("PWD", &cwd);
+        for (key, value) in &spec.variables {
+            command.env(key, value);
+        }
         for (key, value) in &environment.variables {
             command.env(key, value);
         }
@@ -306,8 +254,25 @@ impl Pane {
         &self.spec.title
     }
 
+    pub(crate) fn needs_intro(&self) -> bool {
+        self.spec.transport == Transport::Raw
+    }
+
     pub(crate) fn screen(&self) -> &Screen {
         self.parser.screen()
+    }
+
+    pub(crate) fn automation_input_ready(&self, output_is_quiet: bool) -> bool {
+        let guest = Path::new(self.spec.program.as_os_str())
+            .file_name()
+            .unwrap_or(self.spec.program.as_os_str())
+            .to_string_lossy();
+        if guest.eq_ignore_ascii_case("opencode") {
+            // OpenCode exposes its actual normal-mode prompt on the rendered
+            // screen; silence alone also occurs during startup and shell mode.
+            return opencode_input_ready(&self.parser.screen().contents());
+        }
+        output_is_quiet
     }
 
     pub(crate) fn send_whisper(&mut self, source: &str, message: &str) -> io::Result<()> {
@@ -368,16 +333,27 @@ mod tests {
     }
 
     #[test]
-    fn guest_spec_selects_transport_and_name() {
-        let guest = RoomSpec::parse("raw:codex".into(), 2).unwrap();
-        assert_eq!(guest.transport, Transport::Raw);
-        assert_eq!(guest.program, OsString::from("codex"));
-        assert_eq!(guest.title, "codex · 2");
-    }
-
-    #[test]
     fn shift_tab_uses_the_terminal_backtab_sequence() {
         let key = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
         assert_eq!(key_bytes(key), Some(b"\x1b[Z".to_vec()));
+    }
+
+    #[test]
+    fn rooms_without_cwd_use_crowdeds_launch_directory() {
+        assert_eq!(
+            working_directory(None).unwrap(),
+            env::current_dir().unwrap()
+        );
+    }
+
+    #[test]
+    fn opencode_is_ready_only_at_its_idle_normal_prompt() {
+        assert!(opencode_input_ready("Ask anything... tab agents"));
+        assert!(opencode_input_ready("tab agents  ctrl+p commands"));
+        assert!(!opencode_input_ready("Ask anything... esc interrupt"));
+        assert!(!opencode_input_ready("ctrl+p commands  esc interrupt"));
+        assert!(!opencode_input_ready(
+            "Run a command... ctrl+p commands  esc exit shell mode"
+        ));
     }
 }

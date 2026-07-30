@@ -23,9 +23,10 @@ use ratatui::{
 use tui_term::widget::PseudoTerminal;
 
 use crate::{
-    doorbell::Doorbell,
+    config::room_specs,
+    doorbell::{Doorbell, DoorbellEvent, PulseState},
     mailroom::Mailroom,
-    pane::{Pane, room_specs},
+    pane::Pane,
 };
 
 enum InputMode {
@@ -40,6 +41,59 @@ const AUTO_DELIVERY_LIMIT: usize = 20;
 struct DeliveryFuse {
     used: usize,
     limit: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeliveryGate {
+    AwaitingIntro,
+    IntroSent,
+    IntroRunning,
+    Ready,
+    MessageSent,
+    MessageRunning,
+}
+
+impl DeliveryGate {
+    fn new(needs_intro: bool) -> Self {
+        if needs_intro {
+            Self::AwaitingIntro
+        } else {
+            Self::Ready
+        }
+    }
+
+    fn observe(&mut self, input_ready: bool) {
+        *self = match (*self, input_ready) {
+            (Self::IntroSent, false) => Self::IntroRunning,
+            (Self::IntroRunning, true) => Self::Ready,
+            (Self::MessageSent, false) => Self::MessageRunning,
+            (Self::MessageRunning, true) => Self::Ready,
+            (state, _) => state,
+        };
+    }
+
+    fn can_send_intro(self, input_ready: bool) -> bool {
+        self == Self::AwaitingIntro && input_ready
+    }
+
+    fn intro_sent(&mut self) {
+        *self = Self::IntroSent;
+    }
+
+    fn can_deliver(self, input_ready: bool) -> bool {
+        self == Self::Ready && input_ready
+    }
+
+    fn message_sent(&mut self) {
+        *self = Self::MessageSent;
+    }
+
+    fn is_starting(self) -> bool {
+        matches!(
+            self,
+            Self::AwaitingIntro | Self::IntroSent | Self::IntroRunning
+        )
+    }
 }
 
 impl DeliveryFuse {
@@ -92,6 +146,40 @@ fn message_with_hat(task: Option<&str>, role: Option<&str>, body: &str) -> Strin
     }
 }
 
+fn inject_ready_pending(
+    pending: &mut VecDeque<(u64, usize)>,
+    mailroom: &mut Mailroom,
+    panes: &mut [Pane],
+    gates: &mut [DeliveryGate],
+    input_ready: &[bool],
+    fuse: &mut DeliveryFuse,
+) -> (usize, usize) {
+    let mut injected = 0;
+    let mut failed = 0;
+    let candidates = pending.len();
+    for _ in 0..candidates {
+        if fuse.is_tripped() {
+            break;
+        }
+        let Some((id, target)) = pending.pop_front() else {
+            break;
+        };
+        if !gates[target].can_deliver(input_ready[target]) {
+            pending.push_back((id, target));
+            continue;
+        }
+        match mailroom.inject(id, &mut panes[target]) {
+            Ok(()) => {
+                gates[target].message_sent();
+                fuse.record();
+                injected += 1;
+            }
+            Err(_) => failed += 1,
+        }
+    }
+    (injected, failed)
+}
+
 fn pane_size(outer: Rect) -> PtySize {
     // The border consumes one cell on every side. `saturating_sub` stops tiny
     // terminal sizes from wrapping below zero, and the PTY itself stays >= 1×1.
@@ -134,9 +222,11 @@ fn pane_areas(area: Rect, room_count: usize) -> Vec<Rect> {
     areas
 }
 
-fn content_areas(area: Rect) -> (Rect, Rect) {
-    let [rooms, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
-    (rooms, status)
+fn content_areas(area: Rect) -> (Rect, Rect, Rect) {
+    let [body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+    let [rooms, pulse] =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(26)]).areas(body);
+    (rooms, pulse, status)
 }
 
 fn mail_popup_area(area: Rect) -> Rect {
@@ -204,7 +294,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `?` returns early on an error. The guards below still run their Drop code.
     let _terminal_guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let (rooms, _) = content_areas(terminal.size()?.into());
+    let (rooms, _, _) = content_areas(terminal.size()?.into());
     let areas = pane_areas(rooms, room_count);
     let mut panes = Vec::with_capacity(room_count);
     for (index, (spec, area)) in specs.into_iter().zip(areas).enumerate() {
@@ -215,7 +305,10 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?);
     }
     let roster = panes.iter().map(Pane::title).collect::<Vec<_>>().join("; ");
-    let mut house_rules_pending = vec![true; room_count];
+    let mut delivery_gates = panes
+        .iter()
+        .map(|pane| DeliveryGate::new(pane.needs_intro()))
+        .collect::<Vec<_>>();
     let mut last_output = vec![None::<Instant>; room_count];
     let mut focused = 0;
     let mut input_mode = InputMode::Normal;
@@ -224,6 +317,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut fuse = DeliveryFuse::new(AUTO_DELIVERY_LIMIT);
     let mut delivery_paused = false;
     let mut pending = VecDeque::<(u64, usize)>::new();
+    let mut room_pulses = vec![None::<PulseState>; room_count];
 
     loop {
         let now = Instant::now();
@@ -232,19 +326,24 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                 last_output[index] = Some(now);
             }
         }
+        let input_ready: Vec<_> = panes
+            .iter()
+            .enumerate()
+            .map(|(index, pane)| {
+                let output_is_quiet = last_output[index]
+                    .is_some_and(|last| now.duration_since(last) >= HOUSE_RULES_QUIET);
+                pane.automation_input_ready(output_is_quiet)
+            })
+            .collect();
         for index in 0..room_count {
-            if house_rules_pending[index]
-                && last_output[index]
-                    .is_some_and(|last| now.duration_since(last) >= HOUSE_RULES_QUIET)
-            {
-                // ponytail: output-idle is the generic readiness signal; use
-                // native lifecycle hooks when vendor adapters arrive.
+            delivery_gates[index].observe(input_ready[index]);
+            if delivery_gates[index].can_send_intro(input_ready[index]) {
                 match panes[index]
                     .send_whisper("The Crowded Room", &house_rules(index + 1, &roster))
                 {
-                    Ok(()) => house_rules_pending[index] = false,
+                    Ok(()) => delivery_gates[index].intro_sent(),
                     Err(error) => {
-                        house_rules_pending[index] = false;
+                        delivery_gates[index].intro_sent();
                         notice = Some(format!(
                             "Could not teach {} the house rules: {error}",
                             panes[index].title()
@@ -253,7 +352,35 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        while let Ok(envelope) = doorbell.try_recv() {
+        if !delivery_paused {
+            let (injected, failed) = inject_ready_pending(
+                &mut pending,
+                &mut mailroom,
+                &mut panes,
+                &mut delivery_gates,
+                &input_ready,
+                &mut fuse,
+            );
+            if fuse.is_tripped() {
+                delivery_paused = true;
+                notice = Some(format!(
+                    "Delivery fuse tripped after {injected} queued injections; {} remain",
+                    pending.len()
+                ));
+            } else if injected > 0 || failed > 0 {
+                notice = Some(format!(
+                    "Queued delivery: {injected} injected, {failed} failed"
+                ));
+            }
+        }
+        while let Ok(event) = doorbell.try_recv() {
+            let envelope = match event {
+                DoorbellEvent::Pulse(pulse) => {
+                    room_pulses[pulse.from] = Some(pulse.state);
+                    continue;
+                }
+                DoorbellEvent::Message(envelope) => envelope,
+            };
             let source = panes[envelope.from].title().to_owned();
             let target = panes[envelope.to].title().to_owned();
             let body = message_with_hat(
@@ -261,12 +388,17 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                 envelope.role.as_deref(),
                 &envelope.body,
             );
-            if delivery_paused {
+            if delivery_paused || !delivery_gates[envelope.to].can_deliver(input_ready[envelope.to])
+            {
                 if pending.len() >= 100 {
-                    envelope.reply_failed("paused delivery queue is full");
+                    envelope.reply_failed("delivery queue is full");
                     continue;
                 }
-                let reason = if fuse.is_tripped() {
+                let reason = if delivery_gates[envelope.to].is_starting() {
+                    "room starting"
+                } else if !input_ready[envelope.to] {
+                    "room busy"
+                } else if fuse.is_tripped() {
                     "fuse tripped"
                 } else {
                     "delivery paused"
@@ -280,6 +412,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                 match result {
                     Ok(()) => {
                         envelope.reply_injected(id);
+                        delivery_gates[envelope.to].message_sent();
                         fuse.record();
                         if fuse.is_tripped() {
                             delivery_paused = true;
@@ -304,7 +437,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         terminal.draw(|frame| {
-            let (rooms, status) = content_areas(frame.area());
+            let (rooms, pulse, status) = content_areas(frame.area());
             let areas = pane_areas(rooms, room_count);
             for (index, (pane, area)) in panes.iter().zip(areas.iter()).enumerate() {
                 let border_style = if !pane.is_online() {
@@ -329,6 +462,28 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                     frame.render_widget(block, *area);
                 }
             }
+
+            let pulse_text = panes
+                .iter()
+                .zip(&room_pulses)
+                .map(|(pane, state)| {
+                    let state = if !pane.is_online() {
+                        "offline"
+                    } else if !pane.needs_intro() {
+                        "terminal"
+                    } else {
+                        state.map(PulseState::label).unwrap_or("waiting")
+                    };
+                    format!("{}\n  {state}", pane.title())
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            frame.render_widget(
+                Paragraph::new(pulse_text)
+                    .block(Block::bordered().title(" Room Pulse "))
+                    .wrap(Wrap { trim: false }),
+                pulse,
+            );
 
             let status_text = match &input_mode {
                 InputMode::Normal => notice.clone().unwrap_or_else(|| {
@@ -442,31 +597,10 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                             fuse.reset();
                         }
                         delivery_paused = false;
-                        let mut injected = 0;
-                        let mut failed = 0;
-                        while !fuse.is_tripped() {
-                            let Some((id, target)) = pending.pop_front() else {
-                                break;
-                            };
-                            match mailroom.inject(id, &mut panes[target]) {
-                                Ok(()) => {
-                                    injected += 1;
-                                    fuse.record();
-                                }
-                                Err(_) => failed += 1,
-                            }
-                        }
-                        if fuse.is_tripped() {
-                            delivery_paused = true;
-                            notice = Some(format!(
-                                "Fuse tripped after {injected} queued injections; {} remain",
-                                pending.len()
-                            ));
-                        } else {
-                            notice = Some(format!(
-                                "Automatic delivery resumed: {injected} injected, {failed} failed"
-                            ));
-                        }
+                        notice = Some(format!(
+                            "Automatic delivery resumed; {} queued",
+                            pending.len()
+                        ));
                     } else {
                         delivery_paused = true;
                         notice = Some("Automatic delivery paused".to_owned());
@@ -481,7 +615,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .send_whisper("The Crowded Room", &house_rules(focused + 1, &roster))
                     {
                         Ok(()) => {
-                            house_rules_pending[focused] = false;
+                            delivery_gates[focused].intro_sent();
                             notice = Some(format!(
                                 "{} reintroduced to the room",
                                 panes[focused].title()
@@ -502,11 +636,12 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                         && !panes[focused].is_online() =>
                 {
                     terminal.autoresize()?;
-                    let (rooms, _) = content_areas(terminal.size()?.into());
+                    let (rooms, _, _) = content_areas(terminal.size()?.into());
                     let area = pane_areas(rooms, room_count)[focused];
                     match panes[focused].restart(pane_size(area)) {
                         Ok(()) => {
-                            house_rules_pending[focused] = true;
+                            delivery_gates[focused] =
+                                DeliveryGate::new(panes[focused].needs_intro());
                             last_output[focused] = None;
                             notice = Some(format!("{} restarted", panes[focused].title()));
                         }
@@ -530,15 +665,36 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     if panes[target].is_online() {
                                         let message = std::mem::take(message);
                                         let source = panes[focused].title().to_owned();
-                                        let (id, result) =
-                                            mailroom.deliver(source, &mut panes[target], message);
                                         input_mode = InputMode::Normal;
-                                        notice = Some(match result {
-                                            Ok(()) => format!("Envelope #{id:04} injected"),
-                                            Err(error) => {
-                                                format!("Envelope #{id:04} failed: {error}")
-                                            }
-                                        });
+                                        if delivery_paused
+                                            || !delivery_gates[target]
+                                                .can_deliver(input_ready[target])
+                                        {
+                                            let destination = panes[target].title().to_owned();
+                                            let id = mailroom.queue(
+                                                source,
+                                                destination,
+                                                message,
+                                                "room not ready",
+                                            );
+                                            pending.push_back((id, target));
+                                            notice = Some(format!("Envelope #{id:04} queued"));
+                                        } else {
+                                            let (id, result) = mailroom.deliver(
+                                                source,
+                                                &mut panes[target],
+                                                message,
+                                            );
+                                            notice = Some(match result {
+                                                Ok(()) => {
+                                                    delivery_gates[target].message_sent();
+                                                    format!("Envelope #{id:04} injected")
+                                                }
+                                                Err(error) => {
+                                                    format!("Envelope #{id:04} failed: {error}")
+                                                }
+                                            });
+                                        }
                                     }
                                 }
                                 KeyCode::Backspace => {
@@ -591,7 +747,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 Event::Resize(_, _) => {
                     terminal.autoresize()?;
-                    let (rooms, _) = content_areas(terminal.size()?.into());
+                    let (rooms, _, _) = content_areas(terminal.size()?.into());
                     let areas = pane_areas(rooms, room_count);
                     for (pane, area) in panes.iter_mut().zip(areas.iter()) {
                         pane.resize(pane_size(*area))?;
@@ -648,6 +804,11 @@ mod tests {
             ]
         );
         assert!(pane_areas(Rect::default(), 0).is_empty());
+
+        let (rooms, pulse, status) = content_areas(Rect::new(0, 0, 120, 40));
+        assert_eq!(rooms, Rect::new(0, 0, 94, 39));
+        assert_eq!(pulse, Rect::new(94, 0, 26, 39));
+        assert_eq!(status, Rect::new(0, 39, 120, 1));
     }
 
     #[test]
@@ -669,5 +830,27 @@ mod tests {
         assert!(fuse.is_tripped());
         fuse.reset();
         assert_eq!(fuse.remaining(), 2);
+    }
+
+    #[test]
+    fn delivery_gate_waits_for_each_tui_busy_cycle() {
+        assert_eq!(DeliveryGate::new(false), DeliveryGate::Ready);
+
+        let mut gate = DeliveryGate::new(true);
+        assert!(gate.can_send_intro(true));
+        assert!(!gate.can_deliver(true));
+
+        gate.intro_sent();
+        gate.observe(true);
+        assert_eq!(gate, DeliveryGate::IntroSent);
+        gate.observe(false);
+        gate.observe(true);
+        assert!(gate.can_deliver(true));
+
+        gate.message_sent();
+        assert!(!gate.can_deliver(true));
+        gate.observe(false);
+        gate.observe(true);
+        assert!(gate.can_deliver(true));
     }
 }

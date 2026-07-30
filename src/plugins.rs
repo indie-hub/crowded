@@ -1,0 +1,1359 @@
+//! Project-local plugins shared by Claude, Codex, and OpenCode.
+
+use std::{
+    collections::BTreeMap,
+    env, fs, io,
+    os::unix::fs::symlink,
+    path::{Component, Path, PathBuf},
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::toolbox::remove_empty_directory;
+
+const INSTALLS_DIRECTORY: &str = ".crowded/plugins";
+const MANIFEST_FILE: &str = "crowded-plugin.toml";
+const INSTALL_FILE: &str = ".crowded-install.toml";
+const ADAPTER_FILE: &str = ".crowded-adapters.json";
+const ADAPTER_VERSION: u32 = 1;
+const ADD_USAGE: &str = "usage: crowded plugin add SOURCE [--ref REF]";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginManifest {
+    name: String,
+    version: String,
+}
+
+#[derive(Deserialize)]
+struct NativePluginManifest {
+    name: String,
+    version: String,
+    #[serde(default)]
+    hooks: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct InstallRecord {
+    name: String,
+    version: String,
+    source: String,
+    revision: String,
+    skills: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct AdapterState {
+    version: u32,
+    links: Vec<AdapterLink>,
+    hooks: Vec<AdapterHooks>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct AdapterLink {
+    path: PathBuf,
+    target: PathBuf,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct AdapterHooks {
+    path: PathBuf,
+    entries: BTreeMap<String, Vec<Value>>,
+    #[serde(default)]
+    created: bool,
+}
+
+struct HookUpdate {
+    managed: AdapterHooks,
+    original: Option<String>,
+    generated: Option<String>,
+}
+
+pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = env::args().skip(2);
+    let action = args.next().ok_or_else(|| {
+        invalid_input(
+            "usage: crowded plugin add|list|preview|enable|disable|remove (run a command for details)",
+        )
+    })?;
+    let root = env::current_dir()?;
+
+    match action.as_str() {
+        "add" => {
+            let source = args.next().ok_or_else(|| invalid_input(ADD_USAGE))?;
+            let reference = match (args.next().as_deref(), args.next()) {
+                (None, None) => None,
+                (Some("--ref"), Some(reference)) if args.next().is_none() => Some(reference),
+                _ => return Err(invalid_input(ADD_USAGE).into()),
+            };
+            let installed = add(&root, &source, reference.as_deref())?;
+            println!(
+                "installed {} {} ({}) with {} shared skill(s)",
+                installed.name,
+                installed.version,
+                &installed.revision[..installed.revision.len().min(12)],
+                installed.skills.len()
+            );
+        }
+        "list" if args.next().is_none() => {
+            let installed = list(&root)?;
+            if installed.is_empty() {
+                println!("no local Crowded plugins");
+            } else {
+                for plugin in installed {
+                    let adapters = if root
+                        .join(INSTALLS_DIRECTORY)
+                        .join(&plugin.name)
+                        .join(ADAPTER_FILE)
+                        .is_file()
+                    {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    };
+                    println!(
+                        "{} {} {} {} skill(s), adapters {adapters}",
+                        plugin.name,
+                        plugin.version,
+                        &plugin.revision[..plugin.revision.len().min(12)],
+                        plugin.skills.len(),
+                    );
+                }
+            }
+        }
+        "preview" | "enable" | "disable" => {
+            let name = args
+                .next()
+                .ok_or_else(|| invalid_input(format!("usage: crowded plugin {action} PLUGIN")))?;
+            if args.next().is_some() {
+                return Err(invalid_input(format!("usage: crowded plugin {action} PLUGIN")).into());
+            }
+            match action.as_str() {
+                "preview" => preview_adapters(&root, &name)?,
+                "enable" => {
+                    let state = enable_adapters(&root, &name)?;
+                    println!(
+                        "enabled {} hook target(s) and {} OpenCode file(s)",
+                        state.hooks.len(),
+                        state.links.len()
+                    );
+                }
+                "disable" => {
+                    let state = disable_adapters(&root, &name)?;
+                    println!(
+                        "disabled {} hook target(s) and {} OpenCode file(s)",
+                        state.hooks.len(),
+                        state.links.len()
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+        "remove" => {
+            let name = args
+                .next()
+                .ok_or_else(|| invalid_input("usage: crowded plugin remove PLUGIN"))?;
+            if args.next().is_some() {
+                return Err(invalid_input("usage: crowded plugin remove PLUGIN").into());
+            }
+            let removed = remove(&root, &name)?;
+            println!(
+                "removed {} and {} shared skill(s)",
+                removed.name,
+                removed.skills.len()
+            );
+        }
+        _ => {
+            return Err(invalid_input(
+                "usage: crowded plugin add SOURCE [--ref REF] | list | preview|enable|disable|remove PLUGIN",
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn add(root: &Path, source: &str, reference: Option<&str>) -> io::Result<InstallRecord> {
+    validate_source(source)?;
+    if let Some(reference) = reference {
+        validate_reference(reference)?;
+    }
+
+    create_install_directory(root)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let temporary = root
+        .join(".crowded")
+        .join(format!("plugin-install-{}-{nonce}", std::process::id()));
+    let clone_result = clone_source(source, reference, &temporary);
+    if let Err(error) = clone_result {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+
+    let result = prepare_install(root, source, &temporary);
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&temporary);
+    }
+    result
+}
+
+fn prepare_install(root: &Path, source: &str, temporary: &Path) -> io::Result<InstallRecord> {
+    let manifest = load_manifest(temporary)?;
+    validate_name("plugin", &manifest.name)?;
+    validate_version(&manifest.version)?;
+    let skills = discover_skills(&temporary.join("skills"))?;
+    let revision = git_revision(temporary)?;
+    let installed = root.join(INSTALLS_DIRECTORY).join(&manifest.name);
+    match fs::symlink_metadata(&installed) {
+        Ok(_) => {
+            return Err(invalid_input(format!(
+                "plugin `{}` is already installed",
+                manifest.name
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let record = InstallRecord {
+        name: manifest.name,
+        version: manifest.version,
+        source: source.to_owned(),
+        revision,
+        skills,
+    };
+    let links = skill_links(root, &record);
+    for (link, _) in &links {
+        match fs::symlink_metadata(link) {
+            Ok(_) => {
+                return Err(invalid_input(format!(
+                    "{} already exists; refusing to replace it",
+                    link.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    fs::write(
+        temporary.join(INSTALL_FILE),
+        toml::to_string_pretty(&record).map_err(io::Error::other)?,
+    )?;
+    fs::rename(temporary, &installed)?;
+
+    let mut created = Vec::new();
+    for (link, target) in &links {
+        let result = link
+            .parent()
+            .ok_or_else(|| invalid_input("skill link has no parent"))
+            .and_then(fs::create_dir_all)
+            .and_then(|()| symlink(target, link));
+        if let Err(error) = result {
+            for link in created {
+                let _ = fs::remove_file(link);
+            }
+            let _ = fs::remove_dir_all(&installed);
+            return Err(error);
+        }
+        created.push(link);
+    }
+    Ok(record)
+}
+
+fn list(root: &Path) -> io::Result<Vec<InstallRecord>> {
+    let directory = root.join(INSTALLS_DIRECTORY);
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut installed = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            installed.push(load_record(&entry.path())?);
+        }
+    }
+    installed.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(installed)
+}
+
+fn remove(root: &Path, name: &str) -> io::Result<InstallRecord> {
+    validate_name("plugin", name)?;
+    let installed = root.join(INSTALLS_DIRECTORY).join(name);
+    if fs::symlink_metadata(&installed)?.file_type().is_symlink() {
+        return Err(invalid_data(format!(
+            "{} must not be a symbolic link",
+            installed.display()
+        )));
+    }
+    let record = load_record(&installed)?;
+    if record.name != name {
+        return Err(invalid_data(format!(
+            "{} belongs to plugin `{}`",
+            installed.display(),
+            record.name
+        )));
+    }
+    if installed.join(ADAPTER_FILE).try_exists()? {
+        disable_adapters(root, name)?;
+    }
+
+    let links = skill_links(root, &record);
+    for (link, expected) in &links {
+        match fs::read_link(link) {
+            Ok(actual) if actual == *expected => {}
+            Ok(_) => {
+                return Err(invalid_data(format!(
+                    "{} no longer points to the Crowded-managed skill",
+                    link.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    for (link, _) in &links {
+        match fs::remove_file(link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    fs::remove_dir_all(&installed)?;
+    let data = root.join(".crowded/plugin-data").join(name);
+    if data.try_exists()? {
+        fs::remove_dir_all(data)?;
+        remove_empty_directory(&root.join(".crowded/plugin-data"))?;
+    }
+    remove_empty_directory(&root.join(".agents/skills"))?;
+    remove_empty_directory(&root.join(".claude/skills"))?;
+    remove_empty_directory(&root.join(".opencode/skills"))?;
+    remove_empty_directory(&root.join(INSTALLS_DIRECTORY))?;
+    Ok(record)
+}
+
+fn preview_adapters(root: &Path, name: &str) -> io::Result<()> {
+    let plan = adapter_plan(root, name)?;
+    if plan.hooks.is_empty() && plan.links.is_empty() {
+        println!("{name} has no supported vendor adapters");
+        return Ok(());
+    }
+    for hooks in &plan.hooks {
+        let count: usize = hooks.entries.values().map(Vec::len).sum();
+        println!("hooks  {} ({count} handler(s))", hooks.path.display());
+        for command in hook_commands(&hooks.entries) {
+            println!("       {command}");
+        }
+    }
+    for link in &plan.links {
+        println!(
+            "link   {} -> {}",
+            link.path.display(),
+            link.target.display()
+        );
+    }
+    Ok(())
+}
+
+fn enable_adapters(root: &Path, name: &str) -> io::Result<AdapterState> {
+    validate_name("plugin", name)?;
+    let installed = root.join(INSTALLS_DIRECTORY).join(name);
+    let state_path = installed.join(ADAPTER_FILE);
+    if state_path.try_exists()? {
+        return Err(invalid_input(format!(
+            "plugin `{name}` vendor adapters are already enabled"
+        )));
+    }
+
+    let plan = adapter_plan(root, name)?;
+    if plan.hooks.is_empty() && plan.links.is_empty() {
+        return Err(invalid_input(format!(
+            "plugin `{name}` has no supported vendor adapters"
+        )));
+    }
+    for link in &plan.links {
+        let path = root.join(&link.path);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(invalid_input(format!(
+                    "{} already exists; refusing to replace it",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let updates = plan
+        .hooks
+        .iter()
+        .map(|hooks| prepare_hook_enable(root, hooks))
+        .collect::<io::Result<Vec<_>>>()?;
+
+    fs::create_dir_all(root.join(".crowded/plugin-data").join(name))?;
+    let mut created_links = Vec::new();
+    for link in &plan.links {
+        let path = root.join(&link.path);
+        let result = path
+            .parent()
+            .ok_or_else(|| invalid_input("adapter link has no parent"))
+            .and_then(fs::create_dir_all)
+            .and_then(|()| symlink(&link.target, &path));
+        if let Err(error) = result {
+            rollback_links(root, &created_links);
+            return Err(error);
+        }
+        created_links.push(link.clone());
+    }
+
+    for (applied, update) in updates.iter().enumerate() {
+        if let Err(error) = apply_hook_update(root, update) {
+            rollback_hooks(root, &updates[..applied]);
+            rollback_links(root, &created_links);
+            return Err(error);
+        }
+    }
+
+    let state = AdapterState {
+        version: ADAPTER_VERSION,
+        links: plan.links,
+        hooks: updates
+            .iter()
+            .map(|update| update.managed.clone())
+            .collect(),
+    };
+    let contents = match serde_json::to_string_pretty(&state) {
+        Ok(contents) => contents + "\n",
+        Err(error) => {
+            rollback_hooks(root, &updates);
+            rollback_links(root, &created_links);
+            return Err(io::Error::other(error));
+        }
+    };
+    if let Err(error) = write_text_atomic(&state_path, &contents) {
+        rollback_hooks(root, &updates);
+        rollback_links(root, &created_links);
+        return Err(error);
+    }
+    Ok(state)
+}
+
+fn disable_adapters(root: &Path, name: &str) -> io::Result<AdapterState> {
+    validate_name("plugin", name)?;
+    let installed = root.join(INSTALLS_DIRECTORY).join(name);
+    let state_path = installed.join(ADAPTER_FILE);
+    let state: AdapterState = serde_json::from_str(&fs::read_to_string(&state_path)?)
+        .map_err(|error| invalid_data(format!("invalid {}: {error}", state_path.display())))?;
+    if state.version != ADAPTER_VERSION {
+        return Err(invalid_data(format!(
+            "{} uses unsupported adapter state version {}",
+            state_path.display(),
+            state.version
+        )));
+    }
+
+    for link in &state.links {
+        let path = root.join(&link.path);
+        match fs::read_link(&path) {
+            Ok(target) if target == link.target => {}
+            Ok(_) => {
+                return Err(invalid_data(format!(
+                    "{} no longer points to the Crowded-managed adapter",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let updates = state
+        .hooks
+        .iter()
+        .map(|hooks| prepare_hook_disable(root, hooks))
+        .collect::<io::Result<Vec<_>>>()?;
+
+    for (applied, update) in updates.iter().enumerate() {
+        if let Err(error) = apply_hook_update(root, update) {
+            rollback_hooks(root, &updates[..applied]);
+            return Err(error);
+        }
+    }
+    let mut removed_links = Vec::new();
+    for link in &state.links {
+        let path = root.join(&link.path);
+        match fs::remove_file(&path) {
+            Ok(()) => removed_links.push(link.clone()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                rollback_hooks(root, &updates);
+                restore_links(root, &removed_links);
+                return Err(error);
+            }
+        }
+    }
+    if let Err(error) = fs::remove_file(&state_path) {
+        rollback_hooks(root, &updates);
+        restore_links(root, &removed_links);
+        return Err(error);
+    }
+    remove_empty_directory(&root.join(".opencode/plugins"))?;
+    remove_empty_directory(&root.join(".opencode/command"))?;
+    Ok(state)
+}
+
+fn adapter_plan(root: &Path, name: &str) -> io::Result<AdapterState> {
+    validate_name("plugin", name)?;
+    let installed = root.join(INSTALLS_DIRECTORY).join(name);
+    if fs::symlink_metadata(&installed)?.file_type().is_symlink() {
+        return Err(invalid_data(format!(
+            "{} must not be a symbolic link",
+            installed.display()
+        )));
+    }
+    let record = load_record(&installed)?;
+    if record.name != name {
+        return Err(invalid_data(format!(
+            "{} belongs to plugin `{}`",
+            installed.display(),
+            record.name
+        )));
+    }
+
+    let mut hooks = Vec::new();
+    for (manifest_path, target) in [
+        (
+            ".claude-plugin/plugin.json",
+            PathBuf::from(".claude/settings.local.json"),
+        ),
+        (
+            ".codex-plugin/plugin.json",
+            PathBuf::from(".codex/hooks.json"),
+        ),
+    ] {
+        let manifest_path = installed.join(manifest_path);
+        if !manifest_path.try_exists()? {
+            continue;
+        }
+        let manifest = read_native_manifest(&manifest_path)?;
+        if manifest.name != name {
+            return Err(invalid_data(format!(
+                "{} belongs to plugin `{}`",
+                manifest_path.display(),
+                manifest.name
+            )));
+        }
+        if let Some(hook_path) = manifest.hooks {
+            let hook_path = safe_plugin_file(&installed, &hook_path)?;
+            hooks.push(AdapterHooks {
+                path: target,
+                entries: adapted_hooks(root, name, &hook_path)?,
+                created: false,
+            });
+        }
+    }
+
+    let mut links = Vec::new();
+    collect_adapter_links(name, &installed, ".opencode/plugins", &mut links)?;
+    collect_adapter_links(name, &installed, ".opencode/command", &mut links)?;
+    Ok(AdapterState {
+        version: ADAPTER_VERSION,
+        links,
+        hooks,
+    })
+}
+
+fn read_native_manifest(path: &Path) -> io::Result<NativePluginManifest> {
+    serde_json::from_str(&fs::read_to_string(path)?)
+        .map_err(|error| invalid_data(format!("invalid {}: {error}", path.display())))
+}
+
+fn safe_plugin_file(installed: &Path, relative: &str) -> io::Result<PathBuf> {
+    let relative = Path::new(relative.strip_prefix("./").unwrap_or(relative));
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(invalid_data(
+            "plugin adapter path must stay inside the plugin",
+        ));
+    }
+    let path = installed.join(relative);
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(invalid_data(format!(
+            "{} must be a regular file",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn adapted_hooks(
+    root: &Path,
+    name: &str,
+    hook_path: &Path,
+) -> io::Result<BTreeMap<String, Vec<Value>>> {
+    let document: Value = serde_json::from_str(&fs::read_to_string(hook_path)?)
+        .map_err(|error| invalid_data(format!("invalid {}: {error}", hook_path.display())))?;
+    let hooks = document
+        .get("hooks")
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid_data(format!("{} needs a `hooks` object", hook_path.display())))?;
+    let plugin_root = root.join(INSTALLS_DIRECTORY).join(name);
+    let plugin_data = root.join(".crowded/plugin-data").join(name);
+    let mut adapted = BTreeMap::new();
+    for (event, handlers) in hooks {
+        let mut handlers = handlers.as_array().cloned().ok_or_else(|| {
+            invalid_data(format!(
+                "{} `hooks.{event}` must contain an array",
+                hook_path.display()
+            ))
+        })?;
+        for handler in &mut handlers {
+            adapt_hook_commands(handler, &plugin_root, &plugin_data);
+        }
+        adapted.insert(event.clone(), handlers);
+    }
+    Ok(adapted)
+}
+
+fn hook_commands(entries: &BTreeMap<String, Vec<Value>>) -> Vec<&str> {
+    let mut commands = Vec::new();
+    for handlers in entries.values() {
+        for handler in handlers {
+            collect_hook_commands(handler, &mut commands);
+        }
+    }
+    commands
+}
+
+fn collect_hook_commands<'a>(value: &'a Value, commands: &mut Vec<&'a str>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_hook_commands(value, commands);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(command) = object.get("command").and_then(Value::as_str) {
+                commands.push(command);
+            }
+            for value in object.values() {
+                collect_hook_commands(value, commands);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn adapt_hook_commands(value: &mut Value, plugin_root: &Path, plugin_data: &Path) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                adapt_hook_commands(value, plugin_root, plugin_data);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(Value::String(command)) = object.get_mut("command") {
+                let root = plugin_root.to_string_lossy();
+                let data = plugin_data.to_string_lossy();
+                let adapted = command
+                    .replace("${CLAUDE_PLUGIN_ROOT}", &root)
+                    .replace("$CLAUDE_PLUGIN_ROOT", &root)
+                    .replace("${PLUGIN_ROOT}", &root)
+                    .replace("$PLUGIN_ROOT", &root);
+                *command = format!(
+                    "CLAUDE_PLUGIN_ROOT={} PLUGIN_ROOT={} CLAUDE_PLUGIN_DATA={} PLUGIN_DATA={} {adapted}",
+                    shell_quote(&root),
+                    shell_quote(&root),
+                    shell_quote(&data),
+                    shell_quote(&data)
+                );
+            }
+            for value in object.values_mut() {
+                adapt_hook_commands(value, plugin_root, plugin_data);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_adapter_links(
+    name: &str,
+    installed: &Path,
+    relative_directory: &str,
+    links: &mut Vec<AdapterLink>,
+) -> io::Result<()> {
+    let source = installed.join(relative_directory);
+    let entries = match fs::read_dir(&source) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let metadata = entry.file_type()?;
+        if metadata.is_symlink() {
+            return Err(invalid_data(format!(
+                "{} must not be a symbolic link",
+                entry.path().display()
+            )));
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let file = entry.file_name();
+        let path = entry.path();
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        let supported = match relative_directory {
+            ".opencode/plugins" => {
+                matches!(extension, Some("js" | "mjs" | "cjs" | "ts"))
+            }
+            ".opencode/command" => extension == Some("md"),
+            _ => false,
+        };
+        if !supported {
+            continue;
+        }
+        links.push(AdapterLink {
+            path: Path::new(relative_directory).join(&file),
+            target: PathBuf::from("../../")
+                .join(INSTALLS_DIRECTORY)
+                .join(name)
+                .join(relative_directory)
+                .join(file),
+        });
+    }
+    links.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(())
+}
+
+fn prepare_hook_enable(root: &Path, hooks: &AdapterHooks) -> io::Result<HookUpdate> {
+    let path = root.join(&hooks.path);
+    let original = read_optional_regular(&path)?;
+    let mut document = parse_json_object(original.as_deref(), &path)?;
+    let configured = document
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| invalid_data(format!("{} `hooks` must be an object", path.display())))?;
+    for (event, additions) in &hooks.entries {
+        let handlers = configured
+            .entry(event)
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| {
+                invalid_data(format!(
+                    "{} `hooks.{event}` must be an array",
+                    path.display()
+                ))
+            })?;
+        for addition in additions {
+            if handlers.contains(addition) {
+                return Err(invalid_input(format!(
+                    "{} already contains the `{event}` adapter hook",
+                    path.display()
+                )));
+            }
+            handlers.push(addition.clone());
+        }
+    }
+    let mut generated = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
+    generated.push('\n');
+    let mut managed = hooks.clone();
+    managed.created = original.is_none();
+    Ok(HookUpdate {
+        managed,
+        original,
+        generated: Some(generated),
+    })
+}
+
+fn prepare_hook_disable(root: &Path, hooks: &AdapterHooks) -> io::Result<HookUpdate> {
+    let path = root.join(&hooks.path);
+    let original = read_optional_regular(&path)?;
+    let mut document = parse_json_object(original.as_deref(), &path)?;
+    let root_object = document.as_object_mut().unwrap();
+    let configured = root_object
+        .get_mut("hooks")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| invalid_data(format!("{} `hooks` must be an object", path.display())))?;
+    for (event, removals) in &hooks.entries {
+        let handlers = configured
+            .get_mut(event)
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                invalid_data(format!(
+                    "{} `hooks.{event}` must be an array",
+                    path.display()
+                ))
+            })?;
+        for removal in removals {
+            let position = handlers
+                .iter()
+                .position(|handler| handler == removal)
+                .ok_or_else(|| {
+                    invalid_data(format!(
+                        "{} no longer contains the `{event}` adapter hook",
+                        path.display()
+                    ))
+                })?;
+            handlers.remove(position);
+        }
+        if handlers.is_empty() {
+            configured.remove(event);
+        }
+    }
+    if configured.is_empty() {
+        root_object.remove("hooks");
+    }
+    let generated = if hooks.created && root_object.is_empty() {
+        None
+    } else {
+        let mut output = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
+        output.push('\n');
+        Some(output)
+    };
+    Ok(HookUpdate {
+        managed: hooks.clone(),
+        original,
+        generated,
+    })
+}
+
+fn parse_json_object(original: Option<&str>, path: &Path) -> io::Result<Value> {
+    let document: Value = match original {
+        Some(original) => serde_json::from_str(original)
+            .map_err(|error| invalid_data(format!("invalid {}: {error}", path.display())))?,
+        None => serde_json::json!({}),
+    };
+    if document.is_object() {
+        Ok(document)
+    } else {
+        Err(invalid_data(format!(
+            "{} must contain a JSON object",
+            path.display()
+        )))
+    }
+}
+
+fn read_optional_regular(path: &Path) -> io::Result<Option<String>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(invalid_input(format!(
+            "{} must not be a symbolic link",
+            path.display()
+        ))),
+        Ok(metadata) if metadata.is_file() => fs::read_to_string(path).map(Some),
+        Ok(_) => Err(invalid_input(format!(
+            "{} must be a regular file",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn apply_hook_update(root: &Path, update: &HookUpdate) -> io::Result<()> {
+    let path = root.join(&update.managed.path);
+    match &update.generated {
+        Some(contents) => write_text_atomic(&path, contents),
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+fn rollback_hooks(root: &Path, updates: &[HookUpdate]) {
+    for update in updates.iter().rev() {
+        let path = root.join(&update.managed.path);
+        match &update.original {
+            Some(original) => {
+                let _ = write_text_atomic(&path, original);
+            }
+            None => {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+fn rollback_links(root: &Path, links: &[AdapterLink]) {
+    for link in links.iter().rev() {
+        let _ = fs::remove_file(root.join(&link.path));
+    }
+}
+
+fn restore_links(root: &Path, links: &[AdapterLink]) {
+    for link in links {
+        let path = root.join(&link.path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = symlink(&link.target, path);
+    }
+}
+
+fn write_text_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_input("managed file has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".crowded-adapter-{}-{}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos()
+    ));
+    fs::write(&temporary, contents)?;
+    if let Ok(metadata) = fs::metadata(path) {
+        fs::set_permissions(&temporary, metadata.permissions())?;
+    }
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(temporary);
+            Err(error)
+        }
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn clone_source(source: &str, reference: Option<&str>, destination: &Path) -> io::Result<()> {
+    let source = normalized_source(source);
+    let mut command = Command::new("git");
+    command.args(["clone", "--quiet"]);
+    if !Path::new(&source).exists() {
+        command.args(["--depth", "1"]);
+    }
+    if let Some(reference) = reference {
+        command.args(["--branch", reference]);
+    }
+    let status = command.arg("--").arg(source).arg(destination).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "git clone failed with status {status}"
+        )))
+    }
+}
+
+fn create_install_directory(root: &Path) -> io::Result<()> {
+    let crowded = root.join(".crowded");
+    for directory in [&crowded, &root.join(INSTALLS_DIRECTORY)] {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid_input(format!(
+                    "{} must not be a symbolic link",
+                    directory.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let installs = root.join(INSTALLS_DIRECTORY);
+    fs::create_dir_all(&installs)?;
+    Ok(())
+}
+
+fn normalized_source(source: &str) -> String {
+    if Path::new(source).exists()
+        || source.contains("://")
+        || source.starts_with("git@")
+        || source.matches('/').count() != 1
+    {
+        source.to_owned()
+    } else {
+        format!("https://github.com/{source}.git")
+    }
+}
+
+fn git_revision(directory: &Path) -> io::Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["rev-parse", "HEAD"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            "could not read the installed Git revision",
+        ));
+    }
+    let revision = String::from_utf8(output.stdout)
+        .map_err(io::Error::other)?
+        .trim()
+        .to_owned();
+    if revision.is_empty() {
+        return Err(invalid_data("installed Git revision is empty"));
+    }
+    Ok(revision)
+}
+
+fn load_manifest(directory: &Path) -> io::Result<PluginManifest> {
+    let crowded = directory.join(MANIFEST_FILE);
+    if crowded.try_exists()? {
+        return toml::from_str(&fs::read_to_string(&crowded)?)
+            .map_err(|error| invalid_data(format!("invalid {}: {error}", crowded.display())));
+    }
+
+    for relative in [".codex-plugin/plugin.json", ".claude-plugin/plugin.json"] {
+        let path = directory.join(relative);
+        if path.try_exists()? {
+            let native: NativePluginManifest = serde_json::from_str(&fs::read_to_string(&path)?)
+                .map_err(|error| invalid_data(format!("invalid {}: {error}", path.display())))?;
+            return Ok(PluginManifest {
+                name: native.name,
+                version: native.version,
+            });
+        }
+    }
+
+    Err(invalid_data(format!(
+        "plugin needs `{MANIFEST_FILE}`, `.codex-plugin/plugin.json`, or `.claude-plugin/plugin.json`"
+    )))
+}
+
+fn load_record(directory: &Path) -> io::Result<InstallRecord> {
+    let path = directory.join(INSTALL_FILE);
+    toml::from_str(&fs::read_to_string(&path)?)
+        .map_err(|error| invalid_data(format!("invalid {}: {error}", path.display())))
+}
+
+fn discover_skills(directory: &Path) -> io::Result<Vec<String>> {
+    let mut skills = Vec::new();
+    let entries = fs::read_dir(directory).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            invalid_data("plugin needs a `skills/` directory containing at least one SKILL.md")
+        } else {
+            error
+        }
+    })?;
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_symlink() || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| invalid_data("skill directory name must be UTF-8"))?;
+        validate_name("skill", &name)?;
+        let skill_file = entry.path().join("SKILL.md");
+        if fs::symlink_metadata(&skill_file)?.file_type().is_symlink() {
+            return Err(invalid_data(format!(
+                "{} must not be a symbolic link",
+                skill_file.display()
+            )));
+        }
+        validate_skill(&skill_file, &name)?;
+        skills.push(name);
+    }
+    if skills.is_empty() {
+        return Err(invalid_data(
+            "plugin must contain at least one skills/*/SKILL.md",
+        ));
+    }
+    skills.sort();
+    Ok(skills)
+}
+
+fn validate_skill(path: &Path, directory_name: &str) -> io::Result<()> {
+    let text = fs::read_to_string(path)?;
+    let mut lines = text.lines();
+    if lines.next() != Some("---") {
+        return Err(invalid_data(format!(
+            "{} must begin with YAML frontmatter",
+            path.display()
+        )));
+    }
+    let mut name = None;
+    let mut description = None;
+    let mut closed = false;
+    for line in lines {
+        if line == "---" {
+            closed = true;
+            break;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            let value = value.trim().trim_matches(['"', '\'']);
+            match key.trim() {
+                "name" => name = Some(value),
+                "description" => description = Some(value),
+                _ => {}
+            }
+        }
+    }
+    if !closed || name != Some(directory_name) || description.is_none_or(str::is_empty) {
+        return Err(invalid_data(format!(
+            "{} needs matching `name` and non-empty `description` frontmatter",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn skill_links(root: &Path, plugin: &InstallRecord) -> Vec<(PathBuf, PathBuf)> {
+    let mut links = Vec::with_capacity(plugin.skills.len() * 3);
+    for skill in &plugin.skills {
+        let target = PathBuf::from("../../")
+            .join(INSTALLS_DIRECTORY)
+            .join(&plugin.name)
+            .join("skills")
+            .join(skill);
+        links.push((root.join(".agents/skills").join(skill), target.clone()));
+        links.push((root.join(".claude/skills").join(skill), target.clone()));
+        links.push((root.join(".opencode/skills").join(skill), target));
+    }
+    links
+}
+
+fn validate_name(kind: &str, name: &str) -> io::Result<()> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_input(format!(
+            "{kind} name must be 1..=64 lowercase letters, digits, or single hyphens"
+        )))
+    }
+}
+
+fn validate_version(version: &str) -> io::Result<()> {
+    if version.is_empty() || version.len() > 64 || version.chars().any(char::is_control) {
+        Err(invalid_input(
+            "plugin version must contain 1..=64 characters without controls",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_source(source: &str) -> io::Result<()> {
+    if source.is_empty() || source.len() > 2048 || source.chars().any(char::is_control) {
+        Err(invalid_input(
+            "plugin source must contain 1..=2048 characters without controls",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_reference(reference: &str) -> io::Result<()> {
+    if reference.is_empty()
+        || reference.len() > 255
+        || reference.starts_with('-')
+        || reference.chars().any(char::is_control)
+    {
+        Err(invalid_input(
+            "plugin ref must contain 1..=255 characters, no controls, and cannot start with `-`",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_plugin_is_shared_and_removed_without_touching_other_files() {
+        let base = test_directory();
+        let source = base.join("source");
+        let project = base.join("project");
+        fs::create_dir_all(source.join("skills/room-greeter")).unwrap();
+        fs::create_dir_all(source.join("hooks")).unwrap();
+        fs::create_dir_all(source.join(".opencode/plugins")).unwrap();
+        fs::create_dir_all(source.join(".opencode/command")).unwrap();
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(source.join(".codex-plugin")).unwrap();
+        fs::create_dir(source.join(".claude-plugin")).unwrap();
+        fs::write(
+            source.join(".codex-plugin/plugin.json"),
+            r#"{
+                "name": "greetings",
+                "version": "1.0.0",
+                "description": "Native manifest fixture",
+                "skills": "./skills/",
+                "hooks": "./hooks/hooks.json"
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join(".claude-plugin/plugin.json"),
+            r#"{
+                "name": "greetings",
+                "version": "1.0.0",
+                "hooks": "./hooks/hooks.json"
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("hooks/hooks.json"),
+            r#"{
+                "hooks": {
+                    "SessionStart": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/activate.js\""
+                        }]
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        fs::write(source.join("hooks/activate.js"), "console.log('hello')\n").unwrap();
+        fs::write(
+            source.join(".opencode/plugins/greetings.mjs"),
+            "export const Greetings = async () => ({})\n",
+        )
+        .unwrap();
+        fs::write(
+            source.join(".opencode/command/greet.md"),
+            "---\ndescription: Greet\n---\nHello\n",
+        )
+        .unwrap();
+        fs::write(
+            source.join("skills/room-greeter/SKILL.md"),
+            "---\nname: room-greeter\ndescription: Greets every room\n---\n\nSay hello.\n",
+        )
+        .unwrap();
+        git(&source, &["init", "--quiet"]);
+        git(&source, &["config", "user.name", "Crowded Test"]);
+        git(
+            &source,
+            &["config", "user.email", "crowded@example.invalid"],
+        );
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "--quiet", "-m", "fixture"]);
+
+        fs::create_dir_all(project.join(".claude")).unwrap();
+        fs::create_dir_all(project.join(".codex")).unwrap();
+        let existing_hooks = r#"{
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [{"type": "command", "command": "pulse"}]
+                }]
+            }
+        }"#;
+        fs::write(project.join(".claude/settings.local.json"), existing_hooks).unwrap();
+        fs::write(project.join(".codex/hooks.json"), existing_hooks).unwrap();
+
+        let installed = add(&project, source.to_str().unwrap(), None).unwrap();
+        assert_eq!(installed.name, "greetings");
+        assert_eq!(list(&project).unwrap().len(), 1);
+        for link in [
+            project.join(".agents/skills/room-greeter"),
+            project.join(".claude/skills/room-greeter"),
+            project.join(".opencode/skills/room-greeter"),
+        ] {
+            assert!(
+                fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert!(link.join("SKILL.md").is_file());
+        }
+
+        let adapters = enable_adapters(&project, "greetings").unwrap();
+        assert_eq!(adapters.hooks.len(), 2);
+        assert_eq!(adapters.links.len(), 2);
+        let claude: Value = serde_json::from_str(
+            &fs::read_to_string(project.join(".claude/settings.local.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claude["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+        assert!(
+            claude["hooks"]["SessionStart"][1]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains(".crowded/plugins/greetings/hooks/activate.js")
+        );
+        assert!(
+            fs::symlink_metadata(project.join(".opencode/plugins/greetings.mjs"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        disable_adapters(&project, "greetings").unwrap();
+        for hook_file in [
+            project.join(".claude/settings.local.json"),
+            project.join(".codex/hooks.json"),
+        ] {
+            let hooks: Value =
+                serde_json::from_str(&fs::read_to_string(hook_file).unwrap()).unwrap();
+            assert_eq!(hooks["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        }
+        assert!(!project.join(".opencode/plugins/greetings.mjs").exists());
+
+        remove(&project, "greetings").unwrap();
+        assert!(list(&project).unwrap().is_empty());
+        assert!(!project.join(".agents/skills/room-greeter").exists());
+        assert!(!project.join(".claude/skills/room-greeter").exists());
+        assert!(!project.join(".opencode/skills/room-greeter").exists());
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    fn git(directory: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(directory)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn test_directory() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "crowded-plugin-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+}

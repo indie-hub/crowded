@@ -30,7 +30,14 @@ const EVENT_QUEUE_CAPACITY: usize = 100;
 const DEDUPE_CAPACITY: usize = 256;
 
 #[derive(Deserialize, Serialize)]
-struct WireEnvelope {
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WireRequest {
+    Message(MessageRequest),
+    Pulse(PulseRequest),
+}
+
+#[derive(Deserialize, Serialize)]
+struct MessageRequest {
     token: String,
     id: String,
     to: usize,
@@ -41,6 +48,37 @@ struct WireEnvelope {
     role: Option<String>,
     #[serde(default)]
     hop: u8,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PulseRequest {
+    token: String,
+    id: String,
+    state: PulseState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum PulseState {
+    Starting,
+    Thinking,
+    Working,
+    Ready,
+    Error,
+    Offline,
+}
+
+impl PulseState {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Thinking => "thinking",
+            Self::Working => "working",
+            Self::Ready => "ready",
+            Self::Error => "error",
+            Self::Offline => "offline",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,6 +120,16 @@ pub(crate) struct DoorbellEnvelope {
     reply: SyncSender<WireResponse>,
 }
 
+pub(crate) struct DoorbellPulse {
+    pub(crate) from: usize,
+    pub(crate) state: PulseState,
+}
+
+pub(crate) enum DoorbellEvent {
+    Message(DoorbellEnvelope),
+    Pulse(DoorbellPulse),
+}
+
 impl DoorbellEnvelope {
     pub(crate) fn reply_injected(&self, envelope_id: u64) {
         let _ = self
@@ -103,7 +151,7 @@ impl DoorbellEnvelope {
 pub(crate) struct Doorbell {
     path: PathBuf,
     tokens: Vec<String>,
-    events: Receiver<DoorbellEnvelope>,
+    events: Receiver<DoorbellEvent>,
     stop: Arc<AtomicBool>,
     listener_thread: Option<JoinHandle<()>>,
 }
@@ -150,7 +198,7 @@ impl Doorbell {
         ]))
     }
 
-    pub(crate) fn try_recv(&self) -> Result<DoorbellEnvelope, TryRecvError> {
+    pub(crate) fn try_recv(&self) -> Result<DoorbellEvent, TryRecvError> {
         self.events.try_recv()
     }
 
@@ -180,7 +228,7 @@ fn listener_loop(
     listener: UnixListener,
     tokens: Vec<String>,
     room_count: usize,
-    events: SyncSender<DoorbellEnvelope>,
+    events: SyncSender<DoorbellEvent>,
     stop: Arc<AtomicBool>,
 ) {
     let mut recent_by_room = vec![VecDeque::<Instant>::new(); room_count];
@@ -193,7 +241,7 @@ fn listener_loop(
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                 let request = read_request(&stream);
                 let response = match request {
-                    Ok(request) => {
+                    Ok(WireRequest::Message(request)) => {
                         if seen.contains(&request.id) {
                             Some(WireResponse::accepted("duplicate", None))
                         } else {
@@ -205,18 +253,42 @@ fn listener_loop(
                             ) {
                                 Ok(from) => {
                                     let (reply, reply_rx) = mpsc::sync_channel(1);
-                                    let event = DoorbellEnvelope {
+                                    let event = DoorbellEvent::Message(DoorbellEnvelope {
                                         from,
                                         to: request.to - 1,
                                         body: request.body,
                                         task: request.task,
                                         role: request.role,
                                         reply,
-                                    };
+                                    });
                                     match events.try_send(event) {
                                         Ok(()) => {
                                             remember_id(request.id, &mut seen, &mut seen_order);
                                             reply_rx.recv_timeout(Duration::from_secs(2)).ok()
+                                        }
+                                        Err(TrySendError::Full(_)) => {
+                                            Some(WireResponse::rejected("Doorbell queue is full"))
+                                        }
+                                        Err(TrySendError::Disconnected(_)) => break,
+                                    }
+                                }
+                                Err(error) => Some(WireResponse::rejected(error)),
+                            }
+                        }
+                    }
+                    Ok(WireRequest::Pulse(request)) => {
+                        if seen.contains(&request.id) {
+                            Some(WireResponse::accepted("duplicate", None))
+                        } else {
+                            match validate_pulse(&request, &tokens) {
+                                Ok(from) => {
+                                    match events.try_send(DoorbellEvent::Pulse(DoorbellPulse {
+                                        from,
+                                        state: request.state,
+                                    })) {
+                                        Ok(()) => {
+                                            remember_id(request.id, &mut seen, &mut seen_order);
+                                            Some(WireResponse::accepted("recorded", None))
                                         }
                                         Err(TrySendError::Full(_)) => {
                                             Some(WireResponse::rejected("Doorbell queue is full"))
@@ -241,7 +313,7 @@ fn listener_loop(
     }
 }
 
-fn read_request(stream: &UnixStream) -> io::Result<WireEnvelope> {
+fn read_request(stream: &UnixStream) -> io::Result<WireRequest> {
     let mut line = String::new();
     BufReader::new(stream)
         .take((MAX_WIRE_BYTES + 1) as u64)
@@ -256,7 +328,7 @@ fn read_request(stream: &UnixStream) -> io::Result<WireEnvelope> {
 }
 
 fn validate_request(
-    request: &WireEnvelope,
+    request: &MessageRequest,
     tokens: &[String],
     room_count: usize,
     recent_by_room: &mut [VecDeque<Instant>],
@@ -295,6 +367,17 @@ fn validate_request(
         return Err("source exceeded 5 messages per second".to_owned());
     }
     recent.push_back(now);
+    Ok(from)
+}
+
+fn validate_pulse(request: &PulseRequest, tokens: &[String]) -> Result<usize, String> {
+    let from = tokens
+        .iter()
+        .position(|token| token == &request.token)
+        .ok_or_else(|| "invalid capability".to_owned())?;
+    if request.id.is_empty() || request.id.len() > MAX_ID_BYTES {
+        return Err("pulse id must contain 1..=128 bytes".to_owned());
+    }
     Ok(from)
 }
 
@@ -394,11 +477,10 @@ fn parse_send_args(args: impl IntoIterator<Item = String>) -> Result<SendArgs, S
 pub(crate) fn send_command() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_send_args(env::args().skip(2))?;
 
-    let path = env::var_os("CROWDED_SOCKET").ok_or("CROWDED_SOCKET is not set")?;
     let token = env::var("CROWDED_TOKEN").map_err(|_| "CROWDED_TOKEN is not set")?;
     let room = env::var("CROWDED_ROOM").unwrap_or_else(|_| "external".to_owned());
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let request = WireEnvelope {
+    let request = WireRequest::Message(MessageRequest {
         token,
         id: format!("{room}-{}-{now}", process::id()),
         to: args.target,
@@ -406,21 +488,54 @@ pub(crate) fn send_command() -> Result<(), Box<dyn std::error::Error>> {
         task: args.task,
         role: args.role,
         hop: 0,
-    };
+    });
 
+    let response = send_request(&request)?;
+    println!("{}", serde_json::to_string(&response)?);
+    response.into_result("Doorbell rejected envelope")
+}
+
+pub(crate) fn pulse_command() -> Result<(), Box<dyn std::error::Error>> {
+    let state = match (env::args().nth(2).as_deref(), env::args().nth(3)) {
+        (Some("starting"), None) => PulseState::Starting,
+        (Some("thinking"), None) => PulseState::Thinking,
+        (Some("working"), None) => PulseState::Working,
+        (Some("ready"), None) => PulseState::Ready,
+        (Some("error"), None) => PulseState::Error,
+        (Some("offline"), None) => PulseState::Offline,
+        _ => {
+            return Err(
+                "usage: crowded pulse starting|thinking|working|ready|error|offline".into(),
+            );
+        }
+    };
+    let token = env::var("CROWDED_TOKEN").map_err(|_| "CROWDED_TOKEN is not set")?;
+    let room = env::var("CROWDED_ROOM").unwrap_or_else(|_| "external".to_owned());
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let response = send_request(&WireRequest::Pulse(PulseRequest {
+        token,
+        id: format!("{room}-pulse-{}-{now}", process::id()),
+        state,
+    }))?;
+    response.into_result("Doorbell rejected pulse")
+}
+
+fn send_request(request: &WireRequest) -> Result<WireResponse, Box<dyn std::error::Error>> {
+    let path = env::var_os("CROWDED_SOCKET").ok_or("CROWDED_SOCKET is not set")?;
     let mut stream = UnixStream::connect(path)?;
-    serde_json::to_writer(&mut stream, &request)?;
+    serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
-    let response: WireResponse = serde_json::from_reader(BufReader::new(stream))?;
-    println!("{}", serde_json::to_string(&response)?);
-    if response.ok {
-        Ok(())
-    } else {
-        Err(response
-            .error
-            .unwrap_or_else(|| "Doorbell rejected envelope".to_owned())
-            .into())
+    Ok(serde_json::from_reader(BufReader::new(stream))?)
+}
+
+impl WireResponse {
+    fn into_result(self, fallback: &'static str) -> Result<(), Box<dyn std::error::Error>> {
+        if self.ok {
+            Ok(())
+        } else {
+            Err(self.error.unwrap_or_else(|| fallback.to_owned()).into())
+        }
     }
 }
 
@@ -432,7 +547,7 @@ mod tests {
     fn request_validation_binds_identity_and_limits_hops() {
         let tokens = vec!["left".to_owned(), "right".to_owned()];
         let mut recent = vec![VecDeque::new(), VecDeque::new()];
-        let mut request = WireEnvelope {
+        let mut request = MessageRequest {
             token: "left".to_owned(),
             id: "message-1".to_owned(),
             to: 2,
@@ -479,7 +594,7 @@ mod tests {
     fn request_validation_rejects_control_characters_in_hats() {
         let tokens = vec!["left".to_owned(), "right".to_owned()];
         let mut recent = vec![VecDeque::new(), VecDeque::new()];
-        let request = WireEnvelope {
+        let request = MessageRequest {
             token: "left".to_owned(),
             id: "message-1".to_owned(),
             to: 2,
@@ -503,5 +618,18 @@ mod tests {
         let path = doorbell.path().to_owned();
         drop(doorbell);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn pulse_validation_binds_room_identity() {
+        let request = PulseRequest {
+            token: "left".to_owned(),
+            id: "pulse-1".to_owned(),
+            state: PulseState::Working,
+        };
+        assert_eq!(
+            validate_pulse(&request, &["left".to_owned(), "right".to_owned()]),
+            Ok(0)
+        );
     }
 }
