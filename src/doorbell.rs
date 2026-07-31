@@ -9,7 +9,7 @@ use std::{
     process,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -28,11 +28,13 @@ const MAX_HOPS: u8 = 8;
 const MAX_MESSAGES_PER_SECOND: usize = 5;
 const EVENT_QUEUE_CAPACITY: usize = 100;
 const DEDUPE_CAPACITY: usize = 256;
+static SOCKET_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum WireRequest {
     Message(MessageRequest),
+    Control(ControlRequest),
     Pulse(PulseRequest),
 }
 
@@ -55,6 +57,55 @@ struct PulseRequest {
     token: String,
     id: String,
     state: PulseState,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ControlRequest {
+    token: String,
+    id: String,
+    to: usize,
+    #[serde(flatten)]
+    action: ControlAction,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "action", content = "value", rename_all = "snake_case")]
+pub(crate) enum ControlAction {
+    ClearContext,
+    SetModel(String),
+    SetEffort(Effort),
+}
+
+impl ControlAction {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::ClearContext => "clear context",
+            Self::SetModel(_) => "set model",
+            Self::SetEffort(_) => "set effort",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl Effort {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -125,8 +176,16 @@ pub(crate) struct DoorbellPulse {
     pub(crate) state: PulseState,
 }
 
+pub(crate) struct DoorbellControl {
+    pub(crate) from: usize,
+    pub(crate) to: usize,
+    pub(crate) action: ControlAction,
+    reply: SyncSender<WireResponse>,
+}
+
 pub(crate) enum DoorbellEvent {
     Message(DoorbellEnvelope),
+    Control(DoorbellControl),
     Pulse(DoorbellPulse),
 }
 
@@ -148,6 +207,16 @@ impl DoorbellEnvelope {
     }
 }
 
+impl DoorbellControl {
+    pub(crate) fn reply_applied(&self) {
+        let _ = self.reply.send(WireResponse::accepted("applied", None));
+    }
+
+    pub(crate) fn reply_failed(&self, error: impl Into<String>) {
+        let _ = self.reply.send(WireResponse::rejected(error));
+    }
+}
+
 pub(crate) struct Doorbell {
     path: PathBuf,
     tokens: Vec<String>,
@@ -158,7 +227,8 @@ pub(crate) struct Doorbell {
 
 impl Doorbell {
     pub(crate) fn start(room_count: usize) -> io::Result<Self> {
-        let path = env::temp_dir().join(format!("crowded-{}.sock", process::id()));
+        let nonce = SOCKET_NONCE.fetch_add(1, Ordering::Relaxed);
+        let path = env::temp_dir().join(format!("crowded-{}-{nonce}.sock", process::id()));
         if path.exists() {
             fs::remove_file(&path)?;
         }
@@ -276,6 +346,39 @@ fn listener_loop(
                             }
                         }
                     }
+                    Ok(WireRequest::Control(request)) => {
+                        if seen.contains(&request.id) {
+                            Some(WireResponse::accepted("duplicate", None))
+                        } else {
+                            match validate_control(
+                                &request,
+                                &tokens,
+                                room_count,
+                                &mut recent_by_room,
+                            ) {
+                                Ok(from) => {
+                                    let (reply, reply_rx) = mpsc::sync_channel(1);
+                                    let event = DoorbellEvent::Control(DoorbellControl {
+                                        from,
+                                        to: request.to - 1,
+                                        action: request.action,
+                                        reply,
+                                    });
+                                    match events.try_send(event) {
+                                        Ok(()) => {
+                                            remember_id(request.id, &mut seen, &mut seen_order);
+                                            reply_rx.recv_timeout(Duration::from_secs(2)).ok()
+                                        }
+                                        Err(TrySendError::Full(_)) => {
+                                            Some(WireResponse::rejected("Doorbell queue is full"))
+                                        }
+                                        Err(TrySendError::Disconnected(_)) => break,
+                                    }
+                                }
+                                Err(error) => Some(WireResponse::rejected(error)),
+                            }
+                        }
+                    }
                     Ok(WireRequest::Pulse(request)) => {
                         if seen.contains(&request.id) {
                             Some(WireResponse::accepted("duplicate", None))
@@ -333,28 +436,65 @@ fn validate_request(
     room_count: usize,
     recent_by_room: &mut [VecDeque<Instant>],
 ) -> Result<usize, String> {
-    let from = tokens
-        .iter()
-        .position(|token| token == &request.token)
-        .ok_or_else(|| "invalid capability".to_owned())?;
-    if !(1..=room_count).contains(&request.to) {
-        return Err("target room does not exist".to_owned());
-    }
-    if request.to - 1 == from {
-        return Err("source and target rooms must differ".to_owned());
-    }
+    let from = validate_route(&request.token, &request.id, request.to, tokens, room_count)?;
     if request.body.is_empty() || request.body.len() > MAX_BODY_BYTES {
         return Err("message body must contain 1..=4096 bytes".to_owned());
-    }
-    if request.id.is_empty() || request.id.len() > MAX_ID_BYTES {
-        return Err("message id must contain 1..=128 bytes".to_owned());
     }
     validate_label("task", request.task.as_deref())?;
     validate_label("role", request.role.as_deref())?;
     if request.hop > MAX_HOPS {
         return Err("message exceeded hop limit".to_owned());
     }
+    record_rate(from, recent_by_room)?;
+    Ok(from)
+}
 
+fn validate_control(
+    request: &ControlRequest,
+    tokens: &[String],
+    room_count: usize,
+    recent_by_room: &mut [VecDeque<Instant>],
+) -> Result<usize, String> {
+    let from = validate_route(&request.token, &request.id, request.to, tokens, room_count)?;
+    if let ControlAction::SetModel(model) = &request.action
+        && (model.is_empty()
+            || model.len() > 128
+            || model.starts_with('-')
+            || model.chars().any(char::is_control))
+    {
+        return Err(
+            "model must contain 1..=128 bytes, must not start with `-`, and must not contain controls"
+                .to_owned(),
+        );
+    }
+    record_rate(from, recent_by_room)?;
+    Ok(from)
+}
+
+fn validate_route(
+    token: &str,
+    id: &str,
+    to: usize,
+    tokens: &[String],
+    room_count: usize,
+) -> Result<usize, String> {
+    let from = tokens
+        .iter()
+        .position(|candidate| candidate == token)
+        .ok_or_else(|| "invalid capability".to_owned())?;
+    if !(1..=room_count).contains(&to) {
+        return Err("target room does not exist".to_owned());
+    }
+    if to - 1 == from {
+        return Err("source and target rooms must differ".to_owned());
+    }
+    if id.is_empty() || id.len() > MAX_ID_BYTES {
+        return Err("request id must contain 1..=128 bytes".to_owned());
+    }
+    Ok(from)
+}
+
+fn record_rate(from: usize, recent_by_room: &mut [VecDeque<Instant>]) -> Result<(), String> {
     let now = Instant::now();
     let recent = &mut recent_by_room[from];
     while recent
@@ -367,7 +507,7 @@ fn validate_request(
         return Err("source exceeded 5 messages per second".to_owned());
     }
     recent.push_back(now);
-    Ok(from)
+    Ok(())
 }
 
 fn validate_pulse(request: &PulseRequest, tokens: &[String]) -> Result<usize, String> {
@@ -495,6 +635,51 @@ pub(crate) fn send_command() -> Result<(), Box<dyn std::error::Error>> {
     response.into_result("Doorbell rejected envelope")
 }
 
+const CONTROL_USAGE: &str =
+    "usage: crowded control ROOM clear | model MODEL | effort low|medium|high|xhigh|max";
+
+fn parse_control_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<(usize, ControlAction), String> {
+    let mut args = args.into_iter();
+    let target = args
+        .next()
+        .ok_or_else(|| CONTROL_USAGE.to_owned())?
+        .parse()
+        .map_err(|_| CONTROL_USAGE.to_owned())?;
+    let action = match (args.next().as_deref(), args.next(), args.next()) {
+        (Some("clear"), None, None) => ControlAction::ClearContext,
+        (Some("model"), Some(model), None) => ControlAction::SetModel(model),
+        (Some("effort"), Some(effort), None) => ControlAction::SetEffort(match effort.as_str() {
+            "low" => Effort::Low,
+            "medium" => Effort::Medium,
+            "high" => Effort::High,
+            "xhigh" => Effort::Xhigh,
+            "max" => Effort::Max,
+            _ => return Err(CONTROL_USAGE.to_owned()),
+        }),
+        _ => return Err(CONTROL_USAGE.to_owned()),
+    };
+    Ok((target, action))
+}
+
+pub(crate) fn control_command() -> Result<(), Box<dyn std::error::Error>> {
+    let (target, action) = parse_control_args(env::args().skip(2))?;
+    let token = env::var("CROWDED_TOKEN").map_err(|_| "CROWDED_TOKEN is not set")?;
+    let room = env::var("CROWDED_ROOM").unwrap_or_else(|_| "external".to_owned());
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let request = WireRequest::Control(ControlRequest {
+        token,
+        id: format!("{room}-control-{}-{now}", process::id()),
+        to: target,
+        action,
+    });
+
+    let response = send_request(&request)?;
+    println!("{}", serde_json::to_string(&response)?);
+    response.into_result("Doorbell rejected control")
+}
+
 pub(crate) fn pulse_command() -> Result<(), Box<dyn std::error::Error>> {
     let state = match (env::args().nth(2).as_deref(), env::args().nth(3)) {
         (Some("starting"), None) => PulseState::Starting,
@@ -591,6 +776,54 @@ mod tests {
     }
 
     #[test]
+    fn control_arguments_are_structured_and_validated() {
+        assert_eq!(
+            parse_control_args(["2", "clear"].map(str::to_owned)).unwrap(),
+            (2, ControlAction::ClearContext)
+        );
+        assert_eq!(
+            parse_control_args(["3", "model", "openai/gpt-5"].map(str::to_owned)).unwrap(),
+            (3, ControlAction::SetModel("openai/gpt-5".to_owned()))
+        );
+        assert_eq!(
+            parse_control_args(["1", "effort", "xhigh"].map(str::to_owned)).unwrap(),
+            (1, ControlAction::SetEffort(Effort::Xhigh))
+        );
+        assert!(parse_control_args(["2", "effort", "wild"].map(str::to_owned)).is_err());
+
+        let request = ControlRequest {
+            token: "left".to_owned(),
+            id: "control-1".to_owned(),
+            to: 2,
+            action: ControlAction::SetModel("-unsafe".to_owned()),
+        };
+        let wire = serde_json::to_value(WireRequest::Control(ControlRequest {
+            token: "left".to_owned(),
+            id: "control-wire".to_owned(),
+            to: 2,
+            action: ControlAction::SetModel("sonnet".to_owned()),
+        }))
+        .unwrap();
+        assert_eq!(wire["kind"], "control");
+        assert_eq!(wire["action"], "set_model");
+        assert_eq!(wire["value"], "sonnet");
+
+        let mut recent = vec![VecDeque::new(), VecDeque::new()];
+        assert_eq!(
+            validate_control(
+                &request,
+                &["left".to_owned(), "right".to_owned()],
+                2,
+                &mut recent,
+            ),
+            Err(
+                "model must contain 1..=128 bytes, must not start with `-`, and must not contain controls"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn request_validation_rejects_control_characters_in_hats() {
         let tokens = vec!["left".to_owned(), "right".to_owned()];
         let mut recent = vec![VecDeque::new(), VecDeque::new()];
@@ -618,6 +851,50 @@ mod tests {
         let path = doorbell.path().to_owned();
         drop(doorbell);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn control_crosses_the_authenticated_doorbell() {
+        let doorbell = Doorbell::start(2).unwrap();
+        let path = doorbell.path().to_owned();
+        let token = doorbell.tokens[0].clone();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(path).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &WireRequest::Control(ControlRequest {
+                    token,
+                    id: "control-roundtrip".to_owned(),
+                    to: 2,
+                    action: ControlAction::SetEffort(Effort::High),
+                }),
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match doorbell.try_recv() {
+                Ok(DoorbellEvent::Control(control)) => {
+                    assert_eq!(control.from, 0);
+                    assert_eq!(control.to, 1);
+                    assert_eq!(control.action, ControlAction::SetEffort(Effort::High));
+                    control.reply_applied();
+                    break;
+                }
+                Ok(_) => panic!("unexpected Doorbell event"),
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("control did not arrive: {error}"),
+            }
+        }
+        let response = client.join().unwrap();
+        assert!(response.ok);
+        assert_eq!(response.status, "applied");
     }
 
     #[test]

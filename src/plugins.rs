@@ -104,6 +104,16 @@ pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
                 println!("no local Crowded plugins");
             } else {
                 for plugin in installed {
+                    let active_skill_links = skill_link_presence(&root, &plugin)?
+                        .into_iter()
+                        .filter(|(_, _, present)| *present)
+                        .count();
+                    let skill_links = plugin.skills.len() * 3;
+                    let skills = match active_skill_links {
+                        0 => "disabled",
+                        active if active == skill_links => "enabled",
+                        _ => "partial",
+                    };
                     let adapters = if root
                         .join(INSTALLS_DIRECTORY)
                         .join(&plugin.name)
@@ -115,7 +125,7 @@ pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
                         "disabled"
                     };
                     println!(
-                        "{} {} {} {} skill(s), adapters {adapters}",
+                        "{} {} {} {} skill(s), skills {skills}, adapters {adapters}",
                         plugin.name,
                         plugin.version,
                         &plugin.revision[..plugin.revision.len().min(12)],
@@ -134,19 +144,19 @@ pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
             match action.as_str() {
                 "preview" => preview_adapters(&root, &name)?,
                 "enable" => {
-                    let state = enable_adapters(&root, &name)?;
+                    let (skills, state) = enable_plugin(&root, &name)?;
+                    let hooks = state.as_ref().map_or(0, |state| state.hooks.len());
+                    let open_code = state.as_ref().map_or(0, |state| state.links.len());
                     println!(
-                        "enabled {} hook target(s) and {} OpenCode file(s)",
-                        state.hooks.len(),
-                        state.links.len()
+                        "enabled {skills} shared skill(s), {hooks} hook target(s), and {open_code} OpenCode file(s)"
                     );
                 }
                 "disable" => {
-                    let state = disable_adapters(&root, &name)?;
+                    let (skills, state) = disable_plugin(&root, &name)?;
+                    let hooks = state.as_ref().map_or(0, |state| state.hooks.len());
+                    let open_code = state.as_ref().map_or(0, |state| state.links.len());
                     println!(
-                        "disabled {} hook target(s) and {} OpenCode file(s)",
-                        state.hooks.len(),
-                        state.links.len()
+                        "disabled {skills} shared skill(s), {hooks} hook target(s), and {open_code} OpenCode file(s)"
                     );
                 }
                 _ => unreachable!(),
@@ -285,7 +295,7 @@ fn list(root: &Path) -> io::Result<Vec<InstallRecord>> {
     Ok(installed)
 }
 
-fn remove(root: &Path, name: &str) -> io::Result<InstallRecord> {
+fn installed_record(root: &Path, name: &str) -> io::Result<(PathBuf, InstallRecord)> {
     validate_name("plugin", name)?;
     let installed = root.join(INSTALLS_DIRECTORY).join(name);
     if fs::symlink_metadata(&installed)?.file_type().is_symlink() {
@@ -302,40 +312,101 @@ fn remove(root: &Path, name: &str) -> io::Result<InstallRecord> {
             record.name
         )));
     }
+    Ok((installed, record))
+}
+
+fn enable_plugin(root: &Path, name: &str) -> io::Result<(usize, Option<AdapterState>)> {
+    let (installed, record) = installed_record(root, name)?;
+    let state_path = installed.join(ADAPTER_FILE);
+    let adapters_enabled = state_path.try_exists()?;
+    let plan = if adapters_enabled {
+        None
+    } else {
+        Some(adapter_plan(root, name)?)
+    };
+    let created_skills = enable_skill_links(root, &record)?;
+    if adapters_enabled {
+        if created_skills.is_empty() {
+            return Err(invalid_input(format!("plugin `{name}` is already enabled")));
+        }
+        return Ok((record.skills.len(), None));
+    }
+
+    let plan = plan.unwrap();
+    if plan.hooks.is_empty() && plan.links.is_empty() {
+        if created_skills.is_empty() {
+            return Err(invalid_input(format!("plugin `{name}` is already enabled")));
+        }
+        return Ok((record.skills.len(), None));
+    }
+
+    match enable_adapters(root, name) {
+        Ok(state) => Ok((
+            if created_skills.is_empty() {
+                0
+            } else {
+                record.skills.len()
+            },
+            Some(state),
+        )),
+        Err(error) => match remove_skill_links(&created_skills) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(io::Error::other(format!(
+                "{error}; could not roll back shared skills: {rollback}"
+            ))),
+        },
+    }
+}
+
+fn disable_plugin(root: &Path, name: &str) -> io::Result<(usize, Option<AdapterState>)> {
+    let (installed, record) = installed_record(root, name)?;
+    let adapters_enabled = installed.join(ADAPTER_FILE).try_exists()?;
+    let removed_skills = disable_skill_links(root, &record)?;
+    if !adapters_enabled && removed_skills.is_empty() {
+        return Err(invalid_input(format!(
+            "plugin `{name}` is already disabled"
+        )));
+    }
+
+    let state = if adapters_enabled {
+        match disable_adapters(root, name) {
+            Ok(state) => Some(state),
+            Err(error) => match restore_skill_links(&removed_skills) {
+                Ok(()) => return Err(error),
+                Err(rollback) => {
+                    return Err(io::Error::other(format!(
+                        "{error}; could not restore shared skills: {rollback}"
+                    )));
+                }
+            },
+        }
+    } else {
+        None
+    };
+    remove_empty_skill_directories(root)?;
+    Ok((
+        if removed_skills.is_empty() {
+            0
+        } else {
+            record.skills.len()
+        },
+        state,
+    ))
+}
+
+fn remove(root: &Path, name: &str) -> io::Result<InstallRecord> {
+    let (installed, record) = installed_record(root, name)?;
     if installed.join(ADAPTER_FILE).try_exists()? {
         disable_adapters(root, name)?;
     }
-
-    let links = skill_links(root, &record);
-    for (link, expected) in &links {
-        match fs::read_link(link) {
-            Ok(actual) if actual == *expected => {}
-            Ok(_) => {
-                return Err(invalid_data(format!(
-                    "{} no longer points to the Crowded-managed skill",
-                    link.display()
-                )));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    for (link, _) in &links {
-        match fs::remove_file(link) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
+    disable_skill_links(root, &record)?;
     fs::remove_dir_all(&installed)?;
     let data = root.join(".crowded/plugin-data").join(name);
     if data.try_exists()? {
         fs::remove_dir_all(data)?;
         remove_empty_directory(&root.join(".crowded/plugin-data"))?;
     }
-    remove_empty_directory(&root.join(".agents/skills"))?;
-    remove_empty_directory(&root.join(".claude/skills"))?;
-    remove_empty_directory(&root.join(".opencode/skills"))?;
+    remove_empty_skill_directories(root)?;
     remove_empty_directory(&root.join(INSTALLS_DIRECTORY))?;
     Ok(record)
 }
@@ -1127,6 +1198,108 @@ fn skill_links(root: &Path, plugin: &InstallRecord) -> Vec<(PathBuf, PathBuf)> {
     links
 }
 
+fn skill_link_presence(
+    root: &Path,
+    plugin: &InstallRecord,
+) -> io::Result<Vec<(PathBuf, PathBuf, bool)>> {
+    skill_links(root, plugin)
+        .into_iter()
+        .map(|(link, expected)| {
+            let present = match fs::read_link(&link) {
+                Ok(actual) if actual == expected => true,
+                Ok(_) => {
+                    return Err(invalid_data(format!(
+                        "{} no longer points to the Crowded-managed skill",
+                        link.display()
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                    return Err(invalid_data(format!(
+                        "{} exists but is not a Crowded-managed skill link",
+                        link.display()
+                    )));
+                }
+                Err(error) => return Err(error),
+            };
+            Ok((link, expected, present))
+        })
+        .collect()
+}
+
+fn enable_skill_links(root: &Path, plugin: &InstallRecord) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    let links = skill_link_presence(root, plugin)?;
+    let mut created = Vec::new();
+    for (link, target, present) in links {
+        if present {
+            continue;
+        }
+        let result = link
+            .parent()
+            .ok_or_else(|| invalid_input("skill link has no parent"))
+            .and_then(fs::create_dir_all)
+            .and_then(|()| symlink(&target, &link));
+        if let Err(error) = result {
+            return match remove_skill_links(&created) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(io::Error::other(format!(
+                    "{error}; could not roll back shared skills: {rollback}"
+                ))),
+            };
+        }
+        created.push((link, target));
+    }
+    Ok(created)
+}
+
+fn disable_skill_links(root: &Path, plugin: &InstallRecord) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    let links = skill_link_presence(root, plugin)?;
+    let mut removed = Vec::new();
+    for (link, target, present) in links {
+        if !present {
+            continue;
+        }
+        if let Err(error) = fs::remove_file(&link) {
+            return match restore_skill_links(&removed) {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(io::Error::other(format!(
+                    "{error}; could not restore shared skills: {rollback}"
+                ))),
+            };
+        }
+        removed.push((link, target));
+    }
+    Ok(removed)
+}
+
+fn remove_skill_links(links: &[(PathBuf, PathBuf)]) -> io::Result<()> {
+    for (link, _) in links.iter().rev() {
+        match fs::remove_file(link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn restore_skill_links(links: &[(PathBuf, PathBuf)]) -> io::Result<()> {
+    for (link, target) in links {
+        let parent = link
+            .parent()
+            .ok_or_else(|| invalid_input("skill link has no parent"))?;
+        fs::create_dir_all(parent)?;
+        symlink(target, link)?;
+    }
+    Ok(())
+}
+
+fn remove_empty_skill_directories(root: &Path) -> io::Result<()> {
+    remove_empty_directory(&root.join(".agents/skills"))?;
+    remove_empty_directory(&root.join(".claude/skills"))?;
+    remove_empty_directory(&root.join(".opencode/skills"))
+}
+
 fn validate_name(kind: &str, name: &str) -> io::Result<()> {
     let valid = !name.is_empty()
         && name.len() <= 64
@@ -1291,7 +1464,9 @@ mod tests {
             assert!(link.join("SKILL.md").is_file());
         }
 
-        let adapters = enable_adapters(&project, "greetings").unwrap();
+        let (skills, adapters) = enable_plugin(&project, "greetings").unwrap();
+        assert_eq!(skills, 0);
+        let adapters = adapters.unwrap();
         assert_eq!(adapters.hooks.len(), 2);
         assert_eq!(adapters.links.len(), 2);
         let claude: Value = serde_json::from_str(
@@ -1312,7 +1487,20 @@ mod tests {
                 .is_symlink()
         );
 
+        // Reproduce v0.15.0's partial state: adapters off, skills still linked.
         disable_adapters(&project, "greetings").unwrap();
+        let (skills, adapters) = disable_plugin(&project, "greetings").unwrap();
+        assert_eq!(skills, 1);
+        assert!(adapters.is_none());
+        assert!(!project.join(".agents/skills/room-greeter").exists());
+
+        let (skills, adapters) = enable_plugin(&project, "greetings").unwrap();
+        assert_eq!(skills, 1);
+        assert_eq!(adapters.unwrap().hooks.len(), 2);
+
+        let (skills, adapters) = disable_plugin(&project, "greetings").unwrap();
+        assert_eq!(skills, 1);
+        assert_eq!(adapters.unwrap().hooks.len(), 2);
         for hook_file in [
             project.join(".claude/settings.local.json"),
             project.join(".codex/hooks.json"),
@@ -1322,7 +1510,21 @@ mod tests {
             assert_eq!(hooks["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         }
         assert!(!project.join(".opencode/plugins/greetings.mjs").exists());
+        for link in [
+            project.join(".agents/skills/room-greeter"),
+            project.join(".claude/skills/room-greeter"),
+            project.join(".opencode/skills/room-greeter"),
+        ] {
+            assert!(!link.exists());
+        }
 
+        let (skills, adapters) = enable_plugin(&project, "greetings").unwrap();
+        assert_eq!(skills, 1);
+        assert_eq!(adapters.unwrap().hooks.len(), 2);
+        assert!(project.join(".agents/skills/room-greeter").exists());
+        assert!(project.join(".claude/skills/room-greeter").exists());
+        assert!(project.join(".opencode/skills/room-greeter").exists());
+        assert!(project.join(".opencode/plugins/greetings.mjs").exists());
         remove(&project, "greetings").unwrap();
         assert!(list(&project).unwrap().is_empty());
         assert!(!project.join(".agents/skills/room-greeter").exists());

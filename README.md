@@ -11,16 +11,19 @@ Create `crowded.toml` in the directory where you launch Crowded:
 name = "Claude"
 command = "claude"
 transport = "raw"
+allow_control = true
 
 [[rooms]]
 name = "Codex"
 command = "codex"
 transport = "raw"
+allow_control = true
 
 [[rooms]]
 name = "OpenCode"
 command = "opencode"
 transport = "raw"
+allow_control = true
 ```
 
 Then run:
@@ -56,6 +59,26 @@ retaining the Shared Toolbox:
 ```console
 cargo run -- raw:claude raw:codex
 ```
+
+## The Conductor
+
+A room can control another opted-in agent through Crowded's authenticated
+Doorbell:
+
+```console
+"$CROWDED_BIN" control 2 clear
+"$CROWDED_BIN" control 2 model gpt-5
+"$CROWDED_BIN" control 2 effort high
+```
+
+`allow_control` defaults to `false`. Controls are structured events, so
+ordinary whispers and terminal output cannot trigger them. All three native
+CLIs support `clear` and `model`; Claude and Codex support `effort`. OpenCode
+effort is rejected until it exposes a stable launch option.
+
+This first Conductor slice restarts the target CLI. `clear` also removes known
+resume arguments so the replacement starts a fresh context; model and effort
+retain the room's configured continuation arguments.
 
 ## Shared Plugins
 
@@ -104,11 +127,12 @@ each skill into `.agents/skills/` for Codex, `.claude/skills/` for Claude, and
 Restart the rooms after installation so every CLI refreshes its skill list.
 
 `plugin preview` shows the exact hook commands and files an adapter would add.
-`plugin enable` merges native hooks into `.claude/settings.local.json` and
-`.codex/hooks.json`, and links supported OpenCode plugins and commands into
-`.opencode/`. `plugin disable` reverses only those owned changes; `remove`
-disables them automatically. Crowded does not translate one vendor's plugin
-code into another vendor's format.
+`plugin enable` shares the skills, merges native hooks into
+`.claude/settings.local.json` and `.codex/hooks.json`, and links supported
+OpenCode plugins and commands into `.opencode/`. `plugin disable` removes all
+of those owned changes from every CLI; `remove` disables them automatically.
+Crowded does not translate one vendor's plugin code into another vendor's
+format.
 
 ## Shared Toolbox
 

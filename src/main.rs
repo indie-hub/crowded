@@ -11,6 +11,7 @@ mod toolbox;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("send") => doorbell::send_command(),
+        Some("control") => doorbell::control_command(),
         Some("pulse") => doorbell::pulse_command(),
         Some("plugin") => plugins::command(),
         Some("toolbox") => toolbox::command(),

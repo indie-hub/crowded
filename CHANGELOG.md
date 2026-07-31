@@ -7,6 +7,32 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-30
+
+### Added
+
+- The Conductor: authenticated peer requests for clearing context, selecting a
+  model, and selecting reasoning effort.
+- Per-room `allow_control` opt-in for destructive peer controls.
+- Native launch adapters for Claude and Codex model/effort settings and
+  OpenCode model settings.
+
+### Security
+
+- Control requests travel as structured Doorbell events and cannot be triggered
+  by terminal output or ordinary whispers.
+- Context clearing removes configured resume arguments before restarting the
+  target CLI; unsupported vendor capabilities are rejected.
+
+## [0.15.1] - 2026-07-30
+
+### Fixed
+
+- `plugin disable` now removes shared skill links from Claude, Codex, and
+  OpenCode as well as disabling vendor adapters; `plugin enable` restores both.
+- `plugin list` reports skill and adapter activation separately, making partial
+  legacy state visible.
+
 ## [0.15.0] - 2026-07-30
 
 ### Added
