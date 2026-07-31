@@ -30,7 +30,7 @@ source = "https://github.com/indie-hub/code4me-ntg.git"
 [[setup]]
 name = "ccc-index"
 command = "uvx"
-args = ["--from", "PACKAGE==VERSION", "ccc", "index"]
+args = ["--from", "cocoindex-code[full]==0.2.39", "ccc", "index"]
 ```
 
 Crowded invokes setup programs directly, so `command` may be an existing
@@ -38,6 +38,14 @@ executable, `uvx`, or `npx`; it never installs a system-wide package itself.
 Each successful action creates `.crowded/init/NAME.done`. Failed actions are
 not marked and run again on the next `crowded init`. Existing plugins are left
 at their installed revision; use `crowded plugin update` explicitly.
+
+The starter configuration shares pinned runners for CocoIndex Code, CodeGraph,
+Basic Memory, and Context Mode. It also creates one workspace-named Basic
+Memory project, initializes CodeGraph, and initializes and indexes CCC. Review
+the file before the second `crowded init`: CCC's local embedding dependencies
+can download about 1 GB and its first initialization asks which model to use.
+`uvx` and `npx` must be on `PATH`; if either is missing, Crowded stops before
+running any setup command and names the missing prerequisite.
 
 ## Local rooms
 

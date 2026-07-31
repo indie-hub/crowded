@@ -68,31 +68,28 @@ This is Crowded infrastructure, not a native vendor transport.
 
 1. **Capability discovery** — expose each room's vendor, current model, exact
    model IDs, effort levels, and supported controls so agents do not guess.
-2. **Base environment recipe** — populate `crowded init` with verified,
-   version-pinned runners and initialization actions for Basic Memory,
-   CodeGraph, CocoIndex Code, and Context Mode.
-3. **Shared local memory** — configure one workspace-local Basic Memory project
-   for every room. Basic Memory is the durable memory source of truth; rooms
-   access it through MCP rather than editing its storage directly.
-4. **Room-scoped Headroom** — optionally launch each original vendor CLI through
+2. **Teach the agents the toolbox** — update Code4Me Next Gen so rooms prefer
+   CodeGraph for structural navigation, CCC for semantic discovery, Context
+   Mode for noisy derived data, and Basic Memory for durable shared knowledge.
+3. **Room-scoped Headroom** — optionally launch each original vendor CLI through
    its own local Headroom wrapper/proxy for isolation and per-room metrics.
    Headroom's compression cache and retrieval state are transient; they do not
    replace Basic Memory or the PTY transport.
-5. **Windows portability audit** — isolate the Unix assumptions before the UI
+4. **Windows portability audit** — isolate the Unix assumptions before the UI
    grows around them.
-6. **Front Office** — a TUI for rooms, local MCPs, hooks, plugins, and
+5. **Front Office** — a TUI for rooms, local MCPs, hooks, plugins, and
    permissions.
-7. **Plugin lifecycle** — marketplace discovery, updates, version pinning, and
+6. **Plugin lifecycle** — marketplace discovery, updates, version pinning, and
    rollback.
-8. **Real sandboxing** — isolated worktrees, write leases, resource limits, and
+7. **Real sandboxing** — isolated worktrees, write leases, resource limits, and
    per-room capabilities.
-9. **Optional native integrations** — keep PTY as Crowded's primary,
+8. **Optional native integrations** — keep PTY as Crowded's primary,
    vendor-neutral communication transport. Vendor APIs, hooks, ACP, Codex
    app-server, or Claude Remote Control may add capabilities when useful, but
    must not replace or bypass the room.
-10. **Higher orchestration** — task graphs, explicit handoffs, completion
+9. **Higher orchestration** — task graphs, explicit handoffs, completion
    signals, and room histories.
-11. **TUI polish** — dynamic rooms and layouts, scrollback, searchable mailroom,
+10. **TUI polish** — dynamic rooms and layouts, scrollback, searchable mailroom,
    and a richer Conductor sidebar.
 
 ## Windows checklist
@@ -114,4 +111,7 @@ This is Crowded infrastructure, not a native vendor transport.
   preview/enable/disable/remove.
 - Idempotent `crowded init` with declarative plugins, direct one-time setup
   actions, native toolbox sync, and ignored machine-local state.
+- A version-pinned base environment recipe for Basic Memory, CodeGraph,
+  CocoIndex Code, and Context Mode, including a shared local memory project and
+  initial source indexes.
 - Authenticated Conductor controls for clear, model, and effort where supported.

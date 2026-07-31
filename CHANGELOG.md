@@ -7,6 +7,15 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-31
+
+### Added
+
+- The starter `crowded.toml` now declares pinned MCP runners for Basic Memory,
+  CodeGraph, CocoIndex Code, and Context Mode.
+- Workspace setup creates a shared local Basic Memory project, initializes
+  CodeGraph, and initializes and indexes CocoIndex Code.
+
 ## [0.18.0] - 2026-07-31
 
 ### Added

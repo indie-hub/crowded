@@ -36,13 +36,51 @@ source = "https://github.com/indie-hub/code4me-ntg.git"
 name = "ponytail"
 source = "https://github.com/DietrichGebert/ponytail.git"
 
-# Run setup commands once after editing this file. Crowded invokes the program
-# directly, so `command` may be a global executable, `uvx`, or `npx`.
-#
-# [[setup]]
-# name = "example-init"
-# command = "uvx"
-# args = ["--from", "package==version", "executable", "init"]
+# Shared, pinned tools. `uvx` and `npx` cache packages without installing them
+# system-wide. CCC's `full` extra provides local embeddings without an API key.
+
+[[mcp]]
+name = "ccc"
+command = "uvx"
+args = ["--from", "cocoindex-code[full]==0.2.39", "ccc", "mcp"]
+
+[[mcp]]
+name = "codegraph"
+command = "npx"
+args = ["-y", "@colbymchenry/codegraph@1.5.0", "serve", "--mcp"]
+
+[[mcp]]
+name = "basic-memory"
+command = "uvx"
+args = ["--from", "basic-memory==0.22.1", "basic-memory", "mcp", "--project", __BASIC_MEMORY_PROJECT__]
+
+[[mcp]]
+name = "context-mode"
+command = "npx"
+args = ["-y", "context-mode@1.0.169"]
+
+# Setup commands run once, in order. CCC asks you to choose its embedding model
+# the first time and its local model dependencies can download about 1 GB.
+
+[[setup]]
+name = "basic-memory-project"
+command = "uvx"
+args = ["--from", "basic-memory==0.22.1", "basic-memory", "project", "add", __BASIC_MEMORY_PROJECT__, "basic-memory", "--local"]
+
+[[setup]]
+name = "codegraph-init"
+command = "npx"
+args = ["-y", "@colbymchenry/codegraph@1.5.0", "init", "."]
+
+[[setup]]
+name = "ccc-init"
+command = "uvx"
+args = ["--from", "cocoindex-code[full]==0.2.39", "ccc", "init", "--force"]
+
+[[setup]]
+name = "ccc-index"
+command = "uvx"
+args = ["--from", "cocoindex-code[full]==0.2.39", "ccc", "index"]
 "#;
 
 pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
@@ -61,7 +99,7 @@ fn run_at(root: &Path) -> io::Result<()> {
             .write(true)
             .create_new(true)
             .open(&config_path)?
-            .write_all(STARTER_CONFIG.as_bytes())?;
+            .write_all(starter_config(root).as_bytes())?;
         println!(
             "created {CONFIG_FILE} and ensured {RUNTIME_IGNORE} is ignored; edit the config, then run `crowded init` again"
         );
@@ -138,6 +176,16 @@ fn run_at(root: &Path) -> io::Result<()> {
         pending.len()
     );
     Ok(())
+}
+
+fn starter_config(root: &Path) -> String {
+    let workspace = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("workspace");
+    let project = toml::Value::String(format!("crowded-{workspace}")).to_string();
+    STARTER_CONFIG.replace("__BASIC_MEMORY_PROJECT__", &project)
 }
 
 fn validate(config: &RoomFile) -> io::Result<()> {
@@ -320,6 +368,8 @@ mod tests {
         let starter = load_room_file(&root.join(CONFIG_FILE)).unwrap();
         validate(&starter).unwrap();
         assert_eq!(starter.plugins.len(), 2);
+        assert_eq!(starter.mcp_servers.len(), 4);
+        assert_eq!(starter.setup.len(), 4);
         assert!(
             fs::read_to_string(root.join(".gitignore"))
                 .unwrap()
