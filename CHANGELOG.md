@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-07-31
+
+### Fixed
+
+- CCC's tool environment now constrains `mcp<2`, preventing the incompatible
+  MCP SDK 2.0 release from removing the FastMCP import path CCC still uses.
+
 ## [0.20.1] - 2026-07-31
 
 ### Fixed

@@ -90,7 +90,7 @@ args = ["-y", "@colbymchenry/codegraph@1.5.0", "init", "."]
 [[setup]]
 name = "ccc-install"
 command = "uv"
-args = ["tool", "install", "--upgrade", "cocoindex-code[full]==0.2.39"]
+args = ["tool", "install", "--upgrade", "--with", "mcp<2", "cocoindex-code[full]==0.2.39"]
 
 [[setup]]
 name = "ccc-init"
@@ -398,6 +398,9 @@ mod tests {
         assert_eq!(starter.plugins.len(), 3);
         assert_eq!(starter.mcp_servers.len(), 4);
         assert_eq!(starter.setup.len(), 6);
+        assert!(starter.setup.iter().any(|setup| {
+            setup.name == "ccc-install" && setup.args.iter().any(|arg| arg == "mcp<2")
+        }));
         assert!(
             fs::read_to_string(root.join(".gitignore"))
                 .unwrap()

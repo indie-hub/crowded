@@ -53,6 +53,8 @@ the file before the second `crowded init`: CCC's local embedding dependencies
 can download several GB on Linux and its first initialization asks which model
 to use. The recipe installs Basic Memory and CCC once with `uv tool install`;
 their MCP and setup actions then call the persistent executables directly.
+CCC's environment currently constrains `mcp<2` because CCC still uses the
+Python MCP SDK's 1.x FastMCP import path.
 `uv` and `npx` must be on `PATH`. Crowded checks each executable immediately
 before its action, allowing an earlier setup action to install a tool used by
 the next one.
