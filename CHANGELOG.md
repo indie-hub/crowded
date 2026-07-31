@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.20.4] - 2026-07-31
+
+### Fixed
+
+- Codex deliveries now use bracketed paste, so long final-result envelopes are
+  submitted instead of leaving an extra newline in the prompt.
+
 ## [0.20.3] - 2026-07-31
 
 ### Changed

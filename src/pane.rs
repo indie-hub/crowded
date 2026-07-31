@@ -86,7 +86,12 @@ fn opencode_input_ready(screen: &str) -> bool {
 
 const RAW_SUBMIT_DELAY: Duration = Duration::from_millis(150);
 
-fn whisper_parts(transport: Transport, source: &str, message: &str) -> (Vec<u8>, Option<Vec<u8>>) {
+fn whisper_parts(
+    transport: Transport,
+    bracketed_paste: bool,
+    source: &str,
+    message: &str,
+) -> (Vec<u8>, Option<Vec<u8>>) {
     let note = format!("[whisper from {source}] {message}");
     // ponytail: `Shell` currently means POSIX shell; add cmd/PowerShell
     // encoders only when Windows becomes a real target.
@@ -96,7 +101,12 @@ fn whisper_parts(transport: Transport, source: &str, message: &str) -> (Vec<u8>,
             format!("printf '%s\\n' {}\r", shell_quote(&note)).into_bytes(),
             None,
         ),
-        // Raw TUIs may classify a rapid prompt+Enter sequence as one paste.
+        // Codex's native paste event avoids long messages swallowing Enter as a newline.
+        Transport::Raw if bracketed_paste => (
+            format!("\x1b[200~{note}\x1b[201~").into_bytes(),
+            Some(vec![b'\r']),
+        ),
+        // Other raw TUIs may classify a rapid prompt+Enter sequence as one paste.
         Transport::Raw => (note.into_bytes(), Some(vec![b'\r'])),
     }
 }
@@ -423,10 +433,11 @@ impl Pane {
     }
 
     pub(crate) fn send_whisper(&mut self, source: &str, message: &str) -> io::Result<()> {
-        let (body, submit) = whisper_parts(self.spec.transport, source, message);
+        let bracketed_paste = matches!(cli_vendor(&self.spec), Ok(CliVendor::Codex));
+        let (body, submit) = whisper_parts(self.spec.transport, bracketed_paste, source, message);
         self.write_bytes(&body)?;
         if let Some(submit) = submit {
-            // Codex keeps Enter in paste/newline mode for 120 ms after a burst.
+            // Raw TUIs can keep Enter in paste/newline mode briefly after input.
             // ponytail: this briefly blocks the UI; schedule it asynchronously
             // only if a measured 150 ms pause becomes noticeable.
             thread::sleep(RAW_SUBMIT_DELAY);
@@ -542,13 +553,25 @@ mod tests {
     fn whisper_quotes_shell_metacharacters() {
         assert_eq!(
             String::from_utf8(
-                whisper_parts(Transport::Shell, "Room 1", "it's $HOME; echo nope",).0
+                whisper_parts(Transport::Shell, false, "Room 1", "it's $HOME; echo nope",).0
             )
             .unwrap(),
             "printf '%s\\n' '[whisper from Room 1] it'\"'\"'s $HOME; echo nope'\r"
         );
-        let (body, submit) = whisper_parts(Transport::Raw, "Claude", "hello");
+        let (body, submit) = whisper_parts(Transport::Raw, false, "Claude", "hello");
         assert_eq!(body, b"[whisper from Claude] hello");
+        assert_eq!(submit, Some(vec![b'\r']));
+
+        let (body, submit) = whisper_parts(
+            Transport::Raw,
+            true,
+            "OpenCode · 3",
+            "[task: exercise | requested role: result]\nstatus: done",
+        );
+        assert_eq!(
+            body,
+            b"\x1b[200~[whisper from OpenCode \xc2\xb7 3] [task: exercise | requested role: result]\nstatus: done\x1b[201~"
+        );
         assert_eq!(submit, Some(vec![b'\r']));
     }
 
