@@ -36,13 +36,13 @@ source = "https://github.com/indie-hub/code4me-ntg.git"
 name = "ponytail"
 source = "https://github.com/DietrichGebert/ponytail.git"
 
-# Shared, pinned tools. `uvx` and `npx` cache packages without installing them
-# system-wide. CCC's `full` extra provides local embeddings without an API key.
+# Shared, pinned tools. `uvx` and `npx` cache lightweight runners. CCC is
+# installed once as a user tool because its local embedding environment is big.
 
 [[mcp]]
 name = "ccc"
-command = "uvx"
-args = ["--from", "cocoindex-code[full]==0.2.39", "ccc", "mcp"]
+command = "ccc"
+args = ["mcp"]
 
 [[mcp]]
 name = "codegraph"
@@ -60,7 +60,7 @@ command = "npx"
 args = ["-y", "context-mode@1.0.169"]
 
 # Setup commands run once, in order. CCC asks you to choose its embedding model
-# the first time and its local model dependencies can download about 1 GB.
+# the first time and its local model dependencies can download several GB.
 
 [[setup]]
 name = "basic-memory-project"
@@ -73,14 +73,19 @@ command = "npx"
 args = ["-y", "@colbymchenry/codegraph@1.5.0", "init", "."]
 
 [[setup]]
+name = "ccc-install"
+command = "uv"
+args = ["tool", "install", "--upgrade", "cocoindex-code[full]==0.2.39"]
+
+[[setup]]
 name = "ccc-init"
-command = "uvx"
-args = ["--from", "cocoindex-code[full]==0.2.39", "ccc", "init", "--force"]
+command = "ccc"
+args = ["init", "--force"]
 
 [[setup]]
 name = "ccc-index"
-command = "uvx"
-args = ["--from", "cocoindex-code[full]==0.2.39", "ccc", "index"]
+command = "ccc"
+args = ["index"]
 "#;
 
 pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
@@ -113,9 +118,6 @@ fn run_at(root: &Path) -> io::Result<()> {
         if !setup_is_complete(root, &setup.name)? {
             pending.push(setup);
         }
-    }
-    for setup in &pending {
-        preflight_setup(root, setup)?;
     }
     ensure_runtime_ignored(root)?;
 
@@ -162,6 +164,8 @@ fn run_at(root: &Path) -> io::Result<()> {
         }
     }
     for setup in &pending {
+        // Earlier actions may install an executable consumed by a later one.
+        preflight_setup(root, setup)?;
         run_setup(root, setup)?;
         fs::OpenOptions::new()
             .write(true)
@@ -369,7 +373,7 @@ mod tests {
         validate(&starter).unwrap();
         assert_eq!(starter.plugins.len(), 2);
         assert_eq!(starter.mcp_servers.len(), 4);
-        assert_eq!(starter.setup.len(), 4);
+        assert_eq!(starter.setup.len(), 5);
         assert!(
             fs::read_to_string(root.join(".gitignore"))
                 .unwrap()
@@ -388,14 +392,19 @@ command = "/bin/sh"
 transport = "shell"
 
 [[setup]]
-name = "git-ready"
-command = "git"
-args = ["--version"]
+name = "make-tool"
+command = "/bin/sh"
+args = ["-c", "cp /usr/bin/true generated-tool && chmod +x generated-tool"]
+
+[[setup]]
+name = "use-tool"
+command = "./generated-tool"
 "#,
         )
         .unwrap();
         run_at(&root).unwrap();
-        assert!(marker(&root, "git-ready").is_file());
+        assert!(marker(&root, "make-tool").is_file());
+        assert!(marker(&root, "use-tool").is_file());
         run_at(&root).unwrap();
         assert_eq!(
             fs::read_to_string(root.join(".gitignore"))

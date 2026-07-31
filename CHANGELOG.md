@@ -7,6 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-07-31
+
+### Fixed
+
+- CCC is installed once with `uv tool install`; its MCP, initialization, and
+  indexing now call the persistent `ccc` executable directly instead of
+  creating `uvx` environments for every invocation.
+- Setup executable checks now happen in sequence, allowing one setup action to
+  install a command consumed by the next action.
+
 ## [0.19.0] - 2026-07-31
 
 ### Added
