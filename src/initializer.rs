@@ -31,6 +31,7 @@ allow_control = true
 [[plugin]]
 name = "code4me-ntg"
 source = "https://github.com/indie-hub/code4me-ntg.git"
+adapters = true
 
 [[plugin]]
 name = "ponytail"
@@ -396,6 +397,12 @@ mod tests {
         let starter = load_room_file(&root.join(CONFIG_FILE)).unwrap();
         validate(&starter).unwrap();
         assert_eq!(starter.plugins.len(), 3);
+        assert!(
+            starter
+                .plugins
+                .iter()
+                .any(|plugin| { plugin.name == "code4me-ntg" && plugin.adapters })
+        );
         assert_eq!(starter.mcp_servers.len(), 4);
         assert_eq!(starter.setup.len(), 6);
         assert!(starter.setup.iter().any(|setup| {

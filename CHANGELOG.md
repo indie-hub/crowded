@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.20.3] - 2026-07-31
+
+### Changed
+
+- The starter recipe now enables Code4Me Next Gen's reviewed vendor adapters,
+  activating its advisory toolbox and Basic Memory nudges during initialization.
+
 ## [0.20.2] - 2026-07-31
 
 ### Fixed

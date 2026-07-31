@@ -25,7 +25,8 @@ MCPs:
 [[plugin]]
 name = "code4me-ntg"
 source = "https://github.com/indie-hub/code4me-ntg.git"
-# ref = "v0.3.0"
+adapters = true
+# ref = "v0.4.0"
 
 [[plugin]]
 name = "context-mode"
