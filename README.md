@@ -117,6 +117,7 @@ Install from a local Git repository, Git URL, or GitHub `owner/repo` shorthand:
 
 ```console
 cargo run -- plugin add indie-hub/greetings --ref v1.0.0
+cargo run -- plugin update greetings
 cargo run -- plugin list
 cargo run -- plugin preview greetings
 cargo run -- plugin enable greetings
@@ -127,7 +128,12 @@ cargo run -- plugin remove greetings
 Crowded records the exact Git revision under `.crowded/plugins/`, then links
 each skill into `.agents/skills/` for Codex, `.claude/skills/` for Claude, and
 `.opencode/skills/` for OpenCode. Existing skill paths are never replaced.
-Restart the rooms after installation so every CLI refreshes its skill list.
+Restart the rooms after installation or update so every CLI refreshes its skill
+list.
+
+`plugin update` fetches the installed plugin's recorded source and ref, validates
+the replacement before swapping it in, and preserves its enabled state and
+plugin data. Pass `--ref REF` to move a pinned plugin to another Git ref.
 
 `plugin preview` shows the exact hook commands and files an adapter would add.
 `plugin enable` shares the skills, merges native hooks into

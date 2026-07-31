@@ -7,6 +7,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-07-31
+
+### Added
+
+- `crowded plugin update PLUGIN [--ref REF]` refreshes an installed plugin from
+  its recorded Git source while preserving skill, adapter, and plugin-data
+  state.
+
 ## [0.16.1] - 2026-07-31
 
 ### Changed

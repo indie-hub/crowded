@@ -20,6 +20,7 @@ const INSTALL_FILE: &str = ".crowded-install.toml";
 const ADAPTER_FILE: &str = ".crowded-adapters.json";
 const ADAPTER_VERSION: u32 = 1;
 const ADD_USAGE: &str = "usage: crowded plugin add SOURCE [--ref REF]";
+const UPDATE_USAGE: &str = "usage: crowded plugin update PLUGIN [--ref REF]";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +42,8 @@ struct InstallRecord {
     name: String,
     version: String,
     source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference: Option<String>,
     revision: String,
     skills: Vec<String>,
 }
@@ -76,7 +79,7 @@ pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(2);
     let action = args.next().ok_or_else(|| {
         invalid_input(
-            "usage: crowded plugin add|list|preview|enable|disable|remove (run a command for details)",
+            "usage: crowded plugin add|update|list|preview|enable|disable|remove (run a command for details)",
         )
     })?;
     let root = env::current_dir()?;
@@ -84,11 +87,7 @@ pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
     match action.as_str() {
         "add" => {
             let source = args.next().ok_or_else(|| invalid_input(ADD_USAGE))?;
-            let reference = match (args.next().as_deref(), args.next()) {
-                (None, None) => None,
-                (Some("--ref"), Some(reference)) if args.next().is_none() => Some(reference),
-                _ => return Err(invalid_input(ADD_USAGE).into()),
-            };
+            let reference = optional_reference(&mut args, ADD_USAGE)?;
             let installed = add(&root, &source, reference.as_deref())?;
             println!(
                 "installed {} {} ({}) with {} shared skill(s)",
@@ -97,6 +96,28 @@ pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
                 &installed.revision[..installed.revision.len().min(12)],
                 installed.skills.len()
             );
+        }
+        "update" => {
+            let name = args.next().ok_or_else(|| invalid_input(UPDATE_USAGE))?;
+            let reference = optional_reference(&mut args, UPDATE_USAGE)?;
+            let (previous, installed, changed) = update(&root, &name, reference.as_deref())?;
+            if changed {
+                println!(
+                    "updated {} {} -> {} ({}) with {} shared skill(s)",
+                    installed.name,
+                    previous.version,
+                    installed.version,
+                    &installed.revision[..installed.revision.len().min(12)],
+                    installed.skills.len()
+                );
+            } else {
+                println!(
+                    "{} {} is already current ({})",
+                    installed.name,
+                    installed.version,
+                    &installed.revision[..installed.revision.len().min(12)]
+                );
+            }
         }
         "list" if args.next().is_none() => {
             let installed = list(&root)?;
@@ -178,12 +199,29 @@ pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             return Err(invalid_input(
-                "usage: crowded plugin add SOURCE [--ref REF] | list | preview|enable|disable|remove PLUGIN",
+                "usage: crowded plugin add SOURCE [--ref REF] | update PLUGIN [--ref REF] | list | preview|enable|disable|remove PLUGIN",
             )
             .into());
         }
     }
     Ok(())
+}
+
+fn optional_reference(
+    args: &mut impl Iterator<Item = String>,
+    usage: &str,
+) -> io::Result<Option<String>> {
+    match args.next() {
+        None => Ok(None),
+        Some(flag) if flag == "--ref" => {
+            let reference = args.next().ok_or_else(|| invalid_input(usage))?;
+            if args.next().is_some() {
+                return Err(invalid_input(usage));
+            }
+            Ok(Some(reference))
+        }
+        Some(_) => Err(invalid_input(usage)),
+    }
 }
 
 fn add(root: &Path, source: &str, reference: Option<&str>) -> io::Result<InstallRecord> {
@@ -193,51 +231,39 @@ fn add(root: &Path, source: &str, reference: Option<&str>) -> io::Result<Install
     }
 
     create_install_directory(root)?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(io::Error::other)?
-        .as_nanos();
-    let temporary = root
-        .join(".crowded")
-        .join(format!("plugin-install-{}-{nonce}", std::process::id()));
+    let temporary = temporary_plugin_path(root, "install")?;
     let clone_result = clone_source(source, reference, &temporary);
     if let Err(error) = clone_result {
         let _ = fs::remove_dir_all(&temporary);
         return Err(error);
     }
 
-    let result = prepare_install(root, source, &temporary);
+    let result = prepare_install(root, source, reference, &temporary);
     if result.is_err() {
         let _ = fs::remove_dir_all(&temporary);
     }
     result
 }
 
-fn prepare_install(root: &Path, source: &str, temporary: &Path) -> io::Result<InstallRecord> {
-    let manifest = load_manifest(temporary)?;
-    validate_name("plugin", &manifest.name)?;
-    validate_version(&manifest.version)?;
-    let skills = discover_skills(&temporary.join("skills"))?;
-    let revision = git_revision(temporary)?;
-    let installed = root.join(INSTALLS_DIRECTORY).join(&manifest.name);
+fn prepare_install(
+    root: &Path,
+    source: &str,
+    reference: Option<&str>,
+    temporary: &Path,
+) -> io::Result<InstallRecord> {
+    let record = inspect_plugin(source, reference, temporary)?;
+    let installed = root.join(INSTALLS_DIRECTORY).join(&record.name);
     match fs::symlink_metadata(&installed) {
         Ok(_) => {
             return Err(invalid_input(format!(
                 "plugin `{}` is already installed",
-                manifest.name
+                record.name
             )));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
 
-    let record = InstallRecord {
-        name: manifest.name,
-        version: manifest.version,
-        source: source.to_owned(),
-        revision,
-        skills,
-    };
     let links = skill_links(root, &record);
     for (link, _) in &links {
         match fs::symlink_metadata(link) {
@@ -252,10 +278,7 @@ fn prepare_install(root: &Path, source: &str, temporary: &Path) -> io::Result<In
         }
     }
 
-    fs::write(
-        temporary.join(INSTALL_FILE),
-        toml::to_string_pretty(&record).map_err(io::Error::other)?,
-    )?;
+    write_install_record(temporary, &record)?;
     fs::rename(temporary, &installed)?;
 
     let mut created = Vec::new();
@@ -275,6 +298,31 @@ fn prepare_install(root: &Path, source: &str, temporary: &Path) -> io::Result<In
         created.push(link);
     }
     Ok(record)
+}
+
+fn inspect_plugin(
+    source: &str,
+    reference: Option<&str>,
+    directory: &Path,
+) -> io::Result<InstallRecord> {
+    let manifest = load_manifest(directory)?;
+    validate_name("plugin", &manifest.name)?;
+    validate_version(&manifest.version)?;
+    Ok(InstallRecord {
+        name: manifest.name,
+        version: manifest.version,
+        source: source.to_owned(),
+        reference: reference.map(str::to_owned),
+        revision: git_revision(directory)?,
+        skills: discover_skills(&directory.join("skills"))?,
+    })
+}
+
+fn write_install_record(directory: &Path, record: &InstallRecord) -> io::Result<()> {
+    fs::write(
+        directory.join(INSTALL_FILE),
+        toml::to_string_pretty(record).map_err(io::Error::other)?,
+    )
 }
 
 fn list(root: &Path) -> io::Result<Vec<InstallRecord>> {
@@ -313,6 +361,173 @@ fn installed_record(root: &Path, name: &str) -> io::Result<(PathBuf, InstallReco
         )));
     }
     Ok((installed, record))
+}
+
+fn update(
+    root: &Path,
+    name: &str,
+    reference_override: Option<&str>,
+) -> io::Result<(InstallRecord, InstallRecord, bool)> {
+    validate_name("plugin", name)?;
+    let (installed, previous) = installed_record(root, name)?;
+    validate_source(&previous.source)?;
+    if let Some(reference) = reference_override {
+        validate_reference(reference)?;
+    }
+    let reference = reference_override.or(previous.reference.as_deref());
+
+    let links = skill_link_presence(root, &previous)?;
+    let active_links = links.iter().filter(|(_, _, present)| *present).count();
+    let all_links = previous.skills.len() * 3;
+    if active_links != 0 && active_links != all_links {
+        return Err(invalid_input(format!(
+            "plugin `{name}` has partially enabled skills; enable or disable it before updating"
+        )));
+    }
+    let skills_enabled = active_links == all_links;
+    let adapters_enabled = installed.join(ADAPTER_FILE).try_exists()?;
+
+    create_install_directory(root)?;
+    let temporary = temporary_plugin_path(root, "update")?;
+    if let Err(error) = clone_source(&previous.source, reference, &temporary) {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+    let next = match inspect_plugin(&previous.source, reference, &temporary) {
+        Ok(next) if next.name == name => next,
+        Ok(next) => {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(invalid_data(format!(
+                "plugin `{name}` source now contains plugin `{}`",
+                next.name
+            )));
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+    };
+    if next.revision == previous.revision && next.reference == previous.reference {
+        fs::remove_dir_all(&temporary)?;
+        return Ok((previous, next, false));
+    }
+    if let Err(error) = write_install_record(&temporary, &next) {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+
+    let backup = temporary_plugin_path(root, "backup")?;
+    if let Err(error) =
+        deactivate_plugin_state(root, name, &previous, skills_enabled, adapters_enabled)
+    {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&installed, &backup) {
+        let rollback =
+            activate_plugin_state(root, name, &previous, skills_enabled, adapters_enabled);
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(update_error(error, rollback));
+    }
+    if let Err(error) = fs::rename(&temporary, &installed) {
+        let rollback = restore_previous_plugin(
+            root,
+            name,
+            &installed,
+            &backup,
+            &previous,
+            skills_enabled,
+            adapters_enabled,
+        );
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(update_error(error, rollback));
+    }
+    if let Err(error) = activate_plugin_state(root, name, &next, skills_enabled, adapters_enabled) {
+        let rollback = restore_previous_plugin(
+            root,
+            name,
+            &installed,
+            &backup,
+            &previous,
+            skills_enabled,
+            adapters_enabled,
+        );
+        return Err(update_error(error, rollback));
+    }
+
+    fs::remove_dir_all(backup)?;
+    Ok((previous, next, true))
+}
+
+fn deactivate_plugin_state(
+    root: &Path,
+    name: &str,
+    record: &InstallRecord,
+    skills_enabled: bool,
+    adapters_enabled: bool,
+) -> io::Result<()> {
+    let removed = if skills_enabled {
+        disable_skill_links(root, record)?
+    } else {
+        Vec::new()
+    };
+    if adapters_enabled && let Err(error) = disable_adapters(root, name) {
+        return match restore_skill_links(&removed) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(io::Error::other(format!(
+                "{error}; could not restore shared skills: {rollback}"
+            ))),
+        };
+    }
+    Ok(())
+}
+
+fn activate_plugin_state(
+    root: &Path,
+    name: &str,
+    record: &InstallRecord,
+    skills_enabled: bool,
+    adapters_enabled: bool,
+) -> io::Result<()> {
+    let created = if skills_enabled {
+        enable_skill_links(root, record)?
+    } else {
+        Vec::new()
+    };
+    if adapters_enabled && let Err(error) = enable_adapters(root, name) {
+        return match remove_skill_links(&created) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(io::Error::other(format!(
+                "{error}; could not remove new shared skills: {rollback}"
+            ))),
+        };
+    }
+    Ok(())
+}
+
+fn restore_previous_plugin(
+    root: &Path,
+    name: &str,
+    installed: &Path,
+    backup: &Path,
+    previous: &InstallRecord,
+    skills_enabled: bool,
+    adapters_enabled: bool,
+) -> io::Result<()> {
+    if installed.try_exists()? {
+        fs::remove_dir_all(installed)?;
+    }
+    fs::rename(backup, installed)?;
+    activate_plugin_state(root, name, previous, skills_enabled, adapters_enabled)
+}
+
+fn update_error(error: io::Error, rollback: io::Result<()>) -> io::Error {
+    match rollback {
+        Ok(()) => error,
+        Err(rollback) => io::Error::other(format!(
+            "{error}; could not restore the previous plugin: {rollback}"
+        )),
+    }
 }
 
 fn enable_plugin(root: &Path, name: &str) -> io::Result<(usize, Option<AdapterState>)> {
@@ -1027,6 +1242,16 @@ fn clone_source(source: &str, reference: Option<&str>, destination: &Path) -> io
     }
 }
 
+fn temporary_plugin_path(root: &Path, operation: &str) -> io::Result<PathBuf> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    Ok(root
+        .join(".crowded")
+        .join(format!("plugin-{operation}-{}-{nonce}", std::process::id())))
+}
+
 fn create_install_directory(root: &Path) -> io::Result<()> {
     let crowded = root.join(".crowded");
     for directory in [&crowded, &root.join(INSTALLS_DIRECTORY)] {
@@ -1525,11 +1750,61 @@ mod tests {
         assert!(project.join(".claude/skills/room-greeter").exists());
         assert!(project.join(".opencode/skills/room-greeter").exists());
         assert!(project.join(".opencode/plugins/greetings.mjs").exists());
+
+        for manifest in [
+            source.join(".codex-plugin/plugin.json"),
+            source.join(".claude-plugin/plugin.json"),
+        ] {
+            let updated = fs::read_to_string(&manifest)
+                .unwrap()
+                .replace("1.0.0", "1.1.0");
+            fs::write(manifest, updated).unwrap();
+        }
+        fs::create_dir_all(source.join("skills/room-farewell")).unwrap();
+        fs::write(
+            source.join("skills/room-farewell/SKILL.md"),
+            "---\nname: room-farewell\ndescription: Bids every room farewell\n---\n\nSay goodbye.\n",
+        )
+        .unwrap();
+        fs::write(
+            source.join(".opencode/command/farewell.md"),
+            "---\ndescription: Bid farewell\n---\nGoodbye\n",
+        )
+        .unwrap();
+        fs::create_dir_all(project.join(".crowded/plugin-data/greetings")).unwrap();
+        fs::write(
+            project.join(".crowded/plugin-data/greetings/memory"),
+            "preserve me\n",
+        )
+        .unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "--quiet", "-m", "update fixture"]);
+
+        let (previous, updated, changed) = update(&project, "greetings", None).unwrap();
+        assert!(changed);
+        assert_eq!(previous.version, "1.0.0");
+        assert_eq!(updated.version, "1.1.0");
+        assert_eq!(updated.skills.len(), 2);
+        assert!(project.join(".agents/skills/room-farewell").exists());
+        assert!(project.join(".opencode/command/farewell.md").exists());
+        assert!(
+            project
+                .join(".crowded/plugins/greetings/.crowded-adapters.json")
+                .exists()
+        );
+        assert_eq!(
+            fs::read_to_string(project.join(".crowded/plugin-data/greetings/memory")).unwrap(),
+            "preserve me\n"
+        );
+        assert!(!update(&project, "greetings", None).unwrap().2);
+
         remove(&project, "greetings").unwrap();
         assert!(list(&project).unwrap().is_empty());
         assert!(!project.join(".agents/skills/room-greeter").exists());
+        assert!(!project.join(".agents/skills/room-farewell").exists());
         assert!(!project.join(".claude/skills/room-greeter").exists());
         assert!(!project.join(".opencode/skills/room-greeter").exists());
+        assert!(!project.join(".opencode/command/farewell.md").exists());
 
         fs::remove_dir_all(base).unwrap();
     }
