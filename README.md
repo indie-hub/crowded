@@ -27,6 +27,12 @@ name = "code4me-ntg"
 source = "https://github.com/indie-hub/code4me-ntg.git"
 # ref = "v0.3.0"
 
+[[plugin]]
+name = "context-mode"
+source = "https://github.com/mksglu/context-mode.git"
+ref = "v1.0.169"
+adapters = true
+
 [[setup]]
 name = "ccc-index"
 command = "ccc"
@@ -34,7 +40,8 @@ args = ["index"]
 ```
 
 Crowded invokes setup programs directly, so `command` may be an existing
-executable, `uvx`, or `npx`; it never installs a system-wide package itself.
+executable, `uv`, `uvx`, or `npx`; package installation remains an explicit
+setup action in the reviewed configuration.
 Each successful action creates `.crowded/init/NAME.done`. Failed actions are
 not marked and run again on the next `crowded init`. Existing plugins are left
 at their installed revision; use `crowded plugin update` explicitly.
@@ -184,8 +191,9 @@ plugin data. Pass `--ref REF` to move a pinned plugin to another Git ref.
 `.claude/settings.local.json` and `.codex/hooks.json`, and links supported
 OpenCode plugins and commands into `.opencode/`. `plugin disable` removes all
 of those owned changes from every CLI; `remove` disables them automatically.
-Crowded does not translate one vendor's plugin code into another vendor's
-format.
+Set `adapters = true` on a `[[plugin]]` declaration to have later `crowded init`
+runs enable those adapters after the first-run configuration review. Crowded
+does not translate one vendor's plugin code into another vendor's format.
 
 ## Shared Toolbox
 
@@ -198,6 +206,23 @@ name = "basic-memory"
 command = "basic-memory"
 args = ["mcp"]
 ```
+
+Limit an MCP to particular clients when a vendor has a better native adapter:
+
+```toml
+[[mcp]]
+name = "context-mode"
+command = "npx"
+args = ["-y", "context-mode@1.0.169"]
+clients = ["claude", "codex"]
+
+[[opencode_plugin]]
+package = "context-mode@1.0.169"
+```
+
+That is how the starter config installs Context Mode: Claude and Codex use its
+shared MCP plus native hooks, while OpenCode uses the npm plugin only. Avoiding
+both integrations in OpenCode prevents Context Mode's duplicate-tool conflict.
 
 Shared MCPs currently support native `claude`, `codex`, and `opencode`
 commands. Crowded keeps them project-local and does not modify the guests'

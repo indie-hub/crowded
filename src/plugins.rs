@@ -272,6 +272,16 @@ pub(crate) fn ensure_installed(
     Ok(true)
 }
 
+pub(crate) fn ensure_adapters_enabled(root: &Path, name: &str) -> io::Result<bool> {
+    validate_name("plugin", name)?;
+    let installed = root.join(INSTALLS_DIRECTORY).join(name);
+    if installed.join(ADAPTER_FILE).try_exists()? {
+        return Ok(false);
+    }
+    enable_adapters(root, name)?;
+    Ok(true)
+}
+
 fn add(root: &Path, source: &str, reference: Option<&str>) -> io::Result<InstallRecord> {
     validate_source(source)?;
     if let Some(reference) = reference {
@@ -862,14 +872,16 @@ fn adapter_plan(root: &Path, name: &str) -> io::Result<AdapterState> {
     }
 
     let mut hooks = Vec::new();
-    for (manifest_path, target) in [
+    for (manifest_path, target, conventional_hooks) in [
         (
             ".claude-plugin/plugin.json",
             PathBuf::from(".claude/settings.local.json"),
+            Some("hooks/hooks.json"),
         ),
         (
             ".codex-plugin/plugin.json",
             PathBuf::from(".codex/hooks.json"),
+            None,
         ),
     ] {
         let manifest_path = installed.join(manifest_path);
@@ -884,8 +896,11 @@ fn adapter_plan(root: &Path, name: &str) -> io::Result<AdapterState> {
                 manifest.name
             )));
         }
-        if let Some(hook_path) = manifest.hooks {
-            let hook_path = safe_plugin_file(&installed, &hook_path)?;
+        let hook_path = manifest.hooks.as_deref().or(conventional_hooks);
+        if let Some(hook_path) = hook_path
+            && installed.join(hook_path).try_exists()?
+        {
+            let hook_path = safe_plugin_file(&installed, hook_path)?;
             hooks.push(AdapterHooks {
                 path: target,
                 entries: adapted_hooks(root, name, &hook_path)?,
@@ -1664,8 +1679,7 @@ mod tests {
             source.join(".claude-plugin/plugin.json"),
             r#"{
                 "name": "greetings",
-                "version": "1.0.0",
-                "hooks": "./hooks/hooks.json"
+                "version": "1.0.0"
             }"#,
         )
         .unwrap();

@@ -7,6 +7,20 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-07-31
+
+### Added
+
+- MCP declarations can target selected `claude`, `codex`, or `opencode`
+  clients, and project-local OpenCode npm plugins can be declared with
+  `[[opencode_plugin]]`.
+- Plugin declarations can enable their reviewed vendor adapters during
+  `crowded init` with `adapters = true`; Claude plugins using the standard
+  `hooks/hooks.json` layout are now recognized without extra manifest fields.
+- The starter recipe gives Claude and Codex the Context Mode MCP and native
+  hooks, while OpenCode receives its native Context Mode package without the
+  conflicting duplicate MCP.
+
 ## [0.19.1] - 2026-07-31
 
 ### Fixed

@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{
-    McpConfig, RoomConfig, Transport, claude_mcp_config, load_room_file, opencode_mcp_config,
-    validate_mcp_servers,
+    McpClient, McpConfig, OpenCodePluginConfig, RoomConfig, Transport, claude_mcp_config,
+    load_room_file, opencode_mcp_config, validate_mcp_servers, validate_opencode_plugins,
 };
 
 const STATE_DIRECTORY: &str = ".crowded";
@@ -102,9 +102,15 @@ pub(crate) fn native_files_are_active_at(root: &Path) -> io::Result<bool> {
     for file in &state.files {
         let current = read_optional(&file.path)?;
         let exact = current.as_deref() == Some(&file.generated);
-        let managed_json_is_intact = match (current.as_deref(), json_section(&file.path)) {
-            (Some(current), Some(section)) => managed_json_matches(file, current, section)?,
-            _ => false,
+        let managed_json_is_intact = match current.as_deref() {
+            Some(current) if is_opencode_config(&file.path) => {
+                managed_opencode_matches(file, current)?
+            }
+            Some(current) => match json_section(&file.path) {
+                Some(section) => managed_json_matches(file, current, section)?,
+                None => false,
+            },
+            None => false,
         };
         if !exact && !managed_json_is_intact {
             return Err(invalid_data(format!(
@@ -204,6 +210,14 @@ fn remove(root: &Path) -> io::Result<usize> {
         } else if current.as_deref() == file.original.as_deref() {
             // A failed sync may leave a target untouched; it is already restored.
             removals.push(Removal::AlreadyRestored);
+        } else if let Some(current) = current.as_deref()
+            && is_opencode_config(&file.path)
+            && managed_opencode_matches(file, current)?
+        {
+            match remove_managed_opencode(file, current)? {
+                Some(contents) => removals.push(Removal::RewriteJson(contents)),
+                None => removals.push(Removal::Delete),
+            }
         } else if let (Some(current), Some(section)) =
             (current.as_deref(), json_section(&file.path))
             && managed_json_matches(file, current, section)?
@@ -244,10 +258,92 @@ fn remove(root: &Path) -> io::Result<usize> {
 fn json_section(path: &Path) -> Option<&'static str> {
     match path.file_name().and_then(|name| name.to_str()) {
         Some(".mcp.json") => Some("mcpServers"),
-        Some("opencode.json") => Some("mcp"),
         Some("hooks.json" | "settings.local.json") => Some("hooks"),
         _ => None,
     }
+}
+
+fn is_opencode_config(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("opencode.json")
+}
+
+fn managed_opencode_matches(file: &ManagedFile, current: &str) -> io::Result<bool> {
+    let current: Value = serde_json::from_str(current).map_err(invalid_json(&file.path))?;
+    let current_mcp = current.get("mcp").and_then(Value::as_object);
+    for (name, expected) in owned_json_entries(file, "mcp")? {
+        if current_mcp.and_then(|entries| entries.get(&name)) != Some(&expected) {
+            return Ok(false);
+        }
+    }
+    let current_plugins = current.get("plugin").and_then(Value::as_array);
+    for expected in owned_array_entries(file, "plugin")? {
+        if !current_plugins.is_some_and(|plugins| plugins.contains(&expected)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn remove_managed_opencode(file: &ManagedFile, current: &str) -> io::Result<Option<String>> {
+    let mut current: Value = serde_json::from_str(current).map_err(invalid_json(&file.path))?;
+    let original: Value = match file.original.as_deref() {
+        Some(original) => serde_json::from_str(original).map_err(invalid_json(&file.path))?,
+        None => serde_json::json!({}),
+    };
+    let root = current.as_object_mut().ok_or_else(|| {
+        invalid_data(format!(
+            "{} must contain a JSON object",
+            file.path.display()
+        ))
+    })?;
+
+    let owned_mcp = owned_json_entries(file, "mcp")?;
+    if !owned_mcp.is_empty() {
+        let entries = root
+            .get_mut("mcp")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                invalid_data(format!("{} `mcp` must be an object", file.path.display()))
+            })?;
+        for (name, _) in owned_mcp {
+            entries.remove(&name);
+        }
+        if entries.is_empty() && original.get("mcp").is_none() {
+            root.remove("mcp");
+        }
+    }
+
+    let owned_plugins = owned_array_entries(file, "plugin")?;
+    if !owned_plugins.is_empty() {
+        let plugins = root
+            .get_mut("plugin")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                invalid_data(format!("{} `plugin` must be an array", file.path.display()))
+            })?;
+        for owned in owned_plugins {
+            let position = plugins
+                .iter()
+                .position(|plugin| plugin == &owned)
+                .ok_or_else(|| {
+                    invalid_data(format!(
+                        "{} no longer contains a Crowded-managed OpenCode plugin",
+                        file.path.display()
+                    ))
+                })?;
+            plugins.remove(position);
+        }
+        if plugins.is_empty() && original.get("plugin").is_none() {
+            root.remove("plugin");
+        }
+    }
+
+    if root.is_empty() && file.original.is_none() {
+        return Ok(None);
+    }
+    let mut output = serde_json::to_string_pretty(&current).map_err(invalid_json(&file.path))?;
+    output.push('\n');
+    Ok(Some(output))
 }
 
 fn managed_json_matches(file: &ManagedFile, current: &str, section: &str) -> io::Result<bool> {
@@ -389,15 +485,15 @@ fn owned_hook_entries(file: &ManagedFile) -> io::Result<Vec<(String, Value)>> {
 fn owned_json_entries(file: &ManagedFile, section: &str) -> io::Result<Vec<(String, Value)>> {
     let generated: Value =
         serde_json::from_str(&file.generated).map_err(invalid_json(&file.path))?;
-    let generated = generated
-        .get(section)
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
+    let generated = match generated.get(section) {
+        None => return Ok(Vec::new()),
+        Some(generated) => generated.as_object().ok_or_else(|| {
             invalid_data(format!(
                 "{} generated `{section}` is not a JSON object",
                 file.path.display()
             ))
-        })?;
+        })?,
+    };
     let original: Value = match file.original.as_deref() {
         Some(original) => serde_json::from_str(original).map_err(invalid_json(&file.path))?,
         None => serde_json::json!({}),
@@ -408,6 +504,30 @@ fn owned_json_entries(file: &ManagedFile, section: &str) -> io::Result<Vec<(Stri
         .iter()
         .filter(|(name, _)| original.is_none_or(|entries| !entries.contains_key(*name)))
         .map(|(name, value)| (name.clone(), value.clone()))
+        .collect())
+}
+
+fn owned_array_entries(file: &ManagedFile, section: &str) -> io::Result<Vec<Value>> {
+    let generated: Value =
+        serde_json::from_str(&file.generated).map_err(invalid_json(&file.path))?;
+    let generated = match generated.get(section) {
+        None => return Ok(Vec::new()),
+        Some(generated) => generated.as_array().ok_or_else(|| {
+            invalid_data(format!(
+                "{} generated `{section}` is not an array",
+                file.path.display()
+            ))
+        })?,
+    };
+    let original: Value = match file.original.as_deref() {
+        Some(original) => serde_json::from_str(original).map_err(invalid_json(&file.path))?,
+        None => serde_json::json!({}),
+    };
+    let original = original.get(section).and_then(Value::as_array);
+    Ok(generated
+        .iter()
+        .filter(|entry| original.is_none_or(|entries| !entries.contains(entry)))
+        .cloned()
         .collect())
 }
 
@@ -423,8 +543,14 @@ fn build_plan(root: &Path) -> io::Result<ToolboxState> {
         return Err(invalid_input("crowded.toml needs at least two rooms"));
     }
     validate_mcp_servers(&config.mcp_servers)?;
+    validate_opencode_plugins(&config.opencode_plugins)?;
 
-    let targets = native_targets(root, &config.rooms, !config.mcp_servers.is_empty())?;
+    let targets = native_targets(
+        root,
+        &config.rooms,
+        &config.mcp_servers,
+        &config.opencode_plugins,
+    )?;
     let mut files = Vec::with_capacity(targets.len());
     for (path, target) in targets {
         refuse_symlink(&path)?;
@@ -437,7 +563,13 @@ fn build_plan(root: &Path) -> io::Result<ToolboxState> {
             )));
         }
         let original = read_optional(&path)?;
-        let generated = generate(target, original.as_deref(), &config.mcp_servers, &path)?;
+        let generated = generate(
+            target,
+            original.as_deref(),
+            &config.mcp_servers,
+            &config.opencode_plugins,
+            &path,
+        )?;
         files.push(ManagedFile {
             path,
             original,
@@ -454,7 +586,8 @@ fn build_plan(root: &Path) -> io::Result<ToolboxState> {
 fn native_targets(
     root: &Path,
     rooms: &[RoomConfig],
-    include_mcps: bool,
+    servers: &[McpConfig],
+    opencode_plugins: &[OpenCodePluginConfig],
 ) -> io::Result<BTreeMap<PathBuf, NativeTarget>> {
     let mut targets = BTreeMap::new();
     for room in rooms {
@@ -503,7 +636,14 @@ fn native_targets(
                 )));
             }
         };
-        if include_mcps {
+        let client = match vendor {
+            Vendor::Claude => McpClient::Claude,
+            Vendor::Codex => McpClient::Codex,
+            Vendor::OpenCode => McpClient::Opencode,
+        };
+        if servers.iter().any(|server| server.supports(client))
+            || vendor == Vendor::OpenCode && !opencode_plugins.is_empty()
+        {
             targets.insert(mcp_path, NativeTarget::Mcp(vendor));
         }
         targets.insert(hook_path, NativeTarget::Hooks(vendor));
@@ -515,6 +655,7 @@ fn generate(
     target: NativeTarget,
     original: Option<&str>,
     servers: &[McpConfig],
+    opencode_plugins: &[OpenCodePluginConfig],
     path: &Path,
 ) -> io::Result<String> {
     match target {
@@ -522,9 +663,11 @@ fn generate(
             merge_json(original, &claude_mcp_config(servers)?, "mcpServers", path)
         }
         NativeTarget::Mcp(Vendor::Codex) => merge_codex(original, servers, path),
-        NativeTarget::Mcp(Vendor::OpenCode) => {
-            merge_json(original, &opencode_mcp_config(None, servers)?, "mcp", path)
-        }
+        NativeTarget::Mcp(Vendor::OpenCode) => merge_opencode(
+            original,
+            &opencode_mcp_config(None, servers, opencode_plugins)?,
+            path,
+        ),
         NativeTarget::Hooks(Vendor::Claude | Vendor::Codex) => merge_hooks(original, path),
         NativeTarget::Hooks(Vendor::OpenCode) => {
             if original.is_some() {
@@ -655,6 +798,55 @@ fn merge_json(
     Ok(output)
 }
 
+fn merge_opencode(original: Option<&str>, additions: &str, path: &Path) -> io::Result<String> {
+    let mut document = parse_json_document(original, path)?;
+    let additions: Value = serde_json::from_str(additions).map_err(invalid_json(path))?;
+    let root = document
+        .as_object_mut()
+        .ok_or_else(|| invalid_data(format!("{} must contain a JSON object", path.display())))?;
+
+    if let Some(new_mcp) = additions.get("mcp").and_then(Value::as_object) {
+        let mcp = root
+            .entry("mcp")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                invalid_data(format!(
+                    "{} `mcp` must contain a JSON object",
+                    path.display()
+                ))
+            })?;
+        for (name, value) in new_mcp {
+            if mcp.contains_key(name) {
+                return Err(invalid_input(format!(
+                    "{} already configures MCP `{name}`",
+                    path.display()
+                )));
+            }
+            mcp.insert(name.clone(), value.clone());
+        }
+    }
+
+    if let Some(new_plugins) = additions.get("plugin").and_then(Value::as_array) {
+        let plugins = root
+            .entry("plugin")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| {
+                invalid_data(format!("{} `plugin` must contain an array", path.display()))
+            })?;
+        for plugin in new_plugins {
+            if !plugins.contains(plugin) {
+                plugins.push(plugin.clone());
+            }
+        }
+    }
+
+    let mut output = serde_json::to_string_pretty(&document).map_err(invalid_json(path))?;
+    output.push('\n');
+    Ok(output)
+}
+
 fn parse_json_document(original: Option<&str>, path: &Path) -> io::Result<Value> {
     match original.filter(|text| !text.trim().is_empty()) {
         Some(text) => serde_json::from_str(text).map_err(invalid_json(path)),
@@ -676,7 +868,10 @@ fn merge_codex(original: Option<&str>, servers: &[McpConfig], path: &Path) -> io
                 path.display()
             ))
         })?;
-        for server in servers {
+        for server in servers
+            .iter()
+            .filter(|server| server.supports(McpClient::Codex))
+        {
             if existing.contains_key(&server.name) {
                 return Err(invalid_input(format!(
                     "{} already configures MCP `{}`",
@@ -695,7 +890,10 @@ fn merge_codex(original: Option<&str>, servers: &[McpConfig], path: &Path) -> io
         output.push('\n');
     }
     output.push_str("# Crowded Room Shared Toolbox\n");
-    for server in servers {
+    for server in servers
+        .iter()
+        .filter(|server| server.supports(McpClient::Codex))
+    {
         output.push_str(&format!("[mcp_servers.{}]\n", server.name));
         output.push_str(&format!(
             "command = {}\n",
@@ -911,6 +1109,9 @@ mod tests {
                 name = "everything"
                 command = "npx"
                 args = ["-y", "@modelcontextprotocol/server-everything"]
+
+                [[opencode_plugin]]
+                package = "context-mode@1.0.169"
             "#,
         )
         .unwrap();
@@ -933,6 +1134,9 @@ mod tests {
                 .unwrap()
                 .contains("\"model\": \"openai/gpt-5\"")
         );
+        let opencode: Value =
+            serde_json::from_str(&fs::read_to_string(root.join("opencode.json")).unwrap()).unwrap();
+        assert_eq!(opencode["plugin"][0], "context-mode@1.0.169");
         let claude_hooks: Value = serde_json::from_str(
             &fs::read_to_string(root.join(".claude/settings.local.json")).unwrap(),
         )
@@ -997,6 +1201,7 @@ mod tests {
         assert_eq!(opencode["model"], "openai/gpt-5");
         assert_eq!(opencode["$schema"], "https://opencode.ai/config.json");
         assert!(opencode.get("mcp").is_none());
+        assert!(opencode.get("plugin").is_none());
         assert!(!root.join(STATE_FILE).exists());
 
         fs::remove_dir_all(root).unwrap();

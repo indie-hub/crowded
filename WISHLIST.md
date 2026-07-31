@@ -105,7 +105,7 @@ This is Crowded infrastructure, not a native vendor transport.
 
 - Arbitrary tiled Claude, Codex, OpenCode, and terminal rooms.
 - Structured whispers, role hats, queues, readiness gates, and roster context.
-- Shared local MCP configuration.
+- Shared local MCP configuration, optionally scoped by client.
 - Local hooks and the Room Pulse sidebar.
 - Shared plugins, skills, hooks, and OpenCode components, including
   preview/enable/disable/remove.
@@ -114,4 +114,6 @@ This is Crowded infrastructure, not a native vendor transport.
 - A version-pinned base environment recipe for Basic Memory, CodeGraph,
   CocoIndex Code, and Context Mode, including a shared local memory project and
   initial source indexes.
+- Cross-vendor Context Mode integration: MCP and native hooks for Claude and
+  Codex, and the native npm plugin for OpenCode without a duplicate MCP.
 - Authenticated Conductor controls for clear, model, and effort where supported.

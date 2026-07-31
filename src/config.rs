@@ -23,6 +23,8 @@ pub(crate) struct RoomFile {
     pub(crate) rooms: Vec<RoomConfig>,
     #[serde(default, rename = "mcp")]
     pub(crate) mcp_servers: Vec<McpConfig>,
+    #[serde(default, rename = "opencode_plugin")]
+    pub(crate) opencode_plugins: Vec<OpenCodePluginConfig>,
     #[serde(default, rename = "plugin")]
     pub(crate) plugins: Vec<PluginConfig>,
     #[serde(default)]
@@ -37,6 +39,22 @@ pub(crate) struct McpConfig {
     #[serde(default)]
     pub(crate) args: Vec<String>,
     pub(crate) cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) clients: Vec<McpClient>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum McpClient {
+    Claude,
+    Codex,
+    Opencode,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OpenCodePluginConfig {
+    pub(crate) package: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -46,6 +64,8 @@ pub(crate) struct PluginConfig {
     pub(crate) source: String,
     #[serde(rename = "ref")]
     pub(crate) reference: Option<String>,
+    #[serde(default)]
+    pub(crate) adapters: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -130,8 +150,12 @@ impl RoomSpec {
         })
     }
 
-    fn add_shared_mcps(&mut self, servers: &[McpConfig]) -> io::Result<()> {
-        if servers.is_empty() {
+    fn add_shared_toolbox(
+        &mut self,
+        servers: &[McpConfig],
+        opencode_plugins: &[OpenCodePluginConfig],
+    ) -> io::Result<()> {
+        if servers.is_empty() && opencode_plugins.is_empty() {
             return Ok(());
         }
         let guest = Path::new(self.program.as_os_str())
@@ -141,16 +165,31 @@ impl RoomSpec {
             .to_ascii_lowercase();
 
         match guest.as_str() {
-            "claude" => {
+            "claude"
+                if servers
+                    .iter()
+                    .any(|server| server.supports(McpClient::Claude)) =>
+            {
                 self.args.push("--mcp-config".into());
                 self.args.push(claude_mcp_config(servers)?.into());
             }
-            "codex" => self.prepend_args(codex_mcp_args(servers)),
+            "codex"
+                if servers
+                    .iter()
+                    .any(|server| server.supports(McpClient::Codex)) =>
+            {
+                self.prepend_args(codex_mcp_args(servers))
+            }
             "opencode" => self.variables.push((
                 "OPENCODE_CONFIG_CONTENT".into(),
-                opencode_mcp_config(env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(), servers)?
-                    .into(),
+                opencode_mcp_config(
+                    env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(),
+                    servers,
+                    opencode_plugins,
+                )?
+                .into(),
             )),
+            "claude" | "codex" => {}
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -203,6 +242,12 @@ impl RoomSpec {
     }
 }
 
+impl McpConfig {
+    pub(crate) fn supports(&self, client: McpClient) -> bool {
+        self.clients.is_empty() || self.clients.contains(&client)
+    }
+}
+
 pub(crate) fn validate_mcp_servers(servers: &[McpConfig]) -> io::Result<()> {
     let mut names = HashSet::new();
     for server in servers {
@@ -234,9 +279,31 @@ pub(crate) fn validate_mcp_servers(servers: &[McpConfig]) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_opencode_plugins(plugins: &[OpenCodePluginConfig]) -> io::Result<()> {
+    let mut packages = HashSet::new();
+    for plugin in plugins {
+        if plugin.package.trim().is_empty() || plugin.package.chars().any(char::is_control) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "OpenCode plugin package cannot be empty or contain control characters",
+            ));
+        }
+        if !packages.insert(&plugin.package) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("duplicate OpenCode plugin package: {}", plugin.package),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn claude_mcp_config(servers: &[McpConfig]) -> io::Result<String> {
     let mut configured = serde_json::Map::new();
-    for server in servers {
+    for server in servers
+        .iter()
+        .filter(|server| server.supports(McpClient::Claude))
+    {
         let mut entry = serde_json::json!({
             "command": server.command,
             "args": server.args,
@@ -252,7 +319,10 @@ pub(crate) fn claude_mcp_config(servers: &[McpConfig]) -> io::Result<String> {
 
 fn codex_mcp_args(servers: &[McpConfig]) -> Vec<OsString> {
     let mut args = Vec::new();
-    for server in servers {
+    for server in servers
+        .iter()
+        .filter(|server| server.supports(McpClient::Codex))
+    {
         let prefix = format!("mcp_servers.{}", server.name);
         args.extend([
             "-c".into(),
@@ -292,6 +362,7 @@ fn codex_mcp_args(servers: &[McpConfig]) -> Vec<OsString> {
 pub(crate) fn opencode_mcp_config(
     existing: Option<&str>,
     servers: &[McpConfig],
+    plugins: &[OpenCodePluginConfig],
 ) -> io::Result<String> {
     let mut config = match existing {
         Some(existing) => serde_json::from_str(existing)
@@ -304,29 +375,52 @@ pub(crate) fn opencode_mcp_config(
             "OPENCODE_CONFIG_CONTENT must contain a JSON object",
         )
     })?;
-    let mcp = root
-        .entry("mcp")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "OPENCODE_CONFIG_CONTENT mcp must be a JSON object",
-            )
-        })?;
-
-    for server in servers {
-        let mut command = vec![server.command.clone()];
-        command.extend(server.args.iter().cloned());
-        let mut entry = serde_json::json!({
-            "type": "local",
-            "command": command,
-            "enabled": true,
-        });
-        if let Some(cwd) = &server.cwd {
-            entry["cwd"] = serde_json::Value::String(cwd.to_string_lossy().into_owned());
+    let open_code_servers: Vec<_> = servers
+        .iter()
+        .filter(|server| server.supports(McpClient::Opencode))
+        .collect();
+    if !open_code_servers.is_empty() {
+        let mcp = root
+            .entry("mcp")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "OPENCODE_CONFIG_CONTENT mcp must be a JSON object",
+                )
+            })?;
+        for server in open_code_servers {
+            let mut command = vec![server.command.clone()];
+            command.extend(server.args.iter().cloned());
+            let mut entry = serde_json::json!({
+                "type": "local",
+                "command": command,
+                "enabled": true,
+            });
+            if let Some(cwd) = &server.cwd {
+                entry["cwd"] = serde_json::Value::String(cwd.to_string_lossy().into_owned());
+            }
+            mcp.insert(server.name.clone(), entry);
         }
-        mcp.insert(server.name.clone(), entry);
+    }
+    if !plugins.is_empty() {
+        let configured = root
+            .entry("plugin")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "OPENCODE_CONFIG_CONTENT plugin must be an array",
+                )
+            })?;
+        for plugin in plugins {
+            let package = serde_json::Value::String(plugin.package.clone());
+            if !configured.contains(&package) {
+                configured.push(package);
+            }
+        }
     }
 
     serde_json::to_string(&config)
@@ -350,11 +444,16 @@ pub(crate) fn validate_room_file(file: &RoomFile) -> io::Result<()> {
     room_specs_from_file(file.clone(), false).map(drop)
 }
 
-fn add_shared_mcps(rooms: &mut [RoomSpec], servers: &[McpConfig]) -> io::Result<()> {
+fn add_shared_toolbox(
+    rooms: &mut [RoomSpec],
+    servers: &[McpConfig],
+    opencode_plugins: &[OpenCodePluginConfig],
+) -> io::Result<()> {
     validate_mcp_servers(servers)?;
+    validate_opencode_plugins(opencode_plugins)?;
     for room in rooms {
         if room.transport == Transport::Raw {
-            room.add_shared_mcps(servers)?;
+            room.add_shared_toolbox(servers, opencode_plugins)?;
         }
     }
     Ok(())
@@ -375,9 +474,10 @@ fn room_specs_from_file(file: RoomFile, inject_shared_mcps: bool) -> io::Result<
         .map(|(index, room)| RoomSpec::configured(room, index + 1))
         .collect::<io::Result<_>>()?;
     if inject_shared_mcps {
-        add_shared_mcps(&mut rooms, &file.mcp_servers)?;
+        add_shared_toolbox(&mut rooms, &file.mcp_servers, &file.opencode_plugins)?;
     } else {
         validate_mcp_servers(&file.mcp_servers)?;
+        validate_opencode_plugins(&file.opencode_plugins)?;
     }
     Ok(rooms)
 }
@@ -427,9 +527,10 @@ pub(crate) fn room_specs() -> io::Result<Vec<RoomSpec>> {
         .collect::<io::Result<_>>()?;
     if let Some(file) = file {
         if inject_shared_mcps {
-            add_shared_mcps(&mut rooms, &file.mcp_servers)?;
+            add_shared_toolbox(&mut rooms, &file.mcp_servers, &file.opencode_plugins)?;
         } else {
             validate_mcp_servers(&file.mcp_servers)?;
+            validate_opencode_plugins(&file.opencode_plugins)?;
         }
     }
     Ok(rooms)
@@ -539,6 +640,59 @@ mod tests {
         assert_eq!(opencode["mcp"]["memory"]["command"][0], "basic-memory");
         assert_eq!(opencode["mcp"]["memory"]["command"][1], "mcp");
         assert_eq!(opencode["mcp"]["memory"]["cwd"], "tools");
+    }
+
+    #[test]
+    fn context_mode_uses_mcp_for_claude_and_codex_but_a_plugin_for_opencode() {
+        let rooms = room_specs_from_toml(
+            r#"
+                [[mcp]]
+                name = "context-mode"
+                command = "npx"
+                args = ["-y", "context-mode@1.0.169"]
+                clients = ["claude", "codex"]
+
+                [[opencode_plugin]]
+                package = "context-mode@1.0.169"
+
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+
+                [[rooms]]
+                command = "opencode"
+                transport = "raw"
+            "#,
+        )
+        .unwrap();
+
+        assert!(
+            rooms[0]
+                .args
+                .iter()
+                .any(|arg| { arg.to_string_lossy().contains("context-mode@1.0.169") })
+        );
+        assert!(rooms[1].args.iter().any(|arg| {
+            arg.to_string_lossy()
+                .contains("mcp_servers.context-mode.command")
+        }));
+        let opencode: serde_json::Value = serde_json::from_str(
+            rooms[2]
+                .variables
+                .iter()
+                .find(|(key, _)| key == "OPENCODE_CONFIG_CONTENT")
+                .unwrap()
+                .1
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(opencode.get("mcp").is_none());
+        assert_eq!(opencode["plugin"][0], "context-mode@1.0.169");
     }
 
     #[test]

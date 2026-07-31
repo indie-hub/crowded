@@ -36,6 +36,12 @@ source = "https://github.com/indie-hub/code4me-ntg.git"
 name = "ponytail"
 source = "https://github.com/DietrichGebert/ponytail.git"
 
+[[plugin]]
+name = "context-mode"
+source = "https://github.com/mksglu/context-mode.git"
+ref = "v1.0.169"
+adapters = true
+
 # Shared, pinned tools. `uvx` and `npx` cache lightweight runners. CCC is
 # installed once as a user tool because its local embedding environment is big.
 
@@ -58,6 +64,10 @@ args = ["--from", "basic-memory==0.22.1", "basic-memory", "mcp", "--project", __
 name = "context-mode"
 command = "npx"
 args = ["-y", "context-mode@1.0.169"]
+clients = ["claude", "codex"]
+
+[[opencode_plugin]]
+package = "context-mode@1.0.169"
 
 # Setup commands run once, in order. CCC asks you to choose its embedding model
 # the first time and its local model dependencies can download several GB.
@@ -122,6 +132,7 @@ fn run_at(root: &Path) -> io::Result<()> {
     ensure_runtime_ignored(root)?;
 
     let mut installed = 0;
+    let mut adapters_enabled = 0;
     for plugin in &config.plugins {
         if plugins::ensure_installed(
             root,
@@ -133,6 +144,14 @@ fn run_at(root: &Path) -> io::Result<()> {
             println!("installed plugin `{}`", plugin.name);
         } else {
             println!("plugin `{}` already installed", plugin.name);
+        }
+        if plugin.adapters {
+            if plugins::ensure_adapters_enabled(root, &plugin.name)? {
+                adapters_enabled += 1;
+                println!("enabled plugin `{}` vendor adapters", plugin.name);
+            } else {
+                println!("plugin `{}` vendor adapters already enabled", plugin.name);
+            }
         }
     }
 
@@ -176,7 +195,7 @@ fn run_at(root: &Path) -> io::Result<()> {
     }
 
     println!(
-        "Crowded initialized: {installed} plugin(s) installed, {synced} native file(s) synced, {} setup action(s) run",
+        "Crowded initialized: {installed} plugin(s) installed, {adapters_enabled} plugin adapter(s) enabled, {synced} native file(s) synced, {} setup action(s) run",
         pending.len()
     );
     Ok(())
@@ -371,7 +390,7 @@ mod tests {
         assert!(root.join(CONFIG_FILE).is_file());
         let starter = load_room_file(&root.join(CONFIG_FILE)).unwrap();
         validate(&starter).unwrap();
-        assert_eq!(starter.plugins.len(), 2);
+        assert_eq!(starter.plugins.len(), 3);
         assert_eq!(starter.mcp_servers.len(), 4);
         assert_eq!(starter.setup.len(), 5);
         assert!(
