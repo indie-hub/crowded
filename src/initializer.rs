@@ -42,8 +42,8 @@ source = "https://github.com/mksglu/context-mode.git"
 ref = "v1.0.169"
 adapters = true
 
-# Shared, pinned tools. `uvx` and `npx` cache lightweight runners. CCC is
-# installed once as a user tool because its local embedding environment is big.
+# Shared, pinned tools. `npx` caches lightweight runners. Basic Memory and CCC
+# are installed once as user tools because they are persistent services.
 
 [[mcp]]
 name = "ccc"
@@ -57,8 +57,8 @@ args = ["-y", "@colbymchenry/codegraph@1.5.0", "serve", "--mcp"]
 
 [[mcp]]
 name = "basic-memory"
-command = "uvx"
-args = ["--from", "basic-memory==0.22.1", "basic-memory", "mcp", "--project", __BASIC_MEMORY_PROJECT__]
+command = "basic-memory"
+args = ["mcp", "--project", __BASIC_MEMORY_PROJECT__]
 
 [[mcp]]
 name = "context-mode"
@@ -73,9 +73,14 @@ package = "context-mode@1.0.169"
 # the first time and its local model dependencies can download several GB.
 
 [[setup]]
+name = "basic-memory-install"
+command = "uv"
+args = ["tool", "install", "--upgrade", "basic-memory==0.22.1"]
+
+[[setup]]
 name = "basic-memory-project"
-command = "uvx"
-args = ["--from", "basic-memory==0.22.1", "basic-memory", "project", "add", __BASIC_MEMORY_PROJECT__, "basic-memory", "--local"]
+command = "basic-memory"
+args = ["project", "add", __BASIC_MEMORY_PROJECT__, "basic-memory", "--local"]
 
 [[setup]]
 name = "codegraph-init"
@@ -392,7 +397,7 @@ mod tests {
         validate(&starter).unwrap();
         assert_eq!(starter.plugins.len(), 3);
         assert_eq!(starter.mcp_servers.len(), 4);
-        assert_eq!(starter.setup.len(), 5);
+        assert_eq!(starter.setup.len(), 6);
         assert!(
             fs::read_to_string(root.join(".gitignore"))
                 .unwrap()

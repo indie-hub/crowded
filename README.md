@@ -46,15 +46,16 @@ Each successful action creates `.crowded/init/NAME.done`. Failed actions are
 not marked and run again on the next `crowded init`. Existing plugins are left
 at their installed revision; use `crowded plugin update` explicitly.
 
-The starter configuration shares pinned runners for CocoIndex Code, CodeGraph,
+The starter configuration shares pinned tools for CocoIndex Code, CodeGraph,
 Basic Memory, and Context Mode. It also creates one workspace-named Basic
 Memory project, initializes CodeGraph, and initializes and indexes CCC. Review
 the file before the second `crowded init`: CCC's local embedding dependencies
 can download several GB on Linux and its first initialization asks which model
-to use. The recipe installs CCC once with `uv tool install`; its MCP and setup
-actions then call `ccc` directly. `uv`, `uvx`, and `npx` must be on `PATH`.
-Crowded checks each executable immediately before its action, allowing an
-earlier setup action to install a tool used by the next one.
+to use. The recipe installs Basic Memory and CCC once with `uv tool install`;
+their MCP and setup actions then call the persistent executables directly.
+`uv` and `npx` must be on `PATH`. Crowded checks each executable immediately
+before its action, allowing an earlier setup action to install a tool used by
+the next one.
 
 ## Local rooms
 

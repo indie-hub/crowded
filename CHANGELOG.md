@@ -7,6 +7,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-07-31
+
+### Fixed
+
+- Basic Memory is installed once with `uv tool install`; its MCP and project
+  setup now call the persistent `basic-memory` executable instead of creating
+  separate `uvx` environments.
+
 ## [0.20.0] - 2026-07-31
 
 ### Added
