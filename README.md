@@ -1,5 +1,8 @@
 # Crowded
 
+See [WISHLIST.md](WISHLIST.md) for the living roadmap and durable design
+decisions.
+
 The Crowded Room runs multiple terminal agents under one Ratatui roof.
 
 ## Local rooms

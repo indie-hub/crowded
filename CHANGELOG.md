@@ -7,6 +7,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-07-31
+
+### Changed
+
+- Startup house rules now say explicitly that Doorbell targets are numeric room
+  numbers, identify `$CROWDED_ROOM` as the return address, and explain how
+  delegated replies reuse the task ID.
+
 ## [0.16.0] - 2026-07-30
 
 ### Added

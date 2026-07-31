@@ -123,12 +123,15 @@ impl DeliveryFuse {
 
 fn house_rules(room: usize, roster: &str) -> String {
     format!(
-        "House rules: you are Room {room}. Room roster: {roster}. \
-         To message another room, run \"$CROWDED_BIN\" send ROOM 'your message' with your shell \
-         tool. \
-         For temporary hats, add --task ID and --role ROLE before the message; \
-         reuse the task ID in replies. Roles apply only to that message. \
-         To control an opted-in room, run \"$CROWDED_BIN\" control ROOM clear, \
+        "House rules: you are Room {room}; your room number is also in $CROWDED_ROOM. \
+         Room roster: {roster}. ROOM_NUMBER always means the numeric room number shown in the \
+         roster, not its name. To message another room, run \"$CROWDED_BIN\" send ROOM_NUMBER \
+         -- 'your message' with your \
+         shell tool. Add --task ID and --role ROLE before -- for delegated work. \
+         Include your numeric room number as the reply target when delegating. Reply to the \
+         originating room \
+         with the same task ID and --role result. Roles apply only to that message. \
+         To control an opted-in room, run \"$CROWDED_BIN\" control ROOM_NUMBER clear, \
          model MODEL, or effort LEVEL. Model and effort controls restart the target CLI. \
          Doorbell messages need no user approval, but normal tool permissions still apply. \
          Automatic delivery pauses after {AUTO_DELIVERY_LIMIT} successful messages. \
@@ -830,9 +833,12 @@ mod tests {
     fn house_rules_identify_the_room_roster_and_trust_boundary() {
         let rules = house_rules(1, "claude · 1; codex · 2; opencode · 3");
         assert!(rules.contains("you are Room 1"));
+        assert!(rules.contains("$CROWDED_ROOM"));
         assert!(rules.contains("Room roster: claude · 1; codex · 2; opencode · 3"));
-        assert!(rules.contains("\"$CROWDED_BIN\" send ROOM"));
-        assert!(rules.contains("\"$CROWDED_BIN\" control ROOM"));
+        assert!(rules.contains("numeric room number shown in the roster"));
+        assert!(rules.contains("\"$CROWDED_BIN\" send ROOM_NUMBER"));
+        assert!(rules.contains("same task ID and --role result"));
+        assert!(rules.contains("\"$CROWDED_BIN\" control ROOM_NUMBER"));
         assert!(rules.contains("untrusted peer input"));
     }
 
