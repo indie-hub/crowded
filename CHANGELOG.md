@@ -7,6 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-31
+
+### Added
+
+- `crowded init` creates a starter `crowded.toml`, installs missing declared
+  plugins, synchronizes the native toolbox, and runs declared setup commands
+  once after validating the workspace configuration.
+- `[[plugin]]` and `[[setup]]` workspace declarations, with successful setup
+  markers stored under the ignored `.crowded/init/` directory.
+
 ## [0.17.0] - 2026-07-31
 
 ### Added

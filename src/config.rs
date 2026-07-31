@@ -17,15 +17,19 @@ pub(crate) enum Transport {
     Raw,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RoomFile {
     pub(crate) rooms: Vec<RoomConfig>,
     #[serde(default, rename = "mcp")]
     pub(crate) mcp_servers: Vec<McpConfig>,
+    #[serde(default, rename = "plugin")]
+    pub(crate) plugins: Vec<PluginConfig>,
+    #[serde(default)]
+    pub(crate) setup: Vec<SetupConfig>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpConfig {
     pub(crate) name: String,
@@ -35,7 +39,26 @@ pub(crate) struct McpConfig {
     pub(crate) cwd: Option<PathBuf>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PluginConfig {
+    pub(crate) name: String,
+    pub(crate) source: String,
+    #[serde(rename = "ref")]
+    pub(crate) reference: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetupConfig {
+    pub(crate) name: String,
+    pub(crate) command: String,
+    #[serde(default)]
+    pub(crate) args: Vec<String>,
+    pub(crate) cwd: Option<PathBuf>,
+}
+
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RoomConfig {
     name: Option<String>,
@@ -321,6 +344,10 @@ fn parse_room_file(text: &str) -> io::Result<RoomFile> {
 
 pub(crate) fn load_room_file(path: &Path) -> io::Result<RoomFile> {
     parse_room_file(&fs::read_to_string(path)?)
+}
+
+pub(crate) fn validate_room_file(file: &RoomFile) -> io::Result<()> {
+    room_specs_from_file(file.clone(), false).map(drop)
 }
 
 fn add_shared_mcps(rooms: &mut [RoomSpec], servers: &[McpConfig]) -> io::Result<()> {

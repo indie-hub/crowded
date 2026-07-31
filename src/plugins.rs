@@ -224,6 +224,54 @@ fn optional_reference(
     }
 }
 
+pub(crate) fn validate_install_request(
+    name: &str,
+    source: &str,
+    reference: Option<&str>,
+) -> io::Result<()> {
+    validate_name("plugin", name)?;
+    validate_source(source)?;
+    if let Some(reference) = reference {
+        validate_reference(reference)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_installed(
+    root: &Path,
+    name: &str,
+    source: &str,
+    reference: Option<&str>,
+) -> io::Result<bool> {
+    validate_install_request(name, source, reference)?;
+    let installed = root.join(INSTALLS_DIRECTORY).join(name);
+    if installed.try_exists()? {
+        let (_, record) = installed_record(root, name)?;
+        if record.source != source || record.reference.as_deref() != reference {
+            return Err(invalid_input(format!(
+                "plugin `{name}` is installed from a different source or ref; update or remove it explicitly"
+            )));
+        }
+        return Ok(false);
+    }
+
+    let record = add(root, source, reference)?;
+    if record.name != name {
+        let cleanup = remove(root, &record.name);
+        return match cleanup {
+            Ok(_) => Err(invalid_data(format!(
+                "plugin source contains `{}`, expected `{name}`",
+                record.name
+            ))),
+            Err(cleanup) => Err(io::Error::other(format!(
+                "plugin source contains `{}`, expected `{name}`; cleanup failed: {cleanup}",
+                record.name
+            ))),
+        };
+    }
+    Ok(true)
+}
+
 fn add(root: &Path, source: &str, reference: Option<&str>) -> io::Result<InstallRecord> {
     validate_source(source)?;
     if let Some(reference) = reference {
@@ -1525,7 +1573,7 @@ fn remove_empty_skill_directories(root: &Path) -> io::Result<()> {
     remove_empty_directory(&root.join(".opencode/skills"))
 }
 
-fn validate_name(kind: &str, name: &str) -> io::Result<()> {
+pub(crate) fn validate_name(kind: &str, name: &str) -> io::Result<()> {
     let valid = !name.is_empty()
         && name.len() <= 64
         && !name.starts_with('-')
@@ -1672,7 +1720,9 @@ mod tests {
         fs::write(project.join(".claude/settings.local.json"), existing_hooks).unwrap();
         fs::write(project.join(".codex/hooks.json"), existing_hooks).unwrap();
 
-        let installed = add(&project, source.to_str().unwrap(), None).unwrap();
+        assert!(ensure_installed(&project, "greetings", source.to_str().unwrap(), None).unwrap());
+        assert!(!ensure_installed(&project, "greetings", source.to_str().unwrap(), None).unwrap());
+        let installed = list(&project).unwrap().remove(0);
         assert_eq!(installed.name, "greetings");
         assert_eq!(list(&project).unwrap().len(), 1);
         for link in [

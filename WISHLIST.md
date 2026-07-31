@@ -68,9 +68,9 @@ This is Crowded infrastructure, not a native vendor transport.
 
 1. **Capability discovery** — expose each room's vendor, current model, exact
    model IDs, effort levels, and supported controls so agents do not guess.
-2. **Workspace bootstrap** — add an idempotent `crowded init` that prepares the
-   local Crowded configuration, shared plugins and skills, MCP definitions,
-   hooks, and ignored runtime directories without overwriting existing files.
+2. **Base environment recipe** — populate `crowded init` with verified,
+   version-pinned runners and initialization actions for Basic Memory,
+   CodeGraph, CocoIndex Code, and Context Mode.
 3. **Shared local memory** — configure one workspace-local Basic Memory project
    for every room. Basic Memory is the durable memory source of truth; rooms
    access it through MCP rather than editing its storage directly.
@@ -112,4 +112,6 @@ This is Crowded infrastructure, not a native vendor transport.
 - Local hooks and the Room Pulse sidebar.
 - Shared plugins, skills, hooks, and OpenCode components, including
   preview/enable/disable/remove.
+- Idempotent `crowded init` with declarative plugins, direct one-time setup
+  actions, native toolbox sync, and ignored machine-local state.
 - Authenticated Conductor controls for clear, model, and effort where supported.

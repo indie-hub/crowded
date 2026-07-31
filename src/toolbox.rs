@@ -92,7 +92,7 @@ pub(crate) fn native_files_are_active() -> io::Result<bool> {
     native_files_are_active_at(&env::current_dir()?)
 }
 
-fn native_files_are_active_at(root: &Path) -> io::Result<bool> {
+pub(crate) fn native_files_are_active_at(root: &Path) -> io::Result<bool> {
     let state_path = root.join(STATE_FILE);
     if !state_path.try_exists()? {
         return Ok(false);
@@ -130,7 +130,7 @@ fn preview(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn sync(root: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn sync(root: &Path) -> io::Result<Vec<PathBuf>> {
     let state = build_plan(root)?;
     let staged = stage_files(&state.files)?;
     if let Err(error) = save_state(root, &state) {

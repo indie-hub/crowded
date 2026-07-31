@@ -5,6 +5,40 @@ decisions.
 
 The Crowded Room runs multiple terminal agents under one Ratatui roof.
 
+## Workspace bootstrap
+
+Run this in a clean project directory:
+
+```console
+crowded init
+```
+
+The first run creates a starter `crowded.toml`, adds `/.crowded/` to
+`.gitignore`, and stops so the configuration can be reviewed. Later runs
+validate the whole file, install missing declared plugins, synchronize the
+native toolbox, and run pending setup actions.
+
+Declare shared plugins and direct, one-time setup commands alongside rooms and
+MCPs:
+
+```toml
+[[plugin]]
+name = "code4me-ntg"
+source = "https://github.com/indie-hub/code4me-ntg.git"
+# ref = "v0.3.0"
+
+[[setup]]
+name = "ccc-index"
+command = "uvx"
+args = ["--from", "PACKAGE==VERSION", "ccc", "index"]
+```
+
+Crowded invokes setup programs directly, so `command` may be an existing
+executable, `uvx`, or `npx`; it never installs a system-wide package itself.
+Each successful action creates `.crowded/init/NAME.done`. Failed actions are
+not marked and run again on the next `crowded init`. Existing plugins are left
+at their installed revision; use `crowded plugin update` explicitly.
+
 ## Local rooms
 
 Create `crowded.toml` in the directory where you launch Crowded:
