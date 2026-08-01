@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-01
+
+### Added
+
+- Authenticated `crowded roster` discovery reports every room's numeric ID,
+  name, guest, transport, live state, and peer-control availability as JSON.
+
 ## [0.20.4] - 2026-07-31
 
 ### Fixed

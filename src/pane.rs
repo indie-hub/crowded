@@ -407,6 +407,25 @@ impl Pane {
         &self.spec.title
     }
 
+    pub(crate) fn name(&self) -> &str {
+        &self.spec.name
+    }
+
+    pub(crate) fn guest(&self) -> String {
+        Path::new(self.spec.program.as_os_str())
+            .file_name()
+            .unwrap_or(self.spec.program.as_os_str())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub(crate) fn transport(&self) -> &'static str {
+        match self.spec.transport {
+            Transport::Shell => "shell",
+            Transport::Raw => "raw",
+        }
+    }
+
     pub(crate) fn allows_control(&self) -> bool {
         self.spec.allow_control
     }
@@ -532,6 +551,7 @@ mod tests {
 
     fn room_spec(program: &str, args: &[&str]) -> RoomSpec {
         RoomSpec {
+            name: program.to_owned(),
             title: program.to_owned(),
             program: program.into(),
             args: args.iter().map(OsString::from).collect(),

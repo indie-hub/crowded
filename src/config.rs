@@ -93,6 +93,7 @@ pub(crate) struct RoomConfig {
 
 #[derive(Clone)]
 pub(crate) struct RoomSpec {
+    pub(crate) name: String,
     pub(crate) title: String,
     pub(crate) program: OsString,
     pub(crate) args: Vec<OsString>,
@@ -109,6 +110,7 @@ impl RoomSpec {
             .unwrap_or(program.as_os_str())
             .to_string_lossy();
         Self {
+            name: guest.to_string(),
             title: format!("{guest} · {room_number}"),
             program,
             args: Vec::new(),
@@ -140,6 +142,7 @@ impl RoomSpec {
         }
 
         Ok(Self {
+            name: name.to_owned(),
             title: format!("{name} · {room_number}"),
             program,
             args: config.args.into_iter().map(Into::into).collect(),

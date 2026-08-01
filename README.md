@@ -118,6 +118,20 @@ retaining the Shared Toolbox:
 cargo run -- raw:claude raw:codex
 ```
 
+## Live Roster
+
+Every room can discover the current topology through the authenticated
+Doorbell:
+
+```console
+"$CROWDED_BIN" roster
+```
+
+The JSON response lists each numeric room, name, guest program, transport,
+live state, and whether peer control is enabled. This lets orchestration choose
+from the rooms that actually exist instead of assuming a fixed vendor or room
+number.
+
 ## The Conductor
 
 A room can control another opted-in agent through Crowded's authenticated

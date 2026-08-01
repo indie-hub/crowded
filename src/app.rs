@@ -24,7 +24,7 @@ use tui_term::widget::PseudoTerminal;
 
 use crate::{
     config::room_specs,
-    doorbell::{ControlAction, Doorbell, DoorbellEvent, PulseState},
+    doorbell::{ControlAction, Doorbell, DoorbellEvent, PulseState, RosterRoom},
     mailroom::Mailroom,
     pane::Pane,
 };
@@ -125,7 +125,8 @@ fn house_rules(room: usize, roster: &str) -> String {
     format!(
         "House rules: you are Room {room}; your room number is also in $CROWDED_ROOM. \
          Room roster: {roster}. ROOM_NUMBER always means the numeric room number shown in the \
-         roster, not its name. To message another room, run \"$CROWDED_BIN\" send ROOM_NUMBER \
+         roster, not its name. Run \"$CROWDED_BIN\" roster for the live machine-readable roster. \
+         To message another room, run \"$CROWDED_BIN\" send ROOM_NUMBER \
          -- 'your message' with your \
          shell tool. Add --task ID and --role ROLE before -- for delegated work. \
          Include your numeric room number as the reply target when delegating. Reply to the \
@@ -148,6 +149,34 @@ fn message_with_hat(task: Option<&str>, role: Option<&str>, body: &str) -> Strin
         (Some(task), Some(role)) => {
             format!("[task: {task} | requested role: {role}]\n{body}")
         }
+    }
+}
+
+fn roster_state(
+    online: bool,
+    gate: DeliveryGate,
+    input_ready: bool,
+    pulse: Option<PulseState>,
+) -> PulseState {
+    if !online {
+        return PulseState::Offline;
+    }
+    if let Some(
+        state @ (PulseState::Starting
+        | PulseState::Thinking
+        | PulseState::Working
+        | PulseState::Error
+        | PulseState::Offline),
+    ) = pulse
+    {
+        return state;
+    }
+    if gate.can_deliver(input_ready) {
+        PulseState::Ready
+    } else if gate.is_starting() {
+        PulseState::Starting
+    } else {
+        PulseState::Working
     }
 }
 
@@ -380,6 +409,28 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         while let Ok(event) = doorbell.try_recv() {
             let envelope = match event {
+                DoorbellEvent::Roster(request) => {
+                    request.reply(
+                        panes
+                            .iter()
+                            .enumerate()
+                            .map(|(index, pane)| RosterRoom {
+                                room: index + 1,
+                                name: pane.name().to_owned(),
+                                guest: pane.guest(),
+                                transport: pane.transport().to_owned(),
+                                state: roster_state(
+                                    pane.is_online(),
+                                    delivery_gates[index],
+                                    input_ready[index],
+                                    room_pulses[index],
+                                ),
+                                allow_control: pane.allows_control(),
+                            })
+                            .collect(),
+                    );
+                    continue;
+                }
                 DoorbellEvent::Pulse(pulse) => {
                     room_pulses[pulse.from] = Some(pulse.state);
                     continue;
@@ -836,10 +887,31 @@ mod tests {
         assert!(rules.contains("$CROWDED_ROOM"));
         assert!(rules.contains("Room roster: claude · 1; codex · 2; opencode · 3"));
         assert!(rules.contains("numeric room number shown in the roster"));
+        assert!(rules.contains("\"$CROWDED_BIN\" roster"));
         assert!(rules.contains("\"$CROWDED_BIN\" send ROOM_NUMBER"));
         assert!(rules.contains("same task ID and --role result"));
         assert!(rules.contains("\"$CROWDED_BIN\" control ROOM_NUMBER"));
         assert!(rules.contains("untrusted peer input"));
+    }
+
+    #[test]
+    fn roster_state_prefers_offline_pulses_and_real_readiness() {
+        assert_eq!(
+            roster_state(false, DeliveryGate::Ready, true, Some(PulseState::Ready)),
+            PulseState::Offline
+        );
+        assert_eq!(
+            roster_state(true, DeliveryGate::Ready, true, Some(PulseState::Ready)),
+            PulseState::Ready
+        );
+        assert_eq!(
+            roster_state(true, DeliveryGate::Ready, false, Some(PulseState::Ready)),
+            PulseState::Working
+        );
+        assert_eq!(
+            roster_state(true, DeliveryGate::Ready, true, Some(PulseState::Thinking)),
+            PulseState::Thinking
+        );
     }
 
     #[test]

@@ -36,6 +36,7 @@ enum WireRequest {
     Message(MessageRequest),
     Control(ControlRequest),
     Pulse(PulseRequest),
+    Roster(RosterRequest),
 }
 
 #[derive(Deserialize, Serialize)]
@@ -57,6 +58,12 @@ struct PulseRequest {
     token: String,
     id: String,
     state: PulseState,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RosterRequest {
+    token: String,
+    id: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -119,6 +126,16 @@ pub(crate) enum PulseState {
     Offline,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct RosterRoom {
+    pub(crate) room: usize,
+    pub(crate) name: String,
+    pub(crate) guest: String,
+    pub(crate) transport: String,
+    pub(crate) state: PulseState,
+    pub(crate) allow_control: bool,
+}
+
 impl PulseState {
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -140,6 +157,8 @@ struct WireResponse {
     envelope_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rooms: Option<Vec<RosterRoom>>,
 }
 
 impl WireResponse {
@@ -149,6 +168,17 @@ impl WireResponse {
             status: status.to_owned(),
             envelope_id,
             error: None,
+            rooms: None,
+        }
+    }
+
+    fn roster(rooms: Vec<RosterRoom>) -> Self {
+        Self {
+            ok: true,
+            status: "listed".to_owned(),
+            envelope_id: None,
+            error: None,
+            rooms: Some(rooms),
         }
     }
 
@@ -158,6 +188,7 @@ impl WireResponse {
             status: "rejected".to_owned(),
             envelope_id: None,
             error: Some(error.into()),
+            rooms: None,
         }
     }
 }
@@ -183,10 +214,15 @@ pub(crate) struct DoorbellControl {
     reply: SyncSender<WireResponse>,
 }
 
+pub(crate) struct DoorbellRoster {
+    reply: SyncSender<WireResponse>,
+}
+
 pub(crate) enum DoorbellEvent {
     Message(DoorbellEnvelope),
     Control(DoorbellControl),
     Pulse(DoorbellPulse),
+    Roster(DoorbellRoster),
 }
 
 impl DoorbellEnvelope {
@@ -214,6 +250,12 @@ impl DoorbellControl {
 
     pub(crate) fn reply_failed(&self, error: impl Into<String>) {
         let _ = self.reply.send(WireResponse::rejected(error));
+    }
+}
+
+impl DoorbellRoster {
+    pub(crate) fn reply(&self, rooms: Vec<RosterRoom>) {
+        let _ = self.reply.send(WireResponse::roster(rooms));
     }
 }
 
@@ -403,9 +445,26 @@ fn listener_loop(
                             }
                         }
                     }
+                    Ok(WireRequest::Roster(request)) => {
+                        match validate_roster(&request, &tokens, &mut recent_by_room) {
+                            Ok(_) => {
+                                let (reply, reply_rx) = mpsc::sync_channel(1);
+                                match events
+                                    .try_send(DoorbellEvent::Roster(DoorbellRoster { reply }))
+                                {
+                                    Ok(()) => reply_rx.recv_timeout(Duration::from_secs(2)).ok(),
+                                    Err(TrySendError::Full(_)) => {
+                                        Some(WireResponse::rejected("Doorbell queue is full"))
+                                    }
+                                    Err(TrySendError::Disconnected(_)) => break,
+                                }
+                            }
+                            Err(error) => Some(WireResponse::rejected(error)),
+                        }
+                    }
                     Err(error) => Some(WireResponse::rejected(error.to_string())),
                 }
-                .unwrap_or_else(|| WireResponse::rejected("Mailroom response timed out"));
+                .unwrap_or_else(|| WireResponse::rejected("Doorbell response timed out"));
                 let _ = write_response(&mut stream, &response);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -510,14 +569,33 @@ fn record_rate(from: usize, recent_by_room: &mut [VecDeque<Instant>]) -> Result<
     Ok(())
 }
 
-fn validate_pulse(request: &PulseRequest, tokens: &[String]) -> Result<usize, String> {
+fn validate_identity(
+    token: &str,
+    id: &str,
+    kind: &str,
+    tokens: &[String],
+) -> Result<usize, String> {
     let from = tokens
         .iter()
-        .position(|token| token == &request.token)
+        .position(|candidate| candidate == token)
         .ok_or_else(|| "invalid capability".to_owned())?;
-    if request.id.is_empty() || request.id.len() > MAX_ID_BYTES {
-        return Err("pulse id must contain 1..=128 bytes".to_owned());
+    if id.is_empty() || id.len() > MAX_ID_BYTES {
+        return Err(format!("{kind} id must contain 1..=128 bytes"));
     }
+    Ok(from)
+}
+
+fn validate_pulse(request: &PulseRequest, tokens: &[String]) -> Result<usize, String> {
+    validate_identity(&request.token, &request.id, "pulse", tokens)
+}
+
+fn validate_roster(
+    request: &RosterRequest,
+    tokens: &[String],
+    recent_by_room: &mut [VecDeque<Instant>],
+) -> Result<usize, String> {
+    let from = validate_identity(&request.token, &request.id, "roster", tokens)?;
+    record_rate(from, recent_by_room)?;
     Ok(from)
 }
 
@@ -703,6 +781,22 @@ pub(crate) fn pulse_command() -> Result<(), Box<dyn std::error::Error>> {
         state,
     }))?;
     response.into_result("Doorbell rejected pulse")
+}
+
+pub(crate) fn roster_command() -> Result<(), Box<dyn std::error::Error>> {
+    match (env::args().nth(2).as_deref(), env::args().nth(3)) {
+        (None, None) | (Some("--json"), None) => {}
+        _ => return Err("usage: crowded roster [--json]".into()),
+    }
+    let token = env::var("CROWDED_TOKEN").map_err(|_| "CROWDED_TOKEN is not set")?;
+    let room = env::var("CROWDED_ROOM").unwrap_or_else(|_| "external".to_owned());
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let response = send_request(&WireRequest::Roster(RosterRequest {
+        token,
+        id: format!("{room}-roster-{}-{now}", process::id()),
+    }))?;
+    println!("{}", serde_json::to_string(&response)?);
+    response.into_result("Doorbell rejected roster request")
 }
 
 fn send_request(request: &WireRequest) -> Result<WireResponse, Box<dyn std::error::Error>> {
@@ -908,5 +1002,53 @@ mod tests {
             validate_pulse(&request, &["left".to_owned(), "right".to_owned()]),
             Ok(0)
         );
+    }
+
+    #[test]
+    fn roster_is_authenticated_and_machine_readable() {
+        let doorbell = Doorbell::start(2).unwrap();
+        let path = doorbell.path().to_owned();
+        let token = doorbell.tokens[0].clone();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(path).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &WireRequest::Roster(RosterRequest {
+                    token,
+                    id: "roster-roundtrip".to_owned(),
+                }),
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match doorbell.try_recv() {
+                Ok(DoorbellEvent::Roster(request)) => {
+                    request.reply(vec![RosterRoom {
+                        room: 2,
+                        name: "Builder".to_owned(),
+                        guest: "codex".to_owned(),
+                        transport: "raw".to_owned(),
+                        state: PulseState::Ready,
+                        allow_control: true,
+                    }]);
+                    break;
+                }
+                Ok(_) => panic!("unexpected Doorbell event"),
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("roster request did not arrive: {error}"),
+            }
+        }
+        let response = serde_json::to_value(client.join().unwrap()).unwrap();
+        assert_eq!(response["status"], "listed");
+        assert_eq!(response["rooms"][0]["room"], 2);
+        assert_eq!(response["rooms"][0]["name"], "Builder");
+        assert_eq!(response["rooms"][0]["state"], "ready");
     }
 }
