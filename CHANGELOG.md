@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-08-01
+
+### Changed
+
+- Split the Doorbell into focused command, protocol, and socket-server modules
+  without changing its public behavior.
+
 ## [0.21.0] - 2026-08-01
 
 ### Added
