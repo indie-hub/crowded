@@ -19,12 +19,14 @@ const RUNTIME_IGNORE: &str = "/.crowded/";
 const STARTER_CONFIG: &str = r#"[[rooms]]
 name = "Claude"
 command = "claude"
+vendor = "anthropic"
 transport = "raw"
 allow_control = true
 
 [[rooms]]
 name = "Codex"
 command = "codex"
+vendor = "openai"
 transport = "raw"
 allow_control = true
 

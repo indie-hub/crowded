@@ -411,6 +411,10 @@ impl Pane {
         &self.spec.name
     }
 
+    pub(crate) fn vendor(&self) -> &str {
+        &self.spec.vendor
+    }
+
     pub(crate) fn guest(&self) -> String {
         Path::new(self.spec.program.as_os_str())
             .file_name()
@@ -552,6 +556,7 @@ mod tests {
     fn room_spec(program: &str, args: &[&str]) -> RoomSpec {
         RoomSpec {
             name: program.to_owned(),
+            vendor: "unknown".to_owned(),
             title: program.to_owned(),
             program: program.into(),
             args: args.iter().map(OsString::from).collect(),

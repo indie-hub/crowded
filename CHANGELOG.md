@@ -7,6 +7,15 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-01
+
+### Added
+
+- Add a normalized room `vendor` identity to configuration and live roster
+  output so orchestration can select genuinely cross-vendor agents.
+- Infer `anthropic` for Claude and `openai` for Codex; ambiguous guests remain
+  `unknown` unless configured explicitly.
+
 ## [0.21.1] - 2026-08-01
 
 ### Changed

@@ -418,6 +418,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 room: index + 1,
                                 name: pane.name().to_owned(),
                                 guest: pane.guest(),
+                                vendor: pane.vendor().to_owned(),
                                 transport: pane.transport().to_owned(),
                                 state: roster_state(
                                     pane.is_online(),

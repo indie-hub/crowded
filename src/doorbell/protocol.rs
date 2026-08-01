@@ -117,6 +117,7 @@ pub(crate) struct RosterRoom {
     pub(crate) room: usize,
     pub(crate) name: String,
     pub(crate) guest: String,
+    pub(crate) vendor: String,
     pub(crate) transport: String,
     pub(crate) state: PulseState,
     pub(crate) allow_control: bool,

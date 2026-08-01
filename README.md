@@ -68,18 +68,21 @@ Create `crowded.toml` in the directory where you launch Crowded:
 [[rooms]]
 name = "Claude"
 command = "claude"
+vendor = "anthropic"
 transport = "raw"
 allow_control = true
 
 [[rooms]]
 name = "Codex"
 command = "codex"
+vendor = "openai"
 transport = "raw"
 allow_control = true
 
 [[rooms]]
 name = "OpenCode"
 command = "opencode"
+vendor = "deepseek"
 transport = "raw"
 allow_control = true
 ```
@@ -127,10 +130,11 @@ Doorbell:
 "$CROWDED_BIN" roster
 ```
 
-The JSON response lists each numeric room, name, guest program, transport,
-live state, and whether peer control is enabled. This lets orchestration choose
-from the rooms that actually exist instead of assuming a fixed vendor or room
-number.
+The JSON response lists each numeric room, name, guest program, model vendor,
+transport, live state, and whether peer control is enabled. `claude` and `codex`
+default to `anthropic` and `openai`; other guests default to `unknown`, so set
+`vendor` explicitly for OpenCode and other model drivers. This lets orchestration
+choose from the rooms that actually exist without guessing vendor or room number.
 
 ## The Conductor
 

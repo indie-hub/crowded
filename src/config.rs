@@ -3,7 +3,7 @@
 use std::{
     collections::HashSet,
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs, io,
     path::{Path, PathBuf},
 };
@@ -82,6 +82,7 @@ pub(crate) struct SetupConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RoomConfig {
     name: Option<String>,
+    vendor: Option<String>,
     pub(crate) command: String,
     #[serde(default)]
     args: Vec<String>,
@@ -94,6 +95,7 @@ pub(crate) struct RoomConfig {
 #[derive(Clone)]
 pub(crate) struct RoomSpec {
     pub(crate) name: String,
+    pub(crate) vendor: String,
     pub(crate) title: String,
     pub(crate) program: OsString,
     pub(crate) args: Vec<OsString>,
@@ -111,6 +113,7 @@ impl RoomSpec {
             .to_string_lossy();
         Self {
             name: guest.to_string(),
+            vendor: inferred_vendor(program.as_os_str()).to_owned(),
             title: format!("{guest} · {room_number}"),
             program,
             args: Vec::new(),
@@ -140,9 +143,11 @@ impl RoomSpec {
                 "room name cannot be empty or contain control characters",
             ));
         }
+        let vendor = configured_vendor(program.as_os_str(), config.vendor.as_deref())?;
 
         Ok(Self {
             name: name.to_owned(),
+            vendor,
             title: format!("{name} · {room_number}"),
             program,
             args: config.args.into_iter().map(Into::into).collect(),
@@ -243,6 +248,37 @@ impl RoomSpec {
         };
         Ok(Self::new(program.into(), transport, room_number))
     }
+}
+
+fn inferred_vendor(program: &OsStr) -> &'static str {
+    let guest = Path::new(program)
+        .file_name()
+        .unwrap_or(program)
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    match guest.as_str() {
+        "claude" => "anthropic",
+        "codex" => "openai",
+        _ => "unknown",
+    }
+}
+
+fn configured_vendor(program: &OsStr, configured: Option<&str>) -> io::Result<String> {
+    let vendor = configured
+        .unwrap_or_else(|| inferred_vendor(program))
+        .trim()
+        .to_ascii_lowercase();
+    if vendor.is_empty()
+        || !vendor.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "room vendor must contain only letters, numbers, '.', '_', or '-'",
+        ));
+    }
+    Ok(vendor)
 }
 
 impl McpConfig {
@@ -548,6 +584,7 @@ mod tests {
         let guest = RoomSpec::parse("raw:codex".into(), 2).unwrap();
         assert_eq!(guest.transport, Transport::Raw);
         assert_eq!(guest.program, OsString::from("codex"));
+        assert_eq!(guest.vendor, "openai");
         assert!(guest.args.is_empty());
         assert!(guest.cwd.is_none());
         assert_eq!(guest.title, "codex · 2");
@@ -566,6 +603,7 @@ mod tests {
 
                 [[rooms]]
                 command = "/bin/sh"
+                vendor = "Local"
                 transport = "shell"
                 cwd = "examples"
             "#,
@@ -575,13 +613,21 @@ mod tests {
         assert_eq!(rooms[0].title, "Claude · 1");
         assert_eq!(rooms[0].args, [OsString::from("--continue")]);
         assert!(rooms[0].allow_control);
+        assert_eq!(rooms[0].vendor, "anthropic");
         assert_eq!(rooms[1].title, "sh · 2");
+        assert_eq!(rooms[1].vendor, "local");
         assert_eq!(rooms[1].cwd, Some(PathBuf::from("examples")));
         assert!(!rooms[1].allow_control);
         assert!(room_specs_from_toml("[[rooms]]\ncommand='codex'\ntransport='raw'").is_err());
         assert!(
             room_specs_from_toml("[[rooms]]\ncommand='codex'\ntransport='raw'\nworkdir='typo'")
                 .is_err()
+        );
+        assert!(
+            room_specs_from_toml(
+                "[[rooms]]\ncommand='codex'\nvendor='open ai'\ntransport='raw'\n[[rooms]]\ncommand='claude'\ntransport='raw'"
+            )
+            .is_err()
         );
     }
 

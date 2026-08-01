@@ -482,6 +482,7 @@ mod tests {
                         room: 2,
                         name: "Builder".to_owned(),
                         guest: "codex".to_owned(),
+                        vendor: "openai".to_owned(),
                         transport: "raw".to_owned(),
                         state: PulseState::Ready,
                         allow_control: true,
@@ -499,6 +500,7 @@ mod tests {
         assert_eq!(response["status"], "listed");
         assert_eq!(response["rooms"][0]["room"], 2);
         assert_eq!(response["rooms"][0]["name"], "Builder");
+        assert_eq!(response["rooms"][0]["vendor"], "openai");
         assert_eq!(response["rooms"][0]["state"], "ready");
     }
 }
