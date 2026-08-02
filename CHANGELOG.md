@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-08-02
+
+### Changed
+
+- Move shared MCP configuration adaptation and vendor-specific pane controls
+  behind focused private module boundaries without changing behavior.
+
 ## [0.23.0] - 2026-08-02
 
 ### Added

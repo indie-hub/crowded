@@ -16,6 +16,8 @@ use tui_term::vt100::{Parser, Screen};
 
 use crate::config::{RoomSpec, Transport};
 
+mod controls;
+
 fn key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     // Crossterm gives us structured key events; a PTY understands only bytes.
     // `None` means this small encoder does not support that event.
@@ -109,149 +111,6 @@ fn whisper_parts(
         // Other raw TUIs may classify a rapid prompt+Enter sequence as one paste.
         Transport::Raw => (note.into_bytes(), Some(vec![b'\r'])),
     }
-}
-
-#[derive(Clone, Copy)]
-enum CliVendor {
-    Claude,
-    Codex,
-    OpenCode,
-}
-
-fn cli_vendor(spec: &RoomSpec) -> io::Result<CliVendor> {
-    if spec.transport != Transport::Raw {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "terminal rooms do not support agent controls",
-        ));
-    }
-    let guest = Path::new(spec.program.as_os_str())
-        .file_name()
-        .unwrap_or(spec.program.as_os_str())
-        .to_string_lossy();
-    match guest.to_ascii_lowercase().as_str() {
-        "claude" => Ok(CliVendor::Claude),
-        "codex" => Ok(CliVendor::Codex),
-        "opencode" => Ok(CliVendor::OpenCode),
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("{guest} has no Conductor adapter"),
-        )),
-    }
-}
-
-fn replace_option(args: &mut Vec<OsString>, aliases: &[&str], option: &str, value: &str) {
-    let mut kept = Vec::with_capacity(args.len() + 2);
-    let mut index = 0;
-    while index < args.len() {
-        let argument = args[index].to_string_lossy();
-        if aliases.iter().any(|alias| argument == *alias) {
-            index += 1;
-            if index < args.len() {
-                index += 1;
-            }
-            continue;
-        }
-        if aliases
-            .iter()
-            .any(|alias| argument.starts_with(&format!("{alias}=")))
-        {
-            index += 1;
-            continue;
-        }
-        kept.push(args[index].clone());
-        index += 1;
-    }
-    args.clear();
-    args.push(option.into());
-    args.push(value.into());
-    args.append(&mut kept);
-}
-
-fn replace_codex_effort(args: &mut Vec<OsString>, effort: &str) {
-    let mut kept = Vec::with_capacity(args.len() + 2);
-    let mut index = 0;
-    while index < args.len() {
-        let argument = args[index].to_string_lossy();
-        if matches!(argument.as_ref(), "-c" | "--config")
-            && args.get(index + 1).is_some_and(|value| {
-                value
-                    .to_string_lossy()
-                    .starts_with("model_reasoning_effort=")
-            })
-        {
-            index += 2;
-            continue;
-        }
-        if argument.starts_with("--config=model_reasoning_effort=") {
-            index += 1;
-            continue;
-        }
-        kept.push(args[index].clone());
-        index += 1;
-    }
-    args.clear();
-    args.push("-c".into());
-    args.push(format!("model_reasoning_effort=\"{effort}\"").into());
-    args.append(&mut kept);
-}
-
-fn strip_flags(args: &mut Vec<OsString>, flags: &[&str]) {
-    args.retain(|argument| {
-        let argument = argument.to_string_lossy();
-        !flags
-            .iter()
-            .any(|flag| argument == *flag || argument.starts_with(&format!("{flag}=")))
-    });
-}
-
-fn strip_options(args: &mut Vec<OsString>, options: &[&str]) {
-    let mut kept = Vec::with_capacity(args.len());
-    let mut index = 0;
-    while index < args.len() {
-        let argument = args[index].to_string_lossy();
-        if options.iter().any(|option| argument == *option) {
-            index += 1;
-            if args
-                .get(index)
-                .is_some_and(|value| !value.to_string_lossy().starts_with('-'))
-            {
-                index += 1;
-            }
-            continue;
-        }
-        if options
-            .iter()
-            .any(|option| argument.starts_with(&format!("{option}=")))
-        {
-            index += 1;
-            continue;
-        }
-        kept.push(args[index].clone());
-        index += 1;
-    }
-    *args = kept;
-}
-
-fn clear_resume_args(spec: &mut RoomSpec) -> io::Result<()> {
-    match cli_vendor(spec)? {
-        CliVendor::Claude => {
-            strip_flags(&mut spec.args, &["--continue", "-c", "--fork-session"]);
-            strip_options(&mut spec.args, &["--resume", "-r", "--session-id"]);
-        }
-        CliVendor::Codex => {
-            if let Some(resume) = spec.args.iter().position(|argument| {
-                matches!(argument.to_string_lossy().as_ref(), "resume" | "fork")
-            }) {
-                spec.args.truncate(resume);
-            }
-        }
-        CliVendor::OpenCode => {
-            strip_flags(&mut spec.args, &["--continue", "-c", "--fork"]);
-            strip_options(&mut spec.args, &["--session", "-s"]);
-        }
-    }
-    Ok(())
 }
 
 // `Box<dyn Child>` means "a heap-owned value implementing the Child trait".
@@ -456,7 +315,7 @@ impl Pane {
     }
 
     pub(crate) fn send_whisper(&mut self, source: &str, message: &str) -> io::Result<()> {
-        let bracketed_paste = matches!(cli_vendor(&self.spec), Ok(CliVendor::Codex));
+        let bracketed_paste = controls::uses_bracketed_paste(&self.spec);
         let (body, submit) = whisper_parts(self.spec.transport, bracketed_paste, source, message);
         self.write_bytes(&body)?;
         if let Some(submit) = submit {
@@ -477,7 +336,7 @@ impl Pane {
         &mut self,
         size: PtySize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.reconfigure(size, clear_resume_args)
+        self.reconfigure(size, controls::clear_resume_args)
     }
 
     pub(crate) fn set_model(
@@ -485,11 +344,7 @@ impl Pane {
         model: &str,
         size: PtySize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.reconfigure(size, |spec| {
-            cli_vendor(spec)?;
-            replace_option(&mut spec.args, &["--model", "-m"], "--model", model);
-            Ok(())
-        })
+        self.reconfigure(size, |spec| controls::set_model(spec, model))
     }
 
     pub(crate) fn set_effort(
@@ -497,21 +352,7 @@ impl Pane {
         effort: &str,
         size: PtySize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.reconfigure(size, |spec| {
-            match cli_vendor(spec)? {
-                CliVendor::Claude => {
-                    replace_option(&mut spec.args, &["--effort"], "--effort", effort);
-                }
-                CliVendor::Codex => replace_codex_effort(&mut spec.args, effort),
-                CliVendor::OpenCode => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "OpenCode does not expose a stable effort launch option",
-                    ));
-                }
-            }
-            Ok(())
-        })
+        self.reconfigure(size, |spec| controls::set_effort(spec, effort))
     }
 
     fn reconfigure(
@@ -628,9 +469,9 @@ mod tests {
     #[test]
     fn conductor_rewrites_native_launch_options() {
         let mut claude = room_spec("claude", &["--continue", "--model", "old", "--effort=low"]);
-        replace_option(&mut claude.args, &["--model", "-m"], "--model", "sonnet");
-        replace_option(&mut claude.args, &["--effort"], "--effort", "high");
-        clear_resume_args(&mut claude).unwrap();
+        controls::set_model(&mut claude, "sonnet").unwrap();
+        controls::set_effort(&mut claude, "high").unwrap();
+        controls::clear_resume_args(&mut claude).unwrap();
         assert_eq!(
             arguments(&claude),
             ["--effort", "high", "--model", "sonnet"]
@@ -647,7 +488,7 @@ mod tests {
                 "--last",
             ],
         );
-        replace_codex_effort(&mut codex.args, "xhigh");
+        controls::set_effort(&mut codex, "xhigh").unwrap();
         assert_eq!(
             &arguments(&codex)[..4],
             [
@@ -657,14 +498,14 @@ mod tests {
                 "sandbox_mode=\"workspace-write\"",
             ]
         );
-        clear_resume_args(&mut codex).unwrap();
+        controls::clear_resume_args(&mut codex).unwrap();
         assert_eq!(arguments(&codex).len(), 4);
 
         let mut opencode = room_spec(
             "opencode",
             &["--continue", "--session", "session-1", "--model=old"],
         );
-        clear_resume_args(&mut opencode).unwrap();
+        controls::clear_resume_args(&mut opencode).unwrap();
         assert_eq!(arguments(&opencode), ["--model=old"]);
     }
 }
