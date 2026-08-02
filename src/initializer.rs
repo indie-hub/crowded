@@ -219,7 +219,7 @@ fn starter_config(root: &Path) -> String {
     STARTER_CONFIG.replace("__BASIC_MEMORY_PROJECT__", &project)
 }
 
-fn validate(config: &RoomFile) -> io::Result<()> {
+pub(crate) fn validate(config: &RoomFile) -> io::Result<()> {
     validate_room_file(config)?;
 
     let mut plugins = HashSet::new();

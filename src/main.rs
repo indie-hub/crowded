@@ -1,6 +1,7 @@
 //! The Crowded Room: direct programs sharing a small PTY umbrella.
 
 mod app;
+mod checker;
 mod config;
 mod doorbell;
 mod initializer;
@@ -15,6 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("control") => doorbell::control_command(),
         Some("pulse") => doorbell::pulse_command(),
         Some("roster") => doorbell::roster_command(),
+        Some("check") => checker::command(),
         Some("init") => initializer::command(),
         Some("plugin") => plugins::command(),
         Some("toolbox") => toolbox::command(),

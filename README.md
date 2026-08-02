@@ -18,6 +18,12 @@ The first run creates a starter `crowded.toml`, adds `/.crowded/` to
 validate the whole file, install missing declared plugins, synchronize the
 native toolbox, and run pending setup actions.
 
+Validate a reviewed configuration without changing the workspace:
+
+```console
+crowded check
+```
+
 Declare shared plugins and direct, one-time setup commands alongside rooms and
 MCPs:
 

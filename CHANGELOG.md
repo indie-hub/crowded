@@ -7,6 +7,18 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-02
+
+### Added
+
+- `crowded check` validates the current directory's `crowded.toml` without
+  running initialization, setup actions, or synchronization.
+
+### Changed
+
+- Plugin adapter planning, hooks, links, persisted state, and rollback now live
+  behind one private module boundary.
+
 ## [0.22.0] - 2026-08-01
 
 ### Added
