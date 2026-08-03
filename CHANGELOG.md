@@ -7,10 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.24.2] - 2026-08-03
+
 ### Fixed
 
 - Let setup installers declare the executable they provide so `crowded init`
   skips tools that are already available instead of replacing running files.
+- Complete Windows room startup by answering cursor-position queries and
+  placing guest processes in their cleanup job before they spawn descendants.
+- Wait for Windows raw guests to settle and send Claude prompts as bracketed
+  paste so automatic introductions arrive complete before submission.
 
 ## [0.24.1] - 2026-08-03
 
