@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "crowded"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "crossterm",
  "portable-pty",
@@ -216,6 +216,7 @@ dependencies = [
  "serde_json",
  "toml",
  "tui-term",
+ "windows-sys",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-//! Placeholder local server until a platform-specific Doorbell transport exists.
+//! Placeholder local server for platforms without a Doorbell transport (not Unix or Windows).
 
 use std::{io, path::Path, sync::mpsc::TryRecvError};
 

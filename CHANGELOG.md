@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-03
+
+### Added
+
+- Add a Windows named-pipe Doorbell client and server behind the existing
+  platform boundary, preserving the authenticated JSON protocol.
+
 ## [0.23.3] - 2026-08-03
 
 ### Changed

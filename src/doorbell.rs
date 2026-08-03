@@ -2,12 +2,17 @@
 
 #[cfg(unix)]
 mod client_unix;
+#[cfg(windows)]
+mod client_windows;
 mod commands;
 mod protocol;
 #[cfg(unix)]
 #[path = "doorbell/server_unix.rs"]
 mod server;
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[path = "doorbell/server_windows.rs"]
+mod server;
+#[cfg(not(any(unix, windows)))]
 #[path = "doorbell/server_unsupported.rs"]
 mod server;
 

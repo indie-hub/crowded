@@ -7,6 +7,8 @@ use std::{
 
 #[cfg(unix)]
 use super::client_unix::send_request;
+#[cfg(windows)]
+use super::client_windows::send_request;
 use super::protocol::*;
 
 pub(super) struct SendArgs {
@@ -18,7 +20,7 @@ pub(super) struct SendArgs {
 
 const SEND_USAGE: &str = "usage: crowded send ROOM [--task ID] [--role ROLE] [--] MESSAGE";
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn send_request(_: &WireRequest) -> Result<WireResponse, Box<dyn std::error::Error>> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
