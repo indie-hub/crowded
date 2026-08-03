@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.23.3] - 2026-08-03
+
+### Changed
+
+- Use Windows-native file and directory symlink APIs for plugin installation
+  and adapter links, allowing the full crate to cross-compile for Windows.
+
 ## [0.23.2] - 2026-08-03
 
 ### Changed

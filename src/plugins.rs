@@ -4,11 +4,15 @@ mod adapters;
 
 use std::{
     env, fs, io,
-    os::unix::fs::symlink,
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+#[cfg(windows)]
+use std::os::windows::fs::symlink_dir as symlink;
 
 use serde::{Deserialize, Serialize};
 #[cfg(test)]

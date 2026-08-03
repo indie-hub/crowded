@@ -5,10 +5,14 @@
 use std::{
     collections::BTreeMap,
     fs, io,
-    os::unix::fs::symlink,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+#[cfg(windows)]
+use std::os::windows::fs::symlink_file as symlink;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
