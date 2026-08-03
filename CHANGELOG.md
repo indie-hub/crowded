@@ -7,6 +7,11 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- Let setup installers declare the executable they provide so `crowded init`
+  skips tools that are already available instead of replacing running files.
+
 ## [0.24.1] - 2026-08-03
 
 ### Fixed

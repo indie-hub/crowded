@@ -57,6 +57,7 @@ pub(crate) struct SetupConfig {
     #[serde(default)]
     pub(crate) args: Vec<String>,
     pub(crate) cwd: Option<PathBuf>,
+    pub(crate) provides: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]

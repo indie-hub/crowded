@@ -52,6 +52,8 @@ setup action in the reviewed configuration.
 Each successful action creates `.crowded/init/NAME.done`. Failed actions are
 not marked and run again on the next `crowded init`. Existing plugins are left
 at their installed revision; use `crowded plugin update` explicitly.
+An install action may declare `provides = "tool-name"`; when that executable is
+already on `PATH`, Crowded marks the action satisfied without replacing it.
 
 The starter configuration shares pinned tools for CocoIndex Code, CodeGraph,
 Basic Memory, and Context Mode. It also creates one workspace-named Basic

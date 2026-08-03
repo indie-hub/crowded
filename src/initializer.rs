@@ -81,6 +81,7 @@ package = "context-mode@1.0.169"
 name = "basic-memory-install"
 command = "uv"
 args = ["tool", "install", "--upgrade", "basic-memory==0.22.1"]
+provides = "basic-memory"
 
 [[setup]]
 name = "basic-memory-project"
@@ -96,6 +97,7 @@ args = ["-y", "@colbymchenry/codegraph@1.5.0", "init", "."]
 name = "ccc-install"
 command = "uv"
 args = ["tool", "install", "--upgrade", "--with", "mcp<2", "cocoindex-code[full]==0.2.39"]
+provides = "ccc"
 
 [[setup]]
 name = "ccc-init"
@@ -192,21 +194,28 @@ fn run_at(root: &Path) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
+    let mut setups_run = 0;
+    let mut setups_satisfied = 0;
     for setup in &pending {
+        validate_setup_cwd(root, setup)?;
+        if let Some(provided) = setup.provides.as_deref()
+            && command_is_available(provided, &setup_cwd(root, setup))
+        {
+            mark_setup_complete(root, &setup.name)?;
+            setups_satisfied += 1;
+            println!("setup `{}` already satisfied by `{provided}`", setup.name);
+            continue;
+        }
         // Earlier actions may install an executable consumed by a later one.
         preflight_setup(root, setup)?;
         run_setup(root, setup)?;
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(marker(root, &setup.name))?
-            .write_all(b"complete\n")?;
+        mark_setup_complete(root, &setup.name)?;
+        setups_run += 1;
         println!("completed setup `{}`", setup.name);
     }
 
     println!(
-        "Crowded initialized: {installed} plugin(s) installed, {adapters_enabled} plugin adapter(s) enabled, {synced} native file(s) synced, {} setup action(s) run",
-        pending.len()
+        "Crowded initialized: {installed} plugin(s) installed, {adapters_enabled} plugin adapter(s) enabled, {synced} native file(s) synced, {setups_run} setup action(s) run, {setups_satisfied} already satisfied"
     );
     Ok(())
 }
@@ -248,6 +257,14 @@ pub(crate) fn validate(config: &RoomFile) -> io::Result<()> {
                 setup.name
             )));
         }
+        if setup.provides.as_ref().is_some_and(|provided| {
+            provided.trim().is_empty() || provided.chars().any(char::is_control)
+        }) {
+            return Err(invalid_input(format!(
+                "setup `{}` provides command cannot be empty or contain control characters",
+                setup.name
+            )));
+        }
         if setup
             .args
             .iter()
@@ -273,6 +290,15 @@ pub(crate) fn validate(config: &RoomFile) -> io::Result<()> {
 }
 
 fn preflight_setup(root: &Path, setup: &SetupConfig) -> io::Result<()> {
+    validate_setup_cwd(root, setup)?;
+    let cwd = setup_cwd(root, setup);
+    ResolvedCommand::resolve(OsStr::new(&setup.command), &[], &cwd).map_err(|error| {
+        io::Error::new(error.kind(), format!("setup `{}`: {error}", setup.name))
+    })?;
+    Ok(())
+}
+
+fn validate_setup_cwd(root: &Path, setup: &SetupConfig) -> io::Result<()> {
     let cwd = setup_cwd(root, setup);
     if !cwd.is_dir() {
         return Err(invalid_input(format!(
@@ -281,10 +307,27 @@ fn preflight_setup(root: &Path, setup: &SetupConfig) -> io::Result<()> {
             cwd.display()
         )));
     }
-    ResolvedCommand::resolve(OsStr::new(&setup.command), &[], &cwd).map_err(|error| {
-        io::Error::new(error.kind(), format!("setup `{}`: {error}", setup.name))
-    })?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn command_is_available(command: &str, cwd: &Path) -> bool {
+    ResolvedCommand::resolve(OsStr::new(command), &[], cwd).is_ok()
+}
+
+#[cfg(not(windows))]
+fn command_is_available(command: &str, cwd: &Path) -> bool {
+    let command = Path::new(command);
+    if command.components().count() > 1 {
+        return if command.is_absolute() {
+            command.is_file()
+        } else {
+            cwd.join(command).is_file()
+        };
+    }
+    env::var_os("PATH").is_some_and(|path| {
+        env::split_paths(&path).any(|directory| directory.join(command).is_file())
+    })
 }
 
 fn run_setup(root: &Path, setup: &SetupConfig) -> io::Result<()> {
@@ -313,6 +356,14 @@ fn setup_cwd(root: &Path, setup: &SetupConfig) -> PathBuf {
 
 fn marker(root: &Path, name: &str) -> PathBuf {
     root.join(MARKER_DIRECTORY).join(format!("{name}.done"))
+}
+
+fn mark_setup_complete(root: &Path, name: &str) -> io::Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker(root, name))?
+        .write_all(b"complete\n")
 }
 
 fn setup_is_complete(root: &Path, name: &str) -> io::Result<bool> {
@@ -390,7 +441,9 @@ mod tests {
         assert_eq!(starter.mcp_servers.len(), 4);
         assert_eq!(starter.setup.len(), 6);
         assert!(starter.setup.iter().any(|setup| {
-            setup.name == "ccc-install" && setup.args.iter().any(|arg| arg == "mcp<2")
+            setup.name == "ccc-install"
+                && setup.provides.as_deref() == Some("ccc")
+                && setup.args.iter().any(|arg| arg == "mcp<2")
         }));
         assert!(
             fs::read_to_string(root.join(".gitignore"))
@@ -417,12 +470,18 @@ args = ["-c", "cp /usr/bin/true generated-tool && chmod +x generated-tool"]
 [[setup]]
 name = "use-tool"
 command = "./generated-tool"
+
+[[setup]]
+name = "skip-installed-tool"
+command = "/bin/false"
+provides = "./generated-tool"
 "#,
         )
         .unwrap();
         run_at(&root).unwrap();
         assert!(marker(&root, "make-tool").is_file());
         assert!(marker(&root, "use-tool").is_file());
+        assert!(marker(&root, "skip-installed-tool").is_file());
         run_at(&root).unwrap();
         assert_eq!(
             fs::read_to_string(root.join(".gitignore"))
