@@ -668,7 +668,8 @@ fn generate(
             &opencode_mcp_config(None, servers, opencode_plugins)?,
             path,
         ),
-        NativeTarget::Hooks(Vendor::Claude | Vendor::Codex) => merge_hooks(original, path),
+        NativeTarget::Hooks(Vendor::Claude) => merge_hooks(original, path, false),
+        NativeTarget::Hooks(Vendor::Codex) => merge_hooks(original, path, true),
         NativeTarget::Hooks(Vendor::OpenCode) => {
             if original.is_some() {
                 return Err(invalid_input(format!(
@@ -681,7 +682,7 @@ fn generate(
     }
 }
 
-fn merge_hooks(original: Option<&str>, path: &Path) -> io::Result<String> {
+fn merge_hooks(original: Option<&str>, path: &Path, windows_command: bool) -> io::Result<String> {
     let mut document = parse_json_document(original, path)?;
     let root = document
         .as_object_mut()
@@ -704,13 +705,15 @@ fn merge_hooks(original: Option<&str>, path: &Path) -> io::Result<String> {
         ("Stop", "ready"),
         ("SessionEnd", "offline"),
     ] {
-        let entry = serde_json::json!({
-            "hooks": [{
-                "type": "command",
-                "command": format!("\"$CROWDED_BIN\" pulse {state}"),
-                "timeout": 3
-            }]
+        let mut hook = serde_json::json!({
+            "type": "command",
+            "command": format!("\"$CROWDED_BIN\" pulse {state}"),
+            "timeout": 3
         });
+        if windows_command {
+            hook["commandWindows"] = Value::String(format!("& \"$env:CROWDED_BIN\" pulse {state}"));
+        }
+        let entry = serde_json::json!({ "hooks": [hook] });
         let handlers = hooks
             .entry(event)
             .or_insert_with(|| serde_json::json!([]))
@@ -1146,6 +1149,11 @@ mod tests {
             claude_hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             "\"$CROWDED_BIN\" pulse working"
         );
+        assert!(
+            claude_hooks["hooks"]["PreToolUse"][0]["hooks"][0]
+                .get("commandWindows")
+                .is_none()
+        );
         let mut rewritten_claude = claude_hooks;
         rewritten_claude["newSetting"] = Value::Bool(true);
         rewritten_claude["hooks"]["PreToolUse"]
@@ -1159,7 +1167,13 @@ mod tests {
             serde_json::to_string(&rewritten_claude).unwrap(),
         )
         .unwrap();
-        assert!(root.join(".codex/hooks.json").is_file());
+        let codex_hooks: Value =
+            serde_json::from_str(&fs::read_to_string(root.join(".codex/hooks.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            codex_hooks["hooks"]["PreToolUse"][0]["hooks"][0]["commandWindows"],
+            "& \"$env:CROWDED_BIN\" pulse working"
+        );
         assert!(
             fs::read_to_string(root.join(".opencode/plugins/crowded-pulse.js"))
                 .unwrap()
