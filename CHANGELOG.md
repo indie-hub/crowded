@@ -7,6 +7,15 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.23.2] - 2026-08-03
+
+### Changed
+
+- Move Doorbell command-client Unix socket I/O behind a focused private module
+  boundary without changing command or JSON behavior.
+- Select the Doorbell local server implementation by platform while preserving
+  its application-facing API and Unix behavior.
+
 ## [0.23.1] - 2026-08-02
 
 ### Changed

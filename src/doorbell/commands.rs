@@ -1,13 +1,12 @@
 //! Doorbell command-line clients.
 
 use std::{
-    env,
-    io::{BufReader, Write},
-    os::unix::net::UnixStream,
-    process,
+    env, process,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use super::client_unix::send_request;
 use super::protocol::*;
 
 pub(super) struct SendArgs {
@@ -18,6 +17,15 @@ pub(super) struct SendArgs {
 }
 
 const SEND_USAGE: &str = "usage: crowded send ROOM [--task ID] [--role ROLE] [--] MESSAGE";
+
+#[cfg(not(unix))]
+fn send_request(_: &WireRequest) -> Result<WireResponse, Box<dyn std::error::Error>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Doorbell local transport is not available on this platform",
+    )
+    .into())
+}
 
 pub(super) fn parse_send_args(args: impl IntoIterator<Item = String>) -> Result<SendArgs, String> {
     let mut args = args.into_iter();
@@ -179,15 +187,6 @@ pub(crate) fn roster_command() -> Result<(), Box<dyn std::error::Error>> {
     }))?;
     println!("{}", serde_json::to_string(&response)?);
     response.into_result("Doorbell rejected roster request")
-}
-
-fn send_request(request: &WireRequest) -> Result<WireResponse, Box<dyn std::error::Error>> {
-    let path = env::var_os("CROWDED_SOCKET").ok_or("CROWDED_SOCKET is not set")?;
-    let mut stream = UnixStream::connect(path)?;
-    serde_json::to_writer(&mut stream, request)?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    Ok(serde_json::from_reader(BufReader::new(stream))?)
 }
 
 impl WireResponse {
