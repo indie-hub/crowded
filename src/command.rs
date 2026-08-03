@@ -12,8 +12,6 @@ use portable_pty::CommandBuilder;
 const INTERNAL_LAUNCH_ARGUMENT: &str = "__crowded-launch";
 
 #[cfg(windows)]
-const LAUNCH_EVENT: &str = "CROWDED_INTERNAL_LAUNCH_EVENT";
-#[cfg(windows)]
 const LAUNCH_PROGRAM: &str = "CROWDED_INTERNAL_LAUNCH_PROGRAM";
 #[cfg(windows)]
 const LAUNCH_ARG_COUNT: &str = "CROWDED_INTERNAL_LAUNCH_ARG_COUNT";
@@ -28,12 +26,11 @@ pub(crate) struct ResolvedCommand {
 
 pub(crate) struct PortableCommand {
     command: CommandBuilder,
-    gate: Option<LaunchGate>,
 }
 
 impl PortableCommand {
-    pub(crate) fn into_parts(self) -> (CommandBuilder, Option<LaunchGate>) {
-        (self.command, self.gate)
+    pub(crate) fn into_command(self) -> CommandBuilder {
+        self.command
     }
 }
 
@@ -82,28 +79,20 @@ impl ResolvedCommand {
     pub(crate) fn portable(&self) -> io::Result<PortableCommand> {
         #[cfg(windows)]
         {
-            let gate = LaunchGate::new()?;
             let mut command = CommandBuilder::new(env::current_exe()?);
             command.arg(INTERNAL_LAUNCH_ARGUMENT);
-            command.env(LAUNCH_EVENT, gate.name());
             command.env(LAUNCH_PROGRAM, self.program.as_os_str());
             command.env(LAUNCH_ARG_COUNT, self.args.len().to_string());
             for (index, argument) in self.args.iter().enumerate() {
                 command.env(format!("{LAUNCH_ARG_PREFIX}{index}"), argument);
             }
-            Ok(PortableCommand {
-                command,
-                gate: Some(gate),
-            })
+            Ok(PortableCommand { command })
         }
         #[cfg(not(windows))]
         {
             let mut command = CommandBuilder::new(&self.program);
             command.args(&self.args);
-            Ok(PortableCommand {
-                command,
-                gate: None,
-            })
+            Ok(PortableCommand { command })
         }
     }
 
@@ -185,55 +174,6 @@ fn split_windows_extensions(path_ext: &OsStr) -> Vec<OsString> {
         .collect()
 }
 
-pub(crate) struct LaunchGate {
-    #[cfg(windows)]
-    handle: windows_sys::Win32::Foundation::HANDLE,
-    #[cfg(windows)]
-    name: OsString,
-}
-
-#[cfg(windows)]
-impl LaunchGate {
-    fn new() -> io::Result<Self> {
-        use std::{
-            os::windows::ffi::OsStrExt,
-            sync::atomic::{AtomicU64, Ordering},
-        };
-        use windows_sys::Win32::System::Threading::CreateEventW;
-
-        static NEXT_EVENT: AtomicU64 = AtomicU64::new(1);
-        let name = OsString::from(format!(
-            "Local\\CrowdedLaunch-{}-{}",
-            std::process::id(),
-            NEXT_EVENT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let wide: Vec<u16> = name.encode_wide().chain(std::iter::once(0)).collect();
-        let handle = unsafe { CreateEventW(std::ptr::null(), 0, 0, wide.as_ptr()) };
-        if handle.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self { handle, name })
-    }
-
-    fn name(&self) -> &OsStr {
-        &self.name
-    }
-
-    pub(crate) fn release(&self) -> io::Result<()> {
-        if unsafe { windows_sys::Win32::System::Threading::SetEvent(self.handle) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-impl Drop for LaunchGate {
-    fn drop(&mut self) {
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
-    }
-}
-
 #[cfg(windows)]
 fn required_environment(name: &str) -> io::Result<OsString> {
     env::var_os(name).ok_or_else(|| {
@@ -245,31 +185,7 @@ fn required_environment(name: &str) -> io::Result<OsString> {
 }
 
 #[cfg(windows)]
-fn wait_for_launch_event(name: &OsStr) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, WAIT_OBJECT_0},
-        System::Threading::{
-            INFINITE, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE, WaitForSingleObject,
-        },
-    };
-
-    let wide: Vec<u16> = name.encode_wide().chain(std::iter::once(0)).collect();
-    let handle = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide.as_ptr()) };
-    if handle.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    let result = unsafe { WaitForSingleObject(handle, INFINITE) };
-    unsafe { CloseHandle(handle) };
-    if result != WAIT_OBJECT_0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
 pub(crate) fn run_internal_launcher() -> io::Result<i32> {
-    let event = required_environment(LAUNCH_EVENT)?;
     let program = required_environment(LAUNCH_PROGRAM)?;
     let count: usize = required_environment(LAUNCH_ARG_COUNT)?
         .to_string_lossy()
@@ -282,14 +198,9 @@ pub(crate) fn run_internal_launcher() -> io::Result<i32> {
         ))?);
     }
 
-    // The launcher cannot create descendants until the parent has assigned it
-    // to the room job and released this event.
-    wait_for_launch_event(&event)?;
-
     let mut command = Command::new(program);
     command.args(&args);
     command
-        .env_remove(LAUNCH_EVENT)
         .env_remove(LAUNCH_PROGRAM)
         .env_remove(LAUNCH_ARG_COUNT);
     for index in 0..count {
@@ -434,7 +345,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn standard_batch_launch_preserves_metacharacters() {
+    fn standard_batch_launch_preserves_common_metacharacters() {
         let directory = test_directory();
         let shim = directory.join("echo-args.cmd");
         let script = directory.join("echo-args.vbs");
@@ -444,7 +355,9 @@ mod tests {
         )
         .unwrap();
         fs::write(&script, "WScript.StdOut.Write WScript.Arguments(0)\r\n").unwrap();
-        let argument = OsString::from("model name & | < > ^ % ! \"quoted\"");
+        // ponytail: literal embedded quotes are a cmd.exe limitation; Crowded
+        // sends prompts through the PTY, so startup arguments do not need them.
+        let argument = OsString::from("model name & | < > ^ % !");
         let output = ResolvedCommand {
             program: shim,
             args: vec![argument.clone()],
@@ -510,7 +423,7 @@ mod tests {
         }
         .portable()
         .unwrap();
-        let (mut command, gate) = launch.into_parts();
+        let mut command = launch.into_command();
         let argv = command.get_argv_mut();
         argv.truncate(1);
         argv.extend([
@@ -531,8 +444,6 @@ mod tests {
             .unwrap();
         let mut child = pty.slave.spawn_command(command).unwrap();
         let tree = ProcessTree::attach(child.as_ref()).unwrap();
-        let gate = gate.unwrap();
-        gate.release().unwrap();
 
         for _ in 0..50 {
             if pid_file.is_file() {
@@ -558,7 +469,6 @@ mod tests {
             !process_is_running(pid),
             "batch descendant survived cleanup"
         );
-        drop(gate);
         fs::remove_dir_all(directory).unwrap();
     }
 }

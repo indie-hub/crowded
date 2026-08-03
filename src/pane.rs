@@ -15,7 +15,7 @@ use portable_pty::{Child, MasterPty, PtySize, native_pty_system};
 use tui_term::vt100::{Parser, Screen};
 
 use crate::{
-    command::{LaunchGate, ResolvedCommand},
+    command::ResolvedCommand,
     config::{RoomSpec, Transport},
 };
 
@@ -131,12 +131,10 @@ struct ChildGuard {
     child: Option<Box<dyn Child + Send + Sync>>,
     #[cfg(windows)]
     tree: Option<crate::command::ProcessTree>,
-    #[cfg(windows)]
-    launch_gate: Option<LaunchGate>,
 }
 
 impl ChildGuard {
-    fn new(child: Box<dyn Child + Send + Sync>, gate: Option<LaunchGate>) -> io::Result<Self> {
+    fn new(child: Box<dyn Child + Send + Sync>) -> io::Result<Self> {
         #[cfg(windows)]
         let mut child = child;
         #[cfg(windows)]
@@ -148,27 +146,10 @@ impl ChildGuard {
                 return Err(error);
             }
         };
-        #[cfg(windows)]
-        let gate = if let Some(gate) = gate {
-            if let Err(error) = gate.release() {
-                tree.terminate();
-                let _ = child.wait();
-                return Err(error);
-            }
-            gate
-        } else {
-            tree.terminate();
-            let _ = child.wait();
-            return Err(io::Error::other("Windows launcher gate is missing"));
-        };
-        #[cfg(not(windows))]
-        let _ = gate;
         Ok(Self {
             child: Some(child),
             #[cfg(windows)]
             tree: Some(tree),
-            #[cfg(windows)]
-            launch_gate: Some(gate),
         })
     }
 
@@ -182,8 +163,6 @@ impl ChildGuard {
             self.child.take();
             #[cfg(windows)]
             self.tree.take();
-            #[cfg(windows)]
-            self.launch_gate.take();
         }
         Ok(exited)
     }
@@ -194,8 +173,6 @@ impl ChildGuard {
         if let Some(tree) = self.tree.take() {
             tree.terminate();
         }
-        #[cfg(windows)]
-        self.launch_gate.take();
         if let Some(mut child) = self.child.take() {
             match child.try_wait() {
                 Ok(Some(_)) => {}
@@ -259,7 +236,7 @@ impl Pane {
             path_ext,
         )?
         .portable()?;
-        let (mut command, gate) = launch.into_parts();
+        let mut command = launch.into_command();
         command.cwd(&cwd);
         command.env("PWD", &cwd);
         for (key, value) in &spec.variables {
@@ -268,7 +245,7 @@ impl Pane {
         for (key, value) in &environment.variables {
             command.env(key, value);
         }
-        let child = ChildGuard::new(pty.slave.spawn_command(command)?, gate)?;
+        let child = ChildGuard::new(pty.slave.spawn_command(command)?)?;
         // The parent must not keep a second slave handle alive.
         drop(pty.slave);
 
