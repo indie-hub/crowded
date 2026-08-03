@@ -1,6 +1,6 @@
 [package]
 name = "crowded"
-version = "0.24.0"
+version = "0.24.1"
 edition = "2024"
 
 [dependencies]
@@ -19,4 +19,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authentication_Identity",
     "Win32_Storage_FileSystem",
     "Win32_System_Pipes",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
 ] }

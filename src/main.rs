@@ -2,6 +2,7 @@
 
 mod app;
 mod checker;
+mod command;
 mod config;
 mod doorbell;
 mod initializer;
@@ -11,6 +12,11 @@ mod plugins;
 mod toolbox;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    if command::internal_launcher_requested() {
+        std::process::exit(command::run_internal_launcher()?);
+    }
+
     match std::env::args().nth(1).as_deref() {
         Some("send") => doorbell::send_command(),
         Some("control") => doorbell::control_command(),

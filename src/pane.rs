@@ -11,10 +11,13 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, MasterPty, PtySize, native_pty_system};
 use tui_term::vt100::{Parser, Screen};
 
-use crate::config::{RoomSpec, Transport};
+use crate::{
+    command::{LaunchGate, ResolvedCommand},
+    config::{RoomSpec, Transport},
+};
 
 mod controls;
 
@@ -80,6 +83,15 @@ fn working_directory(configured: Option<&Path>) -> io::Result<PathBuf> {
     Ok(directory)
 }
 
+fn environment_value(variables: &[(OsString, OsString)], name: &str) -> Option<OsString> {
+    variables
+        .iter()
+        .rev()
+        .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+        .or_else(|| env::var_os(name))
+}
+
 fn opencode_input_ready(screen: &str) -> bool {
     (screen.contains("Ask anything") || screen.contains("ctrl+p commands"))
         && !screen.contains("esc interrupt")
@@ -117,9 +129,49 @@ fn whisper_parts(
 // The Option lets cleanup `take()` ownership exactly once.
 struct ChildGuard {
     child: Option<Box<dyn Child + Send + Sync>>,
+    #[cfg(windows)]
+    tree: Option<crate::command::ProcessTree>,
+    #[cfg(windows)]
+    launch_gate: Option<LaunchGate>,
 }
 
 impl ChildGuard {
+    fn new(child: Box<dyn Child + Send + Sync>, gate: Option<LaunchGate>) -> io::Result<Self> {
+        #[cfg(windows)]
+        let mut child = child;
+        #[cfg(windows)]
+        let tree = match crate::command::ProcessTree::attach(child.as_ref()) {
+            Ok(tree) => tree,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        #[cfg(windows)]
+        let gate = if let Some(gate) = gate {
+            if let Err(error) = gate.release() {
+                tree.terminate();
+                let _ = child.wait();
+                return Err(error);
+            }
+            gate
+        } else {
+            tree.terminate();
+            let _ = child.wait();
+            return Err(io::Error::other("Windows launcher gate is missing"));
+        };
+        #[cfg(not(windows))]
+        let _ = gate;
+        Ok(Self {
+            child: Some(child),
+            #[cfg(windows)]
+            tree: Some(tree),
+            #[cfg(windows)]
+            launch_gate: Some(gate),
+        })
+    }
+
     fn poll_exit(&mut self) -> io::Result<bool> {
         let exited = match self.child.as_mut() {
             Some(child) => child.try_wait()?.is_some(),
@@ -128,12 +180,22 @@ impl ChildGuard {
         if exited {
             // `try_wait` has reaped the process, so the handle can go away.
             self.child.take();
+            #[cfg(windows)]
+            self.tree.take();
+            #[cfg(windows)]
+            self.launch_gate.take();
         }
         Ok(exited)
     }
 
     fn cleanup(&mut self) {
         // Taking the handle makes explicit cleanup and Drop safe to repeat.
+        #[cfg(windows)]
+        if let Some(tree) = self.tree.take() {
+            tree.terminate();
+        }
+        #[cfg(windows)]
+        self.launch_gate.take();
         if let Some(mut child) = self.child.take() {
             match child.try_wait() {
                 Ok(Some(_)) => {}
@@ -184,11 +246,20 @@ impl Pane {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // A PTY has two ends: the child receives the slave; we keep the master.
         let pty = native_pty_system().openpty(size)?;
-        let mut command = CommandBuilder::new(spec.program.clone());
-        command.args(&spec.args);
         // portable-pty defaults an omitted cwd to HOME rather than inheriting
         // Crowded's directory, so the project directory must be explicit.
         let cwd = working_directory(spec.cwd.as_deref())?;
+        let path = environment_value(&spec.variables, "PATH");
+        let path_ext = environment_value(&spec.variables, "PATHEXT");
+        let launch = ResolvedCommand::resolve_with_environment(
+            &spec.program,
+            &spec.args,
+            &cwd,
+            path,
+            path_ext,
+        )?
+        .portable()?;
+        let (mut command, gate) = launch.into_parts();
         command.cwd(&cwd);
         command.env("PWD", &cwd);
         for (key, value) in &spec.variables {
@@ -197,9 +268,7 @@ impl Pane {
         for (key, value) in &environment.variables {
             command.env(key, value);
         }
-        let child = ChildGuard {
-            child: Some(pty.slave.spawn_command(command)?),
-        };
+        let child = ChildGuard::new(pty.slave.spawn_command(command)?, gate)?;
         // The parent must not keep a second slave handle alive.
         drop(pty.slave);
 

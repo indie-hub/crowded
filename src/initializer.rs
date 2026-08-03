@@ -2,13 +2,15 @@
 
 use std::{
     collections::HashSet,
-    env, fs,
+    env,
+    ffi::{OsStr, OsString},
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use crate::{
+    command::ResolvedCommand,
     config::{RoomFile, SetupConfig, load_room_file, validate_room_file},
     plugins, toolbox,
 };
@@ -279,22 +281,17 @@ fn preflight_setup(root: &Path, setup: &SetupConfig) -> io::Result<()> {
             cwd.display()
         )));
     }
-    if !command_exists(&setup.command, &cwd) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "setup `{}` needs `{}` on PATH or at the configured path",
-                setup.name, setup.command
-            ),
-        ));
-    }
+    ResolvedCommand::resolve(OsStr::new(&setup.command), &[], &cwd).map_err(|error| {
+        io::Error::new(error.kind(), format!("setup `{}`: {error}", setup.name))
+    })?;
     Ok(())
 }
 
 fn run_setup(root: &Path, setup: &SetupConfig) -> io::Result<()> {
     let cwd = setup_cwd(root, setup);
-    let mut command = Command::new(&setup.command);
-    command.args(&setup.args).current_dir(cwd);
+    let args: Vec<OsString> = setup.args.iter().map(OsString::from).collect();
+    let mut command = ResolvedCommand::resolve(OsStr::new(&setup.command), &args, &cwd)?.standard();
+    command.current_dir(cwd);
     println!("running setup `{}`: {command:?}", setup.name);
     let status = command.status()?;
     if !status.success() {
@@ -312,21 +309,6 @@ fn setup_cwd(root: &Path, setup: &SetupConfig) -> PathBuf {
         Some(cwd) => root.join(cwd),
         None => root.to_path_buf(),
     }
-}
-
-fn command_exists(command: &str, cwd: &Path) -> bool {
-    let command = Path::new(command);
-    if command.components().count() > 1 {
-        return (if command.is_absolute() {
-            command.to_path_buf()
-        } else {
-            cwd.join(command)
-        })
-        .is_file();
-    }
-    env::var_os("PATH").is_some_and(|paths| {
-        env::split_paths(&paths).any(|directory| directory.join(command).is_file())
-    })
 }
 
 fn marker(root: &Path, name: &str) -> PathBuf {

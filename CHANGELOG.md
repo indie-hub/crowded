@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-08-03
+
+### Fixed
+
+- Resolve Windows room and setup commands through PATH and PATHEXT; execute
+  native programs directly and contain batch-shim process trees during cleanup.
+
 ## [0.24.0] - 2026-08-03
 
 ### Added
