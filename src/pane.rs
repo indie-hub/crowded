@@ -21,6 +21,33 @@ use crate::{
 
 mod controls;
 
+const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
+// ponytail: ConPTY only needs a valid DSR here; report the parser's exact
+// cursor if a guest later depends on cursor-aware terminal negotiation.
+const CURSOR_POSITION_RESPONSE: &[u8] = b"\x1b[1;1R";
+
+pub(crate) fn respond_to_terminal_queries(
+    writer: &mut dyn Write,
+    tail: &mut Vec<u8>,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let mut scan = Vec::with_capacity(tail.len() + bytes.len());
+    scan.append(tail);
+    scan.extend_from_slice(bytes);
+    let queries = scan
+        .windows(CURSOR_POSITION_QUERY.len())
+        .filter(|window| *window == CURSOR_POSITION_QUERY)
+        .count();
+    tail.extend_from_slice(&scan[scan.len().saturating_sub(CURSOR_POSITION_QUERY.len() - 1)..]);
+    for _ in 0..queries {
+        writer.write_all(CURSOR_POSITION_RESPONSE)?;
+    }
+    if queries > 0 {
+        writer.flush()?;
+    }
+    Ok(())
+}
+
 fn key_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     // Crossterm gives us structured key events; a PTY understands only bytes.
     // `None` means this small encoder does not support that event.
@@ -98,7 +125,10 @@ fn opencode_input_ready(screen: &str) -> bool {
         && !screen.contains("exit shell mode")
 }
 
+#[cfg(not(windows))]
 const RAW_SUBMIT_DELAY: Duration = Duration::from_millis(150);
+#[cfg(windows)]
+const RAW_SUBMIT_DELAY: Duration = Duration::from_millis(500);
 
 fn whisper_parts(
     transport: Transport,
@@ -115,7 +145,7 @@ fn whisper_parts(
             format!("printf '%s\\n' {}\r", shell_quote(&note)).into_bytes(),
             None,
         ),
-        // Codex's native paste event avoids long messages swallowing Enter as a newline.
+        // A native paste event keeps long agent messages together before Enter.
         Transport::Raw if bracketed_paste => (
             format!("\x1b[200~{note}\x1b[201~").into_bytes(),
             Some(vec![b'\r']),
@@ -134,18 +164,23 @@ struct ChildGuard {
 }
 
 impl ChildGuard {
-    fn new(child: Box<dyn Child + Send + Sync>) -> io::Result<Self> {
+    fn new(
+        child: Box<dyn Child + Send + Sync>,
+        tree: Option<crate::command::ProcessTree>,
+    ) -> io::Result<Self> {
         #[cfg(windows)]
         let mut child = child;
         #[cfg(windows)]
-        let tree = match crate::command::ProcessTree::attach(child.as_ref()) {
-            Ok(tree) => tree,
-            Err(error) => {
+        let tree = match tree {
+            Some(tree) => tree,
+            None => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(error);
+                return Err(io::Error::other("Windows process tree is missing"));
             }
         };
+        #[cfg(not(windows))]
+        let _ = tree;
         Ok(Self {
             child: Some(child),
             #[cfg(windows)]
@@ -199,6 +234,7 @@ pub(crate) struct Pane {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     output_rx: mpsc::Receiver<Vec<u8>>,
+    response_tail: Vec<u8>,
     parser: Parser,
 }
 
@@ -236,7 +272,7 @@ impl Pane {
             path_ext,
         )?
         .portable()?;
-        let mut command = launch.into_command();
+        let (mut command, tree) = launch.into_parts();
         command.cwd(&cwd);
         command.env("PWD", &cwd);
         for (key, value) in &spec.variables {
@@ -245,7 +281,7 @@ impl Pane {
         for (key, value) in &environment.variables {
             command.env(key, value);
         }
-        let child = ChildGuard::new(pty.slave.spawn_command(command)?)?;
+        let child = ChildGuard::new(pty.slave.spawn_command(command)?, tree)?;
         // The parent must not keep a second slave handle alive.
         drop(pty.slave);
 
@@ -271,19 +307,21 @@ impl Pane {
             master: pty.master,
             writer,
             output_rx,
+            response_tail: Vec::new(),
             // vt100 assumes room for wrapping and a double-width character.
             parser: Parser::new(size.rows.max(2), size.cols.max(2), 0),
         })
     }
 
-    pub(crate) fn drain_output(&mut self) -> bool {
+    pub(crate) fn drain_output(&mut self) -> io::Result<bool> {
         // Drain everything currently waiting without blocking the UI thread.
         let mut received = false;
         while let Ok(bytes) = self.output_rx.try_recv() {
             received = true;
+            respond_to_terminal_queries(&mut *self.writer, &mut self.response_tail, &bytes)?;
             self.parser.process(&bytes);
         }
-        received
+        Ok(received)
     }
 
     pub(crate) fn write_key(&mut self, key: KeyEvent) -> io::Result<()> {
@@ -491,6 +529,15 @@ mod tests {
     fn shift_tab_uses_the_terminal_backtab_sequence() {
         let key = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
         assert_eq!(key_bytes(key), Some(b"\x1b[Z".to_vec()));
+    }
+
+    #[test]
+    fn cursor_position_query_is_answered_across_output_chunks() {
+        let mut response = Vec::new();
+        let mut tail = Vec::new();
+        respond_to_terminal_queries(&mut response, &mut tail, b"before\x1b[").unwrap();
+        respond_to_terminal_queries(&mut response, &mut tail, b"6nafter").unwrap();
+        assert_eq!(response, CURSOR_POSITION_RESPONSE);
     }
 
     #[test]

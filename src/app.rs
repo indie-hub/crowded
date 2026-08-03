@@ -35,7 +35,10 @@ enum InputMode {
     MailLog,
 }
 
+#[cfg(not(windows))]
 const HOUSE_RULES_QUIET: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const HOUSE_RULES_QUIET: Duration = Duration::from_secs(5);
 const AUTO_DELIVERY_LIMIT: usize = 20;
 
 struct DeliveryFuse {
@@ -356,7 +359,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let now = Instant::now();
         for (index, pane) in panes.iter_mut().enumerate() {
-            if pane.drain_output() {
+            if pane.drain_output()? {
                 last_output[index] = Some(now);
             }
         }

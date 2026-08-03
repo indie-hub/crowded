@@ -12,6 +12,8 @@ use portable_pty::CommandBuilder;
 const INTERNAL_LAUNCH_ARGUMENT: &str = "__crowded-launch";
 
 #[cfg(windows)]
+const LAUNCH_JOB: &str = "CROWDED_INTERNAL_LAUNCH_JOB";
+#[cfg(windows)]
 const LAUNCH_PROGRAM: &str = "CROWDED_INTERNAL_LAUNCH_PROGRAM";
 #[cfg(windows)]
 const LAUNCH_ARG_COUNT: &str = "CROWDED_INTERNAL_LAUNCH_ARG_COUNT";
@@ -26,11 +28,12 @@ pub(crate) struct ResolvedCommand {
 
 pub(crate) struct PortableCommand {
     command: CommandBuilder,
+    tree: Option<ProcessTree>,
 }
 
 impl PortableCommand {
-    pub(crate) fn into_command(self) -> CommandBuilder {
-        self.command
+    pub(crate) fn into_parts(self) -> (CommandBuilder, Option<ProcessTree>) {
+        (self.command, self.tree)
     }
 }
 
@@ -79,20 +82,28 @@ impl ResolvedCommand {
     pub(crate) fn portable(&self) -> io::Result<PortableCommand> {
         #[cfg(windows)]
         {
+            let tree = ProcessTree::new()?;
             let mut command = CommandBuilder::new(env::current_exe()?);
             command.arg(INTERNAL_LAUNCH_ARGUMENT);
+            command.env(LAUNCH_JOB, tree.name());
             command.env(LAUNCH_PROGRAM, self.program.as_os_str());
             command.env(LAUNCH_ARG_COUNT, self.args.len().to_string());
             for (index, argument) in self.args.iter().enumerate() {
                 command.env(format!("{LAUNCH_ARG_PREFIX}{index}"), argument);
             }
-            Ok(PortableCommand { command })
+            Ok(PortableCommand {
+                command,
+                tree: Some(tree),
+            })
         }
         #[cfg(not(windows))]
         {
             let mut command = CommandBuilder::new(&self.program);
             command.args(&self.args);
-            Ok(PortableCommand { command })
+            Ok(PortableCommand {
+                command,
+                tree: None,
+            })
         }
     }
 
@@ -186,6 +197,7 @@ fn required_environment(name: &str) -> io::Result<OsString> {
 
 #[cfg(windows)]
 pub(crate) fn run_internal_launcher() -> io::Result<i32> {
+    let job = required_environment(LAUNCH_JOB)?;
     let program = required_environment(LAUNCH_PROGRAM)?;
     let count: usize = required_environment(LAUNCH_ARG_COUNT)?
         .to_string_lossy()
@@ -198,9 +210,11 @@ pub(crate) fn run_internal_launcher() -> io::Result<i32> {
         ))?);
     }
 
+    ProcessTree::join_current(&job)?;
     let mut command = Command::new(program);
     command.args(&args);
     command
+        .env_remove(LAUNCH_JOB)
         .env_remove(LAUNCH_PROGRAM)
         .env_remove(LAUNCH_ARG_COUNT);
     for index in 0..count {
@@ -215,23 +229,37 @@ pub(crate) fn internal_launcher_requested() -> bool {
     env::args_os().nth(1).as_deref() == Some(OsStr::new(INTERNAL_LAUNCH_ARGUMENT))
 }
 
-#[cfg(windows)]
-pub(crate) struct ProcessTree(windows_sys::Win32::Foundation::HANDLE);
+pub(crate) struct ProcessTree {
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    #[cfg(windows)]
+    name: OsString,
+}
 
 #[cfg(windows)]
 impl ProcessTree {
-    pub(crate) fn attach(child: &dyn portable_pty::Child) -> io::Result<Self> {
-        use std::{os::windows::io::RawHandle, ptr};
+    fn new() -> io::Result<Self> {
+        use std::{
+            os::windows::ffi::OsStrExt,
+            sync::atomic::{AtomicU64, Ordering},
+        };
         use windows_sys::Win32::{
-            Foundation::{CloseHandle, HANDLE},
+            Foundation::CloseHandle,
             System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
                 JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
                 SetInformationJobObject,
             },
         };
 
-        let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
+        let name = OsString::from(format!(
+            "Local\\CrowdedRoom-{}-{}",
+            std::process::id(),
+            NEXT_JOB.fetch_add(1, Ordering::Relaxed)
+        ));
+        let wide: Vec<u16> = name.encode_wide().chain(std::iter::once(0)).collect();
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), wide.as_ptr()) };
         if job.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -249,26 +277,47 @@ impl ProcessTree {
             unsafe { CloseHandle(job) };
             return Err(io::Error::last_os_error());
         }
-        let process = child
-            .as_raw_handle()
-            .ok_or_else(|| io::Error::other("PTY child has no Windows process handle"))?
-            as RawHandle as HANDLE;
-        if unsafe { AssignProcessToJobObject(job, process) } == 0 {
-            unsafe { CloseHandle(job) };
+        Ok(Self { handle: job, name })
+    }
+
+    fn name(&self) -> &OsStr {
+        &self.name
+    }
+
+    fn join_current(name: &OsStr) -> io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::{
+                JobObjects::{AssignProcessToJobObject, OpenJobObjectW},
+                SystemServices::JOB_OBJECT_ASSIGN_PROCESS,
+                Threading::GetCurrentProcess,
+            },
+        };
+
+        let wide: Vec<u16> = name.encode_wide().chain(std::iter::once(0)).collect();
+        let job = unsafe { OpenJobObjectW(JOB_OBJECT_ASSIGN_PROCESS, 0, wide.as_ptr()) };
+        if job.is_null() {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self(job))
+        if unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) } == 0 {
+            let error = io::Error::last_os_error();
+            unsafe { CloseHandle(job) };
+            return Err(error);
+        }
+        unsafe { CloseHandle(job) };
+        Ok(())
     }
 
     pub(crate) fn terminate(&self) {
-        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1) };
+        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle, 1) };
     }
 }
 
 #[cfg(windows)]
 impl Drop for ProcessTree {
     fn drop(&mut self) {
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
     }
 }
 
@@ -404,7 +453,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn process_tree_termination_reaps_a_batch_descendant() {
-        use std::{thread, time::Duration};
+        use std::{io::Read, thread, time::Duration};
 
         use portable_pty::{PtySize, native_pty_system};
 
@@ -423,7 +472,8 @@ mod tests {
         }
         .portable()
         .unwrap();
-        let mut command = launch.into_command();
+        let (mut command, tree) = launch.into_parts();
+        let tree = tree.unwrap();
         let argv = command.get_argv_mut();
         argv.truncate(1);
         argv.extend([
@@ -442,8 +492,26 @@ mod tests {
                 pixel_height: 0,
             })
             .unwrap();
+        let mut output = pty.master.try_clone_reader().unwrap();
+        let mut input = pty.master.take_writer().unwrap();
+        thread::spawn(move || {
+            let mut bytes = [0; 4096];
+            let mut tail = Vec::new();
+            while let Ok(count) = output.read(&mut bytes) {
+                if count == 0
+                    || crate::pane::respond_to_terminal_queries(
+                        &mut *input,
+                        &mut tail,
+                        &bytes[..count],
+                    )
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let mut child = pty.slave.spawn_command(command).unwrap();
-        let tree = ProcessTree::attach(child.as_ref()).unwrap();
+        drop(pty.slave);
 
         for _ in 0..50 {
             if pid_file.is_file() {
@@ -452,7 +520,12 @@ mod tests {
             thread::sleep(Duration::from_millis(100));
         }
         let pid: u32 = fs::read_to_string(&pid_file)
-            .expect("batch descendant did not report its PID")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "batch descendant did not report its PID ({error}); launcher status: {:?}",
+                    child.try_wait()
+                )
+            })
             .parse()
             .unwrap();
         assert!(process_is_running(pid));

@@ -10,7 +10,7 @@ enum CliVendor {
 }
 
 pub(super) fn uses_bracketed_paste(spec: &RoomSpec) -> bool {
-    matches!(cli_vendor(spec), Ok(CliVendor::Codex))
+    matches!(cli_vendor(spec), Ok(CliVendor::Claude | CliVendor::Codex))
 }
 
 pub(super) fn clear_resume_args(spec: &mut RoomSpec) -> io::Result<()> {
@@ -167,4 +167,30 @@ fn strip_options(args: &mut Vec<OsString>, options: &[&str]) {
         index += 1;
     }
     *args = kept;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_room(program: &str) -> RoomSpec {
+        RoomSpec {
+            name: program.to_owned(),
+            vendor: String::new(),
+            title: program.to_owned(),
+            program: program.into(),
+            args: Vec::new(),
+            transport: Transport::Raw,
+            cwd: None,
+            variables: Vec::new(),
+            allow_control: false,
+        }
+    }
+
+    #[test]
+    fn claude_and_codex_use_bracketed_paste() {
+        assert!(uses_bracketed_paste(&raw_room("claude")));
+        assert!(uses_bracketed_paste(&raw_room("codex")));
+        assert!(!uses_bracketed_paste(&raw_room("opencode")));
+    }
 }
