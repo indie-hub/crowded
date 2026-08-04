@@ -1231,14 +1231,10 @@ mod tests {
             claude["hooks"]["SessionStart"][1]["hooks"][0]["command"]
                 .as_str()
                 .unwrap()
+                .replace('\\', "/")
                 .contains(".crowded/plugins/greetings/hooks/activate.js")
         );
-        assert!(
-            fs::symlink_metadata(project.join(".opencode/plugins/greetings.mjs"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        assert!(project.join(".opencode/plugins/greetings.mjs").is_file());
 
         // Reproduce v0.15.0's partial state: adapters off, skills still linked.
         adapters::disable_adapters(&project, "greetings").unwrap();

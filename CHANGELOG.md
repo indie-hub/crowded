@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.24.6] - 2026-08-04
+
+### Fixed
+
+- Fall back to copying OpenCode adapter files when Windows denies symbolic-link
+  creation.
+
 ## [0.24.5] - 2026-08-04
 
 ### Fixed

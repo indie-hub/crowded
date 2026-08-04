@@ -38,6 +38,8 @@ pub(super) struct AdapterState {
 pub(super) struct AdapterLink {
     path: PathBuf,
     target: PathBuf,
+    #[serde(default)]
+    copied: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -87,7 +89,7 @@ pub(super) fn enable_adapters(root: &Path, name: &str) -> io::Result<AdapterStat
         )));
     }
 
-    let plan = adapter_plan(root, name)?;
+    let mut plan = adapter_plan(root, name)?;
     if plan.hooks.is_empty() && plan.links.is_empty() {
         return Err(invalid_input(format!(
             "plugin `{name}` has no supported vendor adapters"
@@ -114,16 +116,19 @@ pub(super) fn enable_adapters(root: &Path, name: &str) -> io::Result<AdapterStat
 
     fs::create_dir_all(root.join(".crowded/plugin-data").join(name))?;
     let mut created_links = Vec::new();
-    for link in &plan.links {
+    for link in &mut plan.links {
         let path = root.join(&link.path);
         let result = path
             .parent()
             .ok_or_else(|| invalid_input("adapter link has no parent"))
             .and_then(fs::create_dir_all)
-            .and_then(|()| symlink(&link.target, &path));
-        if let Err(error) = result {
-            rollback_links(root, &created_links);
-            return Err(error);
+            .and_then(|()| create_adapter_link(&path, &link.target));
+        match result {
+            Ok(copied) => link.copied = copied,
+            Err(error) => {
+                rollback_links(root, &created_links);
+                return Err(error);
+            }
         }
         created_links.push(link.clone());
     }
@@ -176,6 +181,20 @@ pub(super) fn disable_adapters(root: &Path, name: &str) -> io::Result<AdapterSta
 
     for link in &state.links {
         let path = root.join(&link.path);
+        if link.copied {
+            match fs::read(&path) {
+                Ok(contents) if contents == fs::read(adapter_source(&path, &link.target)?)? => {}
+                Ok(_) => {
+                    return Err(invalid_data(format!(
+                        "{} no longer matches the Crowded-managed adapter",
+                        path.display()
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            continue;
+        }
         match fs::read_link(&path) {
             Ok(target) if target == link.target => {}
             Ok(_) => {
@@ -485,6 +504,7 @@ fn collect_adapter_links(
                 .join(name)
                 .join(relative_directory)
                 .join(file),
+            copied: false,
         });
     }
     links.sort_by(|left, right| left.path.cmp(&right.path));
@@ -656,8 +676,47 @@ fn restore_links(root: &Path, links: &[AdapterLink]) {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = symlink(&link.target, path);
+        if link.copied {
+            let _ = copy_adapter_file(&path, &link.target);
+        } else {
+            let _ = symlink(&link.target, path);
+        }
     }
+}
+
+fn create_adapter_link(path: &Path, target: &Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        symlink(target, path)?;
+        Ok(false)
+    }
+    #[cfg(windows)]
+    {
+        match symlink(target, path) {
+            Ok(()) => Ok(false),
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                copy_adapter_file(path, target)?;
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn copy_adapter_file(path: &Path, target: &Path) -> io::Result<()> {
+    match fs::copy(adapter_source(path, target)?, path) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(path);
+            Err(error)
+        }
+    }
+}
+
+fn adapter_source(path: &Path, target: &Path) -> io::Result<PathBuf> {
+    path.parent()
+        .map(|parent| parent.join(target))
+        .ok_or_else(|| invalid_input("adapter link has no parent"))
 }
 
 fn write_text_atomic(path: &Path, contents: &str) -> io::Result<()> {
