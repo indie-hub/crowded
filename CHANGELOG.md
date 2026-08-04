@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-08-04
+
+### Added
+
+- Configure shared remote MCP servers over Streamable HTTP or legacy SSE.
+
 ## [0.24.6] - 2026-08-04
 
 ### Fixed

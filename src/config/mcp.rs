@@ -8,12 +8,30 @@ use serde::Deserialize;
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpConfig {
     pub(crate) name: String,
-    pub(crate) command: String,
+    pub(crate) command: Option<String>,
     #[serde(default)]
     pub(crate) args: Vec<String>,
     pub(crate) cwd: Option<PathBuf>,
+    pub(crate) url: Option<String>,
+    pub(crate) transport: Option<McpTransport>,
     #[serde(default)]
     pub(crate) clients: Vec<McpClient>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum McpTransport {
+    Http,
+    Sse,
+}
+
+impl McpTransport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Sse => "sse",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
@@ -34,6 +52,37 @@ impl McpConfig {
     pub(crate) fn supports(&self, client: McpClient) -> bool {
         self.clients.is_empty() || self.clients.contains(&client)
     }
+
+    pub(crate) fn command(&self) -> Option<&str> {
+        self.command.as_deref()
+    }
+
+    pub(crate) fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+}
+
+fn has_http_host(url: &str) -> bool {
+    let Some(after_scheme) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host_and_port = authority.rsplit('@').next().unwrap_or_default();
+    if let Some(bracketed) = host_and_port.strip_prefix('[') {
+        return bracketed.split_once(']').is_some_and(|(host, suffix)| {
+            !host.is_empty() && (suffix.is_empty() || suffix.starts_with(':'))
+        });
+    }
+    host_and_port
+        .split(':')
+        .next()
+        .is_some_and(|host| !host.is_empty())
 }
 
 pub(crate) fn validate_mcp_servers(servers: &[McpConfig]) -> io::Result<()> {
@@ -57,11 +106,54 @@ pub(crate) fn validate_mcp_servers(servers: &[McpConfig]) -> io::Result<()> {
                 format!("duplicate MCP name: {}", server.name),
             ));
         }
-        if server.command.trim().is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("MCP {} command cannot be empty", server.name),
-            ));
+        match (
+            server.command.as_deref(),
+            server.url.as_deref(),
+            server.transport,
+        ) {
+            (Some(command), None, None) => {
+                if command.trim().is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("MCP {} command cannot be empty", server.name),
+                    ));
+                }
+            }
+            (None, Some(url), Some(transport)) => {
+                if !has_http_host(url) || url.chars().any(char::is_whitespace) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("MCP {} URL must be an HTTP(S) URL", server.name),
+                    ));
+                }
+                if !server.args.is_empty() || server.cwd.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "MCP {} remote transport cannot use args or cwd",
+                            server.name
+                        ),
+                    ));
+                }
+                if transport == McpTransport::Sse && server.supports(McpClient::Codex) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "MCP {} uses legacy SSE, which cannot target Codex; set clients to claude and/or opencode",
+                            server.name
+                        ),
+                    ));
+                }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "MCP {} must set command for local stdio, or url and transport for remote HTTP/SSE",
+                        server.name
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -92,11 +184,20 @@ pub(crate) fn claude_mcp_config(servers: &[McpConfig]) -> io::Result<String> {
         .iter()
         .filter(|server| server.supports(McpClient::Claude))
     {
-        let mut entry = serde_json::json!({
-            "command": server.command,
-            "args": server.args,
-        });
-        if let Some(cwd) = &server.cwd {
+        let mut entry = if let (Some(url), Some(transport)) = (&server.url, server.transport) {
+            serde_json::json!({
+                "type": transport.as_str(),
+                "url": url,
+            })
+        } else {
+            serde_json::json!({
+                "command": server.command,
+                "args": server.args,
+            })
+        };
+        if server.transport.is_none()
+            && let Some(cwd) = &server.cwd
+        {
             entry["cwd"] = serde_json::Value::String(cwd.to_string_lossy().into_owned());
         }
         configured.insert(server.name.clone(), entry);
@@ -112,36 +213,43 @@ pub(crate) fn codex_mcp_args(servers: &[McpConfig]) -> Vec<OsString> {
         .filter(|server| server.supports(McpClient::Codex))
     {
         let prefix = format!("mcp_servers.{}", server.name);
-        args.extend([
-            "-c".into(),
-            format!(
-                "{prefix}.command={}",
-                toml::Value::String(server.command.clone())
-            )
-            .into(),
-            "-c".into(),
-            format!(
-                "{prefix}.args={}",
-                toml::Value::Array(
-                    server
-                        .args
-                        .iter()
-                        .cloned()
-                        .map(toml::Value::String)
-                        .collect()
-                )
-            )
-            .into(),
-        ]);
-        if let Some(cwd) = &server.cwd {
+        if let Some(url) = &server.url {
+            args.extend([
+                "-c".into(),
+                format!("{prefix}.url={}", toml::Value::String(url.clone())).into(),
+            ]);
+        } else {
             args.extend([
                 "-c".into(),
                 format!(
-                    "{prefix}.cwd={}",
-                    toml::Value::String(cwd.to_string_lossy().into_owned())
+                    "{prefix}.command={}",
+                    toml::Value::String(server.command.clone().unwrap_or_default())
+                )
+                .into(),
+                "-c".into(),
+                format!(
+                    "{prefix}.args={}",
+                    toml::Value::Array(
+                        server
+                            .args
+                            .iter()
+                            .cloned()
+                            .map(toml::Value::String)
+                            .collect()
+                    )
                 )
                 .into(),
             ]);
+            if let Some(cwd) = &server.cwd {
+                args.extend([
+                    "-c".into(),
+                    format!(
+                        "{prefix}.cwd={}",
+                        toml::Value::String(cwd.to_string_lossy().into_owned())
+                    )
+                    .into(),
+                ]);
+            }
         }
     }
     args
@@ -179,14 +287,24 @@ pub(crate) fn opencode_mcp_config(
                 )
             })?;
         for server in open_code_servers {
-            let mut command = vec![server.command.clone()];
-            command.extend(server.args.iter().cloned());
-            let mut entry = serde_json::json!({
-                "type": "local",
-                "command": command,
-                "enabled": true,
-            });
-            if let Some(cwd) = &server.cwd {
+            let mut entry = if let Some(url) = &server.url {
+                serde_json::json!({
+                    "type": "remote",
+                    "url": url,
+                    "enabled": true,
+                })
+            } else {
+                let mut command = vec![server.command.clone().unwrap_or_default()];
+                command.extend(server.args.iter().cloned());
+                serde_json::json!({
+                    "type": "local",
+                    "command": command,
+                    "enabled": true,
+                })
+            };
+            if server.transport.is_none()
+                && let Some(cwd) = &server.cwd
+            {
                 entry["cwd"] = serde_json::Value::String(cwd.to_string_lossy().into_owned());
             }
             mcp.insert(server.name.clone(), entry);

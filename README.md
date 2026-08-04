@@ -237,6 +237,26 @@ command = "basic-memory"
 args = ["mcp"]
 ```
 
+Remote Streamable HTTP servers use a URL instead of a command:
+
+```toml
+[[mcp]]
+name = "remote-tools"
+url = "https://example.com/mcp"
+transport = "http"
+```
+
+Legacy SSE is available to Claude and OpenCode, but must explicitly exclude
+Codex because Codex only documents Streamable HTTP:
+
+```toml
+[[mcp]]
+name = "legacy-tools"
+url = "https://example.com/sse"
+transport = "sse"
+clients = ["claude", "opencode"]
+```
+
 Limit an MCP to particular clients when a vendor has a better native adapter:
 
 ```toml

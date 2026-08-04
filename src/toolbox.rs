@@ -898,26 +898,30 @@ fn merge_codex(original: Option<&str>, servers: &[McpConfig], path: &Path) -> io
         .filter(|server| server.supports(McpClient::Codex))
     {
         output.push_str(&format!("[mcp_servers.{}]\n", server.name));
-        output.push_str(&format!(
-            "command = {}\n",
-            toml::Value::String(server.command.clone())
-        ));
-        output.push_str(&format!(
-            "args = {}\n",
-            toml::Value::Array(
-                server
-                    .args
-                    .iter()
-                    .cloned()
-                    .map(toml::Value::String)
-                    .collect()
-            )
-        ));
-        if let Some(cwd) = &server.cwd {
+        if let Some(url) = server.url() {
+            output.push_str(&format!("url = {}\n", toml::Value::String(url.to_owned())));
+        } else {
             output.push_str(&format!(
-                "cwd = {}\n",
-                toml::Value::String(cwd.to_string_lossy().into_owned())
+                "command = {}\n",
+                toml::Value::String(server.command().unwrap_or_default().to_owned())
             ));
+            output.push_str(&format!(
+                "args = {}\n",
+                toml::Value::Array(
+                    server
+                        .args
+                        .iter()
+                        .cloned()
+                        .map(toml::Value::String)
+                        .collect()
+                )
+            ));
+            if let Some(cwd) = &server.cwd {
+                output.push_str(&format!(
+                    "cwd = {}\n",
+                    toml::Value::String(cwd.to_string_lossy().into_owned())
+                ));
+            }
         }
         output.push('\n');
     }
@@ -1067,6 +1071,40 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn codex_native_config_serializes_streamable_http_url() {
+        let config: crate::config::RoomFile = toml::from_str(
+            r#"
+                [[mcp]]
+                name = "streamable"
+                url = "https://example.com/mcp"
+                transport = "http"
+
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+            "#,
+        )
+        .unwrap();
+        validate_mcp_servers(&config.mcp_servers).unwrap();
+
+        let generated = merge_codex(
+            Some("model = \"gpt-5\"\n"),
+            &config.mcp_servers,
+            Path::new(".codex/config.toml"),
+        )
+        .unwrap();
+
+        assert!(generated.contains("[mcp_servers.streamable]\n"));
+        assert!(generated.contains("url = \"https://example.com/mcp\"\n"));
+        assert!(!generated.contains("command ="));
+        assert!(!generated.contains("args ="));
+    }
 
     #[test]
     fn native_files_merge_and_restore_without_losing_existing_config() {

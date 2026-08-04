@@ -489,6 +489,149 @@ mod tests {
     }
 
     #[test]
+    fn remote_mcps_are_adapted_for_each_native_cli() {
+        let rooms = room_specs_from_toml(
+            r#"
+                [[mcp]]
+                name = "streamable"
+                url = "https://example.com/mcp"
+                transport = "http"
+
+                [[mcp]]
+                name = "legacy"
+                url = "https://example.com/sse"
+                transport = "sse"
+                clients = ["claude", "opencode"]
+
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+
+                [[rooms]]
+                command = "opencode"
+                transport = "raw"
+            "#,
+        )
+        .unwrap();
+
+        let claude: serde_json::Value =
+            serde_json::from_str(rooms[0].args[1].to_str().unwrap()).unwrap();
+        assert_eq!(claude["mcpServers"]["streamable"]["type"], "http");
+        assert_eq!(
+            claude["mcpServers"]["streamable"]["url"],
+            "https://example.com/mcp"
+        );
+        assert_eq!(claude["mcpServers"]["legacy"]["type"], "sse");
+        assert_eq!(
+            claude["mcpServers"]["legacy"]["url"],
+            "https://example.com/sse"
+        );
+
+        let codex: Vec<_> = rooms[1]
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
+        assert!(codex.contains(&"mcp_servers.streamable.url=\"https://example.com/mcp\"".into()));
+        assert!(codex.iter().all(|arg| !arg.contains("legacy")));
+
+        let opencode: serde_json::Value = serde_json::from_str(
+            rooms[2]
+                .variables
+                .iter()
+                .find(|(key, _)| key == "OPENCODE_CONFIG_CONTENT")
+                .unwrap()
+                .1
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(opencode["mcp"]["streamable"]["type"], "remote");
+        assert_eq!(
+            opencode["mcp"]["streamable"]["url"],
+            "https://example.com/mcp"
+        );
+        assert_eq!(opencode["mcp"]["streamable"]["enabled"], true);
+        assert_eq!(opencode["mcp"]["legacy"]["type"], "remote");
+        assert_eq!(opencode["mcp"]["legacy"]["url"], "https://example.com/sse");
+    }
+
+    #[test]
+    fn legacy_sse_cannot_target_codex() {
+        let error = room_specs_from_toml(
+            r#"
+                [[mcp]]
+                name = "legacy"
+                url = "https://example.com/sse"
+                transport = "sse"
+
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+            "#,
+        )
+        .err()
+        .unwrap();
+
+        assert!(error.to_string().contains("cannot target Codex"));
+    }
+
+    #[test]
+    fn remote_mcp_url_requires_a_host() {
+        for url in ["http://", "https:///mcp", "http://?x=1"] {
+            let config = format!(
+                r#"
+                    [[mcp]]
+                    name = "remote"
+                    url = "{url}"
+                    transport = "http"
+
+                    [[rooms]]
+                    command = "claude"
+                    transport = "raw"
+
+                    [[rooms]]
+                    command = "codex"
+                    transport = "raw"
+                "#
+            );
+            let error = room_specs_from_toml(&config).err().unwrap();
+            assert!(
+                error.to_string().contains("must be an HTTP(S) URL"),
+                "{url}: {error}"
+            );
+        }
+
+        for url in ["http://localhost:8080/mcp", "http://[::1]:8080/mcp"] {
+            let config = format!(
+                r#"
+                    [[mcp]]
+                    name = "remote"
+                    url = "{url}"
+                    transport = "http"
+
+                    [[rooms]]
+                    command = "claude"
+                    transport = "raw"
+
+                    [[rooms]]
+                    command = "codex"
+                    transport = "raw"
+                "#
+            );
+            assert!(room_specs_from_toml(&config).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
     fn context_mode_uses_mcp_for_claude_and_codex_but_a_plugin_for_opencode() {
         let rooms = room_specs_from_toml(
             r#"
