@@ -7,6 +7,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- Generate PowerShell `commandWindows` pulse commands in Codex hook files.
+
 ## [0.24.3] - 2026-08-03
 
 ### Fixed
