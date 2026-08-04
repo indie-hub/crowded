@@ -7,9 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.24.4] - 2026-08-04
+
 ### Fixed
 
 - Generate PowerShell `commandWindows` pulse commands in Codex hook files.
+- Fall back to Windows directory junctions when creating plugin skill links is
+  blocked by local symbolic-link privilege policy.
 
 ## [0.24.3] - 2026-08-03
 

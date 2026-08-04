@@ -11,8 +11,6 @@ use std::{
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
-#[cfg(windows)]
-use std::os::windows::fs::symlink_dir as symlink;
 
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -322,7 +320,7 @@ fn prepare_install(
             .parent()
             .ok_or_else(|| invalid_input("skill link has no parent"))
             .and_then(fs::create_dir_all)
-            .and_then(|()| symlink(target, link));
+            .and_then(|()| create_skill_link(target, link));
         if let Err(error) = result {
             for link in created {
                 let _ = remove_skill_link(link);
@@ -870,12 +868,14 @@ fn skill_link_presence(
         .into_iter()
         .map(|(link, expected)| {
             let present = match fs::read_link(&link) {
-                Ok(actual) if actual == expected => true,
-                Ok(_) => {
-                    return Err(invalid_data(format!(
-                        "{} no longer points to the Crowded-managed skill",
-                        link.display()
-                    )));
+                Ok(actual) => {
+                    if !skill_link_matches(&link, &actual, &expected)? {
+                        return Err(invalid_data(format!(
+                            "{} no longer points to the Crowded-managed skill",
+                            link.display()
+                        )));
+                    }
+                    true
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => false,
                 Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
@@ -902,7 +902,7 @@ fn enable_skill_links(root: &Path, plugin: &InstallRecord) -> io::Result<Vec<(Pa
             .parent()
             .ok_or_else(|| invalid_input("skill link has no parent"))
             .and_then(fs::create_dir_all)
-            .and_then(|()| symlink(&target, &link));
+            .and_then(|()| create_skill_link(&target, &link));
         if let Err(error) = result {
             return match remove_skill_links(&created) {
                 Ok(()) => Err(error),
@@ -914,6 +914,59 @@ fn enable_skill_links(root: &Path, plugin: &InstallRecord) -> io::Result<Vec<(Pa
         created.push((link, target));
     }
     Ok(created)
+}
+
+fn skill_link_matches(link: &Path, actual: &Path, expected: &Path) -> io::Result<bool> {
+    let parent = link
+        .parent()
+        .ok_or_else(|| invalid_input("skill link has no parent"))?;
+    let resolve = |target: &Path| {
+        fs::canonicalize(if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            parent.join(target)
+        })
+    };
+    Ok(resolve(actual)? == resolve(expected)?)
+}
+
+#[cfg(unix)]
+fn create_skill_link(target: &Path, link: &Path) -> io::Result<()> {
+    symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_skill_link(target: &Path, link: &Path) -> io::Result<()> {
+    use std::os::windows::fs::symlink_dir;
+
+    match symlink_dir(target, link) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(1314) => {
+            let parent = link
+                .parent()
+                .ok_or_else(|| invalid_input("skill link has no parent"))?;
+            let target = parent.join(target);
+            let status = Command::new("powershell.exe")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "New-Item -ItemType Junction -Path $env:CROWDED_SKILL_LINK -Target $env:CROWDED_SKILL_TARGET -ErrorAction Stop | Out-Null",
+                ])
+                .env("CROWDED_SKILL_LINK", link)
+                .env("CROWDED_SKILL_TARGET", target)
+                .status()?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "could not create Windows skill junction: {status}"
+                )))
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn disable_skill_links(root: &Path, plugin: &InstallRecord) -> io::Result<Vec<(PathBuf, PathBuf)>> {
@@ -963,7 +1016,7 @@ fn restore_skill_links(links: &[(PathBuf, PathBuf)]) -> io::Result<()> {
             .parent()
             .ok_or_else(|| invalid_input("skill link has no parent"))?;
         fs::create_dir_all(parent)?;
-        symlink(target, link)?;
+        create_skill_link(target, link)?;
     }
     Ok(())
 }
@@ -1040,14 +1093,26 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_skill_links_use_directory_removal() {
+    fn windows_skill_links_work_without_symlink_privilege() {
         let base = test_directory();
+        let target = base.join("target");
         let link = base.join("skill-link");
-        fs::create_dir(&link).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "skill").unwrap();
+
+        create_skill_link(Path::new("target"), &link).unwrap();
+
+        assert!(link.join("SKILL.md").is_file());
+        assert!(
+            skill_link_matches(&link, &fs::read_link(&link).unwrap(), Path::new("target")).unwrap()
+        );
 
         remove_skill_link(&link).unwrap();
 
         assert!(!link.exists());
+        assert!(target.join("SKILL.md").is_file());
+        fs::remove_file(target.join("SKILL.md")).unwrap();
+        fs::remove_dir(target).unwrap();
         fs::remove_dir(base).unwrap();
     }
 

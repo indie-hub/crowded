@@ -22,3 +22,9 @@ target
 **/.crowded-toolbox-*.tmp
 # CocoIndex Code (ccc)
 /.cocoindex_code/
+.agents
+.claude
+.code4me
+.codegraph
+.codex
+.opencode
