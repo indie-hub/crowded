@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.24.3] - 2026-08-03
+
+### Fixed
+
+- Remove Windows directory-symlinked plugin skills with the directory API so
+  `crowded plugin disable` no longer fails with Access Denied.
+
 ## [0.24.2] - 2026-08-03
 
 ### Fixed

@@ -325,7 +325,7 @@ fn prepare_install(
             .and_then(|()| symlink(target, link));
         if let Err(error) = result {
             for link in created {
-                let _ = fs::remove_file(link);
+                let _ = remove_skill_link(link);
             }
             let _ = fs::remove_dir_all(&installed);
             return Err(error);
@@ -923,7 +923,7 @@ fn disable_skill_links(root: &Path, plugin: &InstallRecord) -> io::Result<Vec<(P
         if !present {
             continue;
         }
-        if let Err(error) = fs::remove_file(&link) {
+        if let Err(error) = remove_skill_link(&link) {
             return match restore_skill_links(&removed) {
                 Ok(()) => Err(error),
                 Err(rollback) => Err(io::Error::other(format!(
@@ -938,13 +938,23 @@ fn disable_skill_links(root: &Path, plugin: &InstallRecord) -> io::Result<Vec<(P
 
 fn remove_skill_links(links: &[(PathBuf, PathBuf)]) -> io::Result<()> {
     for (link, _) in links.iter().rev() {
-        match fs::remove_file(link) {
+        match remove_skill_link(link) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn remove_skill_link(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)
+}
+
+#[cfg(windows)]
+fn remove_skill_link(path: &Path) -> io::Result<()> {
+    fs::remove_dir(path)
 }
 
 fn restore_skill_links(links: &[(PathBuf, PathBuf)]) -> io::Result<()> {
@@ -1027,6 +1037,19 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_skill_links_use_directory_removal() {
+        let base = test_directory();
+        let link = base.join("skill-link");
+        fs::create_dir(&link).unwrap();
+
+        remove_skill_link(&link).unwrap();
+
+        assert!(!link.exists());
+        fs::remove_dir(base).unwrap();
+    }
 
     #[test]
     fn local_plugin_is_shared_and_removed_without_touching_other_files() {
