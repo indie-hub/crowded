@@ -271,9 +271,10 @@ pub(super) fn adapter_plan(root: &Path, name: &str) -> io::Result<AdapterState> 
             && installed.join(hook_path).try_exists()?
         {
             let hook_path = safe_plugin_file(&installed, hook_path)?;
+            let windows_command = target == Path::new(".codex/hooks.json");
             hooks.push(AdapterHooks {
                 path: target,
-                entries: adapted_hooks(root, name, &hook_path)?,
+                entries: adapted_hooks(root, name, &hook_path, windows_command)?,
                 created: false,
             });
         }
@@ -320,6 +321,7 @@ fn adapted_hooks(
     root: &Path,
     name: &str,
     hook_path: &Path,
+    windows_command: bool,
 ) -> io::Result<BTreeMap<String, Vec<Value>>> {
     let document: Value = serde_json::from_str(&fs::read_to_string(hook_path)?)
         .map_err(|error| invalid_data(format!("invalid {}: {error}", hook_path.display())))?;
@@ -338,7 +340,7 @@ fn adapted_hooks(
             ))
         })?;
         for handler in &mut handlers {
-            adapt_hook_commands(handler, &plugin_root, &plugin_data);
+            adapt_hook_commands(handler, &plugin_root, &plugin_data, windows_command);
         }
         adapted.insert(event.clone(), handlers);
     }
@@ -374,14 +376,28 @@ fn collect_hook_commands<'a>(value: &'a Value, commands: &mut Vec<&'a str>) {
     }
 }
 
-fn adapt_hook_commands(value: &mut Value, plugin_root: &Path, plugin_data: &Path) {
+fn adapt_hook_commands(
+    value: &mut Value,
+    plugin_root: &Path,
+    plugin_data: &Path,
+    windows_command: bool,
+) {
     match value {
         Value::Array(values) => {
             for value in values {
-                adapt_hook_commands(value, plugin_root, plugin_data);
+                adapt_hook_commands(value, plugin_root, plugin_data, windows_command);
             }
         }
         Value::Object(object) => {
+            let windows = windows_command
+                .then(|| {
+                    object
+                        .get("commandWindows")
+                        .or_else(|| object.get("command"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .flatten();
             if let Some(Value::String(command)) = object.get_mut("command") {
                 let root = plugin_root.to_string_lossy();
                 let data = plugin_data.to_string_lossy();
@@ -398,8 +414,27 @@ fn adapt_hook_commands(value: &mut Value, plugin_root: &Path, plugin_data: &Path
                     shell_quote(&data)
                 );
             }
+            if let Some(command) = windows {
+                let root = plugin_root.to_string_lossy();
+                let data = plugin_data.to_string_lossy();
+                let adapted = command
+                    .replace("${CLAUDE_PLUGIN_ROOT}", "$env:CLAUDE_PLUGIN_ROOT")
+                    .replace("$CLAUDE_PLUGIN_ROOT", "$env:CLAUDE_PLUGIN_ROOT")
+                    .replace("${PLUGIN_ROOT}", "$env:PLUGIN_ROOT")
+                    .replace("$PLUGIN_ROOT", "$env:PLUGIN_ROOT");
+                object.insert(
+                    "commandWindows".into(),
+                    Value::String(format!(
+                        "$env:CLAUDE_PLUGIN_ROOT={}; $env:PLUGIN_ROOT={}; $env:CLAUDE_PLUGIN_DATA={}; $env:PLUGIN_DATA={}; {adapted}",
+                        powershell_quote(&root),
+                        powershell_quote(&root),
+                        powershell_quote(&data),
+                        powershell_quote(&data)
+                    )),
+                );
+            }
             for value in object.values_mut() {
-                adapt_hook_commands(value, plugin_root, plugin_data);
+                adapt_hook_commands(value, plugin_root, plugin_data, windows_command);
             }
         }
         _ => {}
@@ -653,4 +688,29 @@ fn write_text_atomic(path: &Path, contents: &str) -> io::Result<()> {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_hooks_get_powershell_commands() {
+        let root = Path::new(r"C:\Plugin O'Brien");
+        let data = Path::new(r"C:\Data O'Brien");
+        let mut hook = serde_json::json!({
+            "command": "node \"${PLUGIN_ROOT}/hooks/codex/pretooluse.mjs\""
+        });
+
+        adapt_hook_commands(&mut hook, root, data, true);
+
+        assert_eq!(
+            hook["commandWindows"],
+            r#"$env:CLAUDE_PLUGIN_ROOT='C:\Plugin O''Brien'; $env:PLUGIN_ROOT='C:\Plugin O''Brien'; $env:CLAUDE_PLUGIN_DATA='C:\Data O''Brien'; $env:PLUGIN_DATA='C:\Data O''Brien'; node "$env:PLUGIN_ROOT/hooks/codex/pretooluse.mjs""#
+        );
+    }
 }

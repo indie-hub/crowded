@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.24.5] - 2026-08-04
+
+### Fixed
+
+- Generate PowerShell `commandWindows` entries for Codex plugin adapter hooks.
+
 ## [0.24.4] - 2026-08-04
 
 ### Fixed
