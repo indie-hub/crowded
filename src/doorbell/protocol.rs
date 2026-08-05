@@ -8,8 +8,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-pub(super) const MAX_WIRE_BYTES: usize = 8 * 1024;
-pub(super) const MAX_BODY_BYTES: usize = 4 * 1024;
+pub(super) const MAX_WIRE_BYTES: usize = 2 * 1024 * 1024;
+pub(super) const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_ID_BYTES: usize = 128;
 pub(super) const MAX_LABEL_BYTES: usize = 64;
 pub(super) const MAX_HOPS: u8 = 8;
@@ -254,7 +254,9 @@ pub(super) fn validate_request(
 ) -> Result<usize, String> {
     let from = validate_route(&request.token, &request.id, request.to, tokens, room_count)?;
     if request.body.is_empty() || request.body.len() > MAX_BODY_BYTES {
-        return Err("message body must contain 1..=4096 bytes".to_owned());
+        return Err(format!(
+            "message body must contain 1..={MAX_BODY_BYTES} bytes"
+        ));
     }
     validate_label("task", request.task.as_deref())?;
     validate_label("role", request.role.as_deref())?;
@@ -367,4 +369,33 @@ pub(super) fn validate_label(name: &str, value: Option<&str>) -> Result<(), Stri
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_large_agent_message() {
+        let request = MessageRequest {
+            token: "sender".to_owned(),
+            id: "large-message".to_owned(),
+            to: 2,
+            body: "x".repeat(64 * 1024),
+            task: None,
+            role: None,
+            hop: 0,
+        };
+        let mut recent = vec![VecDeque::new(), VecDeque::new()];
+
+        assert_eq!(
+            validate_request(
+                &request,
+                &["sender".to_owned(), "receiver".to_owned()],
+                2,
+                &mut recent,
+            ),
+            Ok(0)
+        );
+    }
 }

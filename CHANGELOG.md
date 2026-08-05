@@ -7,6 +7,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-08-04
+
+### Changed
+
+- Raise Doorbell message bodies from 4 KiB to 1 MiB.
+- Wait longer before submitting pasted raw messages on Windows so Codex
+  receives the final Enter key.
+
 ## [0.25.0] - 2026-08-04
 
 ### Added

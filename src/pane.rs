@@ -128,7 +128,7 @@ fn opencode_input_ready(screen: &str) -> bool {
 #[cfg(not(windows))]
 const RAW_SUBMIT_DELAY: Duration = Duration::from_millis(150);
 #[cfg(windows)]
-const RAW_SUBMIT_DELAY: Duration = Duration::from_millis(500);
+const RAW_SUBMIT_DELAY: Duration = Duration::from_secs(1);
 
 fn whisper_parts(
     transport: Transport,
