@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.26.1] - 2026-08-06
+
+### Fixed
+
+- Headroom-wrapped rooms now get extra quiet-time grace before the house-rules intro is delivered, so the `headroom wrap` spawn-then-exec hop's own startup pause is no longer mistaken for the guest CLI being ready.
+
 ## [0.26.0] - 2026-08-06
 
 ### Added

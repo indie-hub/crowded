@@ -39,6 +39,11 @@ enum InputMode {
 const HOUSE_RULES_QUIET: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const HOUSE_RULES_QUIET: Duration = Duration::from_secs(5);
+// ponytail: `headroom wrap` adds a spawn-then-exec hop with its own quiet
+// startup gap before the real guest CLI ever draws a prompt; a flat time-based
+// grace absorbs it. Upgrade path if it still misfires: per-guest content
+// detection like `opencode_input_ready`, keyed off the actual spawned program.
+const HEADROOM_STARTUP_GRACE: Duration = Duration::from_secs(3);
 const AUTO_DELIVERY_LIMIT: usize = 20;
 
 struct DeliveryFuse {
@@ -121,6 +126,17 @@ impl DeliveryFuse {
 
     fn reset(&mut self) {
         self.used = 0;
+    }
+}
+
+/// How long a pane's output must stay quiet before automation treats it as
+/// idle-and-ready. Headroom-wrapped panes get extra grace to absorb the
+/// spawn-then-exec hop's own quiet gap (see `HEADROOM_STARTUP_GRACE`).
+fn quiet_threshold(headroom_active: bool) -> Duration {
+    if headroom_active {
+        HOUSE_RULES_QUIET + HEADROOM_STARTUP_GRACE
+    } else {
+        HOUSE_RULES_QUIET
     }
 }
 
@@ -367,8 +383,9 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .enumerate()
             .map(|(index, pane)| {
-                let output_is_quiet = last_output[index]
-                    .is_some_and(|last| now.duration_since(last) >= HOUSE_RULES_QUIET);
+                let output_is_quiet = last_output[index].is_some_and(|last| {
+                    now.duration_since(last) >= quiet_threshold(pane.headroom_active())
+                });
                 pane.automation_input_ready(output_is_quiet)
             })
             .collect();
@@ -924,6 +941,16 @@ mod tests {
             roster_state(true, DeliveryGate::Ready, true, Some(PulseState::Thinking)),
             PulseState::Thinking
         );
+    }
+
+    #[test]
+    fn quiet_threshold_grants_headroom_panes_extra_startup_grace() {
+        assert_eq!(quiet_threshold(false), HOUSE_RULES_QUIET);
+        assert_eq!(
+            quiet_threshold(true),
+            HOUSE_RULES_QUIET + HEADROOM_STARTUP_GRACE
+        );
+        assert!(quiet_threshold(true) > quiet_threshold(false));
     }
 
     #[test]
