@@ -54,6 +54,19 @@ pub(super) fn set_effort(spec: &mut RoomSpec, effort: &str) -> io::Result<()> {
     Ok(())
 }
 
+pub(super) fn current_model(spec: &RoomSpec) -> Option<String> {
+    let _ = cli_vendor(spec).ok()?;
+    scan_option(&spec.args, &["--model", "-m"])
+}
+
+pub(super) fn current_effort(spec: &RoomSpec) -> Option<String> {
+    match cli_vendor(spec).ok()? {
+        CliVendor::Claude => scan_option(&spec.args, &["--effort"]),
+        CliVendor::Codex => scan_codex_effort(&spec.args),
+        CliVendor::OpenCode => None,
+    }
+}
+
 fn cli_vendor(spec: &RoomSpec) -> io::Result<CliVendor> {
     if spec.transport != Transport::Raw {
         return Err(io::Error::new(
@@ -169,6 +182,45 @@ fn strip_options(args: &mut Vec<OsString>, options: &[&str]) {
     *args = kept;
 }
 
+fn scan_option(args: &[OsString], aliases: &[&str]) -> Option<String> {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].to_string_lossy();
+        for alias in aliases {
+            if argument == *alias {
+                return args
+                    .get(index + 1)
+                    .map(|v| v.to_string_lossy().into_owned());
+            }
+            if let Some(value) = argument.strip_prefix(&format!("{alias}=")) {
+                return Some(value.to_owned());
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn scan_codex_effort(args: &[OsString]) -> Option<String> {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].to_string_lossy();
+        if matches!(argument.as_ref(), "-c" | "--config")
+            && let Some(value) = args.get(index + 1)
+        {
+            let value = value.to_string_lossy();
+            if let Some(effort) = value.strip_prefix("model_reasoning_effort=") {
+                return Some(effort.trim_matches('"').to_owned());
+            }
+        }
+        if let Some(effort) = argument.strip_prefix("--config=model_reasoning_effort=") {
+            return Some(effort.trim_matches('"').to_owned());
+        }
+        index += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +244,27 @@ mod tests {
         assert!(uses_bracketed_paste(&raw_room("claude")));
         assert!(uses_bracketed_paste(&raw_room("codex")));
         assert!(!uses_bracketed_paste(&raw_room("opencode")));
+    }
+
+    #[test]
+    fn current_model_effort_roundtrips_set_for_claude_and_codex() {
+        let mut claude = raw_room("claude");
+        set_model(&mut claude, "sonnet").unwrap();
+        set_effort(&mut claude, "high").unwrap();
+        assert_eq!(current_model(&claude).as_deref(), Some("sonnet"));
+        assert_eq!(current_effort(&claude).as_deref(), Some("high"));
+
+        let mut codex = raw_room("codex");
+        set_model(&mut codex, "gpt-5").unwrap();
+        set_effort(&mut codex, "xhigh").unwrap();
+        assert_eq!(current_model(&codex).as_deref(), Some("gpt-5"));
+        assert_eq!(current_effort(&codex).as_deref(), Some("xhigh"));
+
+        let opencode = raw_room("opencode");
+        assert_eq!(current_effort(&opencode).as_deref(), None);
+
+        let mut opencode = raw_room("opencode");
+        set_model(&mut opencode, "gpt-5").unwrap();
+        assert_eq!(current_model(&opencode).as_deref(), Some("gpt-5"));
     }
 }

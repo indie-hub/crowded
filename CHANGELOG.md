@@ -7,6 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.25.3] - 2026-08-06
+
+### Added
+
+- `crowded control ROOM model M effort E` sets model and effort together in one restart instead of two. `crowded roster` now reports each room's current `model` and `effort`, read live from its launch arguments.
+
+### Changed
+
+- `ControlAction::SetModel`/`SetEffort` merged into a single `ControlAction::Configure { model, effort }` on the Doorbell wire protocol.
+
 ## [0.25.2] - 2026-08-06
 
 ### Fixed

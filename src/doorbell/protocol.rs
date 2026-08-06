@@ -65,16 +65,34 @@ pub(super) struct ControlRequest {
 #[serde(tag = "action", content = "value", rename_all = "snake_case")]
 pub(crate) enum ControlAction {
     ClearContext,
-    SetModel(String),
-    SetEffort(Effort),
+    Configure {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        effort: Option<Effort>,
+    },
 }
 
 impl ControlAction {
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::ClearContext => "clear context",
-            Self::SetModel(_) => "set model",
-            Self::SetEffort(_) => "set effort",
+            Self::Configure {
+                model: Some(_),
+                effort: Some(_),
+            } => "set model and effort",
+            Self::Configure {
+                model: Some(_),
+                effort: None,
+            } => "set model",
+            Self::Configure {
+                model: None,
+                effort: Some(_),
+            } => "set effort",
+            Self::Configure {
+                model: None,
+                effort: None,
+            } => "set model and effort",
         }
     }
 }
@@ -121,6 +139,8 @@ pub(crate) struct RosterRoom {
     pub(crate) transport: String,
     pub(crate) state: PulseState,
     pub(crate) allow_control: bool,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
 }
 
 impl PulseState {
@@ -274,7 +294,9 @@ pub(super) fn validate_control(
     recent_by_room: &mut [VecDeque<Instant>],
 ) -> Result<usize, String> {
     let from = validate_route(&request.token, &request.id, request.to, tokens, room_count)?;
-    if let ControlAction::SetModel(model) = &request.action
+    if let ControlAction::Configure {
+        model: Some(model), ..
+    } = &request.action
         && (model.is_empty()
             || model.len() > 128
             || model.starts_with('-')

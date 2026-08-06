@@ -106,31 +106,58 @@ pub(crate) fn send_command() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 const CONTROL_USAGE: &str =
-    "usage: crowded control ROOM clear | model MODEL | effort low|medium|high|xhigh|max";
+    "usage: crowded control ROOM clear | model MODEL | effort LEVEL | model MODEL effort LEVEL";
 
 pub(super) fn parse_control_args(
     args: impl IntoIterator<Item = String>,
 ) -> Result<(usize, ControlAction), String> {
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
     let target = args
         .next()
         .ok_or_else(|| CONTROL_USAGE.to_owned())?
         .parse()
         .map_err(|_| CONTROL_USAGE.to_owned())?;
-    let action = match (args.next().as_deref(), args.next(), args.next()) {
-        (Some("clear"), None, None) => ControlAction::ClearContext,
-        (Some("model"), Some(model), None) => ControlAction::SetModel(model),
-        (Some("effort"), Some(effort), None) => ControlAction::SetEffort(match effort.as_str() {
-            "low" => Effort::Low,
-            "medium" => Effort::Medium,
-            "high" => Effort::High,
-            "xhigh" => Effort::Xhigh,
-            "max" => Effort::Max,
+    if args.peek().is_some_and(|next| next == "clear") {
+        args.next();
+        if args.next().is_none() {
+            return Ok((target, ControlAction::ClearContext));
+        }
+        return Err(CONTROL_USAGE.to_owned());
+    }
+    let mut model = None;
+    let mut effort = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "clear" => return Err(CONTROL_USAGE.to_owned()),
+            "model" => {
+                if model.is_some() {
+                    return Err(CONTROL_USAGE.to_owned());
+                }
+                let value = args.next().ok_or_else(|| CONTROL_USAGE.to_owned())?;
+                model = Some(value);
+            }
+            "effort" => {
+                if effort.is_some() {
+                    return Err(CONTROL_USAGE.to_owned());
+                }
+                let value = args.next().ok_or_else(|| CONTROL_USAGE.to_owned())?;
+                let parsed = match value.as_str() {
+                    "low" => Effort::Low,
+                    "medium" => Effort::Medium,
+                    "high" => Effort::High,
+                    "xhigh" => Effort::Xhigh,
+                    "max" => Effort::Max,
+                    _ => return Err(CONTROL_USAGE.to_owned()),
+                };
+                effort = Some(parsed);
+            }
             _ => return Err(CONTROL_USAGE.to_owned()),
-        }),
-        _ => return Err(CONTROL_USAGE.to_owned()),
-    };
-    Ok((target, action))
+        }
+    }
+    if model.is_none() && effort.is_none() {
+        return Err(CONTROL_USAGE.to_owned());
+    }
+    Ok((target, ControlAction::Configure { model, effort }))
 }
 
 pub(crate) fn control_command() -> Result<(), Box<dyn std::error::Error>> {

@@ -429,6 +429,8 @@ mod tests {
                         transport: "raw".to_owned(),
                         state: PulseState::Ready,
                         allow_control: true,
+                        model: None,
+                        effort: None,
                     }]);
                     break;
                 }

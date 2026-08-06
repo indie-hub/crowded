@@ -327,30 +327,77 @@ mod tests {
         );
         assert_eq!(
             parse_control_args(["3", "model", "openai/gpt-5"].map(str::to_owned)).unwrap(),
-            (3, ControlAction::SetModel("openai/gpt-5".to_owned()))
+            (
+                3,
+                ControlAction::Configure {
+                    model: Some("openai/gpt-5".to_owned()),
+                    effort: None
+                }
+            )
         );
         assert_eq!(
             parse_control_args(["1", "effort", "xhigh"].map(str::to_owned)).unwrap(),
-            (1, ControlAction::SetEffort(Effort::Xhigh))
+            (
+                1,
+                ControlAction::Configure {
+                    model: None,
+                    effort: Some(Effort::Xhigh)
+                }
+            )
+        );
+        assert_eq!(
+            parse_control_args(["3", "model", "gpt-5", "effort", "high"].map(str::to_owned))
+                .unwrap(),
+            (
+                3,
+                ControlAction::Configure {
+                    model: Some("gpt-5".to_owned()),
+                    effort: Some(Effort::High)
+                }
+            )
+        );
+        assert_eq!(
+            parse_control_args(["1", "effort", "low", "model", "sonnet"].map(str::to_owned))
+                .unwrap(),
+            (
+                1,
+                ControlAction::Configure {
+                    model: Some("sonnet".to_owned()),
+                    effort: Some(Effort::Low)
+                }
+            )
         );
         assert!(parse_control_args(["2", "effort", "wild"].map(str::to_owned)).is_err());
+        assert!(parse_control_args(["2", "model", "a", "model", "b"].map(str::to_owned)).is_err());
+        assert!(
+            parse_control_args(["2", "effort", "high", "effort", "low"].map(str::to_owned))
+                .is_err()
+        );
+        assert!(parse_control_args(["2", "model", "a", "clear"].map(str::to_owned)).is_err());
 
         let request = ControlRequest {
             token: "left".to_owned(),
             id: "control-1".to_owned(),
             to: 2,
-            action: ControlAction::SetModel("-unsafe".to_owned()),
+            action: ControlAction::Configure {
+                model: Some("-unsafe".to_owned()),
+                effort: None,
+            },
         };
         let wire = serde_json::to_value(WireRequest::Control(ControlRequest {
             token: "left".to_owned(),
             id: "control-wire".to_owned(),
             to: 2,
-            action: ControlAction::SetModel("sonnet".to_owned()),
+            action: ControlAction::Configure {
+                model: Some("sonnet".to_owned()),
+                effort: Some(Effort::High),
+            },
         }))
         .unwrap();
         assert_eq!(wire["kind"], "control");
-        assert_eq!(wire["action"], "set_model");
-        assert_eq!(wire["value"], "sonnet");
+        assert_eq!(wire["action"], "configure");
+        assert_eq!(wire["value"]["model"], "sonnet");
+        assert_eq!(wire["value"]["effort"], "high");
 
         let mut recent = vec![VecDeque::new(), VecDeque::new()];
         assert_eq!(
@@ -410,7 +457,10 @@ mod tests {
                     token,
                     id: "control-roundtrip".to_owned(),
                     to: 2,
-                    action: ControlAction::SetEffort(Effort::High),
+                    action: ControlAction::Configure {
+                        model: None,
+                        effort: Some(Effort::High),
+                    },
                 }),
             )
             .unwrap();
@@ -425,7 +475,13 @@ mod tests {
                 Ok(DoorbellEvent::Control(control)) => {
                     assert_eq!(control.from, 0);
                     assert_eq!(control.to, 1);
-                    assert_eq!(control.action, ControlAction::SetEffort(Effort::High));
+                    assert_eq!(
+                        control.action,
+                        ControlAction::Configure {
+                            model: None,
+                            effort: Some(Effort::High)
+                        }
+                    );
                     control.reply_applied();
                     break;
                 }
@@ -486,6 +542,8 @@ mod tests {
                         transport: "raw".to_owned(),
                         state: PulseState::Ready,
                         allow_control: true,
+                        model: None,
+                        effort: None,
                     }]);
                     break;
                 }

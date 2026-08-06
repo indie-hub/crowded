@@ -423,20 +423,29 @@ impl Pane {
         self.reconfigure(size, controls::clear_resume_args)
     }
 
-    pub(crate) fn set_model(
+    pub(crate) fn configure(
         &mut self,
-        model: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
         size: PtySize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.reconfigure(size, |spec| controls::set_model(spec, model))
+        self.reconfigure(size, |spec| {
+            if let Some(model) = model {
+                controls::set_model(spec, model)?;
+            }
+            if let Some(effort) = effort {
+                controls::set_effort(spec, effort)?;
+            }
+            Ok(())
+        })
     }
 
-    pub(crate) fn set_effort(
-        &mut self,
-        effort: &str,
-        size: PtySize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.reconfigure(size, |spec| controls::set_effort(spec, effort))
+    pub(crate) fn current_model(&self) -> Option<String> {
+        controls::current_model(&self.spec)
+    }
+
+    pub(crate) fn current_effort(&self) -> Option<String> {
+        controls::current_effort(&self.spec)
     }
 
     fn reconfigure(

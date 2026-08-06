@@ -139,7 +139,8 @@ Doorbell:
 ```
 
 The JSON response lists each numeric room, name, guest program, model vendor,
-transport, live state, and whether peer control is enabled. `claude` and `codex`
+transport, live state, whether peer control is enabled, and the room's current
+model and effort (read live from launch arguments). `claude` and `codex`
 default to `anthropic` and `openai`; other guests default to `unknown`, so set
 `vendor` explicitly for OpenCode and other model drivers. This lets orchestration
 choose from the rooms that actually exist without guessing vendor or room number.
@@ -153,12 +154,15 @@ Doorbell:
 "$CROWDED_BIN" control 2 clear
 "$CROWDED_BIN" control 2 model gpt-5
 "$CROWDED_BIN" control 2 effort high
+"$CROWDED_BIN" control 2 model gpt-5 effort high
 ```
 
 `allow_control` defaults to `false`. Controls are structured events, so
 ordinary whispers and terminal output cannot trigger them. All three native
 CLIs support `clear` and `model`; Claude and Codex support `effort`. OpenCode
-effort is rejected until it exposes a stable launch option.
+effort is rejected until it exposes a stable launch option. Model and effort
+can be set together in one restart instead of two, and the roster now
+reports each room's current model and effort.
 
 This first Conductor slice restarts the target CLI. `clear` also removes known
 resume arguments so the replacement starts a fresh context; model and effort
