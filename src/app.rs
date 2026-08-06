@@ -432,6 +432,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 allow_control: pane.allows_control(),
                                 model: pane.current_model(),
                                 effort: pane.current_effort(),
+                                headroom: pane.headroom_active(),
                             })
                             .collect(),
                     );
@@ -577,7 +578,12 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         state.map(PulseState::label).unwrap_or("waiting")
                     };
-                    format!("{}\n  {state}", pane.title())
+                    let headroom = if pane.headroom_active() {
+                        " [headroom]"
+                    } else {
+                        ""
+                    };
+                    format!("{}{headroom}\n  {state}", pane.title())
                 })
                 .collect::<Vec<_>>()
                 .join("\n");

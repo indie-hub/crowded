@@ -141,6 +141,7 @@ pub(crate) struct RosterRoom {
     pub(crate) allow_control: bool,
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
+    pub(crate) headroom: bool,
 }
 
 impl PulseState {

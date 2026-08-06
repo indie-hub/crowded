@@ -185,6 +185,44 @@ fn split_windows_extensions(path_ext: &OsStr) -> Vec<OsString> {
         .collect()
 }
 
+fn resolve_unix(program: &Path, path: Option<&OsStr>) -> io::Result<PathBuf> {
+    let bases = path
+        .map(split_unix_paths)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|directory| directory.join(program))
+        .collect::<Vec<_>>();
+    for base in bases {
+        if base.is_file() {
+            return Ok(base);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("command not found on PATH: {}", program.display()),
+    ))
+}
+
+fn split_unix_paths(path: &OsStr) -> Vec<PathBuf> {
+    path.to_string_lossy()
+        .split(':')
+        .filter(|entry| !entry.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Whether the `headroom` wrapper binary is installed on the given PATH.
+/// Mirrors the launch-time lookup (`resolve_windows` for Windows, the new
+/// `resolve_unix` scan for Unix) without spawning a subprocess.
+pub(crate) fn headroom_on_path(path: Option<&OsStr>, path_ext: Option<&OsStr>) -> bool {
+    let program = Path::new("headroom");
+    if cfg!(windows) {
+        resolve_windows(program, Path::new("."), path, path_ext).is_ok()
+    } else {
+        resolve_unix(program, path).is_ok()
+    }
+}
+
 #[cfg(windows)]
 fn required_environment(name: &str) -> io::Result<OsString> {
     env::var_os(name).ok_or_else(|| {
@@ -390,6 +428,27 @@ mod tests {
             direct.get_argv().as_slice(),
             &[OsString::from("claude"), OsString::from("model name")]
         );
+    }
+
+    #[test]
+    fn headroom_detection_finds_and_misses_the_binary_on_path() {
+        let directory = test_directory();
+        let ext = if cfg!(windows) {
+            fs::write(directory.join("headroom.exe"), "").unwrap();
+            OsString::from(".exe;.cmd")
+        } else {
+            fs::write(directory.join("headroom"), "").unwrap();
+            OsString::new()
+        };
+        let path = directory.as_os_str().to_os_string();
+
+        assert!(headroom_on_path(Some(&path), Some(&ext)));
+        assert!(!headroom_on_path(None, None));
+
+        let empty = test_directory();
+        assert!(!headroom_on_path(Some(empty.as_os_str()), Some(&ext)));
+        fs::remove_dir_all(empty).unwrap();
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[cfg(windows)]

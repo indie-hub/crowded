@@ -236,6 +236,7 @@ mod tests {
             cwd: None,
             variables: Vec::new(),
             allow_control: false,
+            use_headroom: false,
         }
     }
 

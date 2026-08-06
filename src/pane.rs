@@ -2,7 +2,7 @@
 
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::mpsc,
@@ -15,7 +15,7 @@ use portable_pty::{Child, MasterPty, PtySize, native_pty_system};
 use tui_term::vt100::{Parser, Screen};
 
 use crate::{
-    command::ResolvedCommand,
+    command::{ResolvedCommand, headroom_on_path},
     config::{RoomSpec, Transport},
 };
 
@@ -117,6 +117,31 @@ fn environment_value(variables: &[(OsString, OsString)], name: &str) -> Option<O
         .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
         .map(|(_, value)| value.clone())
         .or_else(|| env::var_os(name))
+}
+
+/// Decide the actually-launched program and arguments for a room.
+///
+/// When `use_headroom` is set and the `headroom` wrapper is installed on the
+/// room's PATH, the launch becomes `headroom wrap <original-program> <original-args...>`
+/// (the confirmed CLI form, with the `wrap` subcommand). Otherwise the
+/// original command is launched unchanged and missing headroom is a silent
+/// fallback, not an error. Returns `(program, args, headroom_active)`.
+fn headroom_launch(
+    program: &OsStr,
+    args: &[OsString],
+    use_headroom: bool,
+    path: &Option<OsString>,
+    path_ext: &Option<OsString>,
+) -> (OsString, Vec<OsString>, bool) {
+    if use_headroom && headroom_on_path(path.as_deref(), path_ext.as_deref()) {
+        let mut wrapped = Vec::with_capacity(args.len() + 2);
+        wrapped.push(OsString::from("wrap"));
+        wrapped.push(program.to_os_string());
+        wrapped.extend(args.iter().cloned());
+        (OsString::from("headroom"), wrapped, true)
+    } else {
+        (program.to_os_string(), args.to_vec(), false)
+    }
 }
 
 fn opencode_input_ready(screen: &str) -> bool {
@@ -236,6 +261,7 @@ pub(crate) struct Pane {
     output_rx: mpsc::Receiver<Vec<u8>>,
     response_tail: Vec<u8>,
     parser: Parser,
+    headroom_active: bool,
 }
 
 #[derive(Clone)]
@@ -264,14 +290,16 @@ impl Pane {
         let cwd = working_directory(spec.cwd.as_deref())?;
         let path = environment_value(&spec.variables, "PATH");
         let path_ext = environment_value(&spec.variables, "PATHEXT");
-        let launch = ResolvedCommand::resolve_with_environment(
+        let (program, args, headroom_active) = headroom_launch(
             &spec.program,
             &spec.args,
-            &cwd,
-            path,
-            path_ext,
-        )?
-        .portable()?;
+            spec.use_headroom,
+            &path,
+            &path_ext,
+        );
+        let launch =
+            ResolvedCommand::resolve_with_environment(&program, &args, &cwd, path, path_ext)?
+                .portable()?;
         let (mut command, tree) = launch.into_parts();
         command.cwd(&cwd);
         command.env("PWD", &cwd);
@@ -310,6 +338,7 @@ impl Pane {
             response_tail: Vec::new(),
             // vt100 assumes room for wrapping and a double-width character.
             parser: Parser::new(size.rows.max(2), size.cols.max(2), 0),
+            headroom_active,
         })
     }
 
@@ -375,6 +404,10 @@ impl Pane {
 
     pub(crate) fn allows_control(&self) -> bool {
         self.spec.allow_control
+    }
+
+    pub(crate) fn headroom_active(&self) -> bool {
+        self.headroom_active
     }
 
     pub(crate) fn needs_intro(&self) -> bool {
@@ -486,6 +519,12 @@ impl Pane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        ffi::OsStr,
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn room_spec(program: &str, args: &[&str]) -> RoomSpec {
         RoomSpec {
@@ -498,6 +537,7 @@ mod tests {
             cwd: None,
             variables: Vec::new(),
             allow_control: true,
+            use_headroom: false,
         }
     }
 
@@ -506,6 +546,20 @@ mod tests {
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn temporary_bin_directory() -> PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!(
+            "crowded-pane-test-{}-{nonce}",
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        directory
     }
 
     #[test]
@@ -609,5 +663,75 @@ mod tests {
         );
         controls::clear_resume_args(&mut opencode).unwrap();
         assert_eq!(arguments(&opencode), ["--model=old"]);
+    }
+
+    fn headroom_path() -> (PathBuf, Option<OsString>, Option<OsString>) {
+        let directory = temporary_bin_directory();
+        let ext = if cfg!(windows) {
+            fs::write(directory.join("headroom.exe"), "").unwrap();
+            Some(OsString::from(".exe;.cmd"))
+        } else {
+            fs::write(directory.join("headroom"), "").unwrap();
+            None
+        };
+        (
+            directory.clone(),
+            Some(directory.as_os_str().to_os_string()),
+            ext,
+        )
+    }
+
+    #[test]
+    fn spawn_launch_wraps_through_headroom_only_when_flag_and_binary_agree() {
+        let (directory, path, ext) = headroom_path();
+        let original = &["--continue", "--model", "sonnet"];
+
+        let (program, args, active) = headroom_launch(
+            OsStr::new("claude"),
+            &original.iter().map(OsString::from).collect::<Vec<_>>(),
+            true,
+            &path,
+            &ext,
+        );
+        assert_eq!(program, OsString::from("headroom"));
+        assert_eq!(
+            args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>(),
+            ["wrap", "claude", "--continue", "--model", "sonnet"]
+        );
+        assert!(active);
+
+        let (program, args, active) = headroom_launch(
+            OsStr::new("claude"),
+            &original.iter().map(OsString::from).collect::<Vec<_>>(),
+            false,
+            &path,
+            &ext,
+        );
+        assert_eq!(program, OsString::from("claude"));
+        assert_eq!(
+            args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>(),
+            original
+        );
+        assert!(!active);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn spawn_launch_falls_back_unchanged_when_headroom_is_missing() {
+        let empty = temporary_bin_directory();
+        let path = Some(empty.as_os_str().to_os_string());
+        let original = &["--continue"];
+        let args: Vec<OsString> = original.iter().map(OsString::from).collect();
+
+        let (program, args, active) =
+            headroom_launch(OsStr::new("claude"), &args, true, &path, &None);
+        assert_eq!(program, OsString::from("claude"));
+        assert_eq!(
+            args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>(),
+            original
+        );
+        assert!(!active);
+        fs::remove_dir_all(empty).unwrap();
     }
 }

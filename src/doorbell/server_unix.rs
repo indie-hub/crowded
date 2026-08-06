@@ -544,6 +544,7 @@ mod tests {
                         allow_control: true,
                         model: None,
                         effort: None,
+                        headroom: true,
                     }]);
                     break;
                 }
@@ -560,5 +561,6 @@ mod tests {
         assert_eq!(response["rooms"][0]["name"], "Builder");
         assert_eq!(response["rooms"][0]["vendor"], "openai");
         assert_eq!(response["rooms"][0]["state"], "ready");
+        assert_eq!(response["rooms"][0]["headroom"], true);
     }
 }

@@ -93,6 +93,7 @@ command = "opencode"
 vendor = "deepseek"
 transport = "raw"
 allow_control = true
+use_headroom = true
 ```
 
 Then run:
@@ -122,6 +123,19 @@ transport = "shell"
 `shell` rooms print whispers safely and are skipped by Shared Toolbox. `raw`
 rooms are treated as agent TUIs and require a supported native adapter.
 
+Optional `use_headroom` wraps a room's launch through the `headroom` wrapper
+binary when one is installed on `PATH`. It defaults to `false`; a missing
+`headroom` binary is a silent fallback, not an error:
+
+```toml
+use_headroom = true
+```
+
+When active, Crowded launches `headroom wrap <original-command> <original-args...>`.
+The Room Pulse sidebar appends `[headroom]` to that
+room's title, and the live roster reports `headroom: true` for rooms actually
+running under the wrapper.
+
 Command-line guests still work and override the configured room list while
 retaining the Shared Toolbox:
 
@@ -139,8 +153,10 @@ Doorbell:
 ```
 
 The JSON response lists each numeric room, name, guest program, model vendor,
-transport, live state, whether peer control is enabled, and the room's current
-model and effort (read live from launch arguments). `claude` and `codex`
+transport, live state, whether peer control is enabled, the room's current
+model and effort (read live from launch arguments), and whether the room is
+running under the `headroom` wrapper (`headroom: true` only when the config
+flag is set *and* the wrapper was found on `PATH`). `claude` and `codex`
 default to `anthropic` and `openai`; other guests default to `unknown`, so set
 `vendor` explicitly for OpenCode and other model drivers. This lets orchestration
 choose from the rooms that actually exist without guessing vendor or room number.

@@ -72,6 +72,8 @@ pub(crate) struct RoomConfig {
     pub(crate) cwd: Option<PathBuf>,
     #[serde(default)]
     pub(crate) allow_control: bool,
+    #[serde(default)]
+    pub(crate) use_headroom: bool,
 }
 
 #[derive(Clone)]
@@ -85,6 +87,7 @@ pub(crate) struct RoomSpec {
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) variables: Vec<(OsString, OsString)>,
     pub(crate) allow_control: bool,
+    pub(crate) use_headroom: bool,
 }
 
 impl RoomSpec {
@@ -103,6 +106,7 @@ impl RoomSpec {
             cwd: None,
             variables: Vec::new(),
             allow_control: false,
+            use_headroom: false,
         }
     }
 
@@ -137,6 +141,7 @@ impl RoomSpec {
             cwd: config.cwd,
             variables: Vec::new(),
             allow_control: config.allow_control,
+            use_headroom: config.use_headroom,
         })
     }
 
@@ -384,6 +389,8 @@ mod tests {
         assert_eq!(guest.vendor, "openai");
         assert!(guest.args.is_empty());
         assert!(guest.cwd.is_none());
+        assert!(!guest.allow_control);
+        assert!(!guest.use_headroom);
         assert_eq!(guest.title, "codex · 2");
     }
 
@@ -397,6 +404,7 @@ mod tests {
                 args = ["--continue"]
                 transport = "raw"
                 allow_control = true
+                use_headroom = true
 
                 [[rooms]]
                 command = "/bin/sh"
@@ -410,11 +418,13 @@ mod tests {
         assert_eq!(rooms[0].title, "Claude · 1");
         assert_eq!(rooms[0].args, [OsString::from("--continue")]);
         assert!(rooms[0].allow_control);
+        assert!(rooms[0].use_headroom);
         assert_eq!(rooms[0].vendor, "anthropic");
         assert_eq!(rooms[1].title, "sh · 2");
         assert_eq!(rooms[1].vendor, "local");
         assert_eq!(rooms[1].cwd, Some(PathBuf::from("examples")));
         assert!(!rooms[1].allow_control);
+        assert!(!rooms[1].use_headroom);
         assert!(room_specs_from_toml("[[rooms]]\ncommand='codex'\ntransport='raw'").is_err());
         assert!(
             room_specs_from_toml("[[rooms]]\ncommand='codex'\ntransport='raw'\nworkdir='typo'")

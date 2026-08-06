@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-08-06
+
+### Added
+
+- Room config gains `use_headroom`: wraps a room's launch through the `headroom` wrapper binary (`headroom wrap <original-command> <original-args...>`) when installed on `PATH`; falls back to the unwrapped launch silently otherwise. `crowded roster` and the Room Pulse sidebar report which rooms are actually running under Headroom via a live `headroom` field / `[headroom]` tag.
+
 ## [0.25.3] - 2026-08-06
 
 ### Added
