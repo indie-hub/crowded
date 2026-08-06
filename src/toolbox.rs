@@ -99,6 +99,22 @@ pub(crate) fn native_files_are_active_at(root: &Path) -> io::Result<bool> {
     }
 
     let state = load_state(&state_path)?;
+    // Stale state: crowded.toml now requires different native files (e.g. a new
+    // room was added after the last sync). Treat as not active so the caller
+    // falls back to env injection and `crowded init` can re-sync. `src/toolbox.rs:95`
+    if let Ok(config) = load_room_file(&root.join("crowded.toml"))
+        && let Ok(expected) =
+            native_targets(root, &config.rooms, &config.mcp_servers, &config.opencode_plugins)
+    {
+        if state.files.len() != expected.len()
+            || !state
+                .files
+                .iter()
+                .all(|file| expected.contains_key(&file.path))
+        {
+            return Ok(false);
+        }
+    }
     for file in &state.files {
         let current = read_optional(&file.path)?;
         let exact = current.as_deref() == Some(&file.generated);
@@ -532,11 +548,96 @@ fn owned_array_entries(file: &ManagedFile, section: &str) -> io::Result<Vec<Valu
 }
 
 fn build_plan(root: &Path) -> io::Result<ToolboxState> {
-    if root.join(STATE_FILE).try_exists()? {
-        return Err(invalid_input(
-            "the native toolbox is already synced; remove it before syncing again",
-        ));
-    }
+    let state_path = root.join(STATE_FILE);
+    let old_state = if state_path.try_exists()? {
+        // Allow re-sync when the state is stale (e.g. rooms added after last sync).
+        // Otherwise require explicit `toolbox remove` to avoid clobbering.
+        let is_stale = (|| -> io::Result<bool> {
+            let state = load_state(&state_path)?;
+            let config = load_room_file(&root.join("crowded.toml"))?;
+            let expected = native_targets(
+                root,
+                &config.rooms,
+                &config.mcp_servers,
+                &config.opencode_plugins,
+            )?;
+            Ok(state.files.len() != expected.len()
+                || !state
+                    .files
+                    .iter()
+                    .all(|file| expected.contains_key(&file.path)))
+        })()
+        .unwrap_or(false);
+        if !is_stale {
+            return Err(invalid_input(
+                "the native toolbox is already synced; remove it before syncing again",
+            ));
+        }
+        let old_state = load_state(&state_path)?;
+        let config = load_room_file(&root.join("crowded.toml"))?;
+        let expected = native_targets(
+            root,
+            &config.rooms,
+            &config.mcp_servers,
+            &config.opencode_plugins,
+        )?;
+        // Restore orphaned targets that fell out of the new expected set before
+        // dropping the state file (same logic as remove()).
+        for file in &old_state.files {
+            if expected.contains_key(&file.path) {
+                continue;
+            }
+            let current = read_optional(&file.path)?;
+            let removal = if current.as_deref() == Some(&file.generated) {
+                Removal::RestoreSnapshot
+            } else if current.as_deref() == file.original.as_deref() {
+                Removal::AlreadyRestored
+            } else if let Some(current_str) = current.as_deref()
+                && is_opencode_config(&file.path)
+                && managed_opencode_matches(file, current_str)?
+            {
+                match remove_managed_opencode(file, current_str)? {
+                    Some(contents) => Removal::RewriteJson(contents),
+                    None => Removal::Delete,
+                }
+            } else if let (Some(current_str), Some(section)) =
+                (current.as_deref(), json_section(&file.path))
+                && managed_json_matches(file, current_str, section)?
+            {
+                match remove_managed_json(file, current_str, section)? {
+                    Some(contents) => Removal::RewriteJson(contents),
+                    None => Removal::Delete,
+                }
+            } else {
+                return Err(invalid_data(format!(
+                    "{} changed Crowded-managed configuration; refusing to overwrite it",
+                    file.path.display()
+                )));
+            };
+            match removal {
+                Removal::AlreadyRestored => {}
+                Removal::RestoreSnapshot => {
+                    if let Some(original) = &file.original {
+                        fs::write(&file.path, original)?;
+                    } else {
+                        fs::remove_file(&file.path)?;
+                        remove_empty_codex_directory(&file.path)?;
+                    }
+                }
+                Removal::RewriteJson(contents) => fs::write(&file.path, contents)?,
+                Removal::Delete => {
+                    fs::remove_file(&file.path)?;
+                    remove_empty_codex_directory(&file.path)?;
+                }
+            }
+        }
+        // Stale: drop the old state so a fresh plan can be built.
+        fs::remove_file(&state_path)?;
+        let _ = remove_empty_directory(&root.join(STATE_DIRECTORY));
+        Some(old_state)
+    } else {
+        None
+    };
 
     let config = load_room_file(&root.join("crowded.toml"))?;
     if config.rooms.len() < 2 {
@@ -562,7 +663,15 @@ fn build_plan(root: &Path) -> io::Result<ToolboxState> {
                 path.with_extension("jsonc").display()
             )));
         }
-        let original = read_optional(&path)?;
+        let original = if let Some(old) = &old_state {
+            if let Some(prev) = old.files.iter().find(|f| f.path == path) {
+                prev.original.clone()
+            } else {
+                read_optional(&path)?
+            }
+        } else {
+            read_optional(&path)?
+        };
         let generated = generate(
             target,
             original.as_deref(),
@@ -1312,6 +1421,163 @@ mod tests {
         assert!(remove(&root).is_err());
         assert!(root.join(STATE_FILE).exists());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_resync_preserves_original_and_remove_still_cleans() {
+        let root = test_directory();
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::write(root.join(".mcp.json"), "{\n  \"keep\": true\n}\n").unwrap();
+        fs::write(root.join("opencode.json"), "{\n  \"model\": \"openai/gpt-5\"\n}\n").unwrap();
+        fs::write(
+            root.join("crowded.toml"),
+            r#"
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "opencode"
+                transport = "raw"
+
+                [[mcp]]
+                name = "everything"
+                command = "npx"
+                args = ["-y", "@modelcontextprotocol/server-everything"]
+
+                [[opencode_plugin]]
+                package = "context-mode@1.0.169"
+            "#,
+        )
+        .unwrap();
+
+        // First sync with 2 rooms -> 4 files
+        let first = sync(&root).unwrap();
+        assert_eq!(first.len(), 4);
+        assert!(native_files_are_active_at(&root).unwrap());
+
+        // Add a new room -> stale state (4 vs 6 files)
+        fs::write(
+            root.join("crowded.toml"),
+            r#"
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "opencode"
+                transport = "raw"
+
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+
+                [[mcp]]
+                name = "everything"
+                command = "npx"
+                args = ["-y", "@modelcontextprotocol/server-everything"]
+
+                [[opencode_plugin]]
+                package = "context-mode@1.0.169"
+            "#,
+        )
+        .unwrap();
+        // stale sync must succeed and preserve original for surviving paths
+        let second = sync(&root).unwrap();
+        assert_eq!(second.len(), 6);
+        let state: ToolboxState =
+            serde_json::from_str(&fs::read_to_string(root.join(STATE_FILE)).unwrap()).unwrap();
+        let mcp_file = state.files.iter().find(|f| f.path.ends_with(".mcp.json")).unwrap();
+        assert_eq!(mcp_file.original.as_deref(), Some("{\n  \"keep\": true\n}\n"));
+        let opencode_file = state.files.iter().find(|f| f.path.ends_with("opencode.json")).unwrap();
+        assert_eq!(
+            opencode_file.original.as_deref(),
+            Some("{\n  \"model\": \"openai/gpt-5\"\n}\n")
+        );
+
+        // remove after stale resync must strip managed entries
+        remove(&root).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(".mcp.json")).unwrap(),
+            "{\n  \"keep\": true\n}\n"
+        );
+        let opencode_restored: Value =
+            serde_json::from_str(&fs::read_to_string(root.join("opencode.json")).unwrap()).unwrap();
+        assert_eq!(opencode_restored["model"], "openai/gpt-5");
+        assert!(opencode_restored.get("mcp").is_none());
+        assert!(opencode_restored.get("plugin").is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_resync_restores_orphaned_files_when_room_removed() {
+        let root = test_directory();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::write(root.join(".mcp.json"), "{\n  \"keep\": true\n}\n").unwrap();
+        fs::write(root.join(".codex/config.toml"), "model = \"gpt-5\"\n").unwrap();
+        fs::write(
+            root.join("crowded.toml"),
+            r#"
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+
+                [[rooms]]
+                command = "opencode"
+                transport = "raw"
+
+                [[mcp]]
+                name = "everything"
+                command = "npx"
+
+                [[opencode_plugin]]
+                package = "context-mode@1.0.169"
+            "#,
+        )
+        .unwrap();
+
+        let first = sync(&root).unwrap();
+        assert_eq!(first.len(), 6);
+        assert!(root.join(".codex/config.toml").exists());
+        assert!(root.join(".codex/hooks.json").exists());
+
+        // Remove codex room -> expected shrinks, orphans should be restored
+        fs::write(
+            root.join("crowded.toml"),
+            r#"
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "opencode"
+                transport = "raw"
+
+                [[mcp]]
+                name = "everything"
+                command = "npx"
+
+                [[opencode_plugin]]
+                package = "context-mode@1.0.169"
+            "#,
+        )
+        .unwrap();
+
+        let second = sync(&root).unwrap();
+        assert_eq!(second.len(), 4);
+        // orphaned files must have been restored/deleted during stale handling
+        assert_eq!(fs::read_to_string(root.join(".codex/config.toml")).unwrap(), "model = \"gpt-5\"\n");
+        assert!(!root.join(".codex/hooks.json").exists());
+        // surviving files still active
+        assert!(native_files_are_active_at(&root).unwrap());
+
+        remove(&root).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

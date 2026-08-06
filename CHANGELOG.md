@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.25.2] - 2026-08-06
+
+### Fixed
+
+- Toolbox stale resync now preserves the original snapshot for surviving paths and restores orphaned targets before deleting state, so `crowded toolbox remove` remains reliable after rooms are added or removed. Deduplicate stale check in `native_files_are_active_at`. Add regression tests for stale resync.
+
 ## [0.25.1] - 2026-08-04
 
 ### Changed
