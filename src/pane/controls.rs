@@ -108,38 +108,102 @@ fn session_resume_args(vendor: CliVendor, session_id: &str) -> Vec<OsString> {
 
 fn captured_session_id(vendor: CliVendor, spec: &RoomSpec) -> Option<String> {
     let cwd = super::working_directory(spec.cwd.as_deref()).ok()?;
-    super::session_state::lookup(vendor.key(), &cwd)
+    // Keyed by this room's own identity (RoomSpec.title), so a room only ever
+    // resumes the id it (or its own prior spawn under the same title)
+    // captured -- never a sibling room's id for the same (vendor, cwd).
+    super::session_state::lookup(vendor.key(), &cwd, &spec.title)
 }
 
 /// Discover the exact underlying session id for a fresh spawn's vendor
 /// artifact, restricted to artifacts touched after `since` (the instant that
-/// spawn's own intro was delivered). Returns `None` when nothing matches.
+/// spawn's own intro was delivered), and skipping any id already present in
+/// `exclude` (the persisted baseline of claimed ids for this `(vendor, cwd)`).
+/// Returns `None` when nothing matches.
 pub(super) fn discover_session_id(
     vendor: CliVendor,
     cwd: &Path,
     since: SystemTime,
+    exclude: &[String],
 ) -> Option<String> {
     let home = home_dir()?;
     match vendor {
         CliVendor::Claude => {
             let projects = home.join(".claude").join("projects");
-            claude_session_id(&projects, cwd, since)
+            claude_session_id(&projects, cwd, since, exclude)
         }
         CliVendor::Codex => {
             let sessions = home.join(".codex").join("sessions");
-            codex_session_id(&sessions, cwd, since)
+            codex_session_id(&sessions, cwd, since, exclude)
         }
         CliVendor::OpenCode => {
             let database = home.join(".local/share/opencode/opencode.db");
-            opencode_session_id(&database, cwd)
+            opencode_session_id(&database, cwd, exclude)
         }
     }
 }
 
 fn home_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(home) = test_home() {
+            return Some(home);
+        }
+    }
     env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+/// Test-only override for the home directory, so `discover_session_id` (which
+/// resolves vendor artifacts under `~/.claude`, `~/.codex`, `~/.local/share`)
+/// can point at a temp tree in tests instead of the real home.
+#[cfg(test)]
+static TEST_HOME: std::sync::OnceLock<std::sync::RwLock<Option<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn test_home() -> Option<PathBuf> {
+    let lock = TEST_HOME.get_or_init(|| std::sync::RwLock::new(None));
+    lock.read().ok().and_then(|guard| guard.clone())
+}
+
+/// Points `discover_session_id`'s home at a fresh temp tree while held, and
+/// restores the real home on drop.
+#[cfg(test)]
+pub(super) struct HomeDirGuard {
+    home: PathBuf,
+}
+
+#[cfg(test)]
+impl HomeDirGuard {
+    pub(super) fn isolated() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let home = std::env::temp_dir().join(format!(
+            "crowded-fake-home-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let lock = TEST_HOME.get_or_init(|| std::sync::RwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = Some(home.clone());
+        }
+        Self { home }
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.home
+    }
+}
+
+#[cfg(test)]
+impl Drop for HomeDirGuard {
+    fn drop(&mut self) {
+        let lock = TEST_HOME.get_or_init(|| std::sync::RwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = None;
+        }
+        let _ = fs::remove_dir_all(&self.home);
+    }
 }
 
 /// Claude stores transcripts at `~/.claude/projects/<sanitized-cwd>/<session
@@ -151,7 +215,12 @@ fn claude_project_directory(cwd: &Path) -> String {
     cwd.to_string_lossy().replace(['/', '\\'], "-")
 }
 
-fn claude_session_id(projects_dir: &Path, cwd: &Path, since: SystemTime) -> Option<String> {
+fn claude_session_id(
+    projects_dir: &Path,
+    cwd: &Path,
+    since: SystemTime,
+    exclude: &[String],
+) -> Option<String> {
     let project_dir = projects_dir.join(claude_project_directory(cwd));
     let mut newest: Option<(SystemTime, String)> = None;
     for entry in fs::read_dir(project_dir).ok()? {
@@ -174,6 +243,10 @@ fn claude_session_id(projects_dir: &Path, cwd: &Path, since: SystemTime) -> Opti
         let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
             continue;
         };
+        // Skip ids another room (or this room's own prior spawn) already owns.
+        if exclude.iter().any(|id| id == stem) {
+            continue;
+        }
         if newest.as_ref().is_none_or(|(time, _)| modified > *time) {
             newest = Some((modified, stem.to_owned()));
         }
@@ -181,7 +254,12 @@ fn claude_session_id(projects_dir: &Path, cwd: &Path, since: SystemTime) -> Opti
     newest.map(|(_, stem)| stem)
 }
 
-fn codex_session_id(sessions_dir: &Path, cwd: &Path, since: SystemTime) -> Option<String> {
+fn codex_session_id(
+    sessions_dir: &Path,
+    cwd: &Path,
+    since: SystemTime,
+    exclude: &[String],
+) -> Option<String> {
     let mut candidates: Vec<(SystemTime, String)> = Vec::new();
     for year in fs::read_dir(sessions_dir).ok()?.flatten() {
         if !year.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
@@ -210,6 +288,11 @@ fn codex_session_id(sessions_dir: &Path, cwd: &Path, since: SystemTime) -> Optio
                         continue;
                     }
                     if let Some(id) = codex_session_meta_id(&path, cwd) {
+                        // Skip ids another room (or this room's own prior
+                        // spawn) already owns.
+                        if exclude.iter().any(|claimed| claimed == &id) {
+                            continue;
+                        }
                         candidates.push((modified, id));
                     }
                 }
@@ -252,14 +335,17 @@ fn codex_session_meta_id(path: &Path, cwd: &Path) -> Option<String> {
 
 /// Read the newest session row for `cwd` from OpenCode's sqlite database via
 /// the system `sqlite3` CLI. `time_created` is milliseconds; OpenCode creates
-/// the row at spawn (before the intro), so no `since` filter applies here.
-fn opencode_session_id(database: &Path, cwd: &Path) -> Option<String> {
+/// the row at spawn (before the intro), so no `since` filter applies here --
+/// instead, `exclude` (the persisted baseline of already-claimed ids for this
+/// `(vendor, cwd)`) is used to skip rows that are not this spawn's own: a
+/// sibling room's newer row, or this room's own stale pre-clear row.
+fn opencode_session_id(database: &Path, cwd: &Path, exclude: &[String]) -> Option<String> {
     if !database.is_file() {
         return None;
     }
     let output = Command::new("sqlite3")
         .arg(database)
-        .arg(opencode_session_query(cwd))
+        .arg(opencode_session_query(cwd, exclude))
         .output()
         .ok()?;
     if !output.status.success() {
@@ -269,13 +355,22 @@ fn opencode_session_id(database: &Path, cwd: &Path) -> Option<String> {
     if id.is_empty() { None } else { Some(id) }
 }
 
-/// Build the safe lookup query. `cwd` is a local trusted path; single quotes
-/// are the only SQL metacharacter that needs escaping here.
-fn opencode_session_query(cwd: &Path) -> String {
+/// Build the safe lookup query. `cwd` and each excluded id are local trusted
+/// values; single quotes are the only SQL metacharacter that needs escaping
+/// here. Passed as a single argv element to `Command`, never through a shell.
+fn opencode_session_query(cwd: &Path, exclude: &[String]) -> String {
     let escaped = cwd.to_string_lossy().replace('\'', "''");
-    format!(
-        "SELECT id FROM session WHERE directory = '{escaped}' ORDER BY time_created DESC LIMIT 1;"
-    )
+    let mut query = format!("SELECT id FROM session WHERE directory = '{escaped}'");
+    if !exclude.is_empty() {
+        let ids = exclude
+            .iter()
+            .map(|id| id.replace('\'', "''"))
+            .collect::<Vec<_>>()
+            .join("', '");
+        query.push_str(&format!(" AND id NOT IN ('{ids}')"));
+    }
+    query.push_str(" ORDER BY time_created DESC LIMIT 1;");
+    query
 }
 
 pub(super) fn set_model(spec: &mut RoomSpec, model: &str) -> io::Result<()> {
@@ -543,13 +638,14 @@ mod tests {
     fn add_resume_args_prefers_a_captured_exact_session_id() {
         let _state = super::super::session_state::StateRootGuard::isolated();
         let cwd = std::env::current_dir().unwrap();
-        // Pre-seed a captured id for each vendor under the isolated root.
+        // Pre-seed a captured id for each vendor under the isolated root,
+        // keyed by the room title each raw_room below uses.
         for (vendor, id) in [
             ("claude", "claude-ses-1"),
             ("codex", "codex-ses-1"),
             ("opencode", "opencode-ses-1"),
         ] {
-            super::super::session_state::upsert(vendor, &cwd, id);
+            super::super::session_state::upsert(vendor, &cwd, vendor, id);
         }
 
         let mut claude = raw_room("claude");
@@ -612,7 +708,9 @@ mod tests {
         fs::write(&new_path, "{}").unwrap();
 
         let now = SystemTime::now();
-        let old_time = now - Duration::from_secs(120);
+        // Both transcripts are newer than `since` so either is a valid
+        // candidate; only relative recency orders them.
+        let old_time = now - Duration::from_secs(30);
         let recent = now - Duration::from_secs(1);
         set_modified(&old_path, old_time);
         set_modified(&new_path, recent);
@@ -620,13 +718,24 @@ mod tests {
         // The newest transcript after `since` wins; the older one is excluded.
         let since = now - Duration::from_secs(60);
         assert_eq!(
-            claude_session_id(&root, Path::new("/Users/me/project"), since).as_deref(),
+            claude_session_id(&root, Path::new("/Users/me/project"), since, &[]).as_deref(),
             Some("new-session")
+        );
+        // An already-claimed id is skipped, even when it is the newest.
+        assert_eq!(
+            claude_session_id(
+                &root,
+                Path::new("/Users/me/project"),
+                since,
+                &["new-session".to_owned()]
+            )
+            .as_deref(),
+            Some("old-session")
         );
 
         // A `since` after both files are touched finds nothing.
         assert_eq!(
-            claude_session_id(&root, Path::new("/Users/me/project"), now),
+            claude_session_id(&root, Path::new("/Users/me/project"), now, &[]),
             None
         );
 
@@ -655,7 +764,9 @@ mod tests {
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"ses-old\",\"cwd\":\"/repo\"}}\n",
         )
         .unwrap();
-        set_modified(&stale, now - Duration::from_secs(300));
+        // Newer than `since` so it stays a valid candidate for the exclude
+        // check, but older than `ours` so `ses-abc` still wins normally.
+        set_modified(&stale, now - Duration::from_secs(30));
 
         let foreign = day.join("rollout-2026-08-07T10-05-00-0123abcd.jsonl");
         fs::write(
@@ -666,12 +777,18 @@ mod tests {
         set_modified(&foreign, now - Duration::from_secs(5));
 
         assert_eq!(
-            codex_session_id(&root, Path::new("/repo"), since).as_deref(),
+            codex_session_id(&root, Path::new("/repo"), since, &[]).as_deref(),
             Some("ses-abc")
+        );
+        // An already-claimed id is skipped even though it is the newest for
+        // this cwd.
+        assert_eq!(
+            codex_session_id(&root, Path::new("/repo"), since, &["ses-abc".to_owned()]).as_deref(),
+            Some("ses-old")
         );
         // Nothing newer than `since` for this cwd.
         assert_eq!(
-            codex_session_id(&root, Path::new("/repo"), now).as_deref(),
+            codex_session_id(&root, Path::new("/repo"), now, &[]).as_deref(),
             None
         );
 
@@ -680,9 +797,25 @@ mod tests {
 
     #[test]
     fn opencode_session_query_escapes_single_quotes() {
-        let query = opencode_session_query(Path::new("/some/it's-path"));
+        let query = opencode_session_query(Path::new("/some/it's-path"), &[]);
         assert!(query.contains("directory = '/some/it''s-path'"));
         assert!(query.ends_with(" ORDER BY time_created DESC LIMIT 1;"));
+        // No exclude baseline: no NOT IN clause.
+        assert!(!query.contains("NOT IN"));
+    }
+
+    #[test]
+    fn opencode_session_query_excludes_already_claimed_ids() {
+        let query = opencode_session_query(
+            Path::new("/repo"),
+            &["sibling-id".to_owned(), "stale-own-id".to_owned()],
+        );
+        assert!(query.contains("directory = '/repo'"));
+        assert!(query.contains("AND id NOT IN ('sibling-id', 'stale-own-id')"));
+        assert!(query.ends_with(" ORDER BY time_created DESC LIMIT 1;"));
+        // Excluded ids are single-quote escaped the same way as the cwd.
+        let escaped = opencode_session_query(Path::new("/repo"), &["it's-id".to_owned()]);
+        assert!(escaped.contains("AND id NOT IN ('it''s-id')"));
     }
 
     #[test]
@@ -707,16 +840,33 @@ mod tests {
 
         // Newest row for the cwd wins; other cwds don't leak in.
         assert_eq!(
-            opencode_session_id(&database, Path::new("/repo")).as_deref(),
+            opencode_session_id(&database, Path::new("/repo"), &[]).as_deref(),
             Some("ses-new")
         );
+        // An already-claimed id is skipped, so the next-newest row for the cwd
+        // wins instead (the sibling-collision / stale-recapture filter).
         assert_eq!(
-            opencode_session_id(&database, Path::new("/missing")).as_deref(),
+            opencode_session_id(&database, Path::new("/repo"), &["ses-new".to_owned()]).as_deref(),
+            Some("ses-old")
+        );
+        // When every candidate for the cwd is claimed, nothing matches.
+        assert_eq!(
+            opencode_session_id(
+                &database,
+                Path::new("/repo"),
+                &["ses-new".to_owned(), "ses-old".to_owned()]
+            )
+            .as_deref(),
+            None
+        );
+        assert_eq!(
+            opencode_session_id(&database, Path::new("/missing"), &[]).as_deref(),
             None
         );
         // A missing database resolves to None, never an error.
         assert_eq!(
-            opencode_session_id(&database.join("does-not-exist.db"), Path::new("/repo")).as_deref(),
+            opencode_session_id(&database.join("does-not-exist.db"), Path::new("/repo"), &[])
+                .as_deref(),
             None
         );
 

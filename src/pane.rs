@@ -384,7 +384,15 @@ impl Pane {
         let Ok(vendor) = controls::cli_vendor(&self.spec) else {
             return;
         };
-        session_state::capture_async(vendor, self.cwd.clone(), Arc::clone(&self.captured_session));
+        // The room identity (spec.title) keys the persisted entry so this room
+        // only ever resumes its own captured id, even when a sibling room
+        // shares the same (vendor, cwd).
+        session_state::capture_async(
+            vendor,
+            self.cwd.clone(),
+            self.spec.title.clone(),
+            Arc::clone(&self.captured_session),
+        );
     }
 
     /// Whether this pane's exact session id has been captured yet. A plain
