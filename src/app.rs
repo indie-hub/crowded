@@ -628,7 +628,12 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                     } else {
                         ""
                     };
-                    format!("{}{headroom}\n  {state}", pane.title())
+                    let session = if pane.has_captured_session() {
+                        " [session]"
+                    } else {
+                        ""
+                    };
+                    format!("{}{headroom}{session}\n  {state}", pane.title())
                 })
                 .collect::<Vec<_>>()
                 .join("\n");

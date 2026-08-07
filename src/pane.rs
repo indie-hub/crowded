@@ -5,7 +5,7 @@ use std::{
     ffi::{OsStr, OsString},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
     time::Duration,
 };
@@ -279,6 +279,10 @@ pub(crate) struct Pane {
     /// The effective absolute working directory this room launches in; also
     /// the key (with vendor) used to persist its captured session id.
     cwd: PathBuf,
+    /// Shared confirmation that the background session-id capture succeeded;
+    /// written once by the capture thread, read per frame for the Room Pulse
+    /// tag (plain in-memory, never a file read).
+    captured_session: session_state::CapturedSession,
     environment: GuestEnvironment,
     child: ChildGuard,
     master: Box<dyn MasterPty + Send>,
@@ -357,6 +361,7 @@ impl Pane {
         Ok(Self {
             spec,
             cwd,
+            captured_session: session_state::fresh_capture_cell(),
             environment,
             child,
             master: pty.master,
@@ -379,7 +384,13 @@ impl Pane {
         let Ok(vendor) = controls::cli_vendor(&self.spec) else {
             return;
         };
-        session_state::capture_async(vendor, self.cwd.clone());
+        session_state::capture_async(vendor, self.cwd.clone(), Arc::clone(&self.captured_session));
+    }
+
+    /// Whether this pane's exact session id has been captured yet. A plain
+    /// in-memory read of the shared capture cell -- no disk I/O.
+    pub(crate) fn has_captured_session(&self) -> bool {
+        session_state::has_captured_session(&self.captured_session)
     }
 
     pub(crate) fn drain_output(&mut self) -> io::Result<bool> {

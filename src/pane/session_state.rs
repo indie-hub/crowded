@@ -16,7 +16,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process,
-    sync::{Mutex, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -112,13 +112,15 @@ pub(super) fn upsert(vendor: &str, cwd: &Path, session_id: &str) {
 /// Kick off best-effort discovery of one fresh spawn's exact session id,
 /// keyed off that spawn's own delivered intro. Runs on a background thread so
 /// the UI loop is never blocked, and is bounded to [`SESSION_CAPTURE_GRACE`].
-pub(super) fn capture_async(vendor: CliVendor, cwd: PathBuf) {
+/// On success the same path that persists the id also reports it into the
+/// shared `captured` cell for the Room Pulse tag.
+pub(super) fn capture_async(vendor: CliVendor, cwd: PathBuf, captured: CapturedSession) {
     let since = SystemTime::now();
     thread::spawn(move || {
         let deadline = Instant::now() + SESSION_CAPTURE_GRACE;
         loop {
             if let Some(id) = controls::discover_session_id(vendor, &cwd, since) {
-                upsert(vendor.key(), &cwd, &id);
+                record_capture(vendor, &cwd, &id, &captured);
                 return;
             }
             if Instant::now() >= deadline {
@@ -127,6 +129,33 @@ pub(super) fn capture_async(vendor: CliVendor, cwd: PathBuf) {
             thread::sleep(DISCOVERY_POLL);
         }
     });
+}
+
+/// Shared in-memory confirmation that a fresh spawn's exact session id was
+/// captured. The background capture thread writes it on success; the render
+/// loop reads it per frame with a plain in-memory read, never a file read.
+pub(super) type CapturedSession = Arc<Mutex<Option<String>>>;
+
+/// A fresh, unset capture cell for a new pane.
+pub(super) fn fresh_capture_cell() -> CapturedSession {
+    Arc::new(Mutex::new(None))
+}
+
+/// The single success path: persist to disk and report to the shared cell
+/// together, so the pulse tag can never disagree with what resume will use.
+fn record_capture(vendor: CliVendor, cwd: &Path, session_id: &str, captured: &CapturedSession) {
+    upsert(vendor.key(), cwd, session_id);
+    if let Ok(mut guard) = captured.lock() {
+        *guard = Some(session_id.to_owned());
+    }
+}
+
+/// Whether the shared cell reports a successful capture. Plain in-memory.
+pub(super) fn has_captured_session(captured: &CapturedSession) -> bool {
+    captured
+        .lock()
+        .map(|guard| guard.is_some())
+        .unwrap_or(false)
 }
 
 fn load_state() -> io::Result<SessionState> {
@@ -247,6 +276,7 @@ static TEST_ROOT_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 pub(super) struct StateRootGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
+    directory: PathBuf,
 }
 
 #[cfg(test)]
@@ -256,13 +286,19 @@ impl StateRootGuard {
         let lock = TEST_ROOT_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        // Include the process id so a fresh test process never reuses a temp
+        // directory a previous process seeded and left behind.
         let directory = env::temp_dir().join(format!(
-            "crowded-session-state-{}",
+            "crowded-session-state-{}-{}",
+            std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         fs::create_dir_all(&directory).expect("create temp state root");
-        override_state_root(Some(directory));
-        StateRootGuard { _lock: lock }
+        override_state_root(Some(directory.clone()));
+        StateRootGuard {
+            _lock: lock,
+            directory,
+        }
     }
 }
 
@@ -270,6 +306,7 @@ impl StateRootGuard {
 impl Drop for StateRootGuard {
     fn drop(&mut self) {
         override_state_root(None);
+        let _ = fs::remove_dir_all(&self.directory);
     }
 }
 
@@ -321,5 +358,39 @@ mod tests {
         // No guard: the real root (repo dir) is active; a missing state file
         // simply resolves to None.
         assert_eq!(lookup("claude", Path::new("/whatever")), None);
+    }
+
+    #[test]
+    fn record_capture_sets_the_shared_cell_and_persists_together() {
+        let _guard = StateRootGuard::isolated();
+        let cell = fresh_capture_cell();
+        assert!(!has_captured_session(&cell));
+
+        record_capture(CliVendor::Claude, Path::new("/repo"), "ses-captured", &cell);
+
+        // The cell reports the capture, and the same success path also wrote
+        // the persisted state resume will read.
+        assert!(has_captured_session(&cell));
+        assert_eq!(cell.lock().unwrap().as_deref(), Some("ses-captured"));
+        assert_eq!(
+            lookup("claude", Path::new("/repo")).as_deref(),
+            Some("ses-captured")
+        );
+    }
+
+    #[test]
+    fn capture_cell_reads_back_without_touching_disk() {
+        // No StateRootGuard: the accessor is a pure in-memory read of the cell,
+        // independent of any state file.
+        let cell = fresh_capture_cell();
+        assert!(!has_captured_session(&cell));
+        assert!(cell.lock().unwrap().is_none());
+
+        {
+            let mut guard = cell.lock().unwrap();
+            *guard = Some("ses-mem".to_owned());
+        }
+        assert!(has_captured_session(&cell));
+        assert_eq!(cell.lock().unwrap().as_deref(), Some("ses-mem"));
     }
 }
