@@ -23,10 +23,10 @@ use ratatui::{
 use tui_term::widget::PseudoTerminal;
 
 use crate::{
-    config::room_specs,
+    config::{RoomSpec, room_specs, room_specs_resumed},
     doorbell::{ControlAction, Doorbell, DoorbellEvent, PulseState, RosterRoom},
     mailroom::Mailroom,
-    pane::Pane,
+    pane::{self, Pane},
 };
 
 enum InputMode {
@@ -339,8 +339,19 @@ impl Drop for TerminalGuard {
 }
 
 pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse the guest list before changing the parent terminal.
-    let specs = room_specs()?;
+    run_with(room_specs()?)
+}
+
+/// The `crowded resume` entry point: same room resolution as a plain
+/// launch, but every supported guest starts with its resume-most-recent
+/// flag already applied.
+pub(crate) fn run_resumed() -> Result<(), Box<dyn std::error::Error>> {
+    let mut specs = room_specs_resumed()?;
+    pane::resume_supported_specs(&mut specs);
+    run_with(specs)
+}
+
+fn run_with(specs: Vec<RoomSpec>) -> Result<(), Box<dyn std::error::Error>> {
     let room_count = specs.len();
     // Each room receives only its own capability token.
     let doorbell = Doorbell::start(room_count)?;

@@ -338,7 +338,18 @@ fn room_specs_from_toml(text: &str) -> io::Result<Vec<RoomSpec>> {
 }
 
 pub(crate) fn room_specs() -> io::Result<Vec<RoomSpec>> {
-    let guests: Vec<_> = env::args_os().skip(1).collect();
+    room_specs_skipping(1)
+}
+
+/// Same room resolution as [`room_specs`], but skipping one extra leading
+/// argument. Used by the `crowded resume` subcommand, whose own name
+/// occupies the position a guest list would otherwise start at.
+pub(crate) fn room_specs_resumed() -> io::Result<Vec<RoomSpec>> {
+    room_specs_skipping(2)
+}
+
+fn room_specs_skipping(skip: usize) -> io::Result<Vec<RoomSpec>> {
+    let guests: Vec<_> = env::args_os().skip(skip).collect();
     let config = Path::new("crowded.toml");
     let file = if config.try_exists()? {
         Some(load_room_file(config)?)

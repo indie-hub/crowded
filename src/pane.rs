@@ -149,6 +149,16 @@ fn headroom_launch(
     }
 }
 
+/// Apply each guest's "resume most recent conversation" flag ahead of
+/// spawn, for the `crowded resume` CLI entry point. Guests without a
+/// Conductor adapter (shell rooms, unrecognized programs) are left
+/// unchanged rather than failing the whole launch over one room.
+pub(crate) fn resume_supported_specs(specs: &mut [RoomSpec]) {
+    for spec in specs {
+        let _ = controls::add_resume_args(spec);
+    }
+}
+
 fn opencode_input_ready(screen: &str) -> bool {
     (screen.contains("Ask anything") || screen.contains("ctrl+p commands"))
         && !screen.contains("esc interrupt")
@@ -760,5 +770,20 @@ mod tests {
         );
         assert!(!active);
         fs::remove_dir_all(empty).unwrap();
+    }
+
+    #[test]
+    fn resume_supported_specs_skips_guests_without_a_conductor_adapter() {
+        let claude = room_spec("claude", &["--model", "sonnet"]);
+        let mut shell = room_spec("/bin/sh", &[]);
+        shell.transport = Transport::Shell;
+        let shell_args_before = shell.args.clone();
+
+        let mut specs = [claude, shell];
+        resume_supported_specs(&mut specs);
+
+        assert_eq!(arguments(&specs[0]), ["--model", "sonnet", "--continue"]);
+        // No Conductor adapter for a shell room: left byte-identical.
+        assert_eq!(specs[1].args, shell_args_before);
     }
 }

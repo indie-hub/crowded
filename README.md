@@ -199,6 +199,18 @@ OpenCode: `--continue`; Codex: `resume --last`) instead of picking a specific
 session; model and effort retain the room's configured continuation
 arguments.
 
+Run `crowded resume` from the terminal to launch the whole room layout with
+every supported guest resumed from the start, without needing a peer room to
+send a control message first:
+
+```console
+crowded resume
+```
+
+It reads the same `crowded.toml` as plain `crowded`, applying each room's
+continue flag before the first launch. Rooms without a known continue flag
+(shell rooms, unsupported guests) start normally.
+
 ## Shared Plugins
 
 The first local plugin slice shares instruction-only skills with every agent

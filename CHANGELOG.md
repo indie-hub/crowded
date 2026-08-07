@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-08-07
+
+### Added
+
+- `crowded resume` launches the whole room layout with every supported guest resumed from the start, instead of requiring a peer room to send a control message first.
+
 ## [0.27.0] - 2026-08-07
 
 ### Added

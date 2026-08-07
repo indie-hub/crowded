@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("send") => doorbell::send_command(),
         Some("control") => doorbell::control_command(),
+        Some("resume") => app::run_resumed(),
         Some("pulse") => doorbell::pulse_command(),
         Some("roster") => doorbell::roster_command(),
         Some("check") => checker::command(),
