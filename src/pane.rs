@@ -20,6 +20,7 @@ use crate::{
 };
 
 mod controls;
+mod session_state;
 
 const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
 // ponytail: ConPTY only needs a valid DSR here; report the parser's exact
@@ -275,6 +276,9 @@ impl Drop for ChildGuard {
 // One Pane owns everything required to drive one child terminal.
 pub(crate) struct Pane {
     spec: RoomSpec,
+    /// The effective absolute working directory this room launches in; also
+    /// the key (with vendor) used to persist its captured session id.
+    cwd: PathBuf,
     environment: GuestEnvironment,
     child: ChildGuard,
     master: Box<dyn MasterPty + Send>,
@@ -352,6 +356,7 @@ impl Pane {
 
         Ok(Self {
             spec,
+            cwd,
             environment,
             child,
             master: pty.master,
@@ -362,6 +367,19 @@ impl Pane {
             parser: Parser::new(size.rows.max(2), size.cols.max(2), 0),
             headroom_active,
         })
+    }
+
+    /// Best-effort capture of this pane's exact underlying vendor session id,
+    /// keyed off its own freshly-delivered intro (fresh spawns, restarts, and
+    /// post-clear respawns all flow through the intro-sent event). Runs on a
+    /// background thread bounded to `session_state::SESSION_CAPTURE_GRACE`, so
+    /// it never blocks the UI loop. Resumed panes skip the intro and therefore
+    /// never call this.
+    pub(crate) fn begin_session_capture(&self) {
+        let Ok(vendor) = controls::cli_vendor(&self.spec) else {
+            return;
+        };
+        session_state::capture_async(vendor, self.cwd.clone());
     }
 
     pub(crate) fn drain_output(&mut self) -> io::Result<bool> {
@@ -780,6 +798,10 @@ mod tests {
 
     #[test]
     fn resume_supported_specs_skips_guests_without_a_conductor_adapter() {
+        // Isolate the captured-session lookup so parallel tests that seed the
+        // session state cannot leak ids into this resume path.
+        let _state = session_state::StateRootGuard::isolated();
+
         let claude = room_spec("claude", &["--model", "sonnet"]);
         let mut shell = room_spec("/bin/sh", &[]);
         shell.transport = Transport::Shell;

@@ -417,7 +417,10 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                 match panes[index]
                     .send_whisper("The Crowded Room", &house_rules(index + 1, &roster))
                 {
-                    Ok(()) => delivery_gates[index].intro_sent(),
+                    Ok(()) => {
+                        delivery_gates[index].intro_sent();
+                        panes[index].begin_session_capture();
+                    }
                     Err(error) => {
                         delivery_gates[index].intro_sent();
                         notice = Some(format!(
