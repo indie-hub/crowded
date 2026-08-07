@@ -91,9 +91,9 @@ pub(crate) struct RoomSpec {
     pub(crate) allow_control: bool,
     pub(crate) use_headroom: bool,
     /// Args for the `headroom` wrapper itself (e.g. its own flags), placed
-    /// before the wrapped program and its args: `headroom wrap
-    /// <headroom_args...> <program> <args...>`. Ignored when `use_headroom`
-    /// is false or `headroom` is not found on PATH.
+    /// after the wrapped program name and before the program's own args:
+    /// `headroom wrap <program> <headroom_args...> <args...>`. Ignored when
+    /// `use_headroom` is false or `headroom` is not found on PATH.
     pub(crate) headroom_args: Vec<OsString>,
 }
 

@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.28.1] - 2026-08-07
+
+### Fixed
+
+- `headroom_args` now land after the wrapped program name instead of before it (`headroom wrap <program> <headroom_args...> <args...>`), matching `headroom wrap`'s actual CLI contract: the tool name is `wrap`'s own subcommand (e.g. `headroom wrap claude`), and headroom's own flags belong to that subcommand, not before it.
+
 ## [0.28.0] - 2026-08-07
 
 ### Added
@@ -18,7 +24,7 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Added
 
 - `crowded control ROOM resume` restarts the target CLI with each vendor's "continue the most recent conversation" flag (Claude and OpenCode: `--continue`; Codex: `resume --last`), mirroring `clear`'s restart but keeping context instead of dropping it.
-- Room config gains `headroom_args`: extra flags for the `headroom` wrapper itself, inserted before the wrapped program (`headroom wrap <headroom_args...> <original-command> <original-args...>`). Ignored when `use_headroom` is off or the binary is missing.
+- Room config gains `headroom_args`: extra flags for the `headroom` wrapper itself, inserted after the wrapped program name and before the program's own args (`headroom wrap <original-command> <headroom_args...> <original-args...>`). Ignored when `use_headroom` is off or the binary is missing.
 
 ## [0.26.1] - 2026-08-06
 

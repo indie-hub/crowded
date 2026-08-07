@@ -136,16 +136,17 @@ The Room Pulse sidebar appends `[headroom]` to that
 room's title, and the live roster reports `headroom: true` for rooms actually
 running under the wrapper.
 
-`headroom_args` are flags for `headroom` itself, not the wrapped guest. They
-land before the wrapped program on the command line, since `headroom` treats
-everything from the program name onward as the command to run:
+`headroom_args` are flags for `headroom`'s `wrap` subcommand itself, not the
+wrapped guest. `headroom wrap` takes the tool name as its own subcommand
+(`headroom wrap claude`, `headroom wrap codex`, ...), so `headroom_args` land
+after that tool name and before the guest's own arguments:
 
 ```toml
 use_headroom = true
 headroom_args = ["--budget", "5000"]
 ```
 
-This launches `headroom wrap --budget 5000 <original-command> <original-args...>`.
+This launches `headroom wrap <original-command> --budget 5000 <original-args...>`.
 
 Command-line guests still work and override the configured room list while
 retaining the Shared Toolbox:

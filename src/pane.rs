@@ -122,13 +122,14 @@ fn environment_value(variables: &[(OsString, OsString)], name: &str) -> Option<O
 /// Decide the actually-launched program and arguments for a room.
 ///
 /// When `use_headroom` is set and the `headroom` wrapper is installed on the
-/// room's PATH, the launch becomes `headroom wrap <headroom_args...>
-/// <original-program> <original-args...>` (the confirmed CLI form, with the
-/// `wrap` subcommand). `headroom_args` are flags for `headroom` itself and
-/// must land before the wrapped program, since headroom treats everything
-/// from the program name onward as the command to run. Otherwise the
-/// original command is launched unchanged and missing headroom is a silent
-/// fallback, not an error. Returns `(program, args, headroom_active)`.
+/// room's PATH, the launch becomes `headroom wrap <original-program>
+/// <headroom_args...> <original-args...>` (`headroom wrap` takes the tool
+/// name as its own subcommand, e.g. `headroom wrap claude`; `headroom_args`
+/// are flags for that `wrap` subcommand itself, e.g. `--port`, `--memory`,
+/// and must land after the tool name but before the tool's own args, which
+/// are passed through unrecognized). Otherwise the original command is
+/// launched unchanged and missing headroom is a silent fallback, not an
+/// error. Returns `(program, args, headroom_active)`.
 fn headroom_launch(
     program: &OsStr,
     args: &[OsString],
@@ -140,8 +141,8 @@ fn headroom_launch(
     if use_headroom && headroom_on_path(path.as_deref(), path_ext.as_deref()) {
         let mut wrapped = Vec::with_capacity(args.len() + headroom_args.len() + 2);
         wrapped.push(OsString::from("wrap"));
-        wrapped.extend(headroom_args.iter().cloned());
         wrapped.push(program.to_os_string());
+        wrapped.extend(headroom_args.iter().cloned());
         wrapped.extend(args.iter().cloned());
         (OsString::from("headroom"), wrapped, true)
     } else {
@@ -720,15 +721,15 @@ mod tests {
             &ext,
         );
         assert_eq!(program, OsString::from("headroom"));
-        // headroom's own args land between "wrap" and the wrapped program,
-        // i.e. before the environment's own arguments.
+        // headroom's own args land after the wrapped program (its subcommand
+        // name), before the environment's own arguments.
         assert_eq!(
             args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>(),
             [
                 "wrap",
+                "claude",
                 "--budget",
                 "5000",
-                "claude",
                 "--continue",
                 "--model",
                 "sonnet"
