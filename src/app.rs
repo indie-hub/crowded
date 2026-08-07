@@ -104,6 +104,13 @@ impl DeliveryGate {
     }
 }
 
+/// The delivery gate for a pane that just respawned. A genuinely resumed
+/// pane skips the intro whisper; every other respawn path (fresh spawn,
+/// restart, ClearContext, Configure) resends it exactly as before.
+fn gate_after_control(needs_intro: bool, action: &ControlAction) -> DeliveryGate {
+    DeliveryGate::new(needs_intro && !matches!(action, ControlAction::Resume))
+}
+
 impl DeliveryFuse {
     fn new(limit: usize) -> Self {
         Self {
@@ -339,7 +346,9 @@ impl Drop for TerminalGuard {
 }
 
 pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
-    run_with(room_specs()?)
+    let specs = room_specs()?;
+    let resumed = vec![false; specs.len()];
+    run_with(specs, resumed)
 }
 
 /// The `crowded resume` entry point: same room resolution as a plain
@@ -347,12 +356,13 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// flag already applied.
 pub(crate) fn run_resumed() -> Result<(), Box<dyn std::error::Error>> {
     let mut specs = room_specs_resumed()?;
-    pane::resume_supported_specs(&mut specs);
-    run_with(specs)
+    let resumed = pane::resume_supported_specs(&mut specs);
+    run_with(specs, resumed)
 }
 
-fn run_with(specs: Vec<RoomSpec>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std::error::Error>> {
     let room_count = specs.len();
+    debug_assert_eq!(resumed.len(), room_count);
     // Each room receives only its own capability token.
     let doorbell = Doorbell::start(room_count)?;
     // `?` returns early on an error. The guards below still run their Drop code.
@@ -371,7 +381,8 @@ fn run_with(specs: Vec<RoomSpec>) -> Result<(), Box<dyn std::error::Error>> {
     let roster = panes.iter().map(Pane::title).collect::<Vec<_>>().join("; ");
     let mut delivery_gates = panes
         .iter()
-        .map(|pane| DeliveryGate::new(pane.needs_intro()))
+        .enumerate()
+        .map(|(index, pane)| DeliveryGate::new(pane.needs_intro() && !resumed[index]))
         .collect::<Vec<_>>();
     let mut last_output = vec![None::<Instant>; room_count];
     let mut focused = 0;
@@ -497,8 +508,10 @@ fn run_with(specs: Vec<RoomSpec>) -> Result<(), Box<dyn std::error::Error>> {
                     })();
                     match result {
                         Ok(()) => {
-                            delivery_gates[control.to] =
-                                DeliveryGate::new(panes[control.to].needs_intro());
+                            delivery_gates[control.to] = gate_after_control(
+                                panes[control.to].needs_intro(),
+                                &control.action,
+                            );
                             last_output[control.to] = None;
                             room_pulses[control.to] = Some(PulseState::Starting);
                             control.reply_applied();
@@ -1025,5 +1038,32 @@ mod tests {
         gate.observe(false);
         gate.observe(true);
         assert!(gate.can_deliver(true));
+    }
+
+    #[test]
+    fn resume_control_skips_intro_but_clear_and_configure_resend_it() {
+        assert_eq!(
+            gate_after_control(true, &ControlAction::Resume),
+            DeliveryGate::Ready
+        );
+        assert_eq!(
+            gate_after_control(true, &ControlAction::ClearContext),
+            DeliveryGate::AwaitingIntro
+        );
+        assert_eq!(
+            gate_after_control(
+                true,
+                &ControlAction::Configure {
+                    model: None,
+                    effort: None,
+                }
+            ),
+            DeliveryGate::AwaitingIntro
+        );
+        // Terminal panes take no intro either way, including across a resume.
+        assert_eq!(
+            gate_after_control(false, &ControlAction::Resume),
+            DeliveryGate::Ready
+        );
     }
 }

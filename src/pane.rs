@@ -154,10 +154,15 @@ fn headroom_launch(
 /// spawn, for the `crowded resume` CLI entry point. Guests without a
 /// Conductor adapter (shell rooms, unrecognized programs) are left
 /// unchanged rather than failing the whole launch over one room.
-pub(crate) fn resume_supported_specs(specs: &mut [RoomSpec]) {
-    for spec in specs {
-        let _ = controls::add_resume_args(spec);
-    }
+///
+/// Returns, per spec, whether resume args were actually applied. The
+/// caller uses this to tell which panes genuinely resumed and can skip
+/// their intro whisper.
+pub(crate) fn resume_supported_specs(specs: &mut [RoomSpec]) -> Vec<bool> {
+    specs
+        .iter_mut()
+        .map(|spec| controls::add_resume_args(spec).is_ok())
+        .collect()
 }
 
 fn opencode_input_ready(screen: &str) -> bool {
@@ -779,12 +784,15 @@ mod tests {
         let mut shell = room_spec("/bin/sh", &[]);
         shell.transport = Transport::Shell;
         let shell_args_before = shell.args.clone();
+        let unknown = room_spec("raw:editor", &[]);
 
-        let mut specs = [claude, shell];
-        resume_supported_specs(&mut specs);
+        let mut specs = [claude, shell, unknown];
+        let resumed = resume_supported_specs(&mut specs);
 
         assert_eq!(arguments(&specs[0]), ["--model", "sonnet", "--continue"]);
         // No Conductor adapter for a shell room: left byte-identical.
         assert_eq!(specs[1].args, shell_args_before);
+        // Reports, per spec, whether resume args were actually applied.
+        assert_eq!(resumed, [true, false, false]);
     }
 }
