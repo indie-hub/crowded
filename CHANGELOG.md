@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-08-07
+
+### Added
+
+- `crowded control ROOM resume` restarts the target CLI with each vendor's "continue the most recent conversation" flag (Claude and OpenCode: `--continue`; Codex: `resume --last`), mirroring `clear`'s restart but keeping context instead of dropping it.
+- Room config gains `headroom_args`: extra flags for the `headroom` wrapper itself, inserted before the wrapped program (`headroom wrap <headroom_args...> <original-command> <original-args...>`). Ignored when `use_headroom` is off or the binary is missing.
+
 ## [0.26.1] - 2026-08-06
 
 ### Fixed

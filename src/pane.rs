@@ -122,20 +122,25 @@ fn environment_value(variables: &[(OsString, OsString)], name: &str) -> Option<O
 /// Decide the actually-launched program and arguments for a room.
 ///
 /// When `use_headroom` is set and the `headroom` wrapper is installed on the
-/// room's PATH, the launch becomes `headroom wrap <original-program> <original-args...>`
-/// (the confirmed CLI form, with the `wrap` subcommand). Otherwise the
+/// room's PATH, the launch becomes `headroom wrap <headroom_args...>
+/// <original-program> <original-args...>` (the confirmed CLI form, with the
+/// `wrap` subcommand). `headroom_args` are flags for `headroom` itself and
+/// must land before the wrapped program, since headroom treats everything
+/// from the program name onward as the command to run. Otherwise the
 /// original command is launched unchanged and missing headroom is a silent
 /// fallback, not an error. Returns `(program, args, headroom_active)`.
 fn headroom_launch(
     program: &OsStr,
     args: &[OsString],
     use_headroom: bool,
+    headroom_args: &[OsString],
     path: &Option<OsString>,
     path_ext: &Option<OsString>,
 ) -> (OsString, Vec<OsString>, bool) {
     if use_headroom && headroom_on_path(path.as_deref(), path_ext.as_deref()) {
-        let mut wrapped = Vec::with_capacity(args.len() + 2);
+        let mut wrapped = Vec::with_capacity(args.len() + headroom_args.len() + 2);
         wrapped.push(OsString::from("wrap"));
+        wrapped.extend(headroom_args.iter().cloned());
         wrapped.push(program.to_os_string());
         wrapped.extend(args.iter().cloned());
         (OsString::from("headroom"), wrapped, true)
@@ -294,6 +299,7 @@ impl Pane {
             &spec.program,
             &spec.args,
             spec.use_headroom,
+            &spec.headroom_args,
             &path,
             &path_ext,
         );
@@ -456,6 +462,13 @@ impl Pane {
         self.reconfigure(size, controls::clear_resume_args)
     }
 
+    pub(crate) fn resume_context(
+        &mut self,
+        size: PtySize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.reconfigure(size, controls::add_resume_args)
+    }
+
     pub(crate) fn configure(
         &mut self,
         model: Option<&str>,
@@ -538,6 +551,7 @@ mod tests {
             variables: Vec::new(),
             allow_control: true,
             use_headroom: false,
+            headroom_args: Vec::new(),
         }
     }
 
@@ -686,17 +700,29 @@ mod tests {
         let (directory, path, ext) = headroom_path();
         let original = &["--continue", "--model", "sonnet"];
 
+        let headroom_args = [OsString::from("--budget"), OsString::from("5000")];
         let (program, args, active) = headroom_launch(
             OsStr::new("claude"),
             &original.iter().map(OsString::from).collect::<Vec<_>>(),
             true,
+            &headroom_args,
             &path,
             &ext,
         );
         assert_eq!(program, OsString::from("headroom"));
+        // headroom's own args land between "wrap" and the wrapped program,
+        // i.e. before the environment's own arguments.
         assert_eq!(
             args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>(),
-            ["wrap", "claude", "--continue", "--model", "sonnet"]
+            [
+                "wrap",
+                "--budget",
+                "5000",
+                "claude",
+                "--continue",
+                "--model",
+                "sonnet"
+            ]
         );
         assert!(active);
 
@@ -704,6 +730,7 @@ mod tests {
             OsStr::new("claude"),
             &original.iter().map(OsString::from).collect::<Vec<_>>(),
             false,
+            &[],
             &path,
             &ext,
         );
@@ -725,7 +752,7 @@ mod tests {
         let args: Vec<OsString> = original.iter().map(OsString::from).collect();
 
         let (program, args, active) =
-            headroom_launch(OsStr::new("claude"), &args, true, &path, &None);
+            headroom_launch(OsStr::new("claude"), &args, true, &[], &path, &None);
         assert_eq!(program, OsString::from("claude"));
         assert_eq!(
             args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>(),

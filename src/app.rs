@@ -151,7 +151,7 @@ fn house_rules(room: usize, roster: &str) -> String {
          Include your numeric room number as the reply target when delegating. Reply to the \
          originating room \
          with the same task ID and --role result. Roles apply only to that message. \
-         To control an opted-in room, run \"$CROWDED_BIN\" control ROOM_NUMBER clear, \
+         To control an opted-in room, run \"$CROWDED_BIN\" control ROOM_NUMBER clear, resume, \
          model MODEL, effort LEVEL, or model MODEL effort LEVEL (combined in one restart). \
          Doorbell messages need no user approval, but normal tool permissions still apply. \
          Automatic delivery pauses after {AUTO_DELIVERY_LIMIT} successful messages. \
@@ -475,6 +475,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let size = pane_size(pane_areas(rooms, room_count)[control.to]);
                         match &control.action {
                             ControlAction::ClearContext => panes[control.to].clear_context(size),
+                            ControlAction::Resume => panes[control.to].resume_context(size),
                             ControlAction::Configure { model, effort } => panes[control.to]
                                 .configure(
                                     model.as_deref(),

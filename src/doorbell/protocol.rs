@@ -65,6 +65,7 @@ pub(super) struct ControlRequest {
 #[serde(tag = "action", content = "value", rename_all = "snake_case")]
 pub(crate) enum ControlAction {
     ClearContext,
+    Resume,
     Configure {
         #[serde(skip_serializing_if = "Option::is_none")]
         model: Option<String>,
@@ -77,6 +78,7 @@ impl ControlAction {
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::ClearContext => "clear context",
+            Self::Resume => "resume",
             Self::Configure {
                 model: Some(_),
                 effort: Some(_),

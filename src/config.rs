@@ -74,6 +74,8 @@ pub(crate) struct RoomConfig {
     pub(crate) allow_control: bool,
     #[serde(default)]
     pub(crate) use_headroom: bool,
+    #[serde(default)]
+    headroom_args: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -88,6 +90,11 @@ pub(crate) struct RoomSpec {
     pub(crate) variables: Vec<(OsString, OsString)>,
     pub(crate) allow_control: bool,
     pub(crate) use_headroom: bool,
+    /// Args for the `headroom` wrapper itself (e.g. its own flags), placed
+    /// before the wrapped program and its args: `headroom wrap
+    /// <headroom_args...> <program> <args...>`. Ignored when `use_headroom`
+    /// is false or `headroom` is not found on PATH.
+    pub(crate) headroom_args: Vec<OsString>,
 }
 
 impl RoomSpec {
@@ -107,6 +114,7 @@ impl RoomSpec {
             variables: Vec::new(),
             allow_control: false,
             use_headroom: false,
+            headroom_args: Vec::new(),
         }
     }
 
@@ -142,6 +150,7 @@ impl RoomSpec {
             variables: Vec::new(),
             allow_control: config.allow_control,
             use_headroom: config.use_headroom,
+            headroom_args: config.headroom_args.into_iter().map(Into::into).collect(),
         })
     }
 
@@ -391,6 +400,7 @@ mod tests {
         assert!(guest.cwd.is_none());
         assert!(!guest.allow_control);
         assert!(!guest.use_headroom);
+        assert!(guest.headroom_args.is_empty());
         assert_eq!(guest.title, "codex · 2");
     }
 
@@ -405,6 +415,7 @@ mod tests {
                 transport = "raw"
                 allow_control = true
                 use_headroom = true
+                headroom_args = ["--budget", "5000"]
 
                 [[rooms]]
                 command = "/bin/sh"
@@ -419,12 +430,17 @@ mod tests {
         assert_eq!(rooms[0].args, [OsString::from("--continue")]);
         assert!(rooms[0].allow_control);
         assert!(rooms[0].use_headroom);
+        assert_eq!(
+            rooms[0].headroom_args,
+            [OsString::from("--budget"), OsString::from("5000")]
+        );
         assert_eq!(rooms[0].vendor, "anthropic");
         assert_eq!(rooms[1].title, "sh · 2");
         assert_eq!(rooms[1].vendor, "local");
         assert_eq!(rooms[1].cwd, Some(PathBuf::from("examples")));
         assert!(!rooms[1].allow_control);
         assert!(!rooms[1].use_headroom);
+        assert!(rooms[1].headroom_args.is_empty());
         assert!(room_specs_from_toml("[[rooms]]\ncommand='codex'\ntransport='raw'").is_err());
         assert!(
             room_specs_from_toml("[[rooms]]\ncommand='codex'\ntransport='raw'\nworkdir='typo'")

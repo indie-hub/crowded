@@ -105,8 +105,8 @@ pub(crate) fn send_command() -> Result<(), Box<dyn std::error::Error>> {
     response.into_result("Doorbell rejected envelope")
 }
 
-const CONTROL_USAGE: &str =
-    "usage: crowded control ROOM clear | model MODEL | effort LEVEL | model MODEL effort LEVEL";
+const CONTROL_USAGE: &str = "usage: crowded control ROOM clear | resume | model MODEL | \
+     effort LEVEL | model MODEL effort LEVEL";
 
 pub(super) fn parse_control_args(
     args: impl IntoIterator<Item = String>,
@@ -124,11 +124,18 @@ pub(super) fn parse_control_args(
         }
         return Err(CONTROL_USAGE.to_owned());
     }
+    if args.peek().is_some_and(|next| next == "resume") {
+        args.next();
+        if args.next().is_none() {
+            return Ok((target, ControlAction::Resume));
+        }
+        return Err(CONTROL_USAGE.to_owned());
+    }
     let mut model = None;
     let mut effort = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "clear" => return Err(CONTROL_USAGE.to_owned()),
+            "clear" | "resume" => return Err(CONTROL_USAGE.to_owned()),
             "model" => {
                 if model.is_some() {
                     return Err(CONTROL_USAGE.to_owned());

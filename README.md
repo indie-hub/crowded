@@ -136,6 +136,17 @@ The Room Pulse sidebar appends `[headroom]` to that
 room's title, and the live roster reports `headroom: true` for rooms actually
 running under the wrapper.
 
+`headroom_args` are flags for `headroom` itself, not the wrapped guest. They
+land before the wrapped program on the command line, since `headroom` treats
+everything from the program name onward as the command to run:
+
+```toml
+use_headroom = true
+headroom_args = ["--budget", "5000"]
+```
+
+This launches `headroom wrap --budget 5000 <original-command> <original-args...>`.
+
 Command-line guests still work and override the configured room list while
 retaining the Shared Toolbox:
 
@@ -168,6 +179,7 @@ Doorbell:
 
 ```console
 "$CROWDED_BIN" control 2 clear
+"$CROWDED_BIN" control 2 resume
 "$CROWDED_BIN" control 2 model gpt-5
 "$CROWDED_BIN" control 2 effort high
 "$CROWDED_BIN" control 2 model gpt-5 effort high
@@ -175,14 +187,17 @@ Doorbell:
 
 `allow_control` defaults to `false`. Controls are structured events, so
 ordinary whispers and terminal output cannot trigger them. All three native
-CLIs support `clear` and `model`; Claude and Codex support `effort`. OpenCode
-effort is rejected until it exposes a stable launch option. Model and effort
-can be set together in one restart instead of two, and the roster now
-reports each room's current model and effort.
+CLIs support `clear`, `resume`, and `model`; Claude and Codex support
+`effort`. OpenCode effort is rejected until it exposes a stable launch
+option. Model and effort can be set together in one restart instead of two,
+and the roster now reports each room's current model and effort.
 
-This first Conductor slice restarts the target CLI. `clear` also removes known
-resume arguments so the replacement starts a fresh context; model and effort
-retain the room's configured continuation arguments.
+This first Conductor slice restarts the target CLI. `clear` removes known
+resume arguments so the replacement starts a fresh context; `resume` restarts
+with each CLI's "continue the most recent conversation" flag (Claude and
+OpenCode: `--continue`; Codex: `resume --last`) instead of picking a specific
+session; model and effort retain the room's configured continuation
+arguments.
 
 ## Shared Plugins
 

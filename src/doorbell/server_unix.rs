@@ -326,6 +326,12 @@ mod tests {
             (2, ControlAction::ClearContext)
         );
         assert_eq!(
+            parse_control_args(["2", "resume"].map(str::to_owned)).unwrap(),
+            (2, ControlAction::Resume)
+        );
+        assert!(parse_control_args(["2", "resume", "extra"].map(str::to_owned)).is_err());
+        assert!(parse_control_args(["2", "model", "a", "resume"].map(str::to_owned)).is_err());
+        assert_eq!(
             parse_control_args(["3", "model", "openai/gpt-5"].map(str::to_owned)).unwrap(),
             (
                 3,

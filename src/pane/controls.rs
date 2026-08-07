@@ -34,6 +34,37 @@ pub(super) fn clear_resume_args(spec: &mut RoomSpec) -> io::Result<()> {
     Ok(())
 }
 
+/// Relaunch the guest with each vendor's "resume most recent conversation"
+/// flag. Claude and OpenCode take a bare `--continue`; Codex takes a trailing
+/// `resume --last` subcommand (the pattern `clear_resume_args` already
+/// expects when it truncates back to the base args). No session ID is
+/// tracked, so this always resumes the most recent session, not a specific
+/// one.
+pub(super) fn add_resume_args(spec: &mut RoomSpec) -> io::Result<()> {
+    match cli_vendor(spec)? {
+        CliVendor::Claude => {
+            strip_flags(&mut spec.args, &["--continue", "-c", "--fork-session"]);
+            strip_options(&mut spec.args, &["--resume", "-r", "--session-id"]);
+            spec.args.push("--continue".into());
+        }
+        CliVendor::Codex => {
+            if let Some(resume) = spec.args.iter().position(|argument| {
+                matches!(argument.to_string_lossy().as_ref(), "resume" | "fork")
+            }) {
+                spec.args.truncate(resume);
+            }
+            spec.args.push("resume".into());
+            spec.args.push("--last".into());
+        }
+        CliVendor::OpenCode => {
+            strip_flags(&mut spec.args, &["--continue", "-c", "--fork"]);
+            strip_options(&mut spec.args, &["--session", "-s"]);
+            spec.args.push("--continue".into());
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn set_model(spec: &mut RoomSpec, model: &str) -> io::Result<()> {
     cli_vendor(spec)?;
     replace_option(&mut spec.args, &["--model", "-m"], "--model", model);
@@ -237,6 +268,7 @@ mod tests {
             variables: Vec::new(),
             allow_control: false,
             use_headroom: false,
+            headroom_args: Vec::new(),
         }
     }
 
@@ -245,6 +277,47 @@ mod tests {
         assert!(uses_bracketed_paste(&raw_room("claude")));
         assert!(uses_bracketed_paste(&raw_room("codex")));
         assert!(!uses_bracketed_paste(&raw_room("opencode")));
+    }
+
+    #[test]
+    fn add_resume_args_sets_the_vendor_continue_flag() {
+        let mut claude = raw_room("claude");
+        claude.args = vec!["--model".into(), "sonnet".into()];
+        add_resume_args(&mut claude).unwrap();
+        assert_eq!(
+            claude.args,
+            vec![
+                OsString::from("--model"),
+                "sonnet".into(),
+                "--continue".into()
+            ]
+        );
+
+        let mut codex = raw_room("codex");
+        codex.args = vec!["--dangerously-bypass-approvals-and-sandbox".into()];
+        add_resume_args(&mut codex).unwrap();
+        assert_eq!(
+            codex.args,
+            vec![
+                OsString::from("--dangerously-bypass-approvals-and-sandbox"),
+                "resume".into(),
+                "--last".into(),
+            ]
+        );
+        // Resuming again must not stack duplicate "resume --last" pairs.
+        add_resume_args(&mut codex).unwrap();
+        assert_eq!(
+            codex.args,
+            vec![
+                OsString::from("--dangerously-bypass-approvals-and-sandbox"),
+                "resume".into(),
+                "--last".into(),
+            ]
+        );
+
+        let mut opencode = raw_room("opencode");
+        add_resume_args(&mut opencode).unwrap();
+        assert_eq!(opencode.args, vec![OsString::from("--continue")]);
     }
 
     #[test]
