@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.28.2] - 2026-08-07
+
+### Fixed
+
+- The Room Pulse panel no longer gets stuck on "starting" for a resumed room. It was rendering the room's raw, self-reported hook state directly; a resumed room skips the intro whisper, so no later Stop hook ever runs to self-report "ready", and the panel had no way to notice the room had become deliverable. The panel now cross-checks the same `roster_state` (delivery gate + live input-ready reading) that `crowded roster --json` already used, so both agree instead of only the JSON roster ever recovering.
+- `opencode_input_ready` no longer matches on the OpenCode idle prompt phrase when it's wrapped across a line boundary by a narrow pane, and its busy-marker check is confined to a bounded tail window so resumed conversation history can't be mistaken for the current prompt.
+
 ## [0.28.1] - 2026-08-07
 
 ### Fixed

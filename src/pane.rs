@@ -167,9 +167,40 @@ pub(crate) fn resume_supported_specs(specs: &mut [RoomSpec]) -> Vec<bool> {
 }
 
 fn opencode_input_ready(screen: &str) -> bool {
-    (screen.contains("Ask anything") || screen.contains("ctrl+p commands"))
-        && !screen.contains("esc interrupt")
-        && !screen.contains("exit shell mode")
+    // Resumed sessions show prior conversation history in the viewport.
+    // Checking the entire screen for "esc interrupt" is too strict: history
+    // may contain that phrase from a previous thinking turn or from code
+    // in the transcript, even though the current prompt is idle. Only
+    // the prompt area (tail of the screen) matters, and only the busy
+    // indicators near the last prompt matter.
+    let tail = screen
+        .get(screen.len().saturating_sub(1200)..)
+        .unwrap_or(screen);
+    let lines: Vec<&str> = tail.lines().collect();
+    // Narrow panes wrap the marker phrase itself across a line boundary
+    // (e.g. "...ctrl+p" / "commands..."), so a single line's contents can't
+    // be trusted alone. Join each line with the next one (space-separated,
+    // collapsing the wrap) before searching for the marker.
+    let prompt_idx = (0..lines.len()).rposition(|i| {
+        let joined = lines[i..(i + 3).min(lines.len())].join(" ");
+        joined.contains("Ask anything")
+            || (joined.contains("ctrl+p") && joined.contains("commands"))
+    });
+    let Some(idx) = prompt_idx else {
+        return false;
+    };
+    // Prompt must be near the bottom of the visible tail. A prompt
+    // far above (e.g. old history with Ask anything at the top) must
+    // not count; the current idle prompt lives at the bottom.
+    if lines.len() - idx > 6 {
+        return false;
+    }
+    // Only the prompt line and the next couple of lines can contain the
+    // busy indicators when the UI is actually busy. History's "esc
+    // interrupt" far above the prompt must not block readiness.
+    let window = &lines[idx..(idx + 3).min(lines.len())];
+    let prompt_area = window.join("\n");
+    !prompt_area.contains("esc interrupt") && !prompt_area.contains("exit shell mode")
 }
 
 #[cfg(not(windows))]
@@ -686,6 +717,49 @@ mod tests {
         assert!(!opencode_input_ready("ctrl+p commands  esc interrupt"));
         assert!(!opencode_input_ready(
             "Run a command... ctrl+p commands  esc exit shell mode"
+        ));
+    }
+
+    #[test]
+    fn opencode_resumed_history_with_esc_interrupt_still_reports_ready() {
+        let screen = format!(
+            "{}{}{}{}",
+            "history line 1\n".repeat(30),
+            "esc interrupt was shown earlier\n",
+            "history line\n".repeat(10),
+            "Ask anything"
+        );
+        assert!(opencode_input_ready(&screen));
+        let busy_prompt = "Ask anything  esc interrupt";
+        assert!(!opencode_input_ready(busy_prompt));
+        let long_history = format!("{}{}", "Ask anything\n", "x\n".repeat(500));
+        assert!(!opencode_input_ready(&long_history));
+    }
+
+    #[test]
+    fn opencode_ready_marker_wrapped_across_lines_by_a_narrow_pane_still_reports_ready() {
+        let screen = "history line\n".repeat(10)
+            + " /Users/bruno/Documents/ 184.9K (18%) ctrl+p    \n"
+            + " Development/bruno/                   commands  \n"
+            + " crowded                                        \n";
+        assert!(opencode_input_ready(&screen));
+    }
+
+    #[test]
+    fn opencode_narrow_31_cols_ask_truncated_still_reports_ready() {
+        // At 31 cols (inner crowded resume with 3 rooms on 80x24 outer),
+        // "Ask anything" is truncated to "Ask tests\"" and no longer matches.
+        // The status footer's "ctrl+p commands" hint survives truncation on
+        // its own lines and is enough to anchor the prompt.
+        let screen = "history line\n".repeat(5)
+            + "Ask tests\"\n"
+            + "Build\n"
+            + "ctrl+p    \n"
+            + "commands  \n";
+        assert!(opencode_input_ready(&screen));
+        // Busy still blocks
+        assert!(!opencode_input_ready(
+            "Ask tests\"\nBuild\nctrl+p    \ncommands  \nesc interrupt"
         ));
     }
 

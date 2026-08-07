@@ -187,9 +187,9 @@ fn roster_state(
     if !online {
         return PulseState::Offline;
     }
+    let deliverable = gate.can_deliver(input_ready);
     if let Some(
-        state @ (PulseState::Starting
-        | PulseState::Thinking
+        state @ (PulseState::Thinking
         | PulseState::Working
         | PulseState::Error
         | PulseState::Offline),
@@ -197,12 +197,44 @@ fn roster_state(
     {
         return state;
     }
-    if gate.can_deliver(input_ready) {
+    // A resumed room's own SessionStart hook self-reports "starting" when
+    // process boots, but resume intentionally skips the intro whisper, so no
+    // Stop hook ever follows to self-report "ready". Trust the delivery gate
+    // over a stuck "starting" self-report once it independently confirms the
+    // room can receive messages; a legitimate startup never reaches Ready
+    // (gate.is_starting() implies !can_deliver), so this only overrides the
+    // stale case.
+    if pulse == Some(PulseState::Starting) && !deliverable {
+        return PulseState::Starting;
+    }
+    if deliverable {
         PulseState::Ready
     } else if gate.is_starting() {
         PulseState::Starting
     } else {
         PulseState::Working
+    }
+}
+
+/// The Room Pulse panel's label for one room. The self-reported `pulse`
+/// alone is not enough: a resumed room skips the intro whisper, so no Stop
+/// hook ever follows its SessionStart "starting" self-report to correct it.
+/// Routing through `roster_state` cross-checks the delivery gate and live
+/// `input_ready` reading the same way `crowded roster --json` already does,
+/// so the panel and the JSON roster agree instead of the panel alone getting
+/// stuck on a stale self-report.
+fn pulse_label(
+    pane: &Pane,
+    gate: DeliveryGate,
+    input_ready: bool,
+    pulse: Option<PulseState>,
+) -> &'static str {
+    if !pane.is_online() {
+        "offline"
+    } else if !pane.needs_intro() {
+        "terminal"
+    } else {
+        roster_state(true, gate, input_ready, pulse).label()
     }
 }
 
@@ -516,7 +548,10 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                                 &control.action,
                             );
                             last_output[control.to] = None;
-                            room_pulses[control.to] = Some(PulseState::Starting);
+                            room_pulses[control.to] = match &control.action {
+                                ControlAction::Resume => None,
+                                _ => Some(PulseState::Starting),
+                            };
                             control.reply_applied();
                             notice = Some(format!("{source} told {target} to {label}"));
                         }
@@ -614,15 +649,14 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
 
             let pulse_text = panes
                 .iter()
-                .zip(&room_pulses)
-                .map(|(pane, state)| {
-                    let state = if !pane.is_online() {
-                        "offline"
-                    } else if !pane.needs_intro() {
-                        "terminal"
-                    } else {
-                        state.map(PulseState::label).unwrap_or("waiting")
-                    };
+                .enumerate()
+                .map(|(index, pane)| {
+                    let state = pulse_label(
+                        pane,
+                        delivery_gates[index],
+                        input_ready[index],
+                        room_pulses[index],
+                    );
                     let headroom = if pane.headroom_active() {
                         " [headroom]"
                     } else {
@@ -1046,6 +1080,52 @@ mod tests {
         gate.observe(false);
         gate.observe(true);
         assert!(gate.can_deliver(true));
+    }
+
+    #[test]
+    fn roster_state_does_not_stick_on_a_resumed_rooms_stale_starting_self_report() {
+        // Resume skips the intro whisper, so the resumed process's own
+        // SessionStart hook can self-report "starting" with no later Stop
+        // hook to self-report "ready". Once the gate independently confirms
+        // deliverability, that must win over the stale self-report.
+        assert_eq!(
+            roster_state(true, DeliveryGate::Ready, true, Some(PulseState::Starting)),
+            PulseState::Ready
+        );
+        // A genuine startup (gate not yet Ready) still reports Starting.
+        assert_eq!(
+            roster_state(
+                true,
+                DeliveryGate::AwaitingIntro,
+                false,
+                Some(PulseState::Starting)
+            ),
+            PulseState::Starting
+        );
+    }
+
+    #[test]
+    fn resume_control_resets_pulse_so_roster_shows_ready_immediately() {
+        let resume_gate = gate_after_control(true, &ControlAction::Resume);
+        assert_eq!(resume_gate, DeliveryGate::Ready);
+        assert_eq!(
+            roster_state(true, resume_gate, true, None),
+            PulseState::Ready
+        );
+        assert_eq!(
+            roster_state(true, resume_gate, true, Some(PulseState::Starting)),
+            PulseState::Ready
+        );
+        let clear_gate = gate_after_control(true, &ControlAction::ClearContext);
+        assert_eq!(clear_gate, DeliveryGate::AwaitingIntro);
+        assert_eq!(
+            roster_state(true, clear_gate, true, Some(PulseState::Starting)),
+            PulseState::Starting
+        );
+        assert_eq!(
+            roster_state(true, clear_gate, true, None),
+            PulseState::Starting
+        );
     }
 
     #[test]
