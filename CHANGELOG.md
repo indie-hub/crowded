@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-08-10
+
+### Added
+
+- Room Pulse and roster output now share a freshness-aware state resolver, expose the state source and hook age, and recover from stale transient hook reports when delivery readiness is demonstrated.
+- Roster output now reports adapter-derived control capabilities and supported effort levels without claiming an available model catalogue or unsupported OpenCode effort control.
+
 ## [0.28.3] - 2026-08-10
 
 ### Fixed
