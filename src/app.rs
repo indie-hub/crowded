@@ -325,14 +325,25 @@ fn pulse_label(
         "terminal".to_owned()
     } else {
         let resolved = roster_state(true, gate, input_ready, pulse, now);
-        resolved_label(resolved)
+        let hook_age = pulse
+            .filter(|_| resolved.source == PulseSource::Hook)
+            .map(|sample| now.saturating_duration_since(sample.received_at));
+        resolved_label(resolved, hook_age)
     }
 }
 
 /// The visible Room Pulse label for a resolved state: the state plus its
 /// source, so the TUI shows the same provenance the JSON roster reports.
-fn resolved_label(resolved: ResolvedPulse) -> String {
-    format!("{} · {}", resolved.state.label(), resolved.source.label())
+fn resolved_label(resolved: ResolvedPulse, hook_age: Option<Duration>) -> String {
+    match hook_age {
+        Some(age) => format!(
+            "{} · {} · {}s ago",
+            resolved.state.label(),
+            resolved.source.label(),
+            age.as_secs()
+        ),
+        None => format!("{} · {}", resolved.state.label(), resolved.source.label()),
+    }
 }
 
 fn inject_ready_pending(
@@ -1258,35 +1269,45 @@ mod tests {
     }
 
     #[test]
-    fn tui_pulse_label_includes_the_resolved_state_source() {
-        // The panel shows the same state · source pair the JSON roster uses,
-        // with no extra detail or progress.
+    fn tui_pulse_label_includes_human_source_and_hook_age() {
         assert_eq!(
-            resolved_label(ResolvedPulse {
-                state: PulseState::Ready,
-                source: PulseSource::Readiness,
-            }),
-            "ready · readiness"
+            resolved_label(
+                ResolvedPulse {
+                    state: PulseState::Ready,
+                    source: PulseSource::Readiness,
+                },
+                None,
+            ),
+            "ready · screen"
         );
         assert_eq!(
-            resolved_label(ResolvedPulse {
-                state: PulseState::Thinking,
-                source: PulseSource::Hook,
-            }),
-            "thinking · hook"
+            resolved_label(
+                ResolvedPulse {
+                    state: PulseState::Thinking,
+                    source: PulseSource::Hook,
+                },
+                Some(Duration::from_secs(8)),
+            ),
+            "thinking · hook · 8s ago"
         );
         assert_eq!(
-            resolved_label(ResolvedPulse {
-                state: PulseState::Offline,
-                source: PulseSource::Offline,
-            }),
+            resolved_label(
+                ResolvedPulse {
+                    state: PulseState::Offline,
+                    source: PulseSource::Offline,
+                },
+                None,
+            ),
             "offline · offline"
         );
         assert_eq!(
-            resolved_label(ResolvedPulse {
-                state: PulseState::Working,
-                source: PulseSource::Gate,
-            }),
+            resolved_label(
+                ResolvedPulse {
+                    state: PulseState::Working,
+                    source: PulseSource::Gate,
+                },
+                None,
+            ),
             "working · gate"
         );
     }

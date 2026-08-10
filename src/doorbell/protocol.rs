@@ -187,7 +187,7 @@ impl PulseSource {
         match self {
             Self::Offline => "offline",
             Self::Hook => "hook",
-            Self::Readiness => "readiness",
+            Self::Readiness => "screen",
             Self::Gate => "gate",
         }
     }
