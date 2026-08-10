@@ -432,6 +432,8 @@ mod tests {
                         model: None,
                         effort: None,
                         headroom: true,
+                        pulse_age_ms: None,
+                        capabilities: Default::default(),
                     }]);
                     break;
                 }

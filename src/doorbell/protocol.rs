@@ -144,6 +144,39 @@ pub(crate) struct RosterRoom {
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
     pub(crate) headroom: bool,
+    /// Age of the last received Pulse hook sample, in milliseconds, when one
+    /// has been received. Lets consumers tell a fresh self-report from a
+    /// stale one that the delivery gate has since overridden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pulse_age_ms: Option<u64>,
+    /// Adapter-derived capability matrix: which peer controls the adapter can
+    /// apply, which effort levels it accepts, and what is known about the
+    /// model catalogue. Never probed at runtime.
+    #[serde(default)]
+    pub(crate) capabilities: RoomCapabilities,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct RoomCapabilities {
+    /// Whether the Conductor adapter can apply peer controls to this room
+    /// (raw transport with a known guest CLI).
+    #[serde(default)]
+    pub(crate) controls: bool,
+    /// Effort levels the adapter accepts. Empty when the guest has no stable
+    /// effort launch option (OpenCode), so nothing is claimed there.
+    #[serde(default)]
+    pub(crate) effort_levels: Vec<Effort>,
+    /// The model catalogue. Crowded never probes vendors, so this is always
+    /// `Unknown`; the configured `model` field is the only model claim.
+    #[serde(default)]
+    pub(crate) model_catalogue: ModelCatalogue,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ModelCatalogue {
+    #[default]
+    Unknown,
 }
 
 impl PulseState {
@@ -422,5 +455,72 @@ mod tests {
             ),
             Ok(0)
         );
+    }
+
+    #[test]
+    fn roster_capabilities_serialize_backward_compatible_fields() {
+        let room = RosterRoom {
+            room: 1,
+            name: "Builder".to_owned(),
+            guest: "opencode".to_owned(),
+            vendor: "sparks".to_owned(),
+            transport: "raw".to_owned(),
+            state: PulseState::Ready,
+            allow_control: true,
+            model: None,
+            effort: None,
+            headroom: false,
+            pulse_age_ms: Some(1234),
+            capabilities: RoomCapabilities {
+                controls: true,
+                effort_levels: Vec::new(),
+                model_catalogue: ModelCatalogue::Unknown,
+            },
+        };
+        let value = serde_json::to_value(&room).unwrap();
+        assert_eq!(value["state"], "ready");
+        assert_eq!(value["pulse_age_ms"], 1234);
+        assert_eq!(value["capabilities"]["controls"], true);
+        assert_eq!(
+            value["capabilities"]["effort_levels"],
+            serde_json::json!([])
+        );
+        assert_eq!(value["capabilities"]["model_catalogue"], "unknown");
+    }
+
+    #[test]
+    fn roster_capabilities_parse_older_wire_shapes_with_defaults() {
+        let old = r#"{
+            "room": 1,
+            "name": "Builder",
+            "guest": "opencode",
+            "vendor": "sparks",
+            "transport": "raw",
+            "state": "ready",
+            "allow_control": true,
+            "model": null,
+            "effort": null,
+            "headroom": false
+        }"#;
+        let parsed: RosterRoom = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.pulse_age_ms, None);
+        assert!(!parsed.capabilities.controls);
+        assert!(parsed.capabilities.effort_levels.is_empty());
+        assert_eq!(parsed.capabilities.model_catalogue, ModelCatalogue::Unknown);
+    }
+
+    #[test]
+    fn effort_labels_cover_the_doorbell_catalogue() {
+        let labels = [
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::Xhigh,
+            Effort::Max,
+        ]
+        .iter()
+        .map(|effort| effort.label())
+        .collect::<Vec<_>>();
+        assert_eq!(labels, ["low", "medium", "high", "xhigh", "max"]);
     }
 }

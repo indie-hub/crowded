@@ -17,6 +17,7 @@ use tui_term::vt100::{Parser, Screen};
 use crate::{
     command::{ResolvedCommand, headroom_on_path},
     config::{RoomSpec, Transport},
+    doorbell::RoomCapabilities,
 };
 
 mod controls;
@@ -595,6 +596,10 @@ impl Pane {
 
     pub(crate) fn current_effort(&self) -> Option<String> {
         controls::current_effort(&self.spec)
+    }
+
+    pub(crate) fn capabilities(&self) -> RoomCapabilities {
+        controls::capabilities(&self.spec)
     }
 
     fn reconfigure(

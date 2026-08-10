@@ -52,6 +52,11 @@ const HEADROOM_STARTUP_GRACE: Duration = Duration::from_secs(3);
 // detection like `opencode_input_ready`, keyed off the actual program.
 const INTRO_READINESS_CEILING: Duration = Duration::from_secs(15);
 const AUTO_DELIVERY_LIMIT: usize = 20;
+// A transient hook state (starting/thinking/working) is only trusted while
+// fresh. Once its sample is older than this and the delivery gate
+// demonstrably shows the screen ready, the ready screen wins: a hook that
+// stopped reporting must not pin the roster to a stale self-report forever.
+const PULSE_FRESHNESS_WINDOW: Duration = Duration::from_secs(30);
 
 struct DeliveryFuse {
     used: usize,
@@ -191,41 +196,69 @@ fn message_with_hat(task: Option<&str>, role: Option<&str>, body: &str) -> Strin
     }
 }
 
+/// A self-reported hook pulse timestamped at Doorbell receipt, so the roster
+/// resolver can tell a live transient state from a stale one.
+#[derive(Clone, Copy)]
+struct PulseSample {
+    state: PulseState,
+    received_at: Instant,
+}
+
+impl PulseSample {
+    fn now(state: PulseState) -> Self {
+        Self {
+            state,
+            received_at: Instant::now(),
+        }
+    }
+
+    fn is_stale(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.received_at) > PULSE_FRESHNESS_WINDOW
+    }
+}
+
 fn roster_state(
     online: bool,
     gate: DeliveryGate,
     input_ready: bool,
-    pulse: Option<PulseState>,
+    pulse: Option<PulseSample>,
+    now: Instant,
 ) -> PulseState {
     if !online {
         return PulseState::Offline;
     }
     let deliverable = gate.can_deliver(input_ready);
-    if let Some(
-        state @ (PulseState::Thinking
-        | PulseState::Working
-        | PulseState::Error
-        | PulseState::Offline),
-    ) = pulse
-    {
-        return state;
-    }
-    // A resumed room's own SessionStart hook self-reports "starting" when
-    // process boots, but resume intentionally skips the intro whisper, so no
-    // Stop hook ever follows to self-report "ready". Trust the delivery gate
-    // over a stuck "starting" self-report once it independently confirms the
-    // room can receive messages; a legitimate startup never reaches Ready
-    // (gate.is_starting() implies !can_deliver), so this only overrides the
-    // stale case.
-    if pulse == Some(PulseState::Starting) && !deliverable {
-        return PulseState::Starting;
-    }
-    if deliverable {
-        PulseState::Ready
-    } else if gate.is_starting() {
-        PulseState::Starting
-    } else {
-        PulseState::Working
+    let Some(sample) = pulse else {
+        if deliverable {
+            return PulseState::Ready;
+        }
+        return if gate.is_starting() {
+            PulseState::Starting
+        } else {
+            PulseState::Working
+        };
+    };
+    match sample.state {
+        // Terminal self-reports stay authoritative.
+        PulseState::Error | PulseState::Offline => sample.state,
+        // A stale transient hook state (the hook stopped reporting) must not
+        // override a screen the delivery gate demonstrably shows ready.
+        PulseState::Starting | PulseState::Thinking | PulseState::Working
+            if deliverable && sample.is_stale(now) =>
+        {
+            PulseState::Ready
+        }
+        // A genuinely starting room keeps its own self-report until the gate
+        // independently confirms it can receive messages; a legitimate
+        // startup never reaches Ready (gate.is_starting() implies
+        // !can_deliver), so this only overrides the stale case.
+        PulseState::Starting if !deliverable => PulseState::Starting,
+        // Fresh transient self-reports keep their existing priority.
+        PulseState::Thinking | PulseState::Working => sample.state,
+        PulseState::Ready if deliverable => PulseState::Ready,
+        PulseState::Ready if gate.is_starting() => PulseState::Starting,
+        PulseState::Ready => PulseState::Working,
+        PulseState::Starting => PulseState::Ready,
     }
 }
 
@@ -240,14 +273,15 @@ fn pulse_label(
     pane: &Pane,
     gate: DeliveryGate,
     input_ready: bool,
-    pulse: Option<PulseState>,
+    pulse: Option<PulseSample>,
+    now: Instant,
 ) -> &'static str {
     if !pane.is_online() {
         "offline"
     } else if !pane.needs_intro() {
         "terminal"
     } else {
-        roster_state(true, gate, input_ready, pulse).label()
+        roster_state(true, gate, input_ready, pulse, now).label()
     }
 }
 
@@ -442,7 +476,7 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
     let mut fuse = DeliveryFuse::new(AUTO_DELIVERY_LIMIT);
     let mut delivery_paused = false;
     let mut pending = VecDeque::<(u64, usize)>::new();
-    let mut room_pulses = vec![None::<PulseState>; room_count];
+    let mut room_pulses = vec![None::<PulseSample>; room_count];
 
     loop {
         let now = Instant::now();
@@ -527,18 +561,26 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                                     delivery_gates[index],
                                     input_ready[index],
                                     room_pulses[index],
+                                    now,
                                 ),
                                 allow_control: pane.allows_control(),
                                 model: pane.current_model(),
                                 effort: pane.current_effort(),
                                 headroom: pane.headroom_active(),
+                                pulse_age_ms: room_pulses[index].map(|sample| {
+                                    now.saturating_duration_since(sample.received_at)
+                                        .as_millis() as u64
+                                }),
+                                capabilities: pane.capabilities(),
                             })
                             .collect(),
                     );
                     continue;
                 }
                 DoorbellEvent::Pulse(pulse) => {
-                    room_pulses[pulse.from] = Some(pulse.state);
+                    // Timestamp the sample at Doorbell receipt so the freshness
+                    // resolver can tell a live transient state from a stale one.
+                    room_pulses[pulse.from] = Some(PulseSample::now(pulse.state));
                     continue;
                 }
                 DoorbellEvent::Control(control) => {
@@ -576,7 +618,7 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                             spawned_at[control.to] = Instant::now();
                             room_pulses[control.to] = match &control.action {
                                 ControlAction::Resume => None,
-                                _ => Some(PulseState::Starting),
+                                _ => Some(PulseSample::now(PulseState::Starting)),
                             };
                             control.reply_applied();
                             notice = Some(format!("{source} told {target} to {label}"));
@@ -682,6 +724,7 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                         delivery_gates[index],
                         input_ready[index],
                         room_pulses[index],
+                        now,
                     );
                     let headroom = if pane.headroom_active() {
                         " [headroom]"
@@ -864,7 +907,7 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                                 DeliveryGate::new(panes[focused].needs_intro());
                             last_output[focused] = None;
                             spawned_at[focused] = Instant::now();
-                            room_pulses[focused] = Some(PulseState::Starting);
+                            room_pulses[focused] = Some(PulseSample::now(PulseState::Starting));
                             notice = Some(format!("{} restarted", panes[focused].title()));
                         }
                         Err(error) => {
@@ -1019,24 +1062,117 @@ mod tests {
         assert!(rules.contains("untrusted peer input"));
     }
 
+    fn sample(state: PulseState) -> PulseSample {
+        PulseSample::now(state)
+    }
+
+    fn stale_sample(state: PulseState) -> PulseSample {
+        PulseSample {
+            state,
+            received_at: Instant::now() - PULSE_FRESHNESS_WINDOW - Duration::from_secs(1),
+        }
+    }
+
     #[test]
     fn roster_state_prefers_offline_pulses_and_real_readiness() {
+        let now = Instant::now();
         assert_eq!(
-            roster_state(false, DeliveryGate::Ready, true, Some(PulseState::Ready)),
+            roster_state(
+                false,
+                DeliveryGate::Ready,
+                true,
+                Some(sample(PulseState::Ready)),
+                now
+            ),
             PulseState::Offline
         );
         assert_eq!(
-            roster_state(true, DeliveryGate::Ready, true, Some(PulseState::Ready)),
+            roster_state(
+                true,
+                DeliveryGate::Ready,
+                true,
+                Some(sample(PulseState::Ready)),
+                now
+            ),
             PulseState::Ready
         );
         assert_eq!(
-            roster_state(true, DeliveryGate::Ready, false, Some(PulseState::Ready)),
+            roster_state(
+                true,
+                DeliveryGate::Ready,
+                false,
+                Some(sample(PulseState::Ready)),
+                now
+            ),
             PulseState::Working
         );
         assert_eq!(
-            roster_state(true, DeliveryGate::Ready, true, Some(PulseState::Thinking)),
+            roster_state(
+                true,
+                DeliveryGate::Ready,
+                true,
+                Some(sample(PulseState::Thinking)),
+                now
+            ),
             PulseState::Thinking
         );
+    }
+
+    #[test]
+    fn stale_transient_pulse_yields_to_a_demonstrably_ready_screen() {
+        let now = Instant::now();
+        // A hook that self-reported "thinking"/"working" long ago must not
+        // override a screen the delivery gate demonstrably shows ready.
+        assert_eq!(
+            roster_state(
+                true,
+                DeliveryGate::Ready,
+                true,
+                Some(stale_sample(PulseState::Thinking)),
+                now
+            ),
+            PulseState::Ready
+        );
+        assert_eq!(
+            roster_state(
+                true,
+                DeliveryGate::Ready,
+                true,
+                Some(stale_sample(PulseState::Working)),
+                now
+            ),
+            PulseState::Ready
+        );
+        // Terminal self-reports stay authoritative even when stale.
+        assert_eq!(
+            roster_state(
+                true,
+                DeliveryGate::Ready,
+                true,
+                Some(stale_sample(PulseState::Error)),
+                now
+            ),
+            PulseState::Error
+        );
+        // Without a demonstrably ready screen the stale transient report
+        // still stands (the gate cannot confirm deliverability).
+        assert_eq!(
+            roster_state(
+                true,
+                DeliveryGate::Ready,
+                false,
+                Some(stale_sample(PulseState::Working)),
+                now
+            ),
+            PulseState::Working
+        );
+    }
+
+    #[test]
+    fn pulse_sample_marks_a_fresh_transient_self_report_as_fresh() {
+        let now = Instant::now();
+        assert!(!sample(PulseState::Thinking).is_stale(now));
+        assert!(stale_sample(PulseState::Thinking).is_stale(now));
     }
 
     #[test]
@@ -1142,7 +1278,13 @@ mod tests {
         // hook to self-report "ready". Once the gate independently confirms
         // deliverability, that must win over the stale self-report.
         assert_eq!(
-            roster_state(true, DeliveryGate::Ready, true, Some(PulseState::Starting)),
+            roster_state(
+                true,
+                DeliveryGate::Ready,
+                true,
+                Some(sample(PulseState::Starting)),
+                Instant::now()
+            ),
             PulseState::Ready
         );
         // A genuine startup (gate not yet Ready) still reports Starting.
@@ -1151,7 +1293,8 @@ mod tests {
                 true,
                 DeliveryGate::AwaitingIntro,
                 false,
-                Some(PulseState::Starting)
+                Some(sample(PulseState::Starting)),
+                Instant::now()
             ),
             PulseState::Starting
         );
@@ -1162,21 +1305,33 @@ mod tests {
         let resume_gate = gate_after_control(true, &ControlAction::Resume);
         assert_eq!(resume_gate, DeliveryGate::Ready);
         assert_eq!(
-            roster_state(true, resume_gate, true, None),
+            roster_state(true, resume_gate, true, None, Instant::now()),
             PulseState::Ready
         );
         assert_eq!(
-            roster_state(true, resume_gate, true, Some(PulseState::Starting)),
+            roster_state(
+                true,
+                resume_gate,
+                true,
+                Some(sample(PulseState::Starting)),
+                Instant::now()
+            ),
             PulseState::Ready
         );
         let clear_gate = gate_after_control(true, &ControlAction::ClearContext);
         assert_eq!(clear_gate, DeliveryGate::AwaitingIntro);
         assert_eq!(
-            roster_state(true, clear_gate, true, Some(PulseState::Starting)),
+            roster_state(
+                true,
+                clear_gate,
+                true,
+                Some(sample(PulseState::Starting)),
+                Instant::now()
+            ),
             PulseState::Starting
         );
         assert_eq!(
-            roster_state(true, clear_gate, true, None),
+            roster_state(true, clear_gate, true, None, Instant::now()),
             PulseState::Starting
         );
     }

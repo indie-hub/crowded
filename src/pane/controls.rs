@@ -9,7 +9,10 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::config::{RoomSpec, Transport};
+use crate::{
+    config::{RoomSpec, Transport},
+    doorbell::{Effort, ModelCatalogue, RoomCapabilities},
+};
 
 #[derive(Clone, Copy)]
 pub(super) enum CliVendor {
@@ -451,6 +454,31 @@ pub(super) fn cli_vendor(spec: &RoomSpec) -> io::Result<CliVendor> {
             io::ErrorKind::Unsupported,
             format!("{guest} has no Conductor adapter"),
         )),
+    }
+}
+
+/// The adapter-derived capability matrix for one room, read off the same
+/// adapter `set_model`/`set_effort`/`current_*` use. No vendor probes: the
+/// model catalogue is always `Unknown`, and only the configured `model`
+/// field makes any model claim. Effort levels come from the doorbell's
+/// `Effort` set for adapters that accept an effort launch option; OpenCode
+/// has no stable one, so its list stays empty rather than claiming
+/// unsupported effort control.
+pub(super) fn capabilities(spec: &RoomSpec) -> RoomCapabilities {
+    let effort_levels = match cli_vendor(spec) {
+        Ok(CliVendor::Claude | CliVendor::Codex) => vec![
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::Xhigh,
+            Effort::Max,
+        ],
+        Ok(CliVendor::OpenCode) | Err(_) => Vec::new(),
+    };
+    RoomCapabilities {
+        controls: cli_vendor(spec).is_ok(),
+        effort_levels,
+        model_catalogue: ModelCatalogue::Unknown,
     }
 }
 
@@ -1029,5 +1057,43 @@ mod tests {
         let mut opencode = raw_room("opencode");
         set_model(&mut opencode, "gpt-5").unwrap();
         assert_eq!(current_model(&opencode).as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn capabilities_derive_from_the_adapter_without_claiming_opencode_effort() {
+        let claude = raw_room("claude");
+        let claude_caps = capabilities(&claude);
+        assert!(claude_caps.controls);
+        assert_eq!(
+            claude_caps.effort_levels,
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::Xhigh,
+                Effort::Max,
+            ]
+        );
+        assert_eq!(claude_caps.model_catalogue, ModelCatalogue::Unknown);
+
+        let codex = raw_room("codex");
+        let codex_caps = capabilities(&codex);
+        assert!(codex_caps.controls);
+        assert_eq!(codex_caps.effort_levels, claude_caps.effort_levels);
+
+        // OpenCode has a model control but no stable effort launch option, so
+        // the capability matrix must not claim effort support for it.
+        let opencode = raw_room("opencode");
+        let opencode_caps = capabilities(&opencode);
+        assert!(opencode_caps.controls);
+        assert!(opencode_caps.effort_levels.is_empty());
+        assert_eq!(opencode_caps.model_catalogue, ModelCatalogue::Unknown);
+
+        // Terminal rooms have no adapter at all: no controls, no effort.
+        let mut terminal = raw_room("claude");
+        terminal.transport = Transport::Shell;
+        let terminal_caps = capabilities(&terminal);
+        assert!(!terminal_caps.controls);
+        assert!(terminal_caps.effort_levels.is_empty());
     }
 }
