@@ -103,8 +103,12 @@ pub(crate) fn native_files_are_active_at(root: &Path) -> io::Result<bool> {
     // room was added after the last sync). Treat as not active so the caller
     // falls back to env injection and `crowded init` can re-sync. `src/toolbox.rs:95`
     if let Ok(config) = load_room_file(&root.join("crowded.toml"))
-        && let Ok(expected) =
-            native_targets(root, &config.rooms, &config.mcp_servers, &config.opencode_plugins)
+        && let Ok(expected) = native_targets(
+            root,
+            &config.rooms,
+            &config.mcp_servers,
+            &config.opencode_plugins,
+        )
     {
         if state.files.len() != expected.len()
             || !state
@@ -1429,7 +1433,11 @@ mod tests {
         let root = test_directory();
         fs::create_dir_all(root.join(".claude")).unwrap();
         fs::write(root.join(".mcp.json"), "{\n  \"keep\": true\n}\n").unwrap();
-        fs::write(root.join("opencode.json"), "{\n  \"model\": \"openai/gpt-5\"\n}\n").unwrap();
+        fs::write(
+            root.join("opencode.json"),
+            "{\n  \"model\": \"openai/gpt-5\"\n}\n",
+        )
+        .unwrap();
         fs::write(
             root.join("crowded.toml"),
             r#"
@@ -1488,9 +1496,20 @@ mod tests {
         assert_eq!(second.len(), 6);
         let state: ToolboxState =
             serde_json::from_str(&fs::read_to_string(root.join(STATE_FILE)).unwrap()).unwrap();
-        let mcp_file = state.files.iter().find(|f| f.path.ends_with(".mcp.json")).unwrap();
-        assert_eq!(mcp_file.original.as_deref(), Some("{\n  \"keep\": true\n}\n"));
-        let opencode_file = state.files.iter().find(|f| f.path.ends_with("opencode.json")).unwrap();
+        let mcp_file = state
+            .files
+            .iter()
+            .find(|f| f.path.ends_with(".mcp.json"))
+            .unwrap();
+        assert_eq!(
+            mcp_file.original.as_deref(),
+            Some("{\n  \"keep\": true\n}\n")
+        );
+        let opencode_file = state
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("opencode.json"))
+            .unwrap();
         assert_eq!(
             opencode_file.original.as_deref(),
             Some("{\n  \"model\": \"openai/gpt-5\"\n}\n")
@@ -1572,7 +1591,10 @@ mod tests {
         let second = sync(&root).unwrap();
         assert_eq!(second.len(), 4);
         // orphaned files must have been restored/deleted during stale handling
-        assert_eq!(fs::read_to_string(root.join(".codex/config.toml")).unwrap(), "model = \"gpt-5\"\n");
+        assert_eq!(
+            fs::read_to_string(root.join(".codex/config.toml")).unwrap(),
+            "model = \"gpt-5\"\n"
+        );
         assert!(!root.join(".codex/hooks.json").exists());
         // surviving files still active
         assert!(native_files_are_active_at(&root).unwrap());
