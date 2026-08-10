@@ -7,6 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-08-10
+
+### Added
+
+- Roster capability output now lists each supported control explicitly while retaining the legacy control summary for backward compatibility.
+
+### Changed
+
+- Room Pulse now uses human-readable source labels and shows the age of hook-backed states in the TUI.
+
 ## [0.29.0] - 2026-08-10
 
 ### Added
