@@ -5,6 +5,32 @@ decisions.
 
 The Crowded Room runs multiple terminal agents under one Ratatui roof.
 
+Crowded is opinionated by design. The starter configuration wires in a small
+set of plugins — including
+[code4me-ntg](https://github.com/indie-hub/code4me-ntg), which governs how
+rooms plan, delegate, and validate work across each other — plus
+[ponytail](https://github.com/DietrichGebert/ponytail) and
+[context-mode](https://github.com/mksglu/context-mode) for lean
+implementation and large-output handling. Every plugin is optional and can be
+dropped from `crowded.toml`, but they exist because unmanaged multi-room
+orchestration tends to drift into duplicated work and unvalidated changes; we
+strongly recommend keeping them enabled.
+
+## Installation
+
+Crowded is not yet published to crates.io. Build it from source with a Rust
+toolchain and install it onto `PATH`:
+
+```console
+git clone https://github.com/indie-hub/crowded.git
+cd crowded
+cargo install --path .
+```
+
+The `crowded` commands below assume that installed binary. Working directly
+from an uninstalled checkout instead? Use `cargo run --` in place of
+`crowded`, e.g. `cargo run -- init`.
+
 ## Workspace bootstrap
 
 Run this in a clean project directory:
