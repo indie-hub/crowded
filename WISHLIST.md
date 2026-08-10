@@ -64,6 +64,26 @@ Before the Code4Me adapter, add the smallest versioned Doorbell contract:
 
 This is Crowded infrastructure, not a native vendor transport.
 
+### Accepted direction: orchestration and work isolation
+
+- Keep orchestration in Code4Me and keep Crowded as the room, Doorbell, and
+  control layer.
+- Extend tasks only with dependencies, `read` or `write` access, and the
+  resulting commit SHA. Derive ready work from the existing append-only event
+  log instead of adding a scheduler service or workflow database.
+- Allow parallel read-only work, but only one writing task per repository.
+- Give that writer a dedicated Git branch and worktree. Validate its commit in
+  an independent context, then promote it to the canonical branch with
+  `git merge --ff-only` while holding one repository-wide promotion lease.
+- Add at most one Crowded primitive: restart an authenticated room in its
+  assigned worktree directory. Code4Me owns worktree creation and promotion.
+- Treat worktrees as protection from accidental interference, not a security
+  boundary. Add containers or OS sandboxing only when hostile-code containment
+  has a concrete requirement.
+
+The first proof is two parallel read-only tasks plus one isolated writer whose
+validated commit fast-forwards cleanly into the canonical branch.
+
 ## After that
 
 1. **Capability discovery** — expose each room's vendor, current model, exact
@@ -81,14 +101,15 @@ This is Crowded infrastructure, not a native vendor transport.
    permissions.
 6. **Plugin lifecycle** — marketplace discovery, updates, version pinning, and
    rollback.
-7. **Real sandboxing** — isolated worktrees, write leases, resource limits, and
-   per-room capabilities.
+7. **Stronger sandboxing** — after the accepted worktree slice proves useful,
+   add resource limits or OS isolation only for a concrete threat model.
 8. **Optional native integrations** — keep PTY as Crowded's primary,
    vendor-neutral communication transport. Vendor APIs, hooks, ACP, Codex
    app-server, or Claude Remote Control may add capabilities when useful, but
    must not replace or bypass the room.
-9. **Higher orchestration** — task graphs, explicit handoffs, completion
-   signals, and room histories.
+9. **Higher orchestration** — grow beyond the accepted dependency fields and
+   existing result signals only when real workflows require richer graphs or
+   histories.
 10. **TUI polish** — dynamic rooms and layouts, scrollback, searchable mailroom,
    and a richer Conductor sidebar.
 
