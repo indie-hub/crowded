@@ -24,7 +24,7 @@ use tui_term::widget::PseudoTerminal;
 
 use crate::{
     config::{RoomSpec, room_specs, room_specs_resumed},
-    doorbell::{ControlAction, Doorbell, DoorbellEvent, PulseState, RosterRoom},
+    doorbell::{ControlAction, Doorbell, DoorbellEvent, PulseSource, PulseState, RosterRoom},
     mailroom::Mailroom,
     pane::{self, Pane},
 };
@@ -217,48 +217,92 @@ impl PulseSample {
     }
 }
 
+/// The resolved pulse for one room: the state the TUI and the JSON roster
+/// both show, plus the source that produced it, so the two surfaces cannot
+/// drift apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResolvedPulse {
+    state: PulseState,
+    source: PulseSource,
+}
+
 fn roster_state(
     online: bool,
     gate: DeliveryGate,
     input_ready: bool,
     pulse: Option<PulseSample>,
     now: Instant,
-) -> PulseState {
+) -> ResolvedPulse {
     if !online {
-        return PulseState::Offline;
+        return ResolvedPulse {
+            state: PulseState::Offline,
+            source: PulseSource::Offline,
+        };
     }
     let deliverable = gate.can_deliver(input_ready);
     let Some(sample) = pulse else {
-        if deliverable {
-            return PulseState::Ready;
-        }
-        return if gate.is_starting() {
+        let state = if deliverable {
+            PulseState::Ready
+        } else if gate.is_starting() {
             PulseState::Starting
         } else {
             PulseState::Working
         };
+        return ResolvedPulse {
+            state,
+            source: PulseSource::Gate,
+        };
     };
     match sample.state {
         // Terminal self-reports stay authoritative.
-        PulseState::Error | PulseState::Offline => sample.state,
+        PulseState::Error | PulseState::Offline => ResolvedPulse {
+            state: sample.state,
+            source: PulseSource::Hook,
+        },
         // A stale transient hook state (the hook stopped reporting) must not
         // override a screen the delivery gate demonstrably shows ready.
         PulseState::Starting | PulseState::Thinking | PulseState::Working
             if deliverable && sample.is_stale(now) =>
         {
-            PulseState::Ready
+            ResolvedPulse {
+                state: PulseState::Ready,
+                source: PulseSource::Readiness,
+            }
         }
         // A genuinely starting room keeps its own self-report until the gate
         // independently confirms it can receive messages; a legitimate
         // startup never reaches Ready (gate.is_starting() implies
         // !can_deliver), so this only overrides the stale case.
-        PulseState::Starting if !deliverable => PulseState::Starting,
+        PulseState::Starting if !deliverable => ResolvedPulse {
+            state: PulseState::Starting,
+            source: PulseSource::Hook,
+        },
         // Fresh transient self-reports keep their existing priority.
-        PulseState::Thinking | PulseState::Working => sample.state,
-        PulseState::Ready if deliverable => PulseState::Ready,
-        PulseState::Ready if gate.is_starting() => PulseState::Starting,
-        PulseState::Ready => PulseState::Working,
-        PulseState::Starting => PulseState::Ready,
+        PulseState::Thinking | PulseState::Working => ResolvedPulse {
+            state: sample.state,
+            source: PulseSource::Hook,
+        },
+        // A fresh "ready" self-report agrees with the gate.
+        PulseState::Ready if deliverable => ResolvedPulse {
+            state: PulseState::Ready,
+            source: PulseSource::Hook,
+        },
+        // A "ready" self-report that contradicts the gate falls back to the
+        // gate/screen inference, exactly as before.
+        PulseState::Ready if gate.is_starting() => ResolvedPulse {
+            state: PulseState::Starting,
+            source: PulseSource::Gate,
+        },
+        PulseState::Ready => ResolvedPulse {
+            state: PulseState::Working,
+            source: PulseSource::Gate,
+        },
+        // Fresh "starting" with a deliverable gate: readiness won over the
+        // self-report (the resumed-room case).
+        PulseState::Starting => ResolvedPulse {
+            state: PulseState::Ready,
+            source: PulseSource::Readiness,
+        },
     }
 }
 
@@ -267,22 +311,28 @@ fn roster_state(
 /// hook ever follows its SessionStart "starting" self-report to correct it.
 /// Routing through `roster_state` cross-checks the delivery gate and live
 /// `input_ready` reading the same way `crowded roster --json` already does,
-/// so the panel and the JSON roster agree instead of the panel alone getting
-/// stuck on a stale self-report.
+/// so the panel and the JSON roster agree on both the state and its source.
 fn pulse_label(
     pane: &Pane,
     gate: DeliveryGate,
     input_ready: bool,
     pulse: Option<PulseSample>,
     now: Instant,
-) -> &'static str {
+) -> String {
     if !pane.is_online() {
-        "offline"
+        "offline".to_owned()
     } else if !pane.needs_intro() {
-        "terminal"
+        "terminal".to_owned()
     } else {
-        roster_state(true, gate, input_ready, pulse, now).label()
+        let resolved = roster_state(true, gate, input_ready, pulse, now);
+        resolved_label(resolved)
     }
+}
+
+/// The visible Room Pulse label for a resolved state: the state plus its
+/// source, so the TUI shows the same provenance the JSON roster reports.
+fn resolved_label(resolved: ResolvedPulse) -> String {
+    format!("{} · {}", resolved.state.label(), resolved.source.label())
 }
 
 fn inject_ready_pending(
@@ -550,28 +600,33 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                         panes
                             .iter()
                             .enumerate()
-                            .map(|(index, pane)| RosterRoom {
-                                room: index + 1,
-                                name: pane.name().to_owned(),
-                                guest: pane.guest(),
-                                vendor: pane.vendor().to_owned(),
-                                transport: pane.transport().to_owned(),
-                                state: roster_state(
+                            .map(|(index, pane)| {
+                                let resolved = roster_state(
                                     pane.is_online(),
                                     delivery_gates[index],
                                     input_ready[index],
                                     room_pulses[index],
                                     now,
-                                ),
-                                allow_control: pane.allows_control(),
-                                model: pane.current_model(),
-                                effort: pane.current_effort(),
-                                headroom: pane.headroom_active(),
-                                pulse_age_ms: room_pulses[index].map(|sample| {
-                                    now.saturating_duration_since(sample.received_at)
-                                        .as_millis() as u64
-                                }),
-                                capabilities: pane.capabilities(),
+                                );
+                                RosterRoom {
+                                    room: index + 1,
+                                    name: pane.name().to_owned(),
+                                    guest: pane.guest(),
+                                    vendor: pane.vendor().to_owned(),
+                                    transport: pane.transport().to_owned(),
+                                    state: resolved.state,
+                                    state_source: resolved.source,
+                                    allow_control: pane.allows_control(),
+                                    model: pane.current_model(),
+                                    effort: pane.current_effort(),
+                                    headroom: pane.headroom_active(),
+                                    pulse_age_ms: room_pulses[index].map(|sample| {
+                                        now.saturating_duration_since(sample.received_at)
+                                            .as_millis()
+                                            as u64
+                                    }),
+                                    capabilities: pane.capabilities(),
+                                }
                             })
                             .collect(),
                     );
@@ -1084,7 +1139,10 @@ mod tests {
                 Some(sample(PulseState::Ready)),
                 now
             ),
-            PulseState::Offline
+            ResolvedPulse {
+                state: PulseState::Offline,
+                source: PulseSource::Offline,
+            }
         );
         assert_eq!(
             roster_state(
@@ -1094,8 +1152,13 @@ mod tests {
                 Some(sample(PulseState::Ready)),
                 now
             ),
-            PulseState::Ready
+            ResolvedPulse {
+                state: PulseState::Ready,
+                source: PulseSource::Hook,
+            }
         );
+        // A self-reported Ready that contradicts a busy screen falls back to
+        // the gate/screen inference, exactly as before.
         assert_eq!(
             roster_state(
                 true,
@@ -1104,7 +1167,10 @@ mod tests {
                 Some(sample(PulseState::Ready)),
                 now
             ),
-            PulseState::Working
+            ResolvedPulse {
+                state: PulseState::Working,
+                source: PulseSource::Gate,
+            }
         );
         assert_eq!(
             roster_state(
@@ -1114,7 +1180,10 @@ mod tests {
                 Some(sample(PulseState::Thinking)),
                 now
             ),
-            PulseState::Thinking
+            ResolvedPulse {
+                state: PulseState::Thinking,
+                source: PulseSource::Hook,
+            }
         );
     }
 
@@ -1122,7 +1191,8 @@ mod tests {
     fn stale_transient_pulse_yields_to_a_demonstrably_ready_screen() {
         let now = Instant::now();
         // A hook that self-reported "thinking"/"working" long ago must not
-        // override a screen the delivery gate demonstrably shows ready.
+        // override a screen the delivery gate demonstrably shows ready; the
+        // resolved source names the readiness override explicitly.
         assert_eq!(
             roster_state(
                 true,
@@ -1131,7 +1201,10 @@ mod tests {
                 Some(stale_sample(PulseState::Thinking)),
                 now
             ),
-            PulseState::Ready
+            ResolvedPulse {
+                state: PulseState::Ready,
+                source: PulseSource::Readiness,
+            }
         );
         assert_eq!(
             roster_state(
@@ -1141,7 +1214,10 @@ mod tests {
                 Some(stale_sample(PulseState::Working)),
                 now
             ),
-            PulseState::Ready
+            ResolvedPulse {
+                state: PulseState::Ready,
+                source: PulseSource::Readiness,
+            }
         );
         // Terminal self-reports stay authoritative even when stale.
         assert_eq!(
@@ -1152,7 +1228,10 @@ mod tests {
                 Some(stale_sample(PulseState::Error)),
                 now
             ),
-            PulseState::Error
+            ResolvedPulse {
+                state: PulseState::Error,
+                source: PulseSource::Hook,
+            }
         );
         // Without a demonstrably ready screen the stale transient report
         // still stands (the gate cannot confirm deliverability).
@@ -1164,7 +1243,10 @@ mod tests {
                 Some(stale_sample(PulseState::Working)),
                 now
             ),
-            PulseState::Working
+            ResolvedPulse {
+                state: PulseState::Working,
+                source: PulseSource::Hook,
+            }
         );
     }
 
@@ -1173,6 +1255,40 @@ mod tests {
         let now = Instant::now();
         assert!(!sample(PulseState::Thinking).is_stale(now));
         assert!(stale_sample(PulseState::Thinking).is_stale(now));
+    }
+
+    #[test]
+    fn tui_pulse_label_includes_the_resolved_state_source() {
+        // The panel shows the same state · source pair the JSON roster uses,
+        // with no extra detail or progress.
+        assert_eq!(
+            resolved_label(ResolvedPulse {
+                state: PulseState::Ready,
+                source: PulseSource::Readiness,
+            }),
+            "ready · readiness"
+        );
+        assert_eq!(
+            resolved_label(ResolvedPulse {
+                state: PulseState::Thinking,
+                source: PulseSource::Hook,
+            }),
+            "thinking · hook"
+        );
+        assert_eq!(
+            resolved_label(ResolvedPulse {
+                state: PulseState::Offline,
+                source: PulseSource::Offline,
+            }),
+            "offline · offline"
+        );
+        assert_eq!(
+            resolved_label(ResolvedPulse {
+                state: PulseState::Working,
+                source: PulseSource::Gate,
+            }),
+            "working · gate"
+        );
     }
 
     #[test]
@@ -1276,7 +1392,8 @@ mod tests {
         // Resume skips the intro whisper, so the resumed process's own
         // SessionStart hook can self-report "starting" with no later Stop
         // hook to self-report "ready". Once the gate independently confirms
-        // deliverability, that must win over the stale self-report.
+        // deliverability, that must win over the stale self-report and be
+        // sourced as a readiness override, not a fresh hook.
         assert_eq!(
             roster_state(
                 true,
@@ -1285,7 +1402,10 @@ mod tests {
                 Some(sample(PulseState::Starting)),
                 Instant::now()
             ),
-            PulseState::Ready
+            ResolvedPulse {
+                state: PulseState::Ready,
+                source: PulseSource::Readiness,
+            }
         );
         // A genuine startup (gate not yet Ready) still reports Starting.
         assert_eq!(
@@ -1296,7 +1416,10 @@ mod tests {
                 Some(sample(PulseState::Starting)),
                 Instant::now()
             ),
-            PulseState::Starting
+            ResolvedPulse {
+                state: PulseState::Starting,
+                source: PulseSource::Hook,
+            }
         );
     }
 
@@ -1306,7 +1429,10 @@ mod tests {
         assert_eq!(resume_gate, DeliveryGate::Ready);
         assert_eq!(
             roster_state(true, resume_gate, true, None, Instant::now()),
-            PulseState::Ready
+            ResolvedPulse {
+                state: PulseState::Ready,
+                source: PulseSource::Gate,
+            }
         );
         assert_eq!(
             roster_state(
@@ -1316,7 +1442,10 @@ mod tests {
                 Some(sample(PulseState::Starting)),
                 Instant::now()
             ),
-            PulseState::Ready
+            ResolvedPulse {
+                state: PulseState::Ready,
+                source: PulseSource::Readiness,
+            }
         );
         let clear_gate = gate_after_control(true, &ControlAction::ClearContext);
         assert_eq!(clear_gate, DeliveryGate::AwaitingIntro);
@@ -1328,11 +1457,17 @@ mod tests {
                 Some(sample(PulseState::Starting)),
                 Instant::now()
             ),
-            PulseState::Starting
+            ResolvedPulse {
+                state: PulseState::Starting,
+                source: PulseSource::Hook,
+            }
         );
         assert_eq!(
             roster_state(true, clear_gate, true, None, Instant::now()),
-            PulseState::Starting
+            ResolvedPulse {
+                state: PulseState::Starting,
+                source: PulseSource::Gate,
+            }
         );
     }
 

@@ -140,6 +140,13 @@ pub(crate) struct RosterRoom {
     pub(crate) vendor: String,
     pub(crate) transport: String,
     pub(crate) state: PulseState,
+    /// How `state` was resolved: the process is offline, a fresh hook
+    /// self-report is trusted, a stale transient self-report was overridden
+    /// by demonstrable readiness, or the delivery gate/screen inferred it.
+    /// Backward-compatible: old wire shapes without this field deserialize to
+    /// `Gate` (the resolver's most common fallback).
+    #[serde(default)]
+    pub(crate) state_source: PulseSource,
     pub(crate) allow_control: bool,
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
@@ -154,6 +161,36 @@ pub(crate) struct RosterRoom {
     /// model catalogue. Never probed at runtime.
     #[serde(default)]
     pub(crate) capabilities: RoomCapabilities,
+}
+
+/// Where a roster `state` came from. Kept explicit so the TUI and the JSON
+/// roster cannot silently disagree about whether a state is a live hook
+/// self-report or a conductor-side inference.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PulseSource {
+    /// The process is offline; no hook or screen reading applies.
+    Offline,
+    /// The resolved state is a trusted fresh hook self-report.
+    Hook,
+    /// A stale transient hook self-report (starting/thinking/working) was
+    /// overridden because the delivery gate demonstrably showed readiness.
+    Readiness,
+    /// The delivery gate and/or screen inference produced the state, with no
+    /// trusted hook self-report in play.
+    #[default]
+    Gate,
+}
+
+impl PulseSource {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Offline => "offline",
+            Self::Hook => "hook",
+            Self::Readiness => "readiness",
+            Self::Gate => "gate",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -466,6 +503,7 @@ mod tests {
             vendor: "sparks".to_owned(),
             transport: "raw".to_owned(),
             state: PulseState::Ready,
+            state_source: PulseSource::Readiness,
             allow_control: true,
             model: None,
             effort: None,
@@ -479,6 +517,7 @@ mod tests {
         };
         let value = serde_json::to_value(&room).unwrap();
         assert_eq!(value["state"], "ready");
+        assert_eq!(value["state_source"], "readiness");
         assert_eq!(value["pulse_age_ms"], 1234);
         assert_eq!(value["capabilities"]["controls"], true);
         assert_eq!(
@@ -503,10 +542,19 @@ mod tests {
             "headroom": false
         }"#;
         let parsed: RosterRoom = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.state_source, PulseSource::Gate);
         assert_eq!(parsed.pulse_age_ms, None);
         assert!(!parsed.capabilities.controls);
         assert!(parsed.capabilities.effort_levels.is_empty());
         assert_eq!(parsed.capabilities.model_catalogue, ModelCatalogue::Unknown);
+    }
+
+    #[test]
+    fn pulse_source_labels_name_each_resolution_route() {
+        assert_eq!(PulseSource::Offline.label(), "offline");
+        assert_eq!(PulseSource::Hook.label(), "hook");
+        assert_eq!(PulseSource::Readiness.label(), "readiness");
+        assert_eq!(PulseSource::Gate.label(), "gate");
     }
 
     #[test]

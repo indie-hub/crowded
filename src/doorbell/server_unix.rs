@@ -547,6 +547,7 @@ mod tests {
                         vendor: "openai".to_owned(),
                         transport: "raw".to_owned(),
                         state: PulseState::Ready,
+                        state_source: PulseSource::Gate,
                         allow_control: true,
                         model: None,
                         effort: None,
