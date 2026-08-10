@@ -7,6 +7,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.28.3] - 2026-08-10
+
+### Fixed
+
+- Welcome delivery now retries failed writes, uses a bounded readiness fallback, and follows the same capture path for fresh starts, room reintroduction, and non-resume respawns.
+- Codex session capture now waits for delayed rollout creation and accepts current metadata containing both `id` and `session_id`.
+- Persisted session state now follows stable numeric room identity, collapsing stale entries when a room changes guest or vendor while preserving sibling rooms and other working directories.
+
 ## [0.28.2] - 2026-08-07
 
 ### Fixed

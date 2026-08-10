@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -310,6 +310,14 @@ pub(crate) struct Pane {
     /// The effective absolute working directory this room launches in; also
     /// the key (with vendor) used to persist its captured session id.
     cwd: PathBuf,
+    /// The instant this pane's guest process was spawned. Discovery for the
+    /// session-id capture is anchored to this timestamp, not to the later
+    /// intro-sent event: Codex writes its session artifact at process spawn
+    /// (before the intro is delivered) and a `since` taken at intro time
+    /// would wrongly reject it; OpenCode's row is committed much later (at
+    /// first message) but must still postdate this spawn, not an earlier one
+    /// in the same directory.
+    spawned_at: SystemTime,
     /// Shared confirmation that the background session-id capture succeeded;
     /// written once by the capture thread, read per frame for the Room Pulse
     /// tag (plain in-memory, never a file read).
@@ -370,6 +378,11 @@ impl Pane {
         for (key, value) in &environment.variables {
             command.env(key, value);
         }
+        // Anchor session-id discovery to the instant the guest process spawns.
+        // Codex writes its session artifact at spawn, before any intro is
+        // delivered, so the capture `since` must be this instant; OpenCode's
+        // row (committed much later) must still postdate it.
+        let spawned_at = SystemTime::now();
         let child = ChildGuard::new(pty.slave.spawn_command(command)?, tree)?;
         // The parent must not keep a second slave handle alive.
         drop(pty.slave);
@@ -392,6 +405,7 @@ impl Pane {
         Ok(Self {
             spec,
             cwd,
+            spawned_at,
             captured_session: session_state::fresh_capture_cell(),
             environment,
             child,
@@ -406,22 +420,27 @@ impl Pane {
     }
 
     /// Best-effort capture of this pane's exact underlying vendor session id,
-    /// keyed off its own freshly-delivered intro (fresh spawns, restarts, and
-    /// post-clear respawns all flow through the intro-sent event). Runs on a
-    /// background thread bounded to `session_state::SESSION_CAPTURE_GRACE`, so
-    /// it never blocks the UI loop. Resumed panes skip the intro and therefore
-    /// never call this.
+    /// anchored to this pane's own process spawn instant (not the intro-sent
+    /// event) so a `since` taken later never wrongly rejects an artifact this
+    /// spawn already wrote. Runs on a background thread bounded to
+    /// `session_state::SESSION_CAPTURE_GRACE` (OpenCode uses its own, longer
+    /// bound), so it never blocks the UI loop.
+    /// Resumed panes skip the intro and therefore never call this.
     pub(crate) fn begin_session_capture(&self) {
         let Ok(vendor) = controls::cli_vendor(&self.spec) else {
             return;
         };
         // The room identity (spec.title) keys the persisted entry so this room
         // only ever resumes its own captured id, even when a sibling room
-        // shares the same (vendor, cwd).
+        // shares the same (vendor, cwd). The `since` anchor is this pane's
+        // spawn instant: a ClearContext/Configure/restart respawns via
+        // `spawn` (fresh `spawned_at`), so a new capture supersedes the stale
+        // pre-clear id; a resume skips the intro and never gets here.
         session_state::capture_async(
             vendor,
             self.cwd.clone(),
             self.spec.title.clone(),
+            self.spawned_at,
             Arc::clone(&self.captured_session),
         );
     }

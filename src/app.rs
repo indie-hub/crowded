@@ -44,6 +44,13 @@ const HOUSE_RULES_QUIET: Duration = Duration::from_secs(5);
 // grace absorbs it. Upgrade path if it still misfires: per-guest content
 // detection like `opencode_input_ready`, keyed off the actual spawned program.
 const HEADROOM_STARTUP_GRACE: Duration = Duration::from_secs(3);
+// ponytail: some guests never satisfy their own readiness heuristic — a
+// persistently-redrawing TUI (a Codex spinner/status line) never goes quiet,
+// and a narrow-pane prompt marker can miss a live layout the heuristic
+// wasn't tuned against — so without a bound the intro would never send.
+// Upgrade path if this still misfires for a guest: per-guest readiness
+// detection like `opencode_input_ready`, keyed off the actual program.
+const INTRO_READINESS_CEILING: Duration = Duration::from_secs(15);
 const AUTO_DELIVERY_LIMIT: usize = 20;
 
 struct DeliveryFuse {
@@ -80,8 +87,14 @@ impl DeliveryGate {
         };
     }
 
-    fn can_send_intro(self, input_ready: bool) -> bool {
-        self == Self::AwaitingIntro && input_ready
+    /// True once this room may receive its one-time house-rules intro:
+    /// either its own readiness heuristic reports ready, or `waited` has
+    /// crossed `ceiling`. The ceiling is the shared fallback for every
+    /// guest whose heuristic can get stuck (see `INTRO_READINESS_CEILING`);
+    /// it only unblocks the intro, never `can_deliver`, so a genuinely busy
+    /// guest still isn't interrupted for later messages.
+    fn can_send_intro(self, input_ready: bool, waited: Duration, ceiling: Duration) -> bool {
+        self == Self::AwaitingIntro && (input_ready || waited >= ceiling)
     }
 
     fn intro_sent(&mut self) {
@@ -403,12 +416,17 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
     let (rooms, _, _) = content_areas(terminal.size()?.into());
     let areas = pane_areas(rooms, room_count);
     let mut panes = Vec::with_capacity(room_count);
+    // Anchors `INTRO_READINESS_CEILING`: each room's own spawn instant, not
+    // a shared one, so a slow room later in this loop isn't penalized for
+    // rooms spawned before it.
+    let mut spawned_at = Vec::with_capacity(room_count);
     for (index, (spec, area)) in specs.into_iter().zip(areas).enumerate() {
         panes.push(Pane::spawn(
             spec,
             pane_size(area),
             doorbell.guest_environment(index)?,
         )?);
+        spawned_at.push(Instant::now());
     }
     let roster = panes.iter().map(Pane::title).collect::<Vec<_>>().join("; ");
     let mut delivery_gates = panes
@@ -445,7 +463,12 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
             .collect();
         for index in 0..room_count {
             delivery_gates[index].observe(input_ready[index]);
-            if delivery_gates[index].can_send_intro(input_ready[index]) {
+            let waited = now.duration_since(spawned_at[index]);
+            if delivery_gates[index].can_send_intro(
+                input_ready[index],
+                waited,
+                INTRO_READINESS_CEILING,
+            ) {
                 match panes[index]
                     .send_whisper("The Crowded Room", &house_rules(index + 1, &roster))
                 {
@@ -454,7 +477,9 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                         panes[index].begin_session_capture();
                     }
                     Err(error) => {
-                        delivery_gates[index].intro_sent();
+                        // Leave the gate at `AwaitingIntro` so the next loop
+                        // iteration retries; a failed write must not claim a
+                        // successful intro or start session capture.
                         notice = Some(format!(
                             "Could not teach {} the house rules: {error}",
                             panes[index].title()
@@ -548,6 +573,7 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                                 &control.action,
                             );
                             last_output[control.to] = None;
+                            spawned_at[control.to] = Instant::now();
                             room_pulses[control.to] = match &control.action {
                                 ControlAction::Resume => None,
                                 _ => Some(PulseState::Starting),
@@ -809,6 +835,7 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                     {
                         Ok(()) => {
                             delivery_gates[focused].intro_sent();
+                            panes[focused].begin_session_capture();
                             notice = Some(format!(
                                 "{} reintroduced to the room",
                                 panes[focused].title()
@@ -836,6 +863,8 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                             delivery_gates[focused] =
                                 DeliveryGate::new(panes[focused].needs_intro());
                             last_output[focused] = None;
+                            spawned_at[focused] = Instant::now();
+                            room_pulses[focused] = Some(PulseState::Starting);
                             notice = Some(format!("{} restarted", panes[focused].title()));
                         }
                         Err(error) => {
@@ -1065,7 +1094,7 @@ mod tests {
         assert_eq!(DeliveryGate::new(false), DeliveryGate::Ready);
 
         let mut gate = DeliveryGate::new(true);
-        assert!(gate.can_send_intro(true));
+        assert!(gate.can_send_intro(true, Duration::ZERO, INTRO_READINESS_CEILING));
         assert!(!gate.can_deliver(true));
 
         gate.intro_sent();
@@ -1080,6 +1109,30 @@ mod tests {
         gate.observe(false);
         gate.observe(true);
         assert!(gate.can_deliver(true));
+    }
+
+    #[test]
+    fn intro_ceiling_sends_a_stuck_rooms_intro_without_a_ready_heuristic() {
+        // A Codex spinner that never quiets, or an OpenCode marker that
+        // never matches the live layout, both look like this: the readiness
+        // heuristic reports not-ready forever. Before the ceiling, the
+        // room must not receive its intro out of turn.
+        let gate = DeliveryGate::new(true);
+        assert!(!gate.can_send_intro(false, Duration::from_secs(14), INTRO_READINESS_CEILING));
+        // Once the ceiling elapses, the shared fallback sends it anyway.
+        assert!(gate.can_send_intro(false, Duration::from_secs(15), INTRO_READINESS_CEILING));
+        // A room whose heuristic genuinely reports ready never has to wait.
+        assert!(DeliveryGate::new(true).can_send_intro(
+            true,
+            Duration::ZERO,
+            INTRO_READINESS_CEILING
+        ));
+        // Ready rooms need no intro at all, ceiling or not.
+        assert!(!DeliveryGate::Ready.can_send_intro(
+            false,
+            Duration::from_secs(999),
+            INTRO_READINESS_CEILING
+        ));
     }
 
     #[test]

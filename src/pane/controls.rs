@@ -116,7 +116,10 @@ fn captured_session_id(vendor: CliVendor, spec: &RoomSpec) -> Option<String> {
 
 /// Discover the exact underlying session id for a fresh spawn's vendor
 /// artifact, restricted to artifacts touched after `since` (the instant that
-/// spawn's own intro was delivered), and skipping any id already present in
+/// spawn's own process was created -- not the later intro-sent event, because
+/// Codex creates its session artifact at spawn and OpenCode's row, though
+/// committed much later, must still postdate this spawn rather than an
+/// earlier one in the same directory), and skipping any id already present in
 /// `exclude` (the persisted baseline of claimed ids for this `(vendor, cwd)`).
 /// Returns `None` when nothing matches.
 pub(super) fn discover_session_id(
@@ -137,7 +140,7 @@ pub(super) fn discover_session_id(
         }
         CliVendor::OpenCode => {
             let database = home.join(".local/share/opencode/opencode.db");
-            opencode_session_id(&database, cwd, exclude)
+            opencode_session_id(&database, cwd, since, exclude)
         }
     }
 }
@@ -305,12 +308,16 @@ fn codex_session_id(
 
 /// Parse a Codex rollout file's first line: `{"type":"session_meta","payload":
 /// {"id":"<uuid>","cwd":"<path>",...}}`. The ground-truth field is `payload.id`
-/// (the session id); `session_id` is accepted as an alias.
+/// (the session id); `session_id` is a fallback for payloads that omit `id`.
+/// Live Codex 0.147.0 payloads carry *both* fields, so they must be
+/// deserialized independently rather than via `#[serde(alias)]` -- an alias
+/// on `id` makes serde treat a payload containing both keys as a duplicate
+/// field and reject it outright.
 fn codex_session_meta_id(path: &Path, cwd: &Path) -> Option<String> {
     #[derive(Deserialize)]
     struct SessionPayload {
-        #[serde(alias = "session_id")]
-        id: String,
+        id: Option<String>,
+        session_id: Option<String>,
         cwd: String,
     }
 
@@ -330,22 +337,37 @@ fn codex_session_meta_id(path: &Path, cwd: &Path) -> Option<String> {
     if payload.cwd != cwd.to_string_lossy() {
         return None;
     }
-    Some(payload.id)
+    payload.id.or(payload.session_id)
 }
 
 /// Read the newest session row for `cwd` from OpenCode's sqlite database via
-/// the system `sqlite3` CLI. `time_created` is milliseconds; OpenCode creates
-/// the row at spawn (before the intro), so no `since` filter applies here --
-/// instead, `exclude` (the persisted baseline of already-claimed ids for this
-/// `(vendor, cwd)`) is used to skip rows that are not this spawn's own: a
-/// sibling room's newer row, or this room's own stale pre-clear row.
-fn opencode_session_id(database: &Path, cwd: &Path, exclude: &[String]) -> Option<String> {
+/// the system `sqlite3` CLI. `time_created` is milliseconds since the Unix
+/// epoch. Live evidence (OpenCode 1.18.15 under Headroom, this repo, 2026-08-08)
+/// shows the row is committed at first-message time, not at process spawn --
+/// measured 47-55s after the guest process started, confirmed independently
+/// against `ps` start times and the row's own `time_created`. So, unlike
+/// Claude/Codex, the row for this spawn will not exist yet for most of the
+/// capture window; `since` still matters once it does appear, to reject a
+/// stale unclaimed row left over from an earlier spawn in the same directory
+/// that never got captured. `exclude` (the persisted baseline of
+/// already-claimed ids for this `(vendor, cwd)`) additionally skips rows that
+/// belong to a sibling room or this room's own stale pre-clear id.
+fn opencode_session_id(
+    database: &Path,
+    cwd: &Path,
+    since: SystemTime,
+    exclude: &[String],
+) -> Option<String> {
     if !database.is_file() {
         return None;
     }
+    let since_millis = since
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
     let output = Command::new("sqlite3")
         .arg(database)
-        .arg(opencode_session_query(cwd, exclude))
+        .arg(opencode_session_query(cwd, since_millis, exclude))
         .output()
         .ok()?;
     if !output.status.success() {
@@ -357,10 +379,14 @@ fn opencode_session_id(database: &Path, cwd: &Path, exclude: &[String]) -> Optio
 
 /// Build the safe lookup query. `cwd` and each excluded id are local trusted
 /// values; single quotes are the only SQL metacharacter that needs escaping
-/// here. Passed as a single argv element to `Command`, never through a shell.
-fn opencode_session_query(cwd: &Path, exclude: &[String]) -> String {
+/// here. `since_millis` is a locally-computed integer, safe to interpolate
+/// directly. Passed as a single argv element to `Command`, never through a
+/// shell.
+fn opencode_session_query(cwd: &Path, since_millis: u128, exclude: &[String]) -> String {
     let escaped = cwd.to_string_lossy().replace('\'', "''");
-    let mut query = format!("SELECT id FROM session WHERE directory = '{escaped}'");
+    let mut query = format!(
+        "SELECT id FROM session WHERE directory = '{escaped}' AND time_created > {since_millis}"
+    );
     if !exclude.is_empty() {
         let ids = exclude
             .iter()
@@ -796,8 +822,86 @@ mod tests {
     }
 
     #[test]
+    fn codex_session_meta_id_prefers_id_over_session_id_when_both_present() {
+        // Live Codex 0.147.0 shape: the first line carries both `id` and
+        // `session_id`. Before the fix, `#[serde(alias = "session_id")]` on
+        // `id` made serde reject this as a duplicate field; now the two are
+        // independent fields and `id` wins.
+        let root = std::env::temp_dir().join(format!(
+            "crowded-codex-meta-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-both-fields.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"ses-new\",\"session_id\":\"ses-legacy\",\"cwd\":\"/repo\"}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_session_meta_id(&path, Path::new("/repo")).as_deref(),
+            Some("ses-new")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn codex_session_meta_id_falls_back_to_session_id_when_id_is_absent() {
+        let root = std::env::temp_dir().join(format!(
+            "crowded-codex-meta-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-session-id-only.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"ses-legacy\",\"cwd\":\"/repo\"}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_session_meta_id(&path, Path::new("/repo")).as_deref(),
+            Some("ses-legacy")
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn codex_session_meta_id_rejects_wrong_cwd_and_wrong_record_type() {
+        let root = std::env::temp_dir().join(format!(
+            "crowded-codex-meta-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        let wrong_cwd = root.join("rollout-wrong-cwd.jsonl");
+        fs::write(
+            &wrong_cwd,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"ses-abc\",\"cwd\":\"/elsewhere\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(codex_session_meta_id(&wrong_cwd, Path::new("/repo")), None);
+
+        let wrong_type = root.join("rollout-wrong-type.jsonl");
+        fs::write(
+            &wrong_type,
+            "{\"type\":\"turn_context\",\"payload\":{\"id\":\"ses-abc\",\"cwd\":\"/repo\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(codex_session_meta_id(&wrong_type, Path::new("/repo")), None);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn opencode_session_query_escapes_single_quotes() {
-        let query = opencode_session_query(Path::new("/some/it's-path"), &[]);
+        let query = opencode_session_query(Path::new("/some/it's-path"), 0, &[]);
         assert!(query.contains("directory = '/some/it''s-path'"));
         assert!(query.ends_with(" ORDER BY time_created DESC LIMIT 1;"));
         // No exclude baseline: no NOT IN clause.
@@ -805,16 +909,23 @@ mod tests {
     }
 
     #[test]
+    fn opencode_session_query_filters_by_since_millis() {
+        let query = opencode_session_query(Path::new("/repo"), 1_786_195_000_000, &[]);
+        assert!(query.contains("AND time_created > 1786195000000"));
+    }
+
+    #[test]
     fn opencode_session_query_excludes_already_claimed_ids() {
         let query = opencode_session_query(
             Path::new("/repo"),
+            0,
             &["sibling-id".to_owned(), "stale-own-id".to_owned()],
         );
         assert!(query.contains("directory = '/repo'"));
         assert!(query.contains("AND id NOT IN ('sibling-id', 'stale-own-id')"));
         assert!(query.ends_with(" ORDER BY time_created DESC LIMIT 1;"));
         // Excluded ids are single-quote escaped the same way as the cwd.
-        let escaped = opencode_session_query(Path::new("/repo"), &["it's-id".to_owned()]);
+        let escaped = opencode_session_query(Path::new("/repo"), 0, &["it's-id".to_owned()]);
         assert!(escaped.contains("AND id NOT IN ('it''s-id')"));
     }
 
@@ -826,11 +937,15 @@ mod tests {
         let database =
             std::env::temp_dir().join(format!("crowded-opencode-test-{}.db", std::process::id()));
         let _ = fs::remove_file(&database);
+        // time_created values are Unix-epoch milliseconds. `ses-pre-spawn`
+        // predates `since` (a stale row from an earlier spawn in the same
+        // directory) and must never be returned regardless of exclude state.
         let create = "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, \
              time_created INTEGER NOT NULL); \
-             INSERT INTO session VALUES ('ses-new','/repo',1000); \
-             INSERT INTO session VALUES ('ses-old','/repo',500); \
-             INSERT INTO session VALUES ('ses-other','/elsewhere',2000);";
+             INSERT INTO session VALUES ('ses-new','/repo',2000); \
+             INSERT INTO session VALUES ('ses-old','/repo',1500); \
+             INSERT INTO session VALUES ('ses-pre-spawn','/repo',500); \
+             INSERT INTO session VALUES ('ses-other','/elsewhere',2500);";
         let setup = Command::new("sqlite3")
             .arg(&database)
             .arg(create)
@@ -838,35 +953,51 @@ mod tests {
             .unwrap();
         assert!(setup.status.success());
 
-        // Newest row for the cwd wins; other cwds don't leak in.
+        let since = std::time::UNIX_EPOCH + Duration::from_millis(1000);
+
+        // Newest row for the cwd at or after `since` wins; other cwds don't
+        // leak in, and the pre-spawn row is never a candidate.
         assert_eq!(
-            opencode_session_id(&database, Path::new("/repo"), &[]).as_deref(),
+            opencode_session_id(&database, Path::new("/repo"), since, &[]).as_deref(),
             Some("ses-new")
         );
         // An already-claimed id is skipped, so the next-newest row for the cwd
         // wins instead (the sibling-collision / stale-recapture filter).
         assert_eq!(
-            opencode_session_id(&database, Path::new("/repo"), &["ses-new".to_owned()]).as_deref(),
+            opencode_session_id(
+                &database,
+                Path::new("/repo"),
+                since,
+                &["ses-new".to_owned()]
+            )
+            .as_deref(),
             Some("ses-old")
         );
-        // When every candidate for the cwd is claimed, nothing matches.
+        // When every post-`since` candidate for the cwd is claimed, nothing
+        // matches -- the pre-spawn row is not a fallback.
         assert_eq!(
             opencode_session_id(
                 &database,
                 Path::new("/repo"),
+                since,
                 &["ses-new".to_owned(), "ses-old".to_owned()]
             )
             .as_deref(),
             None
         );
         assert_eq!(
-            opencode_session_id(&database, Path::new("/missing"), &[]).as_deref(),
+            opencode_session_id(&database, Path::new("/missing"), since, &[]).as_deref(),
             None
         );
         // A missing database resolves to None, never an error.
         assert_eq!(
-            opencode_session_id(&database.join("does-not-exist.db"), Path::new("/repo"), &[])
-                .as_deref(),
+            opencode_session_id(
+                &database.join("does-not-exist.db"),
+                Path::new("/repo"),
+                since,
+                &[]
+            )
+            .as_deref(),
             None
         );
 
