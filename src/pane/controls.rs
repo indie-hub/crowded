@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::{
     config::{RoomSpec, Transport},
-    doorbell::{Effort, ModelCatalogue, RoomCapabilities},
+    doorbell::{Effort, ModelCatalogue, RoomCapabilities, SupportedControl},
 };
 
 #[derive(Clone, Copy)]
@@ -465,18 +465,35 @@ pub(super) fn cli_vendor(spec: &RoomSpec) -> io::Result<CliVendor> {
 /// has no stable one, so its list stays empty rather than claiming
 /// unsupported effort control.
 pub(super) fn capabilities(spec: &RoomSpec) -> RoomCapabilities {
-    let effort_levels = match cli_vendor(spec) {
-        Ok(CliVendor::Claude | CliVendor::Codex) => vec![
-            Effort::Low,
-            Effort::Medium,
-            Effort::High,
-            Effort::Xhigh,
-            Effort::Max,
-        ],
-        Ok(CliVendor::OpenCode) | Err(_) => Vec::new(),
+    let (supported_controls, effort_levels) = match cli_vendor(spec) {
+        Ok(CliVendor::Claude | CliVendor::Codex) => (
+            vec![
+                SupportedControl::Clear,
+                SupportedControl::Resume,
+                SupportedControl::Model,
+                SupportedControl::Effort,
+            ],
+            vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::Xhigh,
+                Effort::Max,
+            ],
+        ),
+        Ok(CliVendor::OpenCode) => (
+            vec![
+                SupportedControl::Clear,
+                SupportedControl::Resume,
+                SupportedControl::Model,
+            ],
+            Vec::new(),
+        ),
+        Err(_) => (Vec::new(), Vec::new()),
     };
     RoomCapabilities {
-        controls: cli_vendor(spec).is_ok(),
+        controls: !supported_controls.is_empty(),
+        supported_controls,
         effort_levels,
         model_catalogue: ModelCatalogue::Unknown,
     }
@@ -1065,6 +1082,15 @@ mod tests {
         let claude_caps = capabilities(&claude);
         assert!(claude_caps.controls);
         assert_eq!(
+            claude_caps.supported_controls,
+            vec![
+                SupportedControl::Clear,
+                SupportedControl::Resume,
+                SupportedControl::Model,
+                SupportedControl::Effort,
+            ]
+        );
+        assert_eq!(
             claude_caps.effort_levels,
             vec![
                 Effort::Low,
@@ -1086,6 +1112,14 @@ mod tests {
         let opencode = raw_room("opencode");
         let opencode_caps = capabilities(&opencode);
         assert!(opencode_caps.controls);
+        assert_eq!(
+            opencode_caps.supported_controls,
+            vec![
+                SupportedControl::Clear,
+                SupportedControl::Resume,
+                SupportedControl::Model,
+            ]
+        );
         assert!(opencode_caps.effort_levels.is_empty());
         assert_eq!(opencode_caps.model_catalogue, ModelCatalogue::Unknown);
 
@@ -1094,6 +1128,7 @@ mod tests {
         terminal.transport = Transport::Shell;
         let terminal_caps = capabilities(&terminal);
         assert!(!terminal_caps.controls);
+        assert!(terminal_caps.supported_controls.is_empty());
         assert!(terminal_caps.effort_levels.is_empty());
     }
 }

@@ -19,6 +19,6 @@ mod server;
 pub(crate) use commands::{control_command, pulse_command, roster_command, send_command};
 pub(crate) use protocol::{
     ControlAction, DoorbellEvent, Effort, ModelCatalogue, PulseSource, PulseState,
-    RoomCapabilities, RosterRoom,
+    RoomCapabilities, RosterRoom, SupportedControl,
 };
 pub(crate) use server::Doorbell;

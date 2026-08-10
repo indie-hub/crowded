@@ -195,10 +195,13 @@ impl PulseSource {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct RoomCapabilities {
-    /// Whether the Conductor adapter can apply peer controls to this room
-    /// (raw transport with a known guest CLI).
+    /// Backward-compatible summary for older roster consumers. New consumers
+    /// should use `supported_controls`.
     #[serde(default)]
     pub(crate) controls: bool,
+    /// Controls the Conductor adapter can apply without vendor probing.
+    #[serde(default)]
+    pub(crate) supported_controls: Vec<SupportedControl>,
     /// Effort levels the adapter accepts. Empty when the guest has no stable
     /// effort launch option (OpenCode), so nothing is claimed there.
     #[serde(default)]
@@ -207,6 +210,15 @@ pub(crate) struct RoomCapabilities {
     /// `Unknown`; the configured `model` field is the only model claim.
     #[serde(default)]
     pub(crate) model_catalogue: ModelCatalogue,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SupportedControl {
+    Clear,
+    Resume,
+    Model,
+    Effort,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -505,12 +517,17 @@ mod tests {
             state: PulseState::Ready,
             state_source: PulseSource::Readiness,
             allow_control: true,
-            model: None,
-            effort: None,
+            model: Some("deepseek/deepseek-v4-flash".to_owned()),
+            effort: Some("high".to_owned()),
             headroom: false,
             pulse_age_ms: Some(1234),
             capabilities: RoomCapabilities {
                 controls: true,
+                supported_controls: vec![
+                    SupportedControl::Clear,
+                    SupportedControl::Resume,
+                    SupportedControl::Model,
+                ],
                 effort_levels: Vec::new(),
                 model_catalogue: ModelCatalogue::Unknown,
             },
@@ -519,7 +536,13 @@ mod tests {
         assert_eq!(value["state"], "ready");
         assert_eq!(value["state_source"], "readiness");
         assert_eq!(value["pulse_age_ms"], 1234);
+        assert_eq!(value["model"], "deepseek/deepseek-v4-flash");
+        assert_eq!(value["effort"], "high");
         assert_eq!(value["capabilities"]["controls"], true);
+        assert_eq!(
+            value["capabilities"]["supported_controls"],
+            serde_json::json!(["clear", "resume", "model"])
+        );
         assert_eq!(
             value["capabilities"]["effort_levels"],
             serde_json::json!([])
@@ -545,6 +568,7 @@ mod tests {
         assert_eq!(parsed.state_source, PulseSource::Gate);
         assert_eq!(parsed.pulse_age_ms, None);
         assert!(!parsed.capabilities.controls);
+        assert!(parsed.capabilities.supported_controls.is_empty());
         assert!(parsed.capabilities.effort_levels.is_empty());
         assert_eq!(parsed.capabilities.model_catalogue, ModelCatalogue::Unknown);
     }
@@ -553,7 +577,7 @@ mod tests {
     fn pulse_source_labels_name_each_resolution_route() {
         assert_eq!(PulseSource::Offline.label(), "offline");
         assert_eq!(PulseSource::Hook.label(), "hook");
-        assert_eq!(PulseSource::Readiness.label(), "readiness");
+        assert_eq!(PulseSource::Readiness.label(), "screen");
         assert_eq!(PulseSource::Gate.label(), "gate");
     }
 
