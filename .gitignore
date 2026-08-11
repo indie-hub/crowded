@@ -20,6 +20,9 @@ target
 # Machine-local room profiles
 /crowded.toml
 /.crowded/
+# Machine-local Headroom stores and captured session dump
+/.headroom/
+/session.json
 **/.crowded-toolbox-*.tmp
 # CocoIndex Code (ccc)
 /.cocoindex_code/
