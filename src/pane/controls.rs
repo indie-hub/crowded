@@ -14,7 +14,7 @@ use crate::{
     doorbell::{Effort, ModelCatalogue, RoomCapabilities, SupportedControl},
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CliVendor {
     Claude,
     Codex,
@@ -111,10 +111,100 @@ fn session_resume_args(vendor: CliVendor, session_id: &str) -> Vec<OsString> {
 
 fn captured_session_id(vendor: CliVendor, spec: &RoomSpec) -> Option<String> {
     let cwd = super::working_directory(spec.cwd.as_deref()).ok()?;
-    // Keyed by this room's own identity (RoomSpec.title), so a room only ever
-    // resumes the id it (or its own prior spawn under the same title)
-    // captured -- never a sibling room's id for the same (vendor, cwd).
-    super::session_state::lookup(vendor.key(), &cwd, &spec.title)
+    let id = super::session_state::lookup(vendor.key(), &cwd, &spec.title)?;
+    if vendor == CliVendor::OpenCode
+        && let Some(configured) = current_model(spec)
+        && let Some(home) = home_dir()
+        && let Some(stored) = opencode_session_model(&home.join(OPENCODE_DATABASE_PATH), &id)
+        && !opencode_model_matches(&stored, &configured)
+    {
+        // `repair_opencode_session_mappings` has already reassigned what it
+        // could across the whole slate, so a mismatch surviving to here means
+        // no session for this model exists. Resuming this id anyway would
+        // restore another model's conversation, which is the reversal itself;
+        // fall back to the ambiguous "most recent" form instead.
+        return None;
+    }
+    Some(id)
+}
+
+const OPENCODE_DATABASE_PATH: &str = ".local/share/opencode/opencode.db";
+
+/// Reassign persisted OpenCode session ids across every room before any of them
+/// resumes, so no two rooms sharing a working directory resume the same session
+/// and none resumes another model's conversation.
+///
+/// This cannot be decided one room at a time. From inside a single room, "the
+/// sibling is holding the session that belongs to me" and "the sibling legitimately
+/// owns that session" look identical: both are an id recorded against another
+/// room. Only the full slate separates them, because a claim is trustworthy
+/// exactly when its session's recorded model matches that room's configured
+/// model. Trustworthy claims are therefore reserved first and left untouched;
+/// every remaining room then draws from what is left, newest first, and each id
+/// drawn is reserved in turn so a later room cannot take it as well.
+///
+/// Session ids are unique across directories, so one reserved set is safe to
+/// share between rooms with different working directories: an id from elsewhere
+/// simply never matches the query, which is already filtered by directory.
+pub(crate) fn repair_opencode_session_mappings(specs: &[RoomSpec]) {
+    let Some(home) = home_dir() else {
+        return;
+    };
+    let database = home.join(OPENCODE_DATABASE_PATH);
+    if !database.is_file() {
+        return;
+    }
+
+    struct Claim {
+        cwd: PathBuf,
+        title: String,
+        model: String,
+        session_id: Option<String>,
+    }
+
+    let key = CliVendor::OpenCode.key();
+    let claims: Vec<Claim> = specs
+        .iter()
+        .filter(|spec| matches!(cli_vendor(spec), Ok(CliVendor::OpenCode)))
+        .filter_map(|spec| {
+            let cwd = super::working_directory(spec.cwd.as_deref()).ok()?;
+            let model = current_model(spec)?;
+            let session_id = super::session_state::lookup(key, &cwd, &spec.title);
+            Some(Claim {
+                cwd,
+                title: spec.title.clone(),
+                model,
+                session_id,
+            })
+        })
+        .collect();
+
+    let mut reserved: Vec<String> = Vec::new();
+    let mut unresolved: Vec<&Claim> = Vec::new();
+    for claim in &claims {
+        let trustworthy = claim.session_id.as_deref().is_some_and(|id| {
+            opencode_session_model(&database, id)
+                .is_some_and(|stored| opencode_model_matches(&stored, &claim.model))
+        });
+        if trustworthy {
+            reserved.push(claim.session_id.clone().unwrap_or_default());
+        } else {
+            unresolved.push(claim);
+        }
+    }
+
+    for claim in unresolved {
+        if let Some(correct) = opencode_session_id(
+            &database,
+            &claim.cwd,
+            SystemTime::UNIX_EPOCH,
+            &reserved,
+            Some(&claim.model),
+        ) {
+            super::session_state::upsert(key, &claim.cwd, &claim.title, &correct);
+            reserved.push(correct);
+        }
+    }
 }
 
 /// Discover the exact underlying session id for a fresh spawn's vendor
@@ -130,6 +220,7 @@ pub(super) fn discover_session_id(
     cwd: &Path,
     since: SystemTime,
     exclude: &[String],
+    opencode_model: Option<&str>,
 ) -> Option<String> {
     let home = home_dir()?;
     match vendor {
@@ -142,8 +233,8 @@ pub(super) fn discover_session_id(
             codex_session_id(&sessions, cwd, since, exclude)
         }
         CliVendor::OpenCode => {
-            let database = home.join(".local/share/opencode/opencode.db");
-            opencode_session_id(&database, cwd, since, exclude)
+            let database = home.join(OPENCODE_DATABASE_PATH);
+            opencode_session_id(&database, cwd, since, exclude, opencode_model)
         }
     }
 }
@@ -360,6 +451,7 @@ fn opencode_session_id(
     cwd: &Path,
     since: SystemTime,
     exclude: &[String],
+    model: Option<&str>,
 ) -> Option<String> {
     if !database.is_file() {
         return None;
@@ -370,7 +462,7 @@ fn opencode_session_id(
         .unwrap_or(0);
     let output = Command::new("sqlite3")
         .arg(database)
-        .arg(opencode_session_query(cwd, since_millis, exclude))
+        .arg(opencode_session_query(cwd, since_millis, exclude, model))
         .output()
         .ok()?;
     if !output.status.success() {
@@ -380,16 +472,92 @@ fn opencode_session_id(
     if id.is_empty() { None } else { Some(id) }
 }
 
+fn opencode_session_model(database: &Path, session_id: &str) -> Option<String> {
+    if !database.is_file() {
+        return None;
+    }
+    let esc_id = session_id.replace('\'', "''");
+    let query = format!("SELECT model FROM session WHERE id = '{esc_id}';");
+    let output = Command::new("sqlite3")
+        .arg(database)
+        .arg(query)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let model = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if model.is_empty() { None } else { Some(model) }
+}
+
+fn opencode_model_matches(stored: &str, configured: &str) -> bool {
+    let Ok(stored_json) = serde_json::from_str::<serde_json::Value>(stored) else {
+        return false;
+    };
+    let (cfg_provider, cfg_id) = normalize_opencode_model(configured);
+    let stored_provider = stored_json
+        .get("providerID")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let stored_id = stored_json.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(p) = cfg_provider
+        && stored_provider != p
+    {
+        return false;
+    }
+    if let Some(i) = cfg_id
+        && stored_id != i
+    {
+        return false;
+    }
+    true
+}
+
 /// Build the safe lookup query. `cwd` and each excluded id are local trusted
 /// values; single quotes are the only SQL metacharacter that needs escaping
 /// here. `since_millis` is a locally-computed integer, safe to interpolate
 /// directly. Passed as a single argv element to `Command`, never through a
 /// shell.
-fn opencode_session_query(cwd: &Path, since_millis: u128, exclude: &[String]) -> String {
-    let escaped = cwd.to_string_lossy().replace('\'', "''");
+fn normalize_opencode_model(model: &str) -> (Option<String>, Option<String>) {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return (None, None);
+    }
+    if let Some((provider, id)) = trimmed.split_once('/') {
+        let provider = provider.trim();
+        let id = id.trim();
+        if provider.is_empty() || id.is_empty() {
+            return (None, None);
+        }
+        (Some(provider.to_owned()), Some(id.to_owned()))
+    } else {
+        (None, Some(trimmed.to_owned()))
+    }
+}
+
+fn opencode_session_query(
+    cwd: &Path,
+    since_millis: u128,
+    exclude: &[String],
+    model: Option<&str>,
+) -> String {
+    let escaped_cwd = cwd.to_string_lossy().replace('\'', "''");
     let mut query = format!(
-        "SELECT id FROM session WHERE directory = '{escaped}' AND time_created > {since_millis}"
+        "SELECT id FROM session WHERE directory = '{escaped_cwd}' AND time_created > {since_millis}"
     );
+    if let Some(m) = model {
+        let (provider, id) = normalize_opencode_model(m);
+        if let Some(p) = provider {
+            let esc_p = p.replace('\'', "''");
+            query.push_str(&format!(
+                " AND json_extract(model, '$.providerID') = '{esc_p}'"
+            ));
+        }
+        if let Some(i) = id {
+            let esc_i = i.replace('\'', "''");
+            query.push_str(&format!(" AND json_extract(model, '$.id') = '{esc_i}'"));
+        }
+    }
     if !exclude.is_empty() {
         let ids = exclude
             .iter()
@@ -946,7 +1114,7 @@ mod tests {
 
     #[test]
     fn opencode_session_query_escapes_single_quotes() {
-        let query = opencode_session_query(Path::new("/some/it's-path"), 0, &[]);
+        let query = opencode_session_query(Path::new("/some/it's-path"), 0, &[], None);
         assert!(query.contains("directory = '/some/it''s-path'"));
         assert!(query.ends_with(" ORDER BY time_created DESC LIMIT 1;"));
         // No exclude baseline: no NOT IN clause.
@@ -955,7 +1123,7 @@ mod tests {
 
     #[test]
     fn opencode_session_query_filters_by_since_millis() {
-        let query = opencode_session_query(Path::new("/repo"), 1_786_195_000_000, &[]);
+        let query = opencode_session_query(Path::new("/repo"), 1_786_195_000_000, &[], None);
         assert!(query.contains("AND time_created > 1786195000000"));
     }
 
@@ -965,13 +1133,270 @@ mod tests {
             Path::new("/repo"),
             0,
             &["sibling-id".to_owned(), "stale-own-id".to_owned()],
+            None,
         );
         assert!(query.contains("directory = '/repo'"));
         assert!(query.contains("AND id NOT IN ('sibling-id', 'stale-own-id')"));
         assert!(query.ends_with(" ORDER BY time_created DESC LIMIT 1;"));
         // Excluded ids are single-quote escaped the same way as the cwd.
-        let escaped = opencode_session_query(Path::new("/repo"), 0, &["it's-id".to_owned()]);
+        let escaped = opencode_session_query(Path::new("/repo"), 0, &["it's-id".to_owned()], None);
         assert!(escaped.contains("AND id NOT IN ('it''s-id')"));
+    }
+
+    #[test]
+    fn opencode_session_query_filters_by_model() {
+        let query = opencode_session_query(Path::new("/repo"), 0, &[], Some("meta/muse-spark-1.2"));
+        assert!(query.contains("json_extract(model, '$.providerID') = 'meta'"));
+        assert!(query.contains("json_extract(model, '$.id') = 'muse-spark-1.2'"));
+        assert!(query.contains("directory = '/repo'"));
+
+        let query2 = opencode_session_query(Path::new("/repo"), 0, &[], Some("muse-spark-1.2"));
+        assert!(query2.contains("json_extract(model, '$.id') = 'muse-spark-1.2'"));
+        assert!(!query2.contains("providerID"));
+
+        let query3 = opencode_session_query(
+            Path::new("/repo"),
+            0,
+            &[],
+            Some("deepseek/deepseek-v4-flash"),
+        );
+        assert!(query3.contains("providerID') = 'deepseek'"));
+        assert!(query3.contains("id') = 'deepseek-v4-flash'"));
+
+        let query4 = opencode_session_query(Path::new("/repo"), 0, &[], Some("a'b/c'd"));
+        assert!(query4.contains("a''b"));
+        assert!(query4.contains("c''d"));
+    }
+
+    #[test]
+    fn normalize_opencode_model_splits_provider_and_id() {
+        assert_eq!(
+            normalize_opencode_model("meta/muse-spark-1.2"),
+            (Some("meta".to_owned()), Some("muse-spark-1.2".to_owned()))
+        );
+        assert_eq!(
+            normalize_opencode_model("deepseek/deepseek-v4-flash"),
+            (
+                Some("deepseek".to_owned()),
+                Some("deepseek-v4-flash".to_owned())
+            )
+        );
+        assert_eq!(
+            normalize_opencode_model("muse-spark-1.2"),
+            (None, Some("muse-spark-1.2".to_owned()))
+        );
+        assert_eq!(normalize_opencode_model(""), (None, None));
+        assert_eq!(normalize_opencode_model("  "), (None, None));
+        assert_eq!(normalize_opencode_model("a/"), (None, None));
+        assert_eq!(normalize_opencode_model("/b"), (None, None));
+    }
+
+    #[test]
+    fn opencode_session_id_filters_by_model_and_handles_74ms_gap() {
+        if Command::new("sqlite3").arg("--version").output().is_err() {
+            return;
+        }
+        let database = std::env::temp_dir().join(format!(
+            "crowded-opencode-model-test-{}.db",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&database);
+        let create = r#"CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_created INTEGER NOT NULL, model TEXT);
+              INSERT INTO session VALUES ('ses-spark','/repo',1000, '{"providerID":"meta","id":"muse-spark-1.2"}');
+              INSERT INTO session VALUES ('ses-deepseek','/repo',1074, '{"providerID":"deepseek","id":"deepseek-v4-flash"}');"#;
+        let setup = Command::new("sqlite3")
+            .arg(&database)
+            .arg(create)
+            .output()
+            .unwrap();
+        assert!(setup.status.success());
+        let since = SystemTime::UNIX_EPOCH;
+        assert_eq!(
+            opencode_session_id(
+                &database,
+                Path::new("/repo"),
+                since,
+                &[],
+                Some("meta/muse-spark-1.2")
+            )
+            .as_deref(),
+            Some("ses-spark")
+        );
+        assert_eq!(
+            opencode_session_id(
+                &database,
+                Path::new("/repo"),
+                since,
+                &[],
+                Some("deepseek/deepseek-v4-flash")
+            )
+            .as_deref(),
+            Some("ses-deepseek")
+        );
+        assert_eq!(
+            opencode_session_id(&database, Path::new("/repo"), since, &[], None).as_deref(),
+            Some("ses-deepseek")
+        );
+        fs::remove_file(&database).ok();
+    }
+
+    #[test]
+    fn crossed_opencode_mapping_is_self_healed_on_resume() {
+        if Command::new("sqlite3").arg("--version").output().is_err() {
+            return;
+        }
+        let _state = super::super::session_state::StateRootGuard::isolated();
+        let home_guard = crate::pane::controls::HomeDirGuard::isolated();
+        let cwd = std::env::current_dir().unwrap();
+        let db = home_guard.path().join(".local/share/opencode/opencode.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&db);
+        let cwd_str = cwd.to_string_lossy().to_string();
+        let create = format!(
+            r#"CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_created INTEGER NOT NULL, model TEXT);
+              INSERT INTO session VALUES ('ses-spark','{cwd_str}',1000, '{{"providerID":"meta","id":"muse-spark-1.2"}}');
+              INSERT INTO session VALUES ('ses-deepseek','{cwd_str}',1074, '{{"providerID":"deepseek","id":"deepseek-v4-flash"}}');"#,
+        );
+        let setup = Command::new("sqlite3")
+            .arg(&db)
+            .arg(create)
+            .output()
+            .unwrap();
+        assert!(setup.status.success());
+
+        super::super::session_state::upsert(
+            "opencode",
+            &cwd,
+            "OpenCode \u{00b7} 3",
+            "ses-deepseek",
+        );
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 4", "ses-spark");
+
+        let room3 = RoomSpec {
+            name: "OpenCode".to_owned(),
+            vendor: "opencode".to_owned(),
+            title: "OpenCode \u{00b7} 3".to_owned(),
+            program: "opencode".into(),
+            args: vec!["--model".into(), "meta/muse-spark-1.2".into()],
+            transport: crate::config::Transport::Raw,
+            cwd: Some(cwd.clone()),
+            variables: Vec::new(),
+            allow_control: true,
+            use_headroom: false,
+            headroom_args: Vec::new(),
+        };
+        let room4 = RoomSpec {
+            name: "OpenCode".to_owned(),
+            vendor: "opencode".to_owned(),
+            title: "OpenCode \u{00b7} 4".to_owned(),
+            program: "opencode".into(),
+            args: vec!["--model".into(), "deepseek/deepseek-v4-flash".into()],
+            transport: crate::config::Transport::Raw,
+            cwd: Some(cwd.clone()),
+            variables: Vec::new(),
+            allow_control: true,
+            use_headroom: false,
+            headroom_args: Vec::new(),
+        };
+
+        // Repair is a slate-level decision, so drive the same entry point
+        // `crowded resume` uses rather than one room at a time.
+        let mut specs = [room3, room4];
+        crate::pane::resume_supported_specs(&mut specs);
+        assert!(specs[0].args.contains(&OsString::from("ses-spark")));
+        assert!(!specs[0].args.contains(&OsString::from("ses-deepseek")));
+        assert!(specs[1].args.contains(&OsString::from("ses-deepseek")));
+        assert!(!specs[1].args.contains(&OsString::from("ses-spark")));
+
+        assert_eq!(
+            super::super::session_state::lookup("opencode", &cwd, "OpenCode \u{00b7} 3").as_deref(),
+            Some("ses-spark")
+        );
+        assert_eq!(
+            super::super::session_state::lookup("opencode", &cwd, "OpenCode \u{00b7} 4").as_deref(),
+            Some("ses-deepseek")
+        );
+
+        // Re-cross the mapping and repair with the rooms in the opposite order.
+        // Whichever room is considered first, neither may end up on the other's
+        // session.
+        super::super::session_state::upsert(
+            "opencode",
+            &cwd,
+            "OpenCode \u{00b7} 3",
+            "ses-deepseek",
+        );
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 4", "ses-spark");
+        let mut reversed = [specs[1].clone(), specs[0].clone()];
+        for spec in &mut reversed {
+            clear_resume_args(spec).unwrap();
+        }
+        crate::pane::resume_supported_specs(&mut reversed);
+        assert!(reversed[0].args.contains(&OsString::from("ses-deepseek")));
+        assert!(reversed[1].args.contains(&OsString::from("ses-spark")));
+    }
+
+    /// Two rooms on the same model cannot be told apart by the model filter, so
+    /// only the reserved set stops the room being repaired from taking the
+    /// session its sibling already legitimately holds.
+    #[test]
+    fn repair_does_not_take_a_session_a_sibling_already_holds() {
+        if Command::new("sqlite3").arg("--version").output().is_err() {
+            return;
+        }
+        let _state = super::super::session_state::StateRootGuard::isolated();
+        let home_guard = crate::pane::controls::HomeDirGuard::isolated();
+        let cwd = std::env::current_dir().unwrap();
+        let db = home_guard.path().join(OPENCODE_DATABASE_PATH);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&db);
+        let cwd_str = cwd.to_string_lossy().to_string();
+        let model = r#"{"providerID":"deepseek","id":"deepseek-v4-flash"}"#;
+        let create = format!(
+            r#"CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_created INTEGER NOT NULL, model TEXT);
+              INSERT INTO session VALUES ('ses-older','{cwd_str}',1000, '{model}');
+              INSERT INTO session VALUES ('ses-newer','{cwd_str}',2000, '{model}');
+              INSERT INTO session VALUES ('ses-stale','{cwd_str}',500, '{{"providerID":"meta","id":"muse-spark-1.2"}}');"#,
+        );
+        assert!(
+            Command::new("sqlite3")
+                .arg(&db)
+                .arg(create)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+
+        // Room 3 legitimately holds the newest session. Room 4 is on the same
+        // model but points at a session belonging to a different one.
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 3", "ses-newer");
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 4", "ses-stale");
+
+        let spec = |title: &str| RoomSpec {
+            name: "OpenCode".to_owned(),
+            vendor: "opencode".to_owned(),
+            title: title.to_owned(),
+            program: "opencode".into(),
+            args: vec!["--model".into(), "deepseek/deepseek-v4-flash".into()],
+            transport: crate::config::Transport::Raw,
+            cwd: Some(cwd.clone()),
+            variables: Vec::new(),
+            allow_control: true,
+            use_headroom: false,
+            headroom_args: Vec::new(),
+        };
+        let mut specs = [spec("OpenCode \u{00b7} 3"), spec("OpenCode \u{00b7} 4")];
+        crate::pane::resume_supported_specs(&mut specs);
+
+        // Without the reserved set both rooms resume ses-newer.
+        assert!(specs[0].args.contains(&OsString::from("ses-newer")));
+        assert!(specs[1].args.contains(&OsString::from("ses-older")));
+        assert!(!specs[1].args.contains(&OsString::from("ses-newer")));
+        assert_eq!(
+            super::super::session_state::lookup("opencode", &cwd, "OpenCode \u{00b7} 4").as_deref(),
+            Some("ses-older")
+        );
     }
 
     #[test]
@@ -1003,7 +1428,7 @@ mod tests {
         // Newest row for the cwd at or after `since` wins; other cwds don't
         // leak in, and the pre-spawn row is never a candidate.
         assert_eq!(
-            opencode_session_id(&database, Path::new("/repo"), since, &[]).as_deref(),
+            opencode_session_id(&database, Path::new("/repo"), since, &[], None).as_deref(),
             Some("ses-new")
         );
         // An already-claimed id is skipped, so the next-newest row for the cwd
@@ -1013,7 +1438,8 @@ mod tests {
                 &database,
                 Path::new("/repo"),
                 since,
-                &["ses-new".to_owned()]
+                &["ses-new".to_owned()],
+                None
             )
             .as_deref(),
             Some("ses-old")
@@ -1025,13 +1451,14 @@ mod tests {
                 &database,
                 Path::new("/repo"),
                 since,
-                &["ses-new".to_owned(), "ses-old".to_owned()]
+                &["ses-new".to_owned(), "ses-old".to_owned()],
+                None
             )
             .as_deref(),
             None
         );
         assert_eq!(
-            opencode_session_id(&database, Path::new("/missing"), since, &[]).as_deref(),
+            opencode_session_id(&database, Path::new("/missing"), since, &[], None).as_deref(),
             None
         );
         // A missing database resolves to None, never an error.
@@ -1040,7 +1467,8 @@ mod tests {
                 &database.join("does-not-exist.db"),
                 Path::new("/repo"),
                 since,
-                &[]
+                &[],
+                None
             )
             .as_deref(),
             None

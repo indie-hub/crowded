@@ -27,6 +27,11 @@ const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
 // ponytail: ConPTY only needs a valid DSR here; report the parser's exact
 // cursor if a guest later depends on cursor-aware terminal negotiation.
 const CURSOR_POSITION_RESPONSE: &[u8] = b"\x1b[1;1R";
+// Bounded per-pane scrollback: the vt100 parser retains at most this many
+// scrolled-off rows, so history grows predictably no matter how chatty a
+// guest is. The parser stores a full cell grid per retained row, which is
+// why the bound is explicit rather than unbounded.
+const SCROLLBACK_LINES: usize = 1000;
 
 pub(crate) fn respond_to_terminal_queries(
     writer: &mut dyn Write,
@@ -161,6 +166,9 @@ fn headroom_launch(
 /// caller uses this to tell which panes genuinely resumed and can skip
 /// their intro whisper.
 pub(crate) fn resume_supported_specs(specs: &mut [RoomSpec]) -> Vec<bool> {
+    // Runs across the whole slate first: which OpenCode session belongs to
+    // which room cannot be decided from one room's view alone.
+    controls::repair_opencode_session_mappings(specs);
     specs
         .iter_mut()
         .map(|spec| controls::add_resume_args(spec).is_ok())
@@ -330,6 +338,11 @@ pub(crate) struct Pane {
     output_rx: mpsc::Receiver<Vec<u8>>,
     response_tail: Vec<u8>,
     parser: Parser,
+    /// Rows of retained history scrolled into view (0 = live bottom). The
+    /// offset lives in the app's event handling and is pushed into the parser
+    /// only while a frame is being drawn, so automation that reads the live
+    /// screen (readiness, whisper delivery) never sees the scrolled view.
+    scroll_offset: usize,
     headroom_active: bool,
 }
 
@@ -415,7 +428,8 @@ impl Pane {
             output_rx,
             response_tail: Vec::new(),
             // vt100 assumes room for wrapping and a double-width character.
-            parser: Parser::new(size.rows.max(2), size.cols.max(2), 0),
+            parser: Parser::new(size.rows.max(2), size.cols.max(2), SCROLLBACK_LINES),
+            scroll_offset: 0,
             headroom_active,
         })
     }
@@ -437,12 +451,18 @@ impl Pane {
         // spawn instant: a ClearContext/Configure/restart respawns via
         // `spawn` (fresh `spawned_at`), so a new capture supersedes the stale
         // pre-clear id; a resume skips the intro and never gets here.
+        let opencode_model = if vendor == controls::CliVendor::OpenCode {
+            controls::current_model(&self.spec)
+        } else {
+            None
+        };
         session_state::capture_async(
             vendor,
             self.cwd.clone(),
             self.spec.title.clone(),
             self.spawned_at,
             Arc::clone(&self.captured_session),
+            opencode_model,
         );
     }
 
@@ -470,7 +490,7 @@ impl Pane {
         Ok(())
     }
 
-    fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+    pub(crate) fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
         if !self.is_online() {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -526,6 +546,63 @@ impl Pane {
 
     pub(crate) fn screen(&self) -> &Screen {
         self.parser.screen()
+    }
+
+    /// The number of visible rows in this pane's viewport, used as the Page
+    /// Up / Page Down step so each press scrolls exactly one screen.
+    pub(crate) fn visible_height(&self) -> usize {
+        usize::from(self.parser.screen().size().0)
+    }
+
+    /// Scroll the retained view toward the top of the buffer. `set_scrollback`
+    /// clamps to the actual retained history, so this can never overshoot.
+    pub(crate) fn scroll_up(&mut self, rows: usize) {
+        let offset = self.scroll_offset.saturating_add(rows);
+        self.parser.screen_mut().set_scrollback(offset);
+        self.scroll_offset = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    /// Scroll the retained view toward the live bottom. The offset saturates
+    /// at zero, so repeated presses land on the live screen and stop.
+    pub(crate) fn scroll_down(&mut self, rows: usize) {
+        let offset = self.scroll_offset.saturating_sub(rows);
+        self.parser.screen_mut().set_scrollback(offset);
+        self.scroll_offset = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    /// Push this pane's scroll offset into the parser so the next frame
+    /// renders the retained history. Called around the draw pass only.
+    pub(crate) fn apply_scroll(&mut self) {
+        self.parser.screen_mut().set_scrollback(self.scroll_offset);
+    }
+
+    /// Restore the parser to the live bottom after the frame. Automation
+    /// reads (readiness, whisper delivery) must see the live screen, never
+    /// a view the user scrolled away from.
+    pub(crate) fn restore_scroll(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    pub(crate) fn is_alternate_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
+    }
+
+    pub(crate) fn forward_page_up(&mut self) -> io::Result<()> {
+        self.write_bytes(b"\x1b[5~")
+    }
+
+    pub(crate) fn forward_page_down(&mut self) -> io::Result<()> {
+        self.write_bytes(b"\x1b[6~")
+    }
+
+    pub(crate) fn forward_wheel(&mut self, up: bool) -> io::Result<()> {
+        if up {
+            self.forward_page_up()
+        } else {
+            self.forward_page_down()
+        }
     }
 
     pub(crate) fn automation_input_ready(&self, output_is_quiet: bool) -> bool {
@@ -933,5 +1010,205 @@ mod tests {
         assert_eq!(specs[1].args, shell_args_before);
         // Reports, per spec, whether resume args were actually applied.
         assert_eq!(resumed, [true, false, false]);
+    }
+    fn scroll_fixture(rows: u16, cols: u16) -> Pane {
+        let spec = room_spec("fixture", &[]);
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let writer = pty.master.take_writer().unwrap();
+        let (_, output_rx) = mpsc::channel();
+        Pane {
+            spec,
+            cwd: env::current_dir().unwrap(),
+            spawned_at: SystemTime::now(),
+            captured_session: session_state::fresh_capture_cell(),
+            environment: GuestEnvironment::new([]),
+            child: ChildGuard {
+                child: None,
+                #[cfg(windows)]
+                tree: None,
+            },
+            master: pty.master,
+            writer,
+            output_rx,
+            response_tail: Vec::new(),
+            parser: Parser::new(rows, cols, SCROLLBACK_LINES),
+            scroll_offset: 0,
+            headroom_active: false,
+        }
+    }
+
+    #[test]
+    fn scroll_retains_history_and_clamps_at_both_limits() {
+        let mut pane = scroll_fixture(4, 20);
+        for index in 0..10 {
+            pane.parser.process(format!("line {index}\r\n").as_bytes());
+        }
+        assert_eq!(pane.scroll_offset, 0);
+        pane.scroll_up(2);
+        assert_eq!(pane.scroll_offset, 2);
+        pane.scroll_up(usize::MAX);
+        let retained = pane.scroll_offset;
+        assert!(retained > 2, "history was retained ({retained})");
+        pane.scroll_down(usize::MAX);
+        assert_eq!(pane.scroll_offset, 0);
+        assert_eq!(pane.parser.screen().scrollback(), 0);
+    }
+
+    #[test]
+    fn scroll_applies_only_during_a_frame_and_restores_after() {
+        let mut pane = scroll_fixture(4, 20);
+        for index in 0..10 {
+            pane.parser.process(format!("line {index}\r\n").as_bytes());
+        }
+        pane.scroll_up(3);
+        pane.apply_scroll();
+        assert_eq!(pane.parser.screen().scrollback(), 3);
+        pane.restore_scroll();
+        assert_eq!(pane.parser.screen().scrollback(), 0);
+        assert_eq!(pane.visible_height(), 4);
+    }
+
+    #[test]
+    fn page_keys_are_not_forwarded_to_the_child_pty() {
+        for key in [KeyCode::PageUp, KeyCode::PageDown] {
+            assert_eq!(
+                key_bytes(KeyEvent::new(key, KeyModifiers::NONE)),
+                None,
+                "{key:?} must be intercepted by the app, never encoded to the PTY"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_is_parsed_only_by_the_view_never_by_readiness() {
+        let mut pane = scroll_fixture(4, 20);
+        for index in 0..10 {
+            pane.parser.process(format!("line {index}\r\n").as_bytes());
+        }
+        pane.scroll_up(2);
+        let live_bottom = pane.parser.screen().contents();
+        pane.apply_scroll();
+        let scrolled = pane.parser.screen().contents();
+        pane.restore_scroll();
+        assert_eq!(pane.parser.screen().contents(), live_bottom);
+        assert_ne!(scrolled, live_bottom);
+    }
+
+    use std::sync::{Arc, Mutex};
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeChild;
+    impl portable_pty::Child for FakeChild {
+        fn try_wait(&mut self) -> io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+        fn wait(&mut self) -> io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+        fn process_id(&self) -> Option<u32> {
+            Some(1)
+        }
+    }
+    impl portable_pty::ChildKiller for FakeChild {
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(FakeChild)
+        }
+    }
+
+    fn pane_with_capture(rows: u16, cols: u16) -> (Pane, Arc<Mutex<Vec<u8>>>) {
+        let mut pane = scroll_fixture(rows, cols);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        pane.writer = Box::new(SharedWriter(captured.clone()));
+        pane.child = ChildGuard {
+            child: Some(Box::new(FakeChild) as Box<dyn portable_pty::Child + Send + Sync>),
+            #[cfg(windows)]
+            tree: None,
+        };
+        (pane, captured)
+    }
+
+    fn enter_alternate_screen(pane: &mut Pane) {
+        pane.parser.process(b"\x1b[?1049h");
+        assert!(pane.is_alternate_screen(), "must be in alternate screen");
+    }
+
+    #[test]
+    fn alternate_screen_page_keys_forward_exact_bytes() {
+        let (mut pane, captured) = pane_with_capture(4, 20);
+        // Primary screen: PageUp scrolls parent, does not write CSI.
+        for index in 0..10 {
+            pane.parser.process(format!("line {index}\r\n").as_bytes());
+        }
+        let before = pane.scroll_offset;
+        pane.scroll_up(pane.visible_height());
+        assert!(pane.scroll_offset > before);
+        assert!(captured.lock().unwrap().is_empty());
+
+        // Alternate screen: PageUp must forward CSI 5~ and not affect scroll_offset.
+        enter_alternate_screen(&mut pane);
+        let scroll_before = pane.scroll_offset;
+        pane.forward_page_up().unwrap();
+        assert_eq!(pane.scroll_offset, scroll_before);
+        assert_eq!(captured.lock().unwrap().as_slice(), b"\x1b[5~");
+        captured.lock().unwrap().clear();
+        pane.forward_page_down().unwrap();
+        assert_eq!(captured.lock().unwrap().as_slice(), b"\x1b[6~");
+    }
+
+    #[test]
+    fn alternate_screen_wheel_forwards_as_page_navigation() {
+        let (mut pane, captured) = pane_with_capture(4, 20);
+        enter_alternate_screen(&mut pane);
+        pane.forward_wheel(true).unwrap();
+        assert_eq!(captured.lock().unwrap().as_slice(), b"\x1b[5~");
+        // Must not contain raw SGR mouse encoding
+        assert!(
+            !captured.lock().unwrap().windows(2).any(|w| w == b"[<"),
+            "wheel must not leak SGR"
+        );
+        captured.lock().unwrap().clear();
+        pane.forward_wheel(false).unwrap();
+        assert_eq!(captured.lock().unwrap().as_slice(), b"\x1b[6~");
+        captured.lock().unwrap().clear();
+        // Re-entering primary should not forward wheel as CSI
+        pane.parser.process(b"\x1b[?1049l");
+        assert!(!pane.is_alternate_screen());
+    }
+
+    #[test]
+    fn primary_screen_wheel_and_page_still_scroll_parent() {
+        let (mut pane, captured) = pane_with_capture(4, 20);
+        for index in 0..10 {
+            pane.parser.process(format!("line {index}\r\n").as_bytes());
+        }
+        assert!(!pane.is_alternate_screen());
+        pane.scroll_up(3);
+        assert_eq!(pane.scroll_offset, 3);
+        assert!(captured.lock().unwrap().is_empty());
+        pane.scroll_down(3);
+        assert_eq!(pane.scroll_offset, 0);
+        // Wheel in primary must also scroll, not forward, so we test scroll_up directly
+        pane.scroll_up(3);
+        assert_eq!(pane.scroll_offset, 3);
     }
 }
