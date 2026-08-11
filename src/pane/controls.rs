@@ -84,11 +84,22 @@ pub(super) fn add_resume_args(spec: &mut RoomSpec) -> io::Result<()> {
             strip_options(&mut spec.args, &["--session", "-s"]);
         }
     }
-    spec.args.extend(match captured_session_id(vendor, spec) {
-        Some(id) => session_resume_args(vendor, &id),
-        None => recent_resume_args(vendor),
+    spec.args.extend(match captured_resume(vendor, spec) {
+        Resume::Session(id) => session_resume_args(vendor, &id),
+        Resume::MostRecent => recent_resume_args(vendor),
+        Resume::Fresh => Vec::new(),
     });
     Ok(())
+}
+
+/// How a room should relaunch. `Fresh` exists because "resume nothing" and
+/// "resume whatever is newest" are different answers: once an exact id has been
+/// rejected as belonging to another model, the newest conversation in the
+/// directory is the very thing that must not be restored.
+enum Resume {
+    Session(String),
+    MostRecent,
+    Fresh,
 }
 
 /// The ambiguous "resume most recent conversation" args for each vendor.
@@ -109,9 +120,13 @@ fn session_resume_args(vendor: CliVendor, session_id: &str) -> Vec<OsString> {
     }
 }
 
-fn captured_session_id(vendor: CliVendor, spec: &RoomSpec) -> Option<String> {
-    let cwd = super::working_directory(spec.cwd.as_deref()).ok()?;
-    let id = super::session_state::lookup(vendor.key(), &cwd, &spec.title)?;
+fn captured_resume(vendor: CliVendor, spec: &RoomSpec) -> Resume {
+    let Ok(cwd) = super::working_directory(spec.cwd.as_deref()) else {
+        return Resume::MostRecent;
+    };
+    let Some(id) = super::session_state::lookup(vendor.key(), &cwd, &spec.title) else {
+        return Resume::MostRecent;
+    };
     if vendor == CliVendor::OpenCode
         && let Some(configured) = current_model(spec)
         && let Some(home) = home_dir()
@@ -120,12 +135,13 @@ fn captured_session_id(vendor: CliVendor, spec: &RoomSpec) -> Option<String> {
     {
         // `repair_opencode_session_mappings` has already reassigned what it
         // could across the whole slate, so a mismatch surviving to here means
-        // no session for this model exists. Resuming this id anyway would
-        // restore another model's conversation, which is the reversal itself;
-        // fall back to the ambiguous "most recent" form instead.
-        return None;
+        // no session for this model exists. Start fresh rather than falling back
+        // to "most recent": that form is unfiltered by model and by what other
+        // rooms hold, so it would restore the sibling's conversation, which is
+        // the reversal this whole path exists to prevent.
+        return Resume::Fresh;
     }
-    Some(id)
+    Resume::Session(id)
 }
 
 const OPENCODE_DATABASE_PATH: &str = ".local/share/opencode/opencode.db";
@@ -158,7 +174,7 @@ pub(crate) fn repair_opencode_session_mappings(specs: &[RoomSpec]) {
     struct Claim {
         cwd: PathBuf,
         title: String,
-        model: String,
+        model: Option<String>,
         session_id: Option<String>,
     }
 
@@ -168,12 +184,11 @@ pub(crate) fn repair_opencode_session_mappings(specs: &[RoomSpec]) {
         .filter(|spec| matches!(cli_vendor(spec), Ok(CliVendor::OpenCode)))
         .filter_map(|spec| {
             let cwd = super::working_directory(spec.cwd.as_deref()).ok()?;
-            let model = current_model(spec)?;
             let session_id = super::session_state::lookup(key, &cwd, &spec.title);
             Some(Claim {
                 cwd,
                 title: spec.title.clone(),
-                model,
+                model: current_model(spec),
                 session_id,
             })
         })
@@ -182,12 +197,27 @@ pub(crate) fn repair_opencode_session_mappings(specs: &[RoomSpec]) {
     let mut reserved: Vec<String> = Vec::new();
     let mut unresolved: Vec<&Claim> = Vec::new();
     for claim in &claims {
-        let trustworthy = claim.session_id.as_deref().is_some_and(|id| {
-            opencode_session_model(&database, id)
-                .is_some_and(|stored| opencode_model_matches(&stored, &claim.model))
-        });
+        let Some(id) = claim.session_id.as_deref() else {
+            unresolved.push(claim);
+            continue;
+        };
+        // Only one room can resume a session, so a claim on an id already
+        // reserved is not trustworthy however well its model matches: the
+        // earlier claim holds it and this room needs one of its own.
+        if reserved.iter().any(|held| held == id) {
+            unresolved.push(claim);
+            continue;
+        }
+        let trustworthy = match &claim.model {
+            Some(model) => opencode_session_model(&database, id)
+                .is_some_and(|stored| opencode_model_matches(&stored, model)),
+            // A room with no configured model cannot be model-checked, and it
+            // resumes this id regardless. Reserve it anyway, or a room that can
+            // be checked will draw the session out from under it.
+            None => true,
+        };
         if trustworthy {
-            reserved.push(claim.session_id.clone().unwrap_or_default());
+            reserved.push(id.to_owned());
         } else {
             unresolved.push(claim);
         }
@@ -199,7 +229,7 @@ pub(crate) fn repair_opencode_session_mappings(specs: &[RoomSpec]) {
             &claim.cwd,
             SystemTime::UNIX_EPOCH,
             &reserved,
-            Some(&claim.model),
+            claim.model.as_deref(),
         ) {
             super::session_state::upsert(key, &claim.cwd, &claim.title, &correct);
             reserved.push(correct);
@@ -1396,6 +1426,144 @@ mod tests {
         assert_eq!(
             super::super::session_state::lookup("opencode", &cwd, "OpenCode \u{00b7} 4").as_deref(),
             Some("ses-older")
+        );
+    }
+
+    /// Builds a database holding two sessions on one model plus a third on
+    /// another, all in `cwd`, and returns the guards that keep the home
+    /// directory and the persisted state isolated for the test.
+    fn opencode_slate_fixture(
+        cwd: &Path,
+    ) -> Option<(
+        super::super::session_state::StateRootGuard,
+        crate::pane::controls::HomeDirGuard,
+    )> {
+        if Command::new("sqlite3").arg("--version").output().is_err() {
+            return None;
+        }
+        let state = super::super::session_state::StateRootGuard::isolated();
+        let home_guard = crate::pane::controls::HomeDirGuard::isolated();
+        let db = home_guard.path().join(OPENCODE_DATABASE_PATH);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&db);
+        let cwd_str = cwd.to_string_lossy().to_string();
+        let model = r#"{"providerID":"deepseek","id":"deepseek-v4-flash"}"#;
+        let create = format!(
+            r#"CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_created INTEGER NOT NULL, model TEXT);
+              INSERT INTO session VALUES ('ses-older','{cwd_str}',1000, '{model}');
+              INSERT INTO session VALUES ('ses-newer','{cwd_str}',2000, '{model}');
+              INSERT INTO session VALUES ('ses-stale','{cwd_str}',500, '{{"providerID":"meta","id":"muse-spark-1.2"}}');"#,
+        );
+        assert!(
+            Command::new("sqlite3")
+                .arg(&db)
+                .arg(create)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        Some((state, home_guard))
+    }
+
+    fn opencode_spec(cwd: &Path, title: &str, model: Option<&str>) -> RoomSpec {
+        RoomSpec {
+            name: "OpenCode".to_owned(),
+            vendor: "opencode".to_owned(),
+            title: title.to_owned(),
+            program: "opencode".into(),
+            args: match model {
+                Some(model) => vec!["--model".into(), model.into()],
+                None => Vec::new(),
+            },
+            transport: crate::config::Transport::Raw,
+            cwd: Some(cwd.to_path_buf()),
+            variables: Vec::new(),
+            allow_control: true,
+            use_headroom: false,
+            headroom_args: Vec::new(),
+        }
+    }
+
+    /// A matching model is not enough to make a claim trustworthy. When two
+    /// rooms have both persisted the same id, only one can hold it; the other
+    /// must be treated as unresolved and drawn a session of its own.
+    #[test]
+    fn duplicate_claims_on_one_session_do_not_both_resume_it() {
+        let cwd = std::env::current_dir().unwrap();
+        let Some(_guards) = opencode_slate_fixture(&cwd) else {
+            return;
+        };
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 3", "ses-newer");
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 4", "ses-newer");
+
+        let model = Some("deepseek/deepseek-v4-flash");
+        let mut specs = [
+            opencode_spec(&cwd, "OpenCode \u{00b7} 3", model),
+            opencode_spec(&cwd, "OpenCode \u{00b7} 4", model),
+        ];
+        crate::pane::resume_supported_specs(&mut specs);
+
+        assert!(specs[0].args.contains(&OsString::from("ses-newer")));
+        assert!(specs[1].args.contains(&OsString::from("ses-older")));
+        assert!(!specs[1].args.contains(&OsString::from("ses-newer")));
+    }
+
+    /// A room with no `--model` cannot be model-checked, so it resumes its
+    /// persisted id as-is. Its claim must still be reserved, or the sibling that
+    /// can be checked draws that session out from under it.
+    #[test]
+    fn a_modelless_claim_is_reserved_against_a_checkable_sibling() {
+        let cwd = std::env::current_dir().unwrap();
+        let Some(_guards) = opencode_slate_fixture(&cwd) else {
+            return;
+        };
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 3", "ses-newer");
+
+        let mut specs = [
+            opencode_spec(&cwd, "OpenCode \u{00b7} 3", None),
+            opencode_spec(
+                &cwd,
+                "OpenCode \u{00b7} 4",
+                Some("deepseek/deepseek-v4-flash"),
+            ),
+        ];
+        crate::pane::resume_supported_specs(&mut specs);
+
+        assert!(specs[0].args.contains(&OsString::from("ses-newer")));
+        assert!(specs[1].args.contains(&OsString::from("ses-older")));
+        assert!(!specs[1].args.contains(&OsString::from("ses-newer")));
+    }
+
+    /// When no session for this room's model exists, the rejected id must not
+    /// degrade into `--continue`: that form is filtered by neither model nor
+    /// what other rooms hold, so it would restore the very session just refused.
+    #[test]
+    fn a_surviving_model_mismatch_starts_fresh_instead_of_continuing() {
+        let cwd = std::env::current_dir().unwrap();
+        let Some(_guards) = opencode_slate_fixture(&cwd) else {
+            return;
+        };
+        // The only sessions on this room's model belong to its siblings, so the
+        // repair pass has nothing left to hand it.
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 3", "ses-newer");
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 4", "ses-older");
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 5", "ses-stale");
+
+        let model = Some("deepseek/deepseek-v4-flash");
+        let mut specs = [
+            opencode_spec(&cwd, "OpenCode \u{00b7} 3", model),
+            opencode_spec(&cwd, "OpenCode \u{00b7} 4", model),
+            opencode_spec(&cwd, "OpenCode \u{00b7} 5", model),
+        ];
+        crate::pane::resume_supported_specs(&mut specs);
+
+        assert_eq!(
+            specs[2].args,
+            vec![
+                OsString::from("--model"),
+                OsString::from("deepseek/deepseek-v4-flash")
+            ]
         );
     }
 
