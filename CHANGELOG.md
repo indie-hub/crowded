@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.30.1] - 2026-08-11
+
+### Fixed
+
+- Wheel scrolling no longer stalls or overshoots in terminals that report a single notch as a long burst of identical mouse events. Each burst now produces one scroll action, and Crowded requests button reporting and SGR encoding directly instead of also enabling the drag and any-motion reporting it never reads.
+
 ## [0.30.0] - 2026-08-10
 
 ### Added
