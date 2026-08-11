@@ -2,13 +2,13 @@
 
 use std::{
     collections::VecDeque,
-    io,
+    io::{self, Write},
     time::{Duration, Instant},
 };
 
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -52,6 +52,66 @@ const HEADROOM_STARTUP_GRACE: Duration = Duration::from_secs(3);
 // detection like `opencode_input_ready`, keyed off the actual program.
 const INTRO_READINESS_CEILING: Duration = Duration::from_secs(15);
 const AUTO_DELIVERY_LIMIT: usize = 20;
+// How far one wheel notch scrolls the focused pane's retained history. Page
+// Up / Page Down use the full visible height instead; only the wheel uses a
+// small fixed step.
+const WHEEL_SCROLL_STEP: usize = 3;
+
+// Button-event reporting (`?1000h`) plus SGR encoding (`?1006h`), and
+// deliberately not `?1002h`/`?1003h`. Crossterm's `EnableMouseCapture` turns
+// drag and any-motion reporting on as well; Crowded reads neither, but the
+// parent terminal still delivers a motion report for every pointer movement,
+// which competes with the wheel reports we do care about.
+const ENABLE_WHEEL_REPORTING: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+const DISABLE_WHEEL_REPORTING: &[u8] = b"\x1b[?1006l\x1b[?1000l";
+
+// Upper bound on reports discarded per gesture, so a terminal that never stops
+// reporting cannot starve rendering.
+const WHEEL_DRAIN_CEILING: usize = 1024;
+
+fn is_wheel(event: &Event) -> Option<MouseEventKind> {
+    match event {
+        Event::Mouse(mouse)
+            if matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) =>
+        {
+            Some(mouse.kind)
+        }
+        _ => None,
+    }
+}
+
+/// Collapse an already-queued burst of identical wheel reports into the single
+/// report the caller is about to act on.
+///
+/// A physical wheel notch is not one report. Warp resends the same SGR event
+/// well over a hundred times per notch, and terminals that repeat less still
+/// repeat. Acting on each one individually both overshoots the scroll target by
+/// two orders of magnitude and lets the queue outgrow the rate the render loop
+/// can drain it, at which point the wheel stops responding entirely.
+///
+/// Only reports already waiting are consumed, so a terminal that sends exactly
+/// one report per notch is unaffected. Draining stops at the first event that is
+/// not the same wheel direction; that event is handed back through `stashed` so
+/// the next iteration sees it rather than dropping it.
+fn drain_wheel_burst(kind: MouseEventKind, stashed: &mut Option<Event>) -> io::Result<usize> {
+    let mut drained = 0;
+    while drained < WHEEL_DRAIN_CEILING {
+        if !event::poll(Duration::ZERO)? {
+            break;
+        }
+        let event = event::read()?;
+        if is_wheel(&event) != Some(kind) {
+            *stashed = Some(event);
+            break;
+        }
+        drained += 1;
+    }
+    Ok(drained)
+}
+
 // A transient hook state (starting/thinking/working) is only trusted while
 // fresh. Once its sample is older than this and the delivery gate
 // demonstrably shows the screen ready, the ready screen wins: a hook that
@@ -451,6 +511,7 @@ struct TerminalGuard {
     raw: bool,
     alternate: bool,
     cursor_hidden: bool,
+    mouse_captured: bool,
 }
 
 impl TerminalGuard {
@@ -460,11 +521,18 @@ impl TerminalGuard {
             raw: true,
             alternate: false,
             cursor_hidden: false,
+            mouse_captured: false,
         };
         execute!(io::stdout(), EnterAlternateScreen)?;
         guard.alternate = true;
         execute!(io::stdout(), Hide)?;
         guard.cursor_hidden = true;
+        // Wheel scrolling needs the parent terminal to report mouse events.
+        // The flag lets Drop undo this on every exit path.
+        let mut stdout = io::stdout();
+        stdout.write_all(ENABLE_WHEEL_REPORTING)?;
+        stdout.flush()?;
+        guard.mouse_captured = true;
         Ok(guard)
     }
 }
@@ -473,6 +541,11 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Undo setup in reverse order. Cleanup is best-effort because Drop
         // cannot return an error, and restoring as much as possible is safest.
+        if self.mouse_captured {
+            let mut stdout = io::stdout();
+            let _ = stdout.write_all(DISABLE_WHEEL_REPORTING);
+            let _ = stdout.flush();
+        }
         if self.cursor_hidden {
             let _ = execute!(io::stdout(), Show);
         }
@@ -538,6 +611,8 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
     let mut delivery_paused = false;
     let mut pending = VecDeque::<(u64, usize)>::new();
     let mut room_pulses = vec![None::<PulseSample>; room_count];
+    // Holds the event that ended a wheel burst, so draining never discards it.
+    let mut stashed_event: Option<Event> = None;
 
     loop {
         let now = Instant::now();
@@ -754,6 +829,9 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
             }
         }
 
+        for pane in &mut panes {
+            pane.apply_scroll();
+        }
         terminal.draw(|frame| {
             let (rooms, pulse, status) = content_areas(frame.area());
             let areas = pane_areas(rooms, room_count);
@@ -887,15 +965,25 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                 );
             }
         })?;
+        for pane in &mut panes {
+            pane.restore_scroll();
+        }
 
         for pane in &mut panes {
             pane.poll_exit()?;
         }
 
-        // Poll with a short timeout instead of blocking forever in `read()`;
-        // this lets us notice child output and child exit on every loop.
-        if event::poll(Duration::from_millis(16))? {
-            match event::read()? {
+        let next_event = match stashed_event.take() {
+            Some(event) => Some(event),
+            None if event::poll(Duration::from_millis(16))? => Some(event::read()?),
+            None => None,
+        };
+        if let Some(event) = next_event {
+            // One notch, one scroll action, however many times it was reported.
+            if let Some(kind) = is_wheel(&event) {
+                drain_wheel_burst(kind, &mut stashed_event)?;
+            }
+            match event {
                 Event::Key(key)
                     if key.code == KeyCode::Char('q')
                         && key.modifiers == KeyModifiers::CONTROL
@@ -1061,6 +1149,20 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                         {
                             focused = (focused + 1) % panes.len();
                             notice = None;
+                        } else if key.code == KeyCode::PageUp && key.kind == KeyEventKind::Press {
+                            if panes[focused].is_alternate_screen() {
+                                let _ = panes[focused].forward_page_up();
+                            } else {
+                                let rows = panes[focused].visible_height();
+                                panes[focused].scroll_up(rows);
+                            }
+                        } else if key.code == KeyCode::PageDown && key.kind == KeyEventKind::Press {
+                            if panes[focused].is_alternate_screen() {
+                                let _ = panes[focused].forward_page_down();
+                            } else {
+                                let rows = panes[focused].visible_height();
+                                panes[focused].scroll_down(rows);
+                            }
                         } else if panes[focused].is_online() {
                             panes[focused].write_key(key)?;
                         } else {
@@ -1084,6 +1186,34 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                         pane.resize(pane_size(*area))?;
                     }
                 }
+                // Wheel routing depends on whether the focused pane is in
+                // alternate-screen mode: primary screen scrolls parent
+                // scrollback, alternate screen forwards as PageUp/PageDown.
+                Event::Mouse(mouse) => {
+                    if matches!(&input_mode, InputMode::Normal) {
+                        if panes[focused].is_alternate_screen() {
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp => {
+                                    let _ = panes[focused].forward_wheel(true);
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    let _ = panes[focused].forward_wheel(false);
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp => {
+                                    panes[focused].scroll_up(WHEEL_SCROLL_STEP);
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    panes[focused].scroll_down(WHEEL_SCROLL_STEP);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1101,6 +1231,34 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_matching_wheel_directions_are_drained() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+
+        let wheel = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        let up = wheel(MouseEventKind::ScrollUp);
+        let down = wheel(MouseEventKind::ScrollDown);
+        assert_eq!(is_wheel(&up), Some(MouseEventKind::ScrollUp));
+        assert_eq!(is_wheel(&down), Some(MouseEventKind::ScrollDown));
+
+        // A burst only absorbs its own direction; the opposite direction and
+        // every non-wheel event must end the drain so they are handled instead.
+        assert_ne!(is_wheel(&down), is_wheel(&up));
+        assert_eq!(is_wheel(&wheel(MouseEventKind::Moved)), None);
+        assert_eq!(
+            is_wheel(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+            None
+        );
+    }
 
     #[test]
     fn pane_size_uses_the_bordered_inner_area_and_clamps() {
