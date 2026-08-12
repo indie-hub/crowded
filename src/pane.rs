@@ -164,14 +164,16 @@ fn headroom_launch(
 ///
 /// Returns, per spec, whether resume args were actually applied. The
 /// caller uses this to tell which panes genuinely resumed and can skip
-/// their intro whisper.
+/// their intro whisper. A room that was refused its recorded session
+/// starts fresh, so it reports `false` and receives the normal intro and
+/// session capture despite `add_resume_args` having succeeded.
 pub(crate) fn resume_supported_specs(specs: &mut [RoomSpec]) -> Vec<bool> {
     // Runs across the whole slate first: which OpenCode session belongs to
     // which room cannot be decided from one room's view alone.
-    controls::repair_opencode_session_mappings(specs);
+    let refused = controls::repair_opencode_session_mappings(specs);
     specs
         .iter_mut()
-        .map(|spec| controls::add_resume_args(spec).is_ok())
+        .map(|spec| controls::add_resume_args(spec, &refused).unwrap_or(false))
         .collect()
 }
 
@@ -647,7 +649,11 @@ impl Pane {
         &mut self,
         size: PtySize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.reconfigure(size, controls::add_resume_args)
+        // One room resuming on its own request has no slate to be judged
+        // against, so there is no refusal to honour.
+        self.reconfigure(size, |spec| {
+            controls::add_resume_args(spec, &[]).map(|_| ())
+        })
     }
 
     pub(crate) fn configure(

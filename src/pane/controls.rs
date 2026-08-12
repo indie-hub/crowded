@@ -65,7 +65,12 @@ pub(super) fn clear_resume_args(spec: &mut RoomSpec) -> io::Result<()> {
 /// `--resume <id>` / `resume <id>` / `--session <id>`. Every form appends at
 /// the end of the args, matching the pairing convention
 /// `clear_resume_args` already expects.
-pub(super) fn add_resume_args(spec: &mut RoomSpec) -> io::Result<()> {
+/// `refused` carries the rooms `repair_opencode_session_mappings` rejected and
+/// could not re-home; pass an empty slice when resuming a single room, which has
+/// no slate to be judged against. Returns whether resume args were actually
+/// applied, which is not the same as succeeding: a refused room succeeds at
+/// starting fresh.
+pub(super) fn add_resume_args(spec: &mut RoomSpec, refused: &[RoomKey]) -> io::Result<bool> {
     let vendor = cli_vendor(spec)?;
     match vendor {
         CliVendor::Claude => {
@@ -84,13 +89,19 @@ pub(super) fn add_resume_args(spec: &mut RoomSpec) -> io::Result<()> {
             strip_options(&mut spec.args, &["--session", "-s"]);
         }
     }
-    spec.args.extend(match captured_resume(vendor, spec) {
+    let args = match captured_resume(vendor, spec, refused) {
         Resume::Session(id) => session_resume_args(vendor, &id),
         Resume::MostRecent => recent_resume_args(vendor),
         Resume::Fresh => Vec::new(),
-    });
-    Ok(())
+    };
+    let resumed = !args.is_empty();
+    spec.args.extend(args);
+    Ok(resumed)
 }
+
+/// Identifies a room the way its persisted session state does, by working
+/// directory and title.
+pub(crate) type RoomKey = (PathBuf, String);
 
 /// How a room should relaunch. `Fresh` exists because "resume nothing" and
 /// "resume whatever is newest" are different answers: once an exact id has been
@@ -120,28 +131,27 @@ fn session_resume_args(vendor: CliVendor, session_id: &str) -> Vec<OsString> {
     }
 }
 
-fn captured_resume(vendor: CliVendor, spec: &RoomSpec) -> Resume {
+fn captured_resume(vendor: CliVendor, spec: &RoomSpec, refused: &[RoomKey]) -> Resume {
     let Ok(cwd) = super::working_directory(spec.cwd.as_deref()) else {
         return Resume::MostRecent;
     };
-    let Some(id) = super::session_state::lookup(vendor.key(), &cwd, &spec.title) else {
-        return Resume::MostRecent;
-    };
-    if vendor == CliVendor::OpenCode
-        && let Some(configured) = current_model(spec)
-        && let Some(home) = home_dir()
-        && let Some(stored) = opencode_session_model(&home.join(OPENCODE_DATABASE_PATH), &id)
-        && !opencode_model_matches(&stored, &configured)
+    // A refusal is the slate's decision and is final here. This room's recorded
+    // id is still on disk and still looks plausible from inside the room, so
+    // re-deciding from what is visible locally would only reverse the refusal:
+    // the whole reason the slate had to judge it is that a single room cannot
+    // see whether a sibling holds the same session.
+    if refused
+        .iter()
+        .any(|(refused_cwd, refused_title)| *refused_cwd == cwd && *refused_title == spec.title)
     {
-        // `repair_opencode_session_mappings` has already reassigned what it
-        // could across the whole slate, so a mismatch surviving to here means
-        // no session for this model exists. Start fresh rather than falling back
-        // to "most recent": that form is unfiltered by model and by what other
-        // rooms hold, so it would restore the sibling's conversation, which is
-        // the reversal this whole path exists to prevent.
+        // "Most recent" is filtered by neither model nor by what other rooms
+        // hold, so it would restore the very session just refused.
         return Resume::Fresh;
     }
-    Resume::Session(id)
+    match super::session_state::lookup(vendor.key(), &cwd, &spec.title) {
+        Some(id) => Resume::Session(id),
+        None => Resume::MostRecent,
+    }
 }
 
 const OPENCODE_DATABASE_PATH: &str = ".local/share/opencode/opencode.db";
@@ -162,13 +172,18 @@ const OPENCODE_DATABASE_PATH: &str = ".local/share/opencode/opencode.db";
 /// Session ids are unique across directories, so one reserved set is safe to
 /// share between rooms with different working directories: an id from elsewhere
 /// simply never matches the query, which is already filtered by directory.
-pub(crate) fn repair_opencode_session_mappings(specs: &[RoomSpec]) {
+///
+/// Returns the rooms whose recorded id was rejected and could not be replaced.
+/// That verdict has to travel out with them: their id stays on disk, and any
+/// later per-room check would see a plausible-looking claim and trust it again.
+pub(crate) fn repair_opencode_session_mappings(specs: &[RoomSpec]) -> Vec<RoomKey> {
+    let mut refused: Vec<RoomKey> = Vec::new();
     let Some(home) = home_dir() else {
-        return;
+        return refused;
     };
     let database = home.join(OPENCODE_DATABASE_PATH);
     if !database.is_file() {
-        return;
+        return refused;
     }
 
     struct Claim {
@@ -233,8 +248,15 @@ pub(crate) fn repair_opencode_session_mappings(specs: &[RoomSpec]) {
         ) {
             super::session_state::upsert(key, &claim.cwd, &claim.title, &correct);
             reserved.push(correct);
+        } else if claim.session_id.is_some() {
+            // Nothing left to hand this room, and what it recorded was rejected.
+            // A room that never had a mapping is not refused: it has claimed
+            // nothing, so the ambiguous "most recent" form is still its best
+            // available answer.
+            refused.push((claim.cwd.clone(), claim.title.clone()));
         }
     }
+    refused
 }
 
 /// Discover the exact underlying session id for a fresh spawn's vendor
@@ -866,7 +888,7 @@ mod tests {
 
         let mut claude = raw_room("claude");
         claude.args = vec!["--model".into(), "sonnet".into()];
-        add_resume_args(&mut claude).unwrap();
+        add_resume_args(&mut claude, &[]).unwrap();
         assert_eq!(
             claude.args,
             vec![
@@ -878,7 +900,7 @@ mod tests {
 
         let mut codex = raw_room("codex");
         codex.args = vec!["--dangerously-bypass-approvals-and-sandbox".into()];
-        add_resume_args(&mut codex).unwrap();
+        add_resume_args(&mut codex, &[]).unwrap();
         assert_eq!(
             codex.args,
             vec![
@@ -888,7 +910,7 @@ mod tests {
             ]
         );
         // Resuming again must not stack duplicate "resume --last" pairs.
-        add_resume_args(&mut codex).unwrap();
+        add_resume_args(&mut codex, &[]).unwrap();
         assert_eq!(
             codex.args,
             vec![
@@ -899,7 +921,7 @@ mod tests {
         );
 
         let mut opencode = raw_room("opencode");
-        add_resume_args(&mut opencode).unwrap();
+        add_resume_args(&mut opencode, &[]).unwrap();
         assert_eq!(opencode.args, vec![OsString::from("--continue")]);
     }
 
@@ -920,7 +942,7 @@ mod tests {
         let mut claude = raw_room("claude");
         claude.cwd = Some(cwd.clone());
         claude.args = vec!["--model".into(), "sonnet".into()];
-        add_resume_args(&mut claude).unwrap();
+        add_resume_args(&mut claude, &[]).unwrap();
         assert_eq!(
             claude.args,
             vec![
@@ -934,7 +956,7 @@ mod tests {
         let mut codex = raw_room("codex");
         codex.cwd = Some(cwd.clone());
         codex.args = vec!["--dangerously-bypass-approvals-and-sandbox".into()];
-        add_resume_args(&mut codex).unwrap();
+        add_resume_args(&mut codex, &[]).unwrap();
         assert_eq!(
             codex.args,
             vec![
@@ -946,7 +968,7 @@ mod tests {
 
         let mut opencode = raw_room("opencode");
         opencode.cwd = Some(cwd);
-        add_resume_args(&mut opencode).unwrap();
+        add_resume_args(&mut opencode, &[]).unwrap();
         assert_eq!(
             opencode.args,
             vec![OsString::from("--session"), "opencode-ses-1".into()]
@@ -1565,6 +1587,108 @@ mod tests {
                 OsString::from("deepseek/deepseek-v4-flash")
             ]
         );
+    }
+
+    /// The duplicate guard only moves a room to unresolved. When every matching
+    /// session is already reserved there is nothing to move it to, and the
+    /// rejected id is still on disk: without the refusal travelling out of the
+    /// repair pass, the room resumes the duplicate it was just denied.
+    #[test]
+    fn a_refused_duplicate_with_no_replacement_starts_fresh() {
+        let cwd = std::env::current_dir().unwrap();
+        let Some(_guards) = opencode_slate_fixture(&cwd) else {
+            return;
+        };
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 3", "ses-newer");
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 4", "ses-newer");
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 5", "ses-older");
+
+        let model = Some("deepseek/deepseek-v4-flash");
+        let mut specs = [
+            opencode_spec(&cwd, "OpenCode \u{00b7} 3", model),
+            opencode_spec(&cwd, "OpenCode \u{00b7} 4", model),
+            opencode_spec(&cwd, "OpenCode \u{00b7} 5", model),
+        ];
+        let resumed = crate::pane::resume_supported_specs(&mut specs);
+
+        assert!(specs[0].args.contains(&OsString::from("ses-newer")));
+        assert!(specs[2].args.contains(&OsString::from("ses-older")));
+        // The denied duplicate resumes nothing at all.
+        assert_eq!(
+            specs[1].args,
+            vec![
+                OsString::from("--model"),
+                OsString::from("deepseek/deepseek-v4-flash")
+            ]
+        );
+        // A room that starts fresh has not resumed, so it must still receive
+        // its intro and have its new session captured.
+        assert_eq!(resumed, vec![true, false, true]);
+    }
+
+    /// A session whose model column is unreadable cannot be verified, so it
+    /// cannot be trusted either. Repair refuses the claim; the refusal is what
+    /// stops the room resuming a sibling's conversation on legacy state.
+    #[test]
+    fn unverifiable_model_metadata_does_not_resume_the_claim() {
+        let cwd = std::env::current_dir().unwrap();
+        let Some((_state, home_guard)) = opencode_slate_fixture(&cwd) else {
+            return;
+        };
+        let db = home_guard.path().join(OPENCODE_DATABASE_PATH);
+        let cwd_str = cwd.to_string_lossy().to_string();
+        assert!(
+            Command::new("sqlite3")
+                .arg(&db)
+                .arg(format!(
+                    "INSERT INTO session VALUES ('ses-nometa','{cwd_str}',3000, NULL);"
+                ))
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        // Both readable sessions on this model are legitimately held, so no
+        // replacement exists for the room holding the unreadable one.
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 3", "ses-newer");
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 4", "ses-older");
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 5", "ses-nometa");
+
+        let model = Some("deepseek/deepseek-v4-flash");
+        let mut specs = [
+            opencode_spec(&cwd, "OpenCode \u{00b7} 3", model),
+            opencode_spec(&cwd, "OpenCode \u{00b7} 4", model),
+            opencode_spec(&cwd, "OpenCode \u{00b7} 5", model),
+        ];
+        let resumed = crate::pane::resume_supported_specs(&mut specs);
+
+        assert!(!specs[2].args.contains(&OsString::from("ses-nometa")));
+        assert!(!specs[2].args.contains(&OsString::from("--continue")));
+        assert_eq!(
+            specs[2].args,
+            vec![
+                OsString::from("--model"),
+                OsString::from("deepseek/deepseek-v4-flash")
+            ]
+        );
+        assert_eq!(resumed, vec![true, true, false]);
+    }
+
+    /// A room that never recorded a session has claimed nothing, so refusal
+    /// must not reach it: it is free to be given whichever session is still
+    /// unheld, and it counts as resumed. The `--continue` form remains the
+    /// answer only when repair has nothing to give it.
+    #[test]
+    fn a_room_without_a_mapping_is_not_refused() {
+        let cwd = std::env::current_dir().unwrap();
+        let Some(_guards) = opencode_slate_fixture(&cwd) else {
+            return;
+        };
+        let mut specs = [opencode_spec(&cwd, "OpenCode \u{00b7} 9", None)];
+        let resumed = crate::pane::resume_supported_specs(&mut specs);
+
+        assert!(specs[0].args.contains(&OsString::from("--session")));
+        assert_eq!(resumed, vec![true]);
     }
 
     #[test]
