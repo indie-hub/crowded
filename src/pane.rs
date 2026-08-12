@@ -645,15 +645,17 @@ impl Pane {
         self.reconfigure(size, controls::clear_resume_args)
     }
 
+    /// Returns whether a conversation was actually resumed. A room whose
+    /// recorded session cannot be verified as its own starts fresh instead, and
+    /// then still needs its intro and a new session captured.
     pub(crate) fn resume_context(
         &mut self,
         size: PtySize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         // One room resuming on its own request has no slate to be judged
-        // against, so there is no refusal to honour.
-        self.reconfigure(size, |spec| {
-            controls::add_resume_args(spec, &[]).map(|_| ())
-        })
+        // against, so there is no refusal to honour. The objective checks
+        // inside `add_resume_args` still apply.
+        self.reconfigure(size, |spec| controls::add_resume_args(spec, &[]))
     }
 
     pub(crate) fn configure(
@@ -685,17 +687,17 @@ impl Pane {
         controls::capabilities(&self.spec)
     }
 
-    fn reconfigure(
+    fn reconfigure<T>(
         &mut self,
         size: PtySize,
-        configure: impl FnOnce(&mut RoomSpec) -> io::Result<()>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        configure: impl FnOnce(&mut RoomSpec) -> io::Result<T>,
+    ) -> Result<T, Box<dyn std::error::Error>> {
         let mut spec = self.spec.clone();
-        configure(&mut spec)?;
+        let outcome = configure(&mut spec)?;
         let replacement = Self::spawn(spec, size, self.environment.clone())?;
         self.cleanup();
         *self = replacement;
-        Ok(())
+        Ok(outcome)
     }
 
     pub(crate) fn restart(&mut self, size: PtySize) -> Result<(), Box<dyn std::error::Error>> {

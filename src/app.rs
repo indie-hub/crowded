@@ -185,8 +185,11 @@ impl DeliveryGate {
 /// The delivery gate for a pane that just respawned. A genuinely resumed
 /// pane skips the intro whisper; every other respawn path (fresh spawn,
 /// restart, ClearContext, Configure) resends it exactly as before.
-fn gate_after_control(needs_intro: bool, action: &ControlAction) -> DeliveryGate {
-    DeliveryGate::new(needs_intro && !matches!(action, ControlAction::Resume))
+/// A room that resumed a conversation carries its own history and needs no
+/// intro. A resume that could not be honoured leaves the room starting fresh,
+/// which is indistinguishable from any other fresh room and takes the intro.
+fn gate_after_control(needs_intro: bool, resumed: bool) -> DeliveryGate {
+    DeliveryGate::new(needs_intro && !resumed)
 }
 
 impl DeliveryFuse {
@@ -734,27 +737,31 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                         continue;
                     }
 
-                    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                    // Reports whether the room came back holding a prior
+                    // conversation, which only a resume can do and only when it
+                    // was actually honoured.
+                    let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
                         terminal.autoresize()?;
                         let (rooms, _, _) = content_areas(terminal.size()?.into());
                         let size = pane_size(pane_areas(rooms, room_count)[control.to]);
                         match &control.action {
-                            ControlAction::ClearContext => panes[control.to].clear_context(size),
+                            ControlAction::ClearContext => {
+                                panes[control.to].clear_context(size).map(|_| false)
+                            }
                             ControlAction::Resume => panes[control.to].resume_context(size),
                             ControlAction::Configure { model, effort } => panes[control.to]
                                 .configure(
                                     model.as_deref(),
                                     effort.as_ref().map(|e| e.label()),
                                     size,
-                                ),
+                                )
+                                .map(|_| false),
                         }
                     })();
                     match result {
-                        Ok(()) => {
-                            delivery_gates[control.to] = gate_after_control(
-                                panes[control.to].needs_intro(),
-                                &control.action,
-                            );
+                        Ok(resumed) => {
+                            delivery_gates[control.to] =
+                                gate_after_control(panes[control.to].needs_intro(), resumed);
                             last_output[control.to] = None;
                             spawned_at[control.to] = Instant::now();
                             room_pulses[control.to] = match &control.action {
@@ -1604,7 +1611,7 @@ mod tests {
 
     #[test]
     fn resume_control_resets_pulse_so_roster_shows_ready_immediately() {
-        let resume_gate = gate_after_control(true, &ControlAction::Resume);
+        let resume_gate = gate_after_control(true, true);
         assert_eq!(resume_gate, DeliveryGate::Ready);
         assert_eq!(
             roster_state(true, resume_gate, true, None, Instant::now()),
@@ -1626,7 +1633,7 @@ mod tests {
                 source: PulseSource::Readiness,
             }
         );
-        let clear_gate = gate_after_control(true, &ControlAction::ClearContext);
+        let clear_gate = gate_after_control(true, false);
         assert_eq!(clear_gate, DeliveryGate::AwaitingIntro);
         assert_eq!(
             roster_state(
@@ -1652,28 +1659,19 @@ mod tests {
 
     #[test]
     fn resume_control_skips_intro_but_clear_and_configure_resend_it() {
-        assert_eq!(
-            gate_after_control(true, &ControlAction::Resume),
-            DeliveryGate::Ready
-        );
-        assert_eq!(
-            gate_after_control(true, &ControlAction::ClearContext),
-            DeliveryGate::AwaitingIntro
-        );
-        assert_eq!(
-            gate_after_control(
-                true,
-                &ControlAction::Configure {
-                    model: None,
-                    effort: None,
-                }
-            ),
-            DeliveryGate::AwaitingIntro
-        );
+        assert_eq!(gate_after_control(true, true), DeliveryGate::Ready);
+        // Clear and configure never resume, so they resend the intro.
+        assert_eq!(gate_after_control(true, false), DeliveryGate::AwaitingIntro);
         // Terminal panes take no intro either way, including across a resume.
-        assert_eq!(
-            gate_after_control(false, &ControlAction::Resume),
-            DeliveryGate::Ready
-        );
+        assert_eq!(gate_after_control(false, true), DeliveryGate::Ready);
+        assert_eq!(gate_after_control(false, false), DeliveryGate::Ready);
+    }
+
+    /// A resume that could not be honoured leaves the room starting fresh with
+    /// no history on screen. Treating it as resumed would cost that room both
+    /// its intro and its session capture.
+    #[test]
+    fn a_resume_that_started_fresh_still_takes_the_intro() {
+        assert_eq!(gate_after_control(true, false), DeliveryGate::AwaitingIntro);
     }
 }

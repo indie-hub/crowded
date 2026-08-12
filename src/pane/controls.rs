@@ -148,10 +148,41 @@ fn captured_resume(vendor: CliVendor, spec: &RoomSpec, refused: &[RoomKey]) -> R
         // hold, so it would restore the very session just refused.
         return Resume::Fresh;
     }
-    match super::session_state::lookup(vendor.key(), &cwd, &spec.title) {
-        Some(id) => Resume::Session(id),
-        None => Resume::MostRecent,
+    let Some(id) = super::session_state::lookup(vendor.key(), &cwd, &spec.title) else {
+        return Resume::MostRecent;
+    };
+    if vendor == CliVendor::OpenCode && !opencode_claim_is_verifiable(spec, &id) {
+        return Resume::Fresh;
     }
+    Resume::Session(id)
+}
+
+/// Whether this room's recorded OpenCode session can be shown to be on the
+/// model the room is configured for.
+///
+/// Which room *owns* a session needs the whole slate, and that verdict arrives
+/// as a refusal. Whether a session is objectively on this room's model needs
+/// nothing but the row, so it is the one check an isolated resume can still
+/// make, and its only protection. On the slate path this can only ever agree
+/// with the repair pass, which reserved or replaced every claim on exactly this
+/// basis; a room resuming alone has no such pass behind it.
+///
+/// An unreadable or absent model column is not evidence of a match, so it is
+/// treated as failure. A room with no configured model has nothing to compare
+/// against and keeps its claim.
+fn opencode_claim_is_verifiable(spec: &RoomSpec, session_id: &str) -> bool {
+    let Some(configured) = current_model(spec) else {
+        return true;
+    };
+    let Some(home) = home_dir() else {
+        return true;
+    };
+    let database = home.join(OPENCODE_DATABASE_PATH);
+    if !database.is_file() {
+        return true;
+    }
+    opencode_session_model(&database, session_id)
+        .is_some_and(|stored| opencode_model_matches(&stored, &configured))
 }
 
 const OPENCODE_DATABASE_PATH: &str = ".local/share/opencode/opencode.db";
@@ -1689,6 +1720,62 @@ mod tests {
 
         assert!(specs[0].args.contains(&OsString::from("--session")));
         assert_eq!(resumed, vec![true]);
+    }
+
+    /// One room resuming on request has no slate and so receives no refusal.
+    /// It can still check the one thing that needs no slate: whether the
+    /// session it recorded is objectively on the model it is configured for.
+    #[test]
+    fn an_isolated_resume_rejects_a_claim_on_another_model() {
+        let cwd = std::env::current_dir().unwrap();
+        let Some((_state, home_guard)) = opencode_slate_fixture(&cwd) else {
+            return;
+        };
+        let db = home_guard.path().join(OPENCODE_DATABASE_PATH);
+        let cwd_str = cwd.to_string_lossy().to_string();
+        assert!(
+            Command::new("sqlite3")
+                .arg(&db)
+                .arg(format!(
+                    "INSERT INTO session VALUES ('ses-nometa','{cwd_str}',3000, NULL);"
+                ))
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+
+        // Recorded against a session belonging to a different model.
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 3", "ses-stale");
+        let mut mismatched = opencode_spec(
+            &cwd,
+            "OpenCode \u{00b7} 3",
+            Some("deepseek/deepseek-v4-flash"),
+        );
+        assert!(!add_resume_args(&mut mismatched, &[]).unwrap());
+        assert!(!mismatched.args.contains(&OsString::from("--session")));
+        assert!(!mismatched.args.contains(&OsString::from("--continue")));
+
+        // Recorded against a session whose model cannot be read at all, which
+        // is not evidence of a match.
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 4", "ses-nometa");
+        let mut unreadable = opencode_spec(
+            &cwd,
+            "OpenCode \u{00b7} 4",
+            Some("deepseek/deepseek-v4-flash"),
+        );
+        assert!(!add_resume_args(&mut unreadable, &[]).unwrap());
+        assert!(!unreadable.args.contains(&OsString::from("--session")));
+
+        // A claim that does check out is still resumed exactly.
+        super::super::session_state::upsert("opencode", &cwd, "OpenCode \u{00b7} 5", "ses-newer");
+        let mut verified = opencode_spec(
+            &cwd,
+            "OpenCode \u{00b7} 5",
+            Some("deepseek/deepseek-v4-flash"),
+        );
+        assert!(add_resume_args(&mut verified, &[]).unwrap());
+        assert!(verified.args.contains(&OsString::from("ses-newer")));
     }
 
     #[test]
