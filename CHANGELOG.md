@@ -7,6 +7,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- Two OpenCode rooms sharing a working directory no longer resume each other's conversation, and a room no longer resumes a conversation that belongs to a different model. Which room owns which session is now decided once across the whole room slate, and a room whose recorded session is rejected starts fresh instead of continuing the newest conversation in the directory.
+
 ## [0.30.1] - 2026-08-11
 
 ### Fixed
