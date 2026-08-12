@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-08-12
+
+### Changed
+
+- The welcome roster now names each room's configured model and effort, read from the live pane at intro time instead of frozen at startup, so a room reconfigured by a peer control announces what the Doorbell roster JSON reports now. Rooms with no configured value say so explicitly: "unconfigured" when the adapter accepts the control but nothing was set, "unsupported" when it cannot accept one.
+- House rules now ask each room to announce its configured model and effort in its first response, and replace the untrusted-input warning with guidance to ask the originating room when a delegated task is unclear.
+
 ## [0.31.0] - 2026-08-12
 
 ### Changed
