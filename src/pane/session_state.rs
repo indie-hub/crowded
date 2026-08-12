@@ -217,11 +217,19 @@ pub(super) fn capture_async(
     room: String,
     since: SystemTime,
     captured: CapturedSession,
+    opencode_model: Option<String>,
 ) {
     thread::spawn(move || {
         let deadline = Instant::now() + capture_grace(vendor);
         loop {
-            if capture_once(&vendor, &cwd, &room, since, &captured) {
+            if capture_once(
+                &vendor,
+                &cwd,
+                &room,
+                since,
+                &captured,
+                opencode_model.as_deref(),
+            ) {
                 return;
             }
             if Instant::now() >= deadline {
@@ -244,12 +252,13 @@ fn capture_once(
     room: &str,
     since: SystemTime,
     captured: &CapturedSession,
+    opencode_model: Option<&str>,
 ) -> bool {
     let Ok(_guard) = STATE_LOCK.lock() else {
         return false;
     };
     let exclude = claimed_session_ids(vendor.key(), cwd);
-    if let Some(id) = controls::discover_session_id(*vendor, cwd, since, &exclude) {
+    if let Some(id) = controls::discover_session_id(*vendor, cwd, since, &exclude, opencode_model) {
         let mut state = load_state().unwrap_or_else(|_| SessionState::empty());
         state.upsert(vendor.key(), &cwd.to_string_lossy(), room, &id);
         let _ = save_state(&state);
@@ -491,6 +500,7 @@ mod tests {
             "Codex · 2".to_owned(),
             since,
             Arc::clone(&cell),
+            None,
         );
 
         // The background thread polls (250 ms) within the 3s capture grace;
@@ -772,7 +782,14 @@ mod tests {
 
         // The only candidate is the excluded stale id: the tick must not
         // capture it, and must keep polling (returns false).
-        assert!(!capture_once(&CliVendor::OpenCode, cwd, room, since, &cell));
+        assert!(!capture_once(
+            &CliVendor::OpenCode,
+            cwd,
+            room,
+            since,
+            &cell,
+            None
+        ));
         assert!(!has_captured_session(&cell));
         assert_eq!(
             lookup("opencode", cwd, room).as_deref(),
@@ -788,7 +805,14 @@ mod tests {
             .unwrap();
         assert!(advance.status.success());
 
-        assert!(capture_once(&CliVendor::OpenCode, cwd, room, since, &cell));
+        assert!(capture_once(
+            &CliVendor::OpenCode,
+            cwd,
+            room,
+            since,
+            &cell,
+            None
+        ));
         assert_eq!(cell.lock().unwrap().as_deref(), Some("fresh-post-clear-id"));
         assert_eq!(
             lookup("opencode", cwd, room).as_deref(),
@@ -842,7 +866,8 @@ mod tests {
             cwd,
             "OpenCode · 3",
             since,
-            &cell
+            &cell,
+            None
         ));
         assert!(!has_captured_session(&cell));
 
@@ -860,7 +885,8 @@ mod tests {
             cwd,
             "OpenCode · 3",
             since,
-            &cell
+            &cell,
+            None
         ));
         assert_eq!(
             lookup("opencode", cwd, "OpenCode · 3").as_deref(),
@@ -922,6 +948,7 @@ mod tests {
                 "OpenCode · 2",
                 since,
                 &cell_a_clone,
+                None,
             )
         });
         let handle_b = std::thread::spawn(move || {
@@ -932,6 +959,7 @@ mod tests {
                 "OpenCode · 3",
                 since,
                 &cell_b_clone,
+                None,
             )
         });
 
@@ -1038,6 +1066,7 @@ mod tests {
             "Codex · 2".to_owned(),
             since,
             Arc::clone(&cell),
+            None,
         );
 
         let deadline = Instant::now() + capture_grace(CliVendor::Codex) + Duration::from_secs(1);
