@@ -587,8 +587,20 @@ impl Pane {
         self.parser.screen_mut().set_scrollback(0);
     }
 
-    pub(crate) fn is_alternate_screen(&self) -> bool {
-        self.parser.screen().alternate_screen()
+    /// Whether this pane holds any history of its own for the wheel to move
+    /// through. Two kinds of guest hold none: an alternate-screen guest, whose
+    /// grid has no scrollback by construction, and an inline TUI such as Codex
+    /// that repaints inside a scroll region, because lines pushed out of a
+    /// scroll region are discarded rather than retained. Both keep their
+    /// transcript internally, so the wheel has to reach them instead.
+    ///
+    /// `set_scrollback` clamps to what is actually retained, which is what makes
+    /// a one-row request a reliable probe.
+    pub(crate) fn retains_scrollback(&mut self) -> bool {
+        self.parser.screen_mut().set_scrollback(1);
+        let retained = self.parser.screen().scrollback() > 0;
+        self.parser.screen_mut().set_scrollback(0);
+        retained
     }
 
     pub(crate) fn forward_page_up(&mut self) -> io::Result<()> {
@@ -1157,7 +1169,52 @@ mod tests {
 
     fn enter_alternate_screen(pane: &mut Pane) {
         pane.parser.process(b"\x1b[?1049h");
-        assert!(pane.is_alternate_screen(), "must be in alternate screen");
+        assert!(
+            pane.parser.screen().alternate_screen(),
+            "must be in alternate screen"
+        );
+    }
+
+    #[test]
+    fn an_inline_tui_scrolling_inside_a_region_retains_no_history() {
+        let mut pane = scroll_fixture(6, 20);
+        // How Codex renders: a top-anchored scroll region with its input box
+        // parked on the rows below, advanced with CSI S rather than by writing
+        // past the last row. Lines pushed out of a scroll region are discarded,
+        // so none of this reaches the pane's scrollback however much is drawn.
+        pane.parser.process(b"\x1b[1;4r");
+        for index in 0..20 {
+            pane.parser
+                .process(format!("\x1b[S\x1b[4;1Hline {index}").as_bytes());
+        }
+        assert!(
+            !pane.parser.screen().alternate_screen(),
+            "Codex stays on the primary screen"
+        );
+        assert!(
+            !pane.retains_scrollback(),
+            "a pane with no history of its own must hand the wheel to its guest"
+        );
+
+        // A guest writing ordinary lines does build history, and keeps the wheel.
+        let mut plain = scroll_fixture(6, 20);
+        for index in 0..20 {
+            plain.parser.process(format!("line {index}\r\n").as_bytes());
+        }
+        assert!(plain.retains_scrollback());
+    }
+
+    #[test]
+    fn alternate_screen_retains_no_history_either() {
+        let mut pane = scroll_fixture(4, 20);
+        for index in 0..10 {
+            pane.parser.process(format!("line {index}\r\n").as_bytes());
+        }
+        assert!(pane.retains_scrollback());
+        // The alternate grid carries no scrollback, so an alternate-screen guest
+        // is routed to its own scroll by the same rule, with no separate case.
+        enter_alternate_screen(&mut pane);
+        assert!(!pane.retains_scrollback());
     }
 
     #[test]
@@ -1200,7 +1257,7 @@ mod tests {
         captured.lock().unwrap().clear();
         // Re-entering primary should not forward wheel as CSI
         pane.parser.process(b"\x1b[?1049l");
-        assert!(!pane.is_alternate_screen());
+        assert!(!pane.parser.screen().alternate_screen());
     }
 
     #[test]
@@ -1209,7 +1266,7 @@ mod tests {
         for index in 0..10 {
             pane.parser.process(format!("line {index}\r\n").as_bytes());
         }
-        assert!(!pane.is_alternate_screen());
+        assert!(!pane.parser.screen().alternate_screen());
         pane.scroll_up(3);
         assert_eq!(pane.scroll_offset, 3);
         assert!(captured.lock().unwrap().is_empty());
