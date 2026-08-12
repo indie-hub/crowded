@@ -10,21 +10,21 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use portable_pty::PtySize;
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Text},
     widgets::{Block, Clear, Paragraph, Wrap},
-    Terminal,
 };
 use tui_term::widget::PseudoTerminal;
 
 use crate::{
-    config::{room_specs, room_specs_resumed, RoomSpec},
+    config::{RoomSpec, room_specs, room_specs_resumed},
     doorbell::{ControlAction, Doorbell, DoorbellEvent, PulseSource, PulseState, RosterRoom},
     mailroom::Mailroom,
     pane::{self, Pane},
