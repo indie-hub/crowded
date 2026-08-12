@@ -7,6 +7,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.30.2] - 2026-08-12
+
 ### Fixed
 
 - Scrolling no longer occasionally types the text of a mouse report, such as `[<65;176;43M`, into the focused room's prompt. A wheel report split across two terminal reads was being mistaken for an Esc keypress followed by ordinary typing and forwarded to the guest; such a run is now recognized and dropped, while anything that turns out to be real typing is passed on in the order it was pressed.
