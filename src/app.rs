@@ -1157,18 +1157,18 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                             focused = (focused + 1) % panes.len();
                             notice = None;
                         } else if key.code == KeyCode::PageUp && key.kind == KeyEventKind::Press {
-                            if panes[focused].retains_scrollback() {
+                            if panes[focused].is_alternate_screen() {
+                                let _ = panes[focused].forward_page_up();
+                            } else {
                                 let rows = panes[focused].visible_height();
                                 panes[focused].scroll_up(rows);
-                            } else {
-                                let _ = panes[focused].forward_page_up();
                             }
                         } else if key.code == KeyCode::PageDown && key.kind == KeyEventKind::Press {
-                            if panes[focused].retains_scrollback() {
+                            if panes[focused].is_alternate_screen() {
+                                let _ = panes[focused].forward_page_down();
+                            } else {
                                 let rows = panes[focused].visible_height();
                                 panes[focused].scroll_down(rows);
-                            } else {
-                                let _ = panes[focused].forward_page_down();
                             }
                         } else if panes[focused].is_online() {
                             panes[focused].write_key(key)?;
@@ -1193,27 +1193,31 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                         pane.resize(pane_size(*area))?;
                     }
                 }
-                // Wheel routing follows who holds the history. A pane with
-                // retained scrollback scrolls it; a pane with none has a guest
-                // that kept the transcript itself, so the notch is forwarded as
-                // PageUp/PageDown for the guest to act on.
+                // Wheel routing depends on whether the focused pane is in
+                // alternate-screen mode: primary screen scrolls parent
+                // scrollback, alternate screen forwards as PageUp/PageDown.
                 Event::Mouse(mouse) => {
                     if matches!(&input_mode, InputMode::Normal) {
-                        let retains = panes[focused].retains_scrollback();
-                        match mouse.kind {
-                            MouseEventKind::ScrollUp if retains => {
-                                panes[focused].scroll_up(WHEEL_SCROLL_STEP);
+                        if panes[focused].is_alternate_screen() {
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp => {
+                                    let _ = panes[focused].forward_wheel(true);
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    let _ = panes[focused].forward_wheel(false);
+                                }
+                                _ => {}
                             }
-                            MouseEventKind::ScrollDown if retains => {
-                                panes[focused].scroll_down(WHEEL_SCROLL_STEP);
+                        } else {
+                            match mouse.kind {
+                                MouseEventKind::ScrollUp => {
+                                    panes[focused].scroll_up(WHEEL_SCROLL_STEP);
+                                }
+                                MouseEventKind::ScrollDown => {
+                                    panes[focused].scroll_down(WHEEL_SCROLL_STEP);
+                                }
+                                _ => {}
                             }
-                            MouseEventKind::ScrollUp => {
-                                let _ = panes[focused].forward_wheel(true);
-                            }
-                            MouseEventKind::ScrollDown => {
-                                let _ = panes[focused].forward_wheel(false);
-                            }
-                            _ => {}
                         }
                     }
                 }

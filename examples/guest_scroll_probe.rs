@@ -42,5 +42,13 @@ fn main() -> io::Result<()> {
     }
     parser.screen_mut().set_scrollback(0);
     println!("scrollback rows  {depth}");
+
+    // A fourth argument dumps the rendered screen, which is how two captures
+    // taken either side of a keypress can be compared for actual movement
+    // rather than for how many bytes the guest happened to emit.
+    if env::args().nth(4).is_some() {
+        println!("---- screen ----");
+        println!("{}", parser.screen().contents());
+    }
     Ok(())
 }
