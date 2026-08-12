@@ -18,6 +18,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
+    text::{Line, Text},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
 use tui_term::widget::PseudoTerminal;
@@ -467,6 +468,16 @@ fn pulse_label(
     }
 }
 
+/// The Room Pulse entry style for one room: the same cyan cue as the
+/// focused pane's border, so the panel and the room grid agree on focus.
+fn pulse_entry_style(index: usize, focused: usize) -> Style {
+    if index == focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    }
+}
+
 /// The visible Room Pulse label for a resolved state: the state plus its
 /// source, so the TUI shows the same provenance the JSON roster reports.
 fn resolved_label(resolved: ResolvedPulse, hook_age: Option<Duration>) -> String {
@@ -560,7 +571,7 @@ fn pane_areas(area: Rect, room_count: usize) -> Vec<Rect> {
 fn content_areas(area: Rect) -> (Rect, Rect, Rect) {
     let [body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     let [rooms, pulse] =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(26)]).areas(body);
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(30)]).areas(body);
     (rooms, pulse, status)
 }
 
@@ -940,10 +951,10 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                 }
             }
 
-            let pulse_text = panes
+            let pulse_lines = panes
                 .iter()
                 .enumerate()
-                .map(|(index, pane)| {
+                .flat_map(|(index, pane)| {
                     let state = pulse_label(
                         pane,
                         delivery_gates[index],
@@ -961,12 +972,15 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                     } else {
                         ""
                     };
-                    format!("{}{headroom}{session}\n  {state}", pane.title())
+                    let style = pulse_entry_style(index, focused);
+                    [
+                        Line::styled(format!("{}{headroom}{session}", pane.title()), style),
+                        Line::styled(format!("  {state}"), style),
+                    ]
                 })
-                .collect::<Vec<_>>()
-                .join("\n");
+                .collect::<Vec<_>>();
             frame.render_widget(
-                Paragraph::new(pulse_text)
+                Paragraph::new(Text::from(pulse_lines))
                     .block(Block::bordered().title(" Room Pulse "))
                     .wrap(Wrap { trim: false }),
                 pulse,
@@ -1636,9 +1650,16 @@ mod tests {
         assert!(pane_areas(Rect::default(), 0).is_empty());
 
         let (rooms, pulse, status) = content_areas(Rect::new(0, 0, 120, 40));
-        assert_eq!(rooms, Rect::new(0, 0, 94, 39));
-        assert_eq!(pulse, Rect::new(94, 0, 26, 39));
+        assert_eq!(rooms, Rect::new(0, 0, 90, 39));
+        assert_eq!(pulse, Rect::new(90, 0, 30, 39));
         assert_eq!(status, Rect::new(0, 39, 120, 1));
+    }
+
+    #[test]
+    fn pulse_entry_style_highlights_only_the_focused_room() {
+        assert_eq!(pulse_entry_style(1, 1), Style::default().fg(Color::Cyan));
+        assert_eq!(pulse_entry_style(0, 1), Style::default());
+        assert_eq!(pulse_entry_style(2, 1), Style::default());
     }
 
     #[test]

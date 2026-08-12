@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-08-12
+
+### Changed
+
+- Room Pulse now highlights the currently focused room in cyan and uses a 30-column panel, making focus clearer and leaving more room for status details.
+
 ## [0.30.2] - 2026-08-12
 
 ### Fixed
