@@ -8,7 +8,7 @@ use std::{
 
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -96,7 +96,7 @@ fn is_wheel(event: &Event) -> Option<MouseEventKind> {
 /// one report per notch is unaffected. Draining stops at the first event that is
 /// not the same wheel direction; that event is handed back through `stashed` so
 /// the next iteration sees it rather than dropping it.
-fn drain_wheel_burst(kind: MouseEventKind, stashed: &mut Option<Event>) -> io::Result<usize> {
+fn drain_wheel_burst(kind: MouseEventKind, stashed: &mut VecDeque<Event>) -> io::Result<usize> {
     let mut drained = 0;
     while drained < WHEEL_DRAIN_CEILING {
         if !event::poll(Duration::ZERO)? {
@@ -104,12 +104,84 @@ fn drain_wheel_burst(kind: MouseEventKind, stashed: &mut Option<Event>) -> io::R
         }
         let event = event::read()?;
         if is_wheel(&event) != Some(kind) {
-            *stashed = Some(event);
+            stashed.push_back(event);
             break;
         }
         drained += 1;
     }
     Ok(drained)
+}
+
+// Longest parameter run held before deciding this is not a report after all.
+// An SGR report is `<button;column;row`, so three numbers and two semicolons.
+const REPORT_HELD_CEILING: usize = 20;
+
+/// Suppresses an SGR mouse report that crossterm tore in half.
+///
+/// Crossterm decides a lone escape byte is the Esc key whenever the terminal
+/// read that delivered it stopped short of filling crossterm's buffer. A wheel
+/// report split across two reads therefore arrives as Esc followed by its own
+/// text as ordinary characters, and forwarding those to the focused guest types
+/// `[<65;176;43M` into its prompt. Crowded asked the parent terminal for these
+/// reports, so they are never something the user pressed. Warp sends well over a
+/// hundred per notch, which is what makes a read land on that boundary often
+/// enough to see.
+///
+/// Keys are held only while the run still matches the report grammar. Anything
+/// that breaks it is handed back in the order it was typed, so a user who
+/// presses Esc and then types loses nothing. Esc itself is never held: it is
+/// too useful to delay, and a stray one is invisible where the characters are
+/// not.
+#[derive(Default)]
+struct TornMouseReport {
+    after_escape: bool,
+    held: Vec<KeyEvent>,
+}
+
+impl TornMouseReport {
+    /// The keys to act on now. Empty while a possible report is in flight; the
+    /// whole held run, oldest first, once it turns out not to be one.
+    fn filter(&mut self, key: KeyEvent) -> Vec<KeyEvent> {
+        if key.kind != KeyEventKind::Press {
+            return vec![key];
+        }
+        if key.code == KeyCode::Esc {
+            self.after_escape = true;
+            let mut flushed = std::mem::take(&mut self.held);
+            flushed.push(key);
+            return flushed;
+        }
+        let character = match key.code {
+            KeyCode::Char(character) => character,
+            _ => {
+                self.after_escape = false;
+                let mut flushed = std::mem::take(&mut self.held);
+                flushed.push(key);
+                return flushed;
+            }
+        };
+        // `M` and `m` end a report; the bound keeps a run that never terminates
+        // from holding keys indefinitely.
+        let continues = match self.held.len() {
+            0 => self.after_escape && character == '[',
+            1 => character == '<',
+            2..=REPORT_HELD_CEILING => character.is_ascii_digit() || character == ';',
+            _ => false,
+        };
+        if self.held.len() >= 2 && matches!(character, 'M' | 'm') {
+            self.after_escape = false;
+            self.held.clear();
+            return Vec::new();
+        }
+        if !continues {
+            self.after_escape = false;
+            let mut flushed = std::mem::take(&mut self.held);
+            flushed.push(key);
+            return flushed;
+        }
+        self.held.push(key);
+        Vec::new()
+    }
 }
 
 // A transient hook state (starting/thinking/working) is only trusted while
@@ -614,8 +686,10 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
     let mut delivery_paused = false;
     let mut pending = VecDeque::<(u64, usize)>::new();
     let mut room_pulses = vec![None::<PulseSample>; room_count];
-    // Holds the event that ended a wheel burst, so draining never discards it.
-    let mut stashed_event: Option<Event> = None;
+    // Holds the event that ended a wheel burst, so draining never discards it,
+    // and any key run handed back by the torn-report filter.
+    let mut stashed_events: VecDeque<Event> = VecDeque::new();
+    let mut torn_report = TornMouseReport::default();
 
     loop {
         let now = Instant::now();
@@ -980,15 +1054,28 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
             pane.poll_exit()?;
         }
 
-        let next_event = match stashed_event.take() {
+        let next_event = match stashed_events.pop_front() {
             Some(event) => Some(event),
             None if event::poll(Duration::from_millis(16))? => Some(event::read()?),
             None => None,
         };
+        // A wheel report crossterm failed to keep whole arrives as keys. Act on
+        // what the filter releases: the first key now, the rest next time round.
+        let next_event = match next_event {
+            Some(Event::Key(key)) => {
+                let mut released = torn_report.filter(key).into_iter().map(Event::Key);
+                let first = released.next();
+                for (offset, event) in released.enumerate() {
+                    stashed_events.insert(offset, event);
+                }
+                first
+            }
+            other => other,
+        };
         if let Some(event) = next_event {
             // One notch, one scroll action, however many times it was reported.
             if let Some(kind) = is_wheel(&event) {
-                drain_wheel_burst(kind, &mut stashed_event)?;
+                drain_wheel_burst(kind, &mut stashed_events)?;
             }
             match event {
                 Event::Key(key)
@@ -1238,6 +1325,54 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn released(keys: &str) -> String {
+        // Feeds one key at a time, as the event loop does, and collects what the
+        // filter lets through. `\x1b` stands for the bare Esc crossterm reports
+        // when a read ends on the escape byte of a sequence.
+        let mut filter = TornMouseReport::default();
+        let mut out = String::new();
+        for character in keys.chars() {
+            let code = if character == '\x1b' {
+                KeyCode::Esc
+            } else {
+                KeyCode::Char(character)
+            };
+            for key in filter.filter(KeyEvent::new(code, KeyModifiers::NONE)) {
+                match key.code {
+                    KeyCode::Esc => out.push('\x1b'),
+                    KeyCode::Char(character) => out.push(character),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_torn_wheel_report_never_reaches_the_guest() {
+        // What the user saw typed into a Codex prompt.
+        assert_eq!(released("\x1b[<65;176;43M"), "\x1b");
+        // Back to back, as a burst delivers them.
+        assert_eq!(released("\x1b[<64;20;10M\x1b[<64;20;10M"), "\x1b\x1b");
+        // A release report ends with `m` rather than `M`.
+        assert_eq!(released("\x1b[<0;5;5m"), "\x1b");
+    }
+
+    #[test]
+    fn typing_after_escape_survives_in_order() {
+        // Nothing here is a report, so every key must come back as pressed.
+        assert_eq!(released("\x1b[1] fix"), "\x1b[1] fix");
+        assert_eq!(released("\x1bhello"), "\x1bhello");
+        assert_eq!(released("[<65;176;43M"), "[<65;176;43M");
+        assert_eq!(released("\x1b[<9x"), "\x1b[<9x");
+        // A run that never terminates is released rather than held forever.
+        let digits = "1".repeat(REPORT_HELD_CEILING + 2);
+        assert_eq!(
+            released(&format!("\x1b[<{digits}")),
+            format!("\x1b[<{digits}")
+        );
+    }
 
     #[test]
     fn only_matching_wheel_directions_are_drained() {

@@ -1,6 +1,6 @@
 [package]
 name = "crowded"
-version = "0.30.1"
+version = "0.30.2"
 edition = "2024"
 
 [dependencies]
@@ -11,6 +11,16 @@ tui-term = "0.3.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1.4"
+
+# vt100 discards a row that scrolls out of any scroll region, so an inline TUI
+# that renders inside a top-anchored region - Codex does - builds no scrollback
+# and leaves the wheel nothing to move. xterm keeps such a row whenever the
+# region starts at the top of the screen. doy/vt100-rust#33 makes vt100 agree;
+# until that ships in a release, build against the branch carrying it. Drop this
+# block once a published vt100 contains the fix: the scrollback test in
+# src/pane.rs fails if it is removed too early.
+[patch.crates-io]
+vt100 = { git = "https://github.com/second-state/vt100-rust", rev = "ac79c37448d381ff9821a223ba487a6ac00f93cf" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

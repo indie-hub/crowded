@@ -1161,6 +1161,30 @@ mod tests {
     }
 
     #[test]
+    fn an_inline_tui_scrolling_inside_a_region_builds_scrollback() {
+        let mut pane = scroll_fixture(6, 20);
+        // How Codex renders: a top-anchored scroll region with its input box
+        // parked on the rows below, advanced with CSI S rather than by writing
+        // past the last row. A row leaving the top of the screen belongs in the
+        // scrollback even though a region is set, so the wheel has something to
+        // move; this fails against a vt100 that discards it.
+        pane.parser.process(b"\x1b[1;4r");
+        for index in 0..20 {
+            pane.parser
+                .process(format!("\x1b[S\x1b[4;1Hline {index}").as_bytes());
+        }
+        assert!(
+            !pane.is_alternate_screen(),
+            "Codex stays on the primary screen"
+        );
+        pane.scroll_up(3);
+        assert_eq!(
+            pane.scroll_offset, 3,
+            "the wheel must move retained history"
+        );
+    }
+
+    #[test]
     fn alternate_screen_page_keys_forward_exact_bytes() {
         let (mut pane, captured) = pane_with_capture(4, 20);
         // Primary screen: PageUp scrolls parent, does not write CSI.

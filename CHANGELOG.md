@@ -7,8 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.30.2] - 2026-08-12
+
 ### Fixed
 
+- Scrolling no longer occasionally types the text of a mouse report, such as `[<65;176;43M`, into the focused room's prompt. A wheel report split across two terminal reads was being mistaken for an Esc keypress followed by ordinary typing and forwarded to the guest; such a run is now recognized and dropped, while anything that turns out to be real typing is passed on in the order it was pressed.
+- The wheel and the page keys now scroll a Codex room. A guest that renders inline inside a scroll region anchored to the top of the screen, as Codex does, builds room history again instead of having every line that leaves the viewport discarded, so there is something to scroll back through.
 - Two OpenCode rooms sharing a working directory no longer resume each other's conversation, and a room no longer resumes a conversation that belongs to a different model. Which room owns which session is now decided once across the whole room slate, and a room whose recorded session is rejected starts fresh instead of continuing the newest conversation in the directory.
 
 ## [0.30.1] - 2026-08-11
