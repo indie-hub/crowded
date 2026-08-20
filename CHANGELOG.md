@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.32.1] - 2026-08-20
+
+### Fixed
+
+- Clearing a room now persists a fresh-session marker, so a later resume cannot restore the pre-clear session or fall back to the most recent one.
+
 ## [0.32.0] - 2026-08-12
 
 ### Changed
