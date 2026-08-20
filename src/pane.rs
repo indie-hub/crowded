@@ -642,6 +642,13 @@ impl Pane {
         &mut self,
         size: PtySize,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Record durable fresh-state intent before reconfiguration so a later
+        // resume from the pre-clear spawn never restores the stale session.
+        if let Ok(vendor) = controls::cli_vendor(&self.spec) {
+            if let Ok(cwd) = working_directory(self.spec.cwd.as_deref()) {
+                session_state::clear_room(vendor.key(), &cwd, &self.spec.title);
+            }
+        }
         self.reconfigure(size, controls::clear_resume_args)
     }
 

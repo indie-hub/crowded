@@ -176,6 +176,25 @@ pub(super) fn lookup(vendor: &str, cwd: &Path, room: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The sentinel session id written by [`clear_room`] to record a durable
+/// fresh-state intent. A room whose persisted id is this value resumes with
+/// no resume args until a genuine capture supersedes it.
+pub(super) const FRESH_STATE_MARKER: &str = "__fresh__";
+
+/// Record that a room was cleared and must not resume its prior session.
+/// Replaces the room's persisted entry (if any) with a [`FRESH_STATE_MARKER`]
+/// so that a later resume reads the marker instead of a stale pre-clear id.
+/// A subsequent successful capture supersedes the marker with the real id.
+#[allow(dead_code)]
+pub(super) fn clear_room(vendor: &str, cwd: &Path, room: &str) {
+    let Ok(_guard) = STATE_LOCK.lock() else {
+        return;
+    };
+    let mut state = load_state().unwrap_or_else(|_| SessionState::empty());
+    state.upsert(vendor, &cwd.to_string_lossy(), room, FRESH_STATE_MARKER);
+    let _ = save_state(&state);
+}
+
 /// Record or supersede the captured session id for `(vendor, cwd, room)`.
 /// Called from background capture threads, so writes are serialized and saved
 /// atomically (temp file + rename).
@@ -1075,5 +1094,88 @@ mod tests {
         }
 
         assert_eq!(cell.lock().unwrap().as_deref(), Some("ses-slow-write"));
+    }
+
+    /// Regression: clear must record a durable fresh-state marker so a later
+    /// resume never restores the pre-clear session id. After clear_room, the
+    /// marker supersedes the stale entry; a subsequent capture replaces the
+    /// marker with the real id.
+    #[test]
+    fn clear_room_replaces_stale_id_with_fresh_marker_and_capture_supersedes_it() {
+        let _guard = StateRootGuard::isolated();
+        let cwd = Path::new("/repo");
+        let room = "Claude · 1";
+
+        // Pre-seed a stale session id for this room.
+        upsert("claude", cwd, room, "stale-pre-clear-id");
+        assert_eq!(
+            lookup("claude", cwd, room).as_deref(),
+            Some("stale-pre-clear-id")
+        );
+
+        // Clear replaces the stale id with the marker.
+        clear_room("claude", cwd, room);
+        assert_eq!(
+            lookup("claude", cwd, room).as_deref(),
+            Some(FRESH_STATE_MARKER)
+        );
+        // The marker is in the claimed ids baseline so a capture cannot
+        // re-claim a fresh id that happens to match it (extremely unlikely
+        // but defensively correct).
+        let claimed = claimed_session_ids("claude", cwd);
+        assert!(claimed.iter().any(|id| id == FRESH_STATE_MARKER));
+
+        // A subsequent capture supersedes the marker with the real id.
+        upsert("claude", cwd, room, "fresh-post-clear-id");
+        assert_eq!(
+            lookup("claude", cwd, room).as_deref(),
+            Some("fresh-post-clear-id")
+        );
+        // Exactly one entry for the room: the marker was collapsed, not kept.
+        let state = load_state().unwrap();
+        let room_entries: Vec<_> = state
+            .sessions
+            .iter()
+            .filter(|e| e.cwd == "/repo" && room_identity(&e.room) == "1")
+            .collect();
+        assert_eq!(room_entries.len(), 1, "marker superseded by fresh capture");
+    }
+
+    /// Regression: clear_room must not disturb sibling rooms sharing the same
+    /// (vendor, cwd). Only the targeted room's entry is replaced.
+    #[test]
+    fn clear_room_preserves_sibling_room_entries() {
+        let _guard = StateRootGuard::isolated();
+        let cwd = Path::new("/repo");
+        upsert("claude", cwd, "Claude · 1", "id-room-1");
+        upsert("claude", cwd, "Claude · 2", "id-room-2");
+
+        clear_room("claude", cwd, "Claude · 1");
+
+        assert_eq!(
+            lookup("claude", cwd, "Claude · 1").as_deref(),
+            Some(FRESH_STATE_MARKER)
+        );
+        assert_eq!(
+            lookup("claude", cwd, "Claude · 2").as_deref(),
+            Some("id-room-2"),
+            "sibling room untouched"
+        );
+    }
+
+    /// Regression: clear on a room with no prior entry still records the
+    /// marker, so a later resume starts fresh rather than falling back to the
+    /// vendor's most-recent form.
+    #[test]
+    fn clear_room_records_marker_even_when_no_prior_entry_exists() {
+        let _guard = StateRootGuard::isolated();
+        let cwd = Path::new("/repo");
+        assert_eq!(lookup("claude", cwd, "Claude · 1"), None);
+
+        clear_room("claude", cwd, "Claude · 1");
+        assert_eq!(
+            lookup("claude", cwd, "Claude · 1").as_deref(),
+            Some(FRESH_STATE_MARKER)
+        );
     }
 }

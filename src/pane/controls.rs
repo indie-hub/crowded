@@ -151,6 +151,11 @@ fn captured_resume(vendor: CliVendor, spec: &RoomSpec, refused: &[RoomKey]) -> R
     let Some(id) = super::session_state::lookup(vendor.key(), &cwd, &spec.title) else {
         return Resume::MostRecent;
     };
+    // A clear recorded durable fresh-state intent. The room must not resume
+    // the pre-clear session; a genuine capture will supersede the marker.
+    if id == super::session_state::FRESH_STATE_MARKER {
+        return Resume::Fresh;
+    }
     if vendor == CliVendor::OpenCode && !opencode_claim_is_verifiable(spec, &id) {
         return Resume::Fresh;
     }
@@ -1937,5 +1942,46 @@ mod tests {
         assert!(!terminal_caps.controls);
         assert!(terminal_caps.supported_controls.is_empty());
         assert!(terminal_caps.effort_levels.is_empty());
+    }
+
+    /// Regression: after clear_room records the fresh-state marker, a later
+    /// resume must produce no resume args (Resume::Fresh), not resume the
+    /// stale pre-clear session or fall back to the most-recent form.
+    #[test]
+    fn add_resume_args_starts_fresh_after_clear_marker() {
+        let _state = super::super::session_state::StateRootGuard::isolated();
+        let cwd = std::env::current_dir().unwrap();
+        let room = "claude";
+        // Pre-seed a stale session id.
+        super::super::session_state::upsert("claude", &cwd, room, "stale-pre-clear-id");
+        // Clear records the marker.
+        super::super::session_state::clear_room("claude", &cwd, room);
+
+        let mut spec = raw_room("claude");
+        spec.cwd = Some(cwd);
+        let resumed = add_resume_args(&mut spec, &[]).unwrap();
+        // Fresh: no resume args were applied, no --continue.
+        assert!(!resumed);
+        assert!(!spec.args.contains(&OsString::from("--continue")));
+        assert!(!spec.args.contains(&OsString::from("--resume")));
+        assert!(!spec.args.contains(&OsString::from("--session")));
+    }
+
+    /// Regression: a successful capture supersedes the clear marker, so a
+    /// later resume targets the exact fresh id rather than starting fresh.
+    #[test]
+    fn add_resume_args_prefers_fresh_capture_over_clear_marker() {
+        let _state = super::super::session_state::StateRootGuard::isolated();
+        let cwd = std::env::current_dir().unwrap();
+        let room = "codex";
+        // Clear first, then a capture supersedes the marker.
+        super::super::session_state::clear_room("codex", &cwd, room);
+        super::super::session_state::upsert("codex", &cwd, room, "fresh-capture-id");
+
+        let mut spec = raw_room("codex");
+        spec.cwd = Some(cwd);
+        add_resume_args(&mut spec, &[]).unwrap();
+        assert!(spec.args.contains(&OsString::from("fresh-capture-id")));
+        assert!(!spec.args.contains(&OsString::from("--last")));
     }
 }
