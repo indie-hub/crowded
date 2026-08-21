@@ -188,17 +188,6 @@ pub(crate) enum PulseSource {
     Gate,
 }
 
-impl PulseSource {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Offline => "offline",
-            Self::Hook => "hook",
-            Self::Readiness => "screen",
-            Self::Gate => "gate",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct RoomCapabilities {
     /// Backward-compatible summary for older roster consumers. New consumers
@@ -579,14 +568,6 @@ mod tests {
         assert!(parsed.capabilities.supported_controls.is_empty());
         assert!(parsed.capabilities.effort_levels.is_empty());
         assert_eq!(parsed.capabilities.model_catalogue, ModelCatalogue::Unknown);
-    }
-
-    #[test]
-    fn pulse_source_labels_name_each_resolution_route() {
-        assert_eq!(PulseSource::Offline.label(), "offline");
-        assert_eq!(PulseSource::Hook.label(), "hook");
-        assert_eq!(PulseSource::Readiness.label(), "screen");
-        assert_eq!(PulseSource::Gate.label(), "gate");
     }
 
     #[test]

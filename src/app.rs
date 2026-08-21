@@ -537,18 +537,99 @@ fn pulse_entry_style(index: usize, focused: usize) -> Style {
     }
 }
 
-/// The visible Room Pulse label for a resolved state: the state plus its
-/// source, so the TUI shows the same provenance the JSON roster reports.
+/// The visible Room Pulse state word for a resolved state, plus the hook age
+/// when one is known. The state source is reported separately by
+/// `crowded roster --json`; this compact panel shows only the state.
 fn resolved_label(resolved: ResolvedPulse, hook_age: Option<Duration>) -> String {
     match hook_age {
-        Some(age) => format!(
-            "{} · {} · {}s ago",
-            resolved.state.label(),
-            resolved.source.label(),
-            age.as_secs()
-        ),
-        None => format!("{} · {}", resolved.state.label(), resolved.source.label()),
+        Some(age) => format!("{} · {}s", resolved.state.label(), age.as_secs()),
+        None => resolved.state.label().to_owned(),
     }
+}
+
+/// Compact single-letter badges for the Room Pulse title line: "H" for an
+/// active headroom, "S" for a captured session, space-joined. Empty when
+/// neither is active so the title line stays short for realistic room names.
+fn pulse_badges(headroom: bool, session: bool) -> String {
+    let mut markers = Vec::new();
+    if headroom {
+        markers.push("H");
+    }
+    if session {
+        markers.push("S");
+    }
+    markers.join(" ")
+}
+
+/// The Room Pulse Total line: the sum of every known per-room cost. `captured`
+/// marks which rooms have a captured session; a room's cost is "known" only
+/// when it parses as a `$...` figure. Rooms without a captured session are
+/// excluded from both K and N, and sessions with an unknown cost count toward
+/// N but not K while adding nothing to the sum. Returns None when no room has
+/// a captured session, so no Total line is shown.
+fn pulse_total(costs: &[Option<(Instant, String)>], captured: &[bool]) -> Option<String> {
+    let mut total = 0.0f64;
+    let mut known = 0usize;
+    let mut n = 0usize;
+    for (index, &has_session) in captured.iter().enumerate() {
+        if !has_session {
+            continue;
+        }
+        n += 1;
+        if let Some(Some((_, cost))) = costs.get(index)
+            && let Some(parsed) = cost.strip_prefix('$').and_then(|s| s.parse::<f64>().ok())
+        {
+            total += parsed;
+            known += 1;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    Some(if known == n {
+        format!("Total: ${total:.6}")
+    } else {
+        format!("Total ({known}/{n} known): ${total:.6}")
+    })
+}
+
+/// Render the full Room Pulse line list: each room's title and state line, a
+/// blank separator between rooms, and the optional Total line. `costs` holds
+/// one optional cost string per room (the rendered `$...` or "unknown" figure
+/// produced by the cost cache). `focused` selects the cyan-highlighted room,
+/// matching `pulse_entry_style`.
+fn render_pulse_lines(
+    titles: &[&str],
+    headrooms: &[bool],
+    sessions: &[bool],
+    states: &[&str],
+    costs: &[Option<(Instant, String)>],
+    focused: usize,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+    for index in 0..titles.len() {
+        if index > 0 {
+            lines.push(Line::default());
+        }
+        let badges = pulse_badges(headrooms[index], sessions[index]);
+        let title = if badges.is_empty() {
+            titles[index].to_owned()
+        } else {
+            format!("{}  {badges}", titles[index])
+        };
+        let cost = costs
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(|(_, cost)| format!(" · {cost}"))
+            .unwrap_or_default();
+        let style = pulse_entry_style(index, focused);
+        lines.push(Line::styled(title, style));
+        lines.push(Line::styled(format!("  {}{cost}", states[index]), style));
+    }
+    if let Some(total) = pulse_total(costs, sessions) {
+        lines.push(Line::styled(total, Style::default()));
+    }
+    lines
 }
 
 fn refresh_pulse_cost(
@@ -645,7 +726,7 @@ fn pane_areas(area: Rect, room_count: usize) -> Vec<Rect> {
 fn content_areas(area: Rect) -> (Rect, Rect, Rect) {
     let [body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
     let [rooms, pulse] =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(30)]).areas(body);
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(36)]).areas(body);
     (rooms, pulse, status)
 }
 
@@ -1063,38 +1144,31 @@ fn run_with(
                 }
             }
 
-            let pulse_lines = panes
+            let titles: Vec<&str> = panes.iter().map(|pane| pane.title()).collect();
+            let headrooms: Vec<bool> = panes.iter().map(|pane| pane.headroom_active()).collect();
+            let sessions: Vec<bool> = panes.iter().map(|pane| pane.has_captured_session()).collect();
+            let states: Vec<String> = panes
                 .iter()
                 .enumerate()
-                .flat_map(|(index, pane)| {
-                    let state = pulse_label(
+                .map(|(index, pane)| {
+                    pulse_label(
                         pane,
                         delivery_gates[index],
                         input_ready[index],
                         room_pulses[index],
                         now,
-                    );
-                    let headroom = if pane.headroom_active() {
-                        " [headroom]"
-                    } else {
-                        ""
-                    };
-                    let session = if pane.has_captured_session() {
-                        " [session]"
-                    } else {
-                        ""
-                    };
-                    let cost = pulse_costs[index]
-                        .as_ref()
-                        .map(|(_, cost)| format!(" · {cost}"))
-                        .unwrap_or_default();
-                    let style = pulse_entry_style(index, focused);
-                    [
-                        Line::styled(format!("{}{headroom}{session}", pane.title()), style),
-                        Line::styled(format!("  {state}{cost}"), style),
-                    ]
+                    )
                 })
-                .collect::<Vec<_>>();
+                .collect();
+            let states: Vec<&str> = states.iter().map(String::as_str).collect();
+            let pulse_lines = render_pulse_lines(
+                &titles,
+                &headrooms,
+                &sessions,
+                &states,
+                &pulse_costs,
+                focused,
+            );
             frame.render_widget(
                 Paragraph::new(Text::from(pulse_lines))
                     .block(Block::bordered().title(" Room Pulse "))
@@ -1730,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_pulse_label_includes_human_source_and_hook_age() {
+    fn tui_pulse_label_drops_source_and_shows_state_plus_age() {
         assert_eq!(
             resolved_label(
                 ResolvedPulse {
@@ -1739,7 +1813,7 @@ mod tests {
                 },
                 None,
             ),
-            "ready · screen"
+            "ready"
         );
         assert_eq!(
             resolved_label(
@@ -1749,7 +1823,7 @@ mod tests {
                 },
                 Some(Duration::from_secs(8)),
             ),
-            "thinking · hook · 8s ago"
+            "thinking · 8s"
         );
         assert_eq!(
             resolved_label(
@@ -1759,7 +1833,7 @@ mod tests {
                 },
                 None,
             ),
-            "offline · offline"
+            "offline"
         );
         assert_eq!(
             resolved_label(
@@ -1769,8 +1843,99 @@ mod tests {
                 },
                 None,
             ),
-            "working · gate"
+            "working"
         );
+    }
+
+    #[test]
+    fn pulse_badges_are_compact_and_conditional() {
+        assert_eq!(pulse_badges(false, false), "");
+        assert_eq!(pulse_badges(true, false), "H");
+        assert_eq!(pulse_badges(false, true), "S");
+        assert_eq!(pulse_badges(true, true), "H S");
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn render_pulse_lines_separates_rooms_and_appends_total() {
+        let costs = vec![
+            Some((Instant::now(), "$0.100000".to_owned())),
+            Some((Instant::now(), "$0.200000".to_owned())),
+            Some((Instant::now(), "$0.050000".to_owned())),
+        ];
+        let lines = render_pulse_lines(
+            &["Kiwi K2.7 code · 3", "Claude · 1", "DeepSeek · 4"],
+            &[true, false, false],
+            &[true, true, true],
+            &["ready · 5s", "thinking · 8s", "working"],
+            &costs,
+            0,
+        );
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(
+            text,
+            vec![
+                "Kiwi K2.7 code · 3  H S",
+                "  ready · 5s · $0.100000",
+                "",
+                "Claude · 1  S",
+                "  thinking · 8s · $0.200000",
+                "",
+                "DeepSeek · 4  S",
+                "  working · $0.050000",
+                "Total: $0.350000",
+            ]
+        );
+    }
+
+    #[test]
+    fn pulse_total_sums_only_known_costs() {
+        // All captured rooms known: no K/N qualifier.
+        let costs = vec![
+            Some((Instant::now(), "$0.100000".to_owned())),
+            Some((Instant::now(), "$0.250000".to_owned())),
+            Some((Instant::now(), "$0.050000".to_owned())),
+        ];
+        let all = vec![true, true, true];
+        assert_eq!(
+            pulse_total(&costs, &all),
+            Some("Total: $0.400000".to_owned())
+        );
+
+        // One unknown among captured: K/N qualifier, unknown adds nothing.
+        let costs = vec![
+            Some((Instant::now(), "$0.100000".to_owned())),
+            Some((Instant::now(), "unknown".to_owned())),
+            Some((Instant::now(), "$0.050000".to_owned())),
+        ];
+        assert_eq!(
+            pulse_total(&costs, &all),
+            Some("Total (2/3 known): $0.150000".to_owned())
+        );
+
+        // A captured room with an unknown cost counts toward N but not K,
+        // while a room that never captured a session is excluded from both
+        // even when its cost figure is known.
+        let costs = vec![
+            Some((Instant::now(), "$0.100000".to_owned())),
+            Some((Instant::now(), "$0.050000".to_owned())),
+            Some((Instant::now(), "unknown".to_owned())),
+        ];
+        let partial = vec![true, false, true];
+        assert_eq!(
+            pulse_total(&costs, &partial),
+            Some("Total (1/2 known): $0.100000".to_owned())
+        );
+
+        // No captured sessions: line omitted entirely.
+        let none = vec![false, false, false];
+        assert_eq!(pulse_total(&costs, &none), None);
     }
 
     #[test]
@@ -1831,8 +1996,8 @@ mod tests {
         assert!(pane_areas(Rect::default(), 0).is_empty());
 
         let (rooms, pulse, status) = content_areas(Rect::new(0, 0, 120, 40));
-        assert_eq!(rooms, Rect::new(0, 0, 90, 39));
-        assert_eq!(pulse, Rect::new(90, 0, 30, 39));
+        assert_eq!(rooms, Rect::new(0, 0, 84, 39));
+        assert_eq!(pulse, Rect::new(84, 0, 36, 39));
         assert_eq!(status, Rect::new(0, 39, 120, 1));
     }
 

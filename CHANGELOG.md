@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-08-21
+
+### Changed
+
+- The Room Pulse panel is easier to scan: each room's title now carries compact `H`/`S` badges instead of bracketed `[headroom]`/`[session]` tags, the state line drops the diagnostic pulse-source label (still available via `crowded roster --json`), a blank line separates consecutive rooms, and the panel is 36 columns wide instead of 30. A `Total:` line now sums every room's known usage cost, noting the known/total count when some rooms don't have one yet.
+
 ## [0.36.1] - 2026-08-21
 
 ### Fixed
