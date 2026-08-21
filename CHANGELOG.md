@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-08-21
+
+### Added
+
+- The Doorbell roster now reports a per-room usage-cost estimate: Claude and Codex costs are computed from their own transcript token usage against an operator-configured `token_pricing` table in `crowded.toml`, while OpenCode rooms report the cost their own session already tracks. A room with no configured rate, or an unavailable/unparsable transcript, reports `"unknown"` rather than a fabricated figure.
+- The Room Pulse panel now shows that same cost alongside each room's state, once the room has captured its session, refreshed on an interval rather than recomputed every frame.
+
 ## [0.34.0] - 2026-08-21
 
 ### Added
