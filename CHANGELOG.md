@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.36.1] - 2026-08-21
+
+### Fixed
+
+- Claude and Codex usage-cost figures were roughly 1,000,000x too large: `token_pricing.toml` rates are USD per 1,000,000 tokens (the standard vendor convention), but the cost calculation multiplied raw token counts by the configured rate with no division by 1,000,000. OpenCode was unaffected, since it reports the cost its own session already tracks rather than using the pricing table.
+
 ## [0.36.0] - 2026-08-21
 
 ### Changed

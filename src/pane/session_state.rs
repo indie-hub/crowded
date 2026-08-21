@@ -228,10 +228,14 @@ fn optional_token(value: &Value, name: &str) -> Option<f64> {
         .map_or(Some(0.0), |value| value.as_u64().map(|value| value as f64))
 }
 
+fn token_cost(tokens: f64, rate: f64) -> f64 {
+    tokens * rate / 1_000_000.0
+}
+
 fn priced_tokens(tokens: f64, rate: Option<f64>) -> Option<f64> {
     (tokens == 0.0)
         .then_some(0.0)
-        .or_else(|| rate.map(|rate| tokens * rate))
+        .or_else(|| rate.map(|rate| token_cost(tokens, rate)))
 }
 
 fn claude_cost(home: &Path, cwd: &Path, session_id: &str, pricing: &[TokenPricing]) -> Option<f64> {
@@ -250,7 +254,7 @@ fn claude_cost(home: &Path, cwd: &Path, session_id: &str, pricing: &[TokenPricin
         let message = entry.get("message")?;
         let rate = pricing_for(pricing, message.get("model")?.as_str()?)?;
         let usage = message.get("usage")?;
-        cost += token(usage, "input_tokens")? * rate.input;
+        cost += token_cost(token(usage, "input_tokens")?, rate.input);
         cost += priced_tokens(
             optional_token(usage, "cache_creation_input_tokens")?,
             rate.cache_creation_input,
@@ -259,7 +263,7 @@ fn claude_cost(home: &Path, cwd: &Path, session_id: &str, pricing: &[TokenPricin
             optional_token(usage, "cache_read_input_tokens")?,
             rate.cache_read_input,
         )?;
-        cost += token(usage, "output_tokens")? * rate.output;
+        cost += token_cost(token(usage, "output_tokens")?, rate.output);
     }
     Some(cost)
 }
@@ -301,9 +305,9 @@ fn codex_cost(home: &Path, session_id: &str, pricing: &[TokenPricing]) -> Option
     let cached = optional_token(&usage, "cached_input_tokens")?;
     (cached <= input).then_some(())?;
     Some(
-        (input - cached) * rate.input
+        token_cost(input - cached, rate.input)
             + priced_tokens(cached, rate.cached_input)?
-            + token(&usage, "output_tokens")? * rate.output,
+            + token_cost(token(&usage, "output_tokens")?, rate.output),
     )
 }
 
@@ -688,7 +692,7 @@ mod tests {
                 "session",
                 &[pricing("claude-sonnet-5")]
             ),
-            Some(27.5)
+            Some(0.0000275)
         );
         assert_eq!(claude_cost(&home, Path::new("/repo"), "session", &[]), None);
         let _ = fs::remove_dir_all(home);
@@ -711,7 +715,7 @@ mod tests {
 
         assert_eq!(
             codex_cost(&home, "session", &[pricing("gpt-5.6-terra")]),
-            Some(185.0)
+            Some(0.000185)
         );
         assert_eq!(codex_cost(&home, "session", &[]), None);
         let _ = fs::remove_dir_all(home);
