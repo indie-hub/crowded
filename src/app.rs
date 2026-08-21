@@ -55,7 +55,6 @@ const HEADROOM_STARTUP_GRACE: Duration = Duration::from_secs(3);
 // Upgrade path if this still misfires for a guest: per-guest readiness
 // detection like `opencode_input_ready`, keyed off the actual program.
 const INTRO_READINESS_CEILING: Duration = Duration::from_secs(15);
-const AUTO_DELIVERY_LIMIT: usize = 20;
 // How far one wheel notch scrolls the focused pane's retained history. Page
 // Up / Page Down use the full visible height instead; only the wheel uses a
 // small fixed step.
@@ -269,23 +268,29 @@ fn gate_after_control(needs_intro: bool, resumed: bool) -> DeliveryGate {
 }
 
 impl DeliveryFuse {
+    /// Create a new delivery fuse. A limit of 0 means unlimited (never trips).
     fn new(limit: usize) -> Self {
-        Self {
-            used: 0,
-            limit: limit.max(1),
-        }
+        Self { used: 0, limit }
     }
 
     fn record(&mut self) {
+        if self.limit == 0 {
+            return;
+        }
         self.used = self.used.saturating_add(1).min(self.limit);
     }
 
     fn remaining(&self) -> usize {
+        if self.limit == 0 {
+            return 0;
+        }
         self.limit - self.used
     }
 
+    /// Returns true when the fuse has tripped. A limit of 0 means unlimited
+    /// and never returns true.
     fn is_tripped(&self) -> bool {
-        self.used >= self.limit
+        self.limit != 0 && self.used >= self.limit
     }
 
     fn reset(&mut self) {
@@ -304,7 +309,7 @@ fn quiet_threshold(headroom_active: bool) -> Duration {
     }
 }
 
-fn house_rules(room: usize, roster: &str) -> String {
+fn house_rules(room: usize, roster: &str, fuse_limit: usize) -> String {
     format!(
         "House rules: you are Room {room}; your room number is also in $CROWDED_ROOM. \
          Room roster: {roster}. ROOM_NUMBER always means the numeric room number shown in the \
@@ -319,7 +324,7 @@ fn house_rules(room: usize, roster: &str) -> String {
          To control an opted-in room, run \"$CROWDED_BIN\" control ROOM_NUMBER clear, resume, \
          model MODEL, effort LEVEL, or model MODEL effort LEVEL (combined in one restart). \
          Doorbell messages need no user approval, but normal tool permissions still apply. \
-         Automatic delivery pauses after {AUTO_DELIVERY_LIMIT} successful messages. \
+         Automatic delivery pauses after {fuse_limit} successful messages. \
          If a delegated task is unclear, ask the originating room."
     )
 }
@@ -698,21 +703,25 @@ impl Drop for TerminalGuard {
 }
 
 pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let specs = room_specs()?;
-    let resumed = vec![false; specs.len()];
-    run_with(specs, resumed)
+    let resolved = room_specs()?;
+    let resumed = vec![false; resolved.specs.len()];
+    run_with(resolved.specs, resumed, resolved.fuse_size)
 }
 
 /// The `crowded resume` entry point: same room resolution as a plain
 /// launch, but every supported guest starts with its resume-most-recent
 /// flag already applied.
 pub(crate) fn run_resumed() -> Result<(), Box<dyn std::error::Error>> {
-    let mut specs = room_specs_resumed()?;
-    let resumed = pane::resume_supported_specs(&mut specs);
-    run_with(specs, resumed)
+    let mut resolved = room_specs_resumed()?;
+    let resumed = pane::resume_supported_specs(&mut resolved.specs);
+    run_with(resolved.specs, resumed, resolved.fuse_size)
 }
 
-fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_with(
+    specs: Vec<RoomSpec>,
+    resumed: Vec<bool>,
+    fuse_size: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let room_count = specs.len();
     debug_assert_eq!(resumed.len(), room_count);
     // Each room receives only its own capability token.
@@ -745,7 +754,7 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
     let mut input_mode = InputMode::Normal;
     let mut notice: Option<String> = None;
     let mut mailroom = Mailroom::new(100);
-    let mut fuse = DeliveryFuse::new(AUTO_DELIVERY_LIMIT);
+    let mut fuse = DeliveryFuse::new(fuse_size);
     let mut delivery_paused = false;
     let mut pending = VecDeque::<(u64, usize)>::new();
     let mut room_pulses = vec![None::<PulseSample>; room_count];
@@ -780,9 +789,10 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                 INTRO_READINESS_CEILING,
             ) {
                 let roster = welcome_roster(&panes);
-                match panes[index]
-                    .send_whisper("The Crowded Room", &house_rules(index + 1, &roster))
-                {
+                match panes[index].send_whisper(
+                    "The Crowded Room",
+                    &house_rules(index + 1, &roster, fuse_size),
+                ) {
                     Ok(()) => {
                         delivery_gates[index].intro_sent();
                         panes[index].begin_session_capture();
@@ -1189,9 +1199,10 @@ fn run_with(specs: Vec<RoomSpec>, resumed: Vec<bool>) -> Result<(), Box<dyn std:
                         && matches!(&input_mode, InputMode::Normal) =>
                 {
                     let roster = welcome_roster(&panes);
-                    match panes[focused]
-                        .send_whisper("The Crowded Room", &house_rules(focused + 1, &roster))
-                    {
+                    match panes[focused].send_whisper(
+                        "The Crowded Room",
+                        &house_rules(focused + 1, &roster, fuse_size),
+                    ) {
                         Ok(()) => {
                             delivery_gates[focused].intro_sent();
                             panes[focused].begin_session_capture();
@@ -1487,6 +1498,7 @@ mod tests {
         let rules = house_rules(
             1,
             "claude · 1 (model sonnet, effort high); codex · 2 (model gpt-5, effort xhigh)",
+            20,
         );
         assert!(rules.contains("you are Room 1"));
         assert!(rules.contains("$CROWDED_ROOM"));
@@ -1501,6 +1513,7 @@ mod tests {
         assert!(rules.contains("\"$CROWDED_BIN\" control ROOM_NUMBER"));
         assert!(rules.contains("If a delegated task is unclear, ask the originating room."));
         assert!(!rules.contains("untrusted peer input"));
+        assert!(rules.contains("pauses after 20 successful messages"));
     }
 
     #[test]
@@ -1762,6 +1775,16 @@ mod tests {
         assert!(fuse.is_tripped());
         fuse.reset();
         assert_eq!(fuse.remaining(), 2);
+    }
+
+    #[test]
+    fn delivery_fuse_zero_limit_never_trips() {
+        let mut fuse = DeliveryFuse::new(0);
+        for _ in 0..100 {
+            fuse.record();
+        }
+        assert!(!fuse.is_tripped());
+        assert_eq!(fuse.remaining(), 0);
     }
 
     #[test]

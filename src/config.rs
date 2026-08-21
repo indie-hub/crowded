@@ -24,6 +24,8 @@ pub(crate) enum Transport {
     Raw,
 }
 
+pub(crate) const DEFAULT_FUSE_LIMIT: usize = 20;
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RoomFile {
@@ -36,6 +38,16 @@ pub(crate) struct RoomFile {
     pub(crate) plugins: Vec<PluginConfig>,
     #[serde(default)]
     pub(crate) setup: Vec<SetupConfig>,
+    /// Automatic delivery fuse limit. 0 means unlimited (never trips).
+    /// Omitting the field defaults to [`DEFAULT_FUSE_LIMIT`].
+    #[serde(default)]
+    pub(crate) fuse_size: Option<usize>,
+}
+
+/// Config values resolved from `RoomFile` for use at runtime.
+pub(crate) struct ResolvedConfig {
+    pub(crate) specs: Vec<RoomSpec>,
+    pub(crate) fuse_size: usize,
 }
 
 #[derive(Clone, Deserialize)]
@@ -309,13 +321,15 @@ fn add_shared_toolbox(
     Ok(())
 }
 
-fn room_specs_from_file(file: RoomFile, inject_shared_mcps: bool) -> io::Result<Vec<RoomSpec>> {
+fn room_specs_from_file(file: RoomFile, inject_shared_mcps: bool) -> io::Result<ResolvedConfig> {
     if file.rooms.len() < 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "crowded.toml needs at least two rooms",
         ));
     }
+
+    let fuse_size = file.fuse_size.unwrap_or(DEFAULT_FUSE_LIMIT);
 
     let mut rooms: Vec<_> = file
         .rooms
@@ -329,26 +343,29 @@ fn room_specs_from_file(file: RoomFile, inject_shared_mcps: bool) -> io::Result<
         validate_mcp_servers(&file.mcp_servers)?;
         validate_opencode_plugins(&file.opencode_plugins)?;
     }
-    Ok(rooms)
+    Ok(ResolvedConfig {
+        specs: rooms,
+        fuse_size,
+    })
 }
 
 #[cfg(test)]
-fn room_specs_from_toml(text: &str) -> io::Result<Vec<RoomSpec>> {
+fn room_specs_from_toml(text: &str) -> io::Result<ResolvedConfig> {
     room_specs_from_file(parse_room_file(text)?, true)
 }
 
-pub(crate) fn room_specs() -> io::Result<Vec<RoomSpec>> {
+pub(crate) fn room_specs() -> io::Result<ResolvedConfig> {
     room_specs_skipping(1)
 }
 
 /// Same room resolution as [`room_specs`], but skipping one extra leading
 /// argument. Used by the `crowded resume` subcommand, whose own name
 /// occupies the position a guest list would otherwise start at.
-pub(crate) fn room_specs_resumed() -> io::Result<Vec<RoomSpec>> {
+pub(crate) fn room_specs_resumed() -> io::Result<ResolvedConfig> {
     room_specs_skipping(2)
 }
 
-fn room_specs_skipping(skip: usize) -> io::Result<Vec<RoomSpec>> {
+fn room_specs_skipping(skip: usize) -> io::Result<ResolvedConfig> {
     let guests: Vec<_> = env::args_os().skip(skip).collect();
     let config = Path::new("crowded.toml");
     let file = if config.try_exists()? {
@@ -369,10 +386,13 @@ fn room_specs_skipping(skip: usize) -> io::Result<Vec<RoomSpec>> {
                 "/bin/sh".into()
             }
         });
-        return Ok(vec![
-            RoomSpec::new(shell.clone(), Transport::Shell, 1),
-            RoomSpec::new(shell, Transport::Shell, 2),
-        ]);
+        return Ok(ResolvedConfig {
+            specs: vec![
+                RoomSpec::new(shell.clone(), Transport::Shell, 1),
+                RoomSpec::new(shell, Transport::Shell, 2),
+            ],
+            fuse_size: DEFAULT_FUSE_LIMIT,
+        });
     }
     if guests.len() < 2 {
         return Err(io::Error::new(
@@ -381,6 +401,10 @@ fn room_specs_skipping(skip: usize) -> io::Result<Vec<RoomSpec>> {
         ));
     }
 
+    let fuse_size = file
+        .as_ref()
+        .and_then(|f| f.fuse_size)
+        .unwrap_or(DEFAULT_FUSE_LIMIT);
     let mut rooms: Vec<_> = guests
         .into_iter()
         .enumerate()
@@ -394,7 +418,10 @@ fn room_specs_skipping(skip: usize) -> io::Result<Vec<RoomSpec>> {
             validate_opencode_plugins(&file.opencode_plugins)?;
         }
     }
-    Ok(rooms)
+    Ok(ResolvedConfig {
+        specs: rooms,
+        fuse_size,
+    })
 }
 
 #[cfg(test)]
@@ -417,7 +444,7 @@ mod tests {
 
     #[test]
     fn toml_rooms_support_names_arguments_and_optional_cwd() {
-        let rooms = room_specs_from_toml(
+        let config = room_specs_from_toml(
             r#"
                 [[rooms]]
                 name = "Claude"
@@ -436,6 +463,7 @@ mod tests {
             "#,
         )
         .unwrap();
+        let rooms = &config.specs;
 
         assert_eq!(rooms[0].title, "Claude · 1");
         assert_eq!(rooms[0].args, [OsString::from("--continue")]);
@@ -452,6 +480,7 @@ mod tests {
         assert!(!rooms[1].allow_control);
         assert!(!rooms[1].use_headroom);
         assert!(rooms[1].headroom_args.is_empty());
+        assert_eq!(config.fuse_size, DEFAULT_FUSE_LIMIT);
         assert!(room_specs_from_toml("[[rooms]]\ncommand='codex'\ntransport='raw'").is_err());
         assert!(
             room_specs_from_toml("[[rooms]]\ncommand='codex'\ntransport='raw'\nworkdir='typo'")
@@ -489,7 +518,8 @@ mod tests {
                 transport = "raw"
             "#,
         )
-        .unwrap();
+        .unwrap()
+        .specs;
 
         assert_eq!(rooms[0].args[0], "--continue");
         assert_eq!(rooms[0].args[1], "--mcp-config");
@@ -553,7 +583,8 @@ mod tests {
                 transport = "raw"
             "#,
         )
-        .unwrap();
+        .unwrap()
+        .specs;
 
         let claude: serde_json::Value =
             serde_json::from_str(rooms[0].args[1].to_str().unwrap()).unwrap();
@@ -694,7 +725,8 @@ mod tests {
                 transport = "raw"
             "#,
         )
-        .unwrap();
+        .unwrap()
+        .specs;
 
         assert!(
             rooms[0]
@@ -742,7 +774,8 @@ mod tests {
             .unwrap(),
             false,
         )
-        .unwrap();
+        .unwrap()
+        .specs;
 
         assert!(rooms.iter().all(|room| room.args.is_empty()));
         assert!(rooms.iter().all(|room| room.variables.is_empty()));
@@ -766,10 +799,66 @@ mod tests {
                 transport = "shell"
             "#,
         )
-        .unwrap();
+        .unwrap()
+        .specs;
 
         assert_eq!(rooms[0].args[0], "--mcp-config");
         assert_eq!(rooms[1].args, [OsString::from("-l")]);
         assert!(rooms[1].variables.is_empty());
+    }
+
+    #[test]
+    fn fuse_size_defaults_to_20_when_omitted() {
+        let config = room_specs_from_toml(
+            r#"
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.fuse_size, 20);
+    }
+
+    #[test]
+    fn fuse_size_is_configurable() {
+        let config = room_specs_from_toml(
+            r#"
+                fuse_size = 10
+
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.fuse_size, 10);
+    }
+
+    #[test]
+    fn fuse_size_zero_means_unlimited() {
+        let config = room_specs_from_toml(
+            r#"
+                fuse_size = 0
+
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.fuse_size, 0);
     }
 }
