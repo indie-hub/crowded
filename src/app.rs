@@ -59,6 +59,7 @@ const INTRO_READINESS_CEILING: Duration = Duration::from_secs(15);
 // Up / Page Down use the full visible height instead; only the wheel uses a
 // small fixed step.
 const WHEEL_SCROLL_STEP: usize = 3;
+const PULSE_COST_REFRESH: Duration = Duration::from_secs(3);
 
 // Button-event reporting (`?1000h`) plus SGR encoding (`?1006h`), and
 // deliberately not `?1002h`/`?1003h`. Crossterm's `EnableMouseCapture` turns
@@ -550,6 +551,21 @@ fn resolved_label(resolved: ResolvedPulse, hook_age: Option<Duration>) -> String
     }
 }
 
+fn refresh_pulse_cost(
+    cache: &mut Option<(Instant, String)>,
+    captured: bool,
+    now: Instant,
+    compute: impl FnOnce() -> String,
+) {
+    if !captured {
+        *cache = None;
+    } else if cache.as_ref().is_none_or(|(refreshed, _)| {
+        now.saturating_duration_since(*refreshed) >= PULSE_COST_REFRESH
+    }) {
+        *cache = Some((now, compute()));
+    }
+}
+
 fn inject_ready_pending(
     pending: &mut VecDeque<(u64, usize)>,
     mailroom: &mut Mailroom,
@@ -769,6 +785,7 @@ fn run_with(
     let mut delivery_paused = false;
     let mut pending = VecDeque::<(u64, usize)>::new();
     let mut room_pulses = vec![None::<PulseSample>; room_count];
+    let mut pulse_costs = vec![None::<(Instant, String)>; room_count];
     // Holds the event that ended a wheel burst, so draining never discards it,
     // and any key run handed back by the torn-report filter.
     let mut stashed_events: VecDeque<Event> = VecDeque::new();
@@ -1003,6 +1020,19 @@ fn run_with(
             }
         }
 
+        for (index, pane) in panes.iter().enumerate() {
+            refresh_pulse_cost(
+                &mut pulse_costs[index],
+                pane.has_captured_session(),
+                now,
+                || {
+                    pane::usage_cost(&pane.guest(), pane.cwd(), pane.title(), &token_pricing)
+                        .map(|cost| format!("${cost:.6}"))
+                        .unwrap_or_else(|| "unknown".to_owned())
+                },
+            );
+        }
+
         for pane in &mut panes {
             pane.apply_scroll();
         }
@@ -1054,10 +1084,14 @@ fn run_with(
                     } else {
                         ""
                     };
+                    let cost = pulse_costs[index]
+                        .as_ref()
+                        .map(|(_, cost)| format!(" · {cost}"))
+                        .unwrap_or_default();
                     let style = pulse_entry_style(index, focused);
                     [
                         Line::styled(format!("{}{headroom}{session}", pane.title()), style),
-                        Line::styled(format!("  {state}"), style),
+                        Line::styled(format!("  {state}{cost}"), style),
                     ]
                 })
                 .collect::<Vec<_>>();
@@ -1737,6 +1771,40 @@ mod tests {
             ),
             "working · gate"
         );
+    }
+
+    #[test]
+    fn pulse_cost_refreshes_only_after_the_interval_and_only_for_sessions() {
+        let now = Instant::now();
+        let mut cache = None;
+        let mut calls = 0;
+
+        refresh_pulse_cost(&mut cache, true, now, || {
+            calls += 1;
+            "$1.000000".to_owned()
+        });
+        refresh_pulse_cost(&mut cache, true, now + Duration::from_secs(2), || {
+            calls += 1;
+            "$2.000000".to_owned()
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(
+            cache.as_ref().map(|(_, cost)| cost.as_str()),
+            Some("$1.000000")
+        );
+
+        refresh_pulse_cost(&mut cache, true, now + Duration::from_secs(3), || {
+            calls += 1;
+            "$2.000000".to_owned()
+        });
+        assert_eq!(calls, 2);
+
+        refresh_pulse_cost(&mut cache, false, now + Duration::from_secs(4), || {
+            calls += 1;
+            "$3.000000".to_owned()
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(cache, None);
     }
 
     #[test]
