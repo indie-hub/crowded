@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-08-21
+
+### Added
+
+- `crowded --help` and `crowded -h` now print a usage summary listing every subcommand (send, control, resume, pulse, roster, check, init, plugin, toolbox) and exit 0, instead of falling through to the GUEST parser's error.
+
 ## [0.32.1] - 2026-08-20
 
 ### Fixed
