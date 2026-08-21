@@ -469,6 +469,17 @@ pub(super) fn fresh_capture_cell() -> CapturedSession {
     Arc::new(Mutex::new(None))
 }
 
+/// The capture cell for a newly spawned pane, seeded from a persisted session
+/// id when one already exists for `(vendor, cwd, room)`. A room with no usable
+/// mapping (never captured, or a durable clear marker) gets an empty cell that
+/// the intro-triggered capture populates later.
+pub(super) fn initial_capture_cell(vendor: &str, cwd: &Path, room: &str) -> CapturedSession {
+    match lookup(vendor, cwd, room) {
+        Some(id) if id != FRESH_STATE_MARKER => Arc::new(Mutex::new(Some(id))),
+        _ => fresh_capture_cell(),
+    }
+}
+
 /// The single success path: persist to disk and report to the shared cell
 /// together, so the pulse tag can never disagree with what resume will use.
 #[allow(dead_code)]
@@ -807,6 +818,39 @@ mod tests {
         assert_eq!(state.lookup("claude", "/nope", "Claude · 1"), None);
         // Same room, wrong vendor, resolves to None.
         assert_eq!(state.lookup("opencode", "/a", "Claude · 1"), None);
+    }
+
+    #[test]
+    fn initial_capture_cell_seeds_a_valid_persisted_id_but_not_a_fresh_or_cleared_room() {
+        let _guard = StateRootGuard::isolated();
+        let cwd = Path::new("/repo");
+        let room = "Claude · 1";
+
+        // No persisted entry: starts empty, capture populates later.
+        assert!(!has_captured_session(&initial_capture_cell(
+            "claude", cwd, room
+        )));
+
+        // A valid persisted id for this room seeds the cell immediately, so
+        // the pulse cost gate opens at spawn -- the resumed-room fix.
+        upsert("claude", cwd, room, "ses-persisted");
+        assert!(has_captured_session(&initial_capture_cell(
+            "claude", cwd, room
+        )));
+        assert_eq!(
+            initial_capture_cell("claude", cwd, room)
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("ses-persisted")
+        );
+
+        // A durable clear marker must not seed: the room starts fresh until a
+        // genuine capture supersedes the marker.
+        clear_room("claude", cwd, room);
+        assert!(!has_captured_session(&initial_capture_cell(
+            "claude", cwd, room
+        )));
     }
 
     /// Regression: reconfiguring a room to a new vendor (OpenCode · 2 ->

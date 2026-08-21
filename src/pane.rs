@@ -420,11 +420,20 @@ impl Pane {
             }
         });
 
+        // A resumed (or otherwise relaunched) room whose exact session id is
+        // already persisted opens with that id seeded, so the Room Pulse cost
+        // gate is true immediately instead of only after an intro-triggered
+        // capture -- which a resume deliberately skips.
+        let captured_session = match controls::cli_vendor(&spec) {
+            Ok(vendor) => session_state::initial_capture_cell(vendor.key(), &cwd, &spec.title),
+            Err(_) => session_state::fresh_capture_cell(),
+        };
+
         Ok(Self {
             spec,
             cwd,
             spawned_at,
-            captured_session: session_state::fresh_capture_cell(),
+            captured_session,
             environment,
             child,
             master: pty.master,

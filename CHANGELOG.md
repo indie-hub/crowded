@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.37.1] - 2026-08-21
+
+### Fixed
+
+- A resumed room never showed a usage cost in the Room Pulse panel, even though its exact session id was already known before the process started: the cost gate read a per-process capture cell that only the intro-triggered capture flow wrote, and a resumed room skips that intro. The cell is now seeded from the persisted session-state store at spawn whenever a valid session mapping already exists, so any room with a known session shows its cost immediately.
+
 ## [0.37.0] - 2026-08-21
 
 ### Changed
