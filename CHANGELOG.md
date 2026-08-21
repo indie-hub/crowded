@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-08-21
+
+### Changed
+
+- Operator-supplied token pricing now lives exclusively in the optional sibling `token_pricing.toml`; a `[[token_pricing]]` table left in `crowded.toml` is rejected as invalid configuration.
+
 ## [0.35.0] - 2026-08-21
 
 ### Added

@@ -26,6 +26,7 @@ pub(crate) enum Transport {
 }
 
 pub(crate) const DEFAULT_FUSE_LIMIT: usize = 20;
+const TOKEN_PRICING_FILE: &str = "token_pricing.toml";
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,8 +44,6 @@ pub(crate) struct RoomFile {
     /// Omitting the field defaults to [`DEFAULT_FUSE_LIMIT`].
     #[serde(default)]
     pub(crate) fuse_size: Option<usize>,
-    #[serde(default, rename = "token_pricing")]
-    pub(crate) token_pricing: Vec<TokenPricing>,
 }
 
 /// Config values resolved from `RoomFile` for use at runtime.
@@ -63,6 +62,13 @@ pub(crate) struct TokenPricing {
     pub(crate) cached_input: Option<f64>,
     pub(crate) cache_creation_input: Option<f64>,
     pub(crate) cache_read_input: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenPricingFile {
+    #[serde(default)]
+    token_pricing: Vec<TokenPricing>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -317,8 +323,22 @@ pub(crate) fn load_room_file(path: &Path) -> io::Result<RoomFile> {
     parse_room_file(&fs::read_to_string(path)?)
 }
 
+fn load_token_pricing_file(path: &Path) -> io::Result<Vec<TokenPricing>> {
+    if !path.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let file: TokenPricingFile = toml::from_str(&fs::read_to_string(path)?).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid {TOKEN_PRICING_FILE}: {error}"),
+        )
+    })?;
+    validate_token_pricing(&file.token_pricing)?;
+    Ok(file.token_pricing)
+}
+
 pub(crate) fn validate_room_file(file: &RoomFile) -> io::Result<()> {
-    room_specs_from_file(file.clone(), false).map(drop)
+    room_specs_from_file(file.clone(), false, Vec::new()).map(drop)
 }
 
 fn add_shared_toolbox(
@@ -336,7 +356,11 @@ fn add_shared_toolbox(
     Ok(())
 }
 
-fn room_specs_from_file(file: RoomFile, inject_shared_mcps: bool) -> io::Result<ResolvedConfig> {
+fn room_specs_from_file(
+    file: RoomFile,
+    inject_shared_mcps: bool,
+    token_pricing: Vec<TokenPricing>,
+) -> io::Result<ResolvedConfig> {
     if file.rooms.len() < 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -345,8 +369,6 @@ fn room_specs_from_file(file: RoomFile, inject_shared_mcps: bool) -> io::Result<
     }
 
     let fuse_size = file.fuse_size.unwrap_or(DEFAULT_FUSE_LIMIT);
-    validate_token_pricing(&file.token_pricing)?;
-    let token_pricing = file.token_pricing.clone();
 
     let mut rooms: Vec<_> = file
         .rooms
@@ -398,7 +420,7 @@ fn validate_token_pricing(pricing: &[TokenPricing]) -> io::Result<()> {
 
 #[cfg(test)]
 fn room_specs_from_toml(text: &str) -> io::Result<ResolvedConfig> {
-    room_specs_from_file(parse_room_file(text)?, true)
+    room_specs_from_file(parse_room_file(text)?, true, Vec::new())
 }
 
 pub(crate) fn room_specs() -> io::Result<ResolvedConfig> {
@@ -415,6 +437,7 @@ pub(crate) fn room_specs_resumed() -> io::Result<ResolvedConfig> {
 fn room_specs_skipping(skip: usize) -> io::Result<ResolvedConfig> {
     let guests: Vec<_> = env::args_os().skip(skip).collect();
     let config = Path::new("crowded.toml");
+    let token_pricing = load_token_pricing_file(&config.with_file_name(TOKEN_PRICING_FILE))?;
     let file = if config.try_exists()? {
         Some(load_room_file(config)?)
     } else {
@@ -424,7 +447,7 @@ fn room_specs_skipping(skip: usize) -> io::Result<ResolvedConfig> {
 
     if guests.is_empty() {
         if let Some(file) = file {
-            return room_specs_from_file(file, inject_shared_mcps);
+            return room_specs_from_file(file, inject_shared_mcps, token_pricing);
         }
         let shell = env::var_os("SHELL").unwrap_or_else(|| {
             if cfg!(windows) {
@@ -453,11 +476,6 @@ fn room_specs_skipping(skip: usize) -> io::Result<ResolvedConfig> {
         .as_ref()
         .and_then(|f| f.fuse_size)
         .unwrap_or(DEFAULT_FUSE_LIMIT);
-    let token_pricing = file
-        .as_ref()
-        .map(|file| file.token_pricing.clone())
-        .unwrap_or_default();
-    validate_token_pricing(&token_pricing)?;
     let mut rooms: Vec<_> = guests
         .into_iter()
         .enumerate()
@@ -549,9 +567,36 @@ mod tests {
     }
 
     #[test]
-    fn token_pricing_is_optional_and_model_keyed() {
-        let config = room_specs_from_toml(
+    fn token_pricing_file_is_optional_and_model_keyed() {
+        let path =
+            env::temp_dir().join(format!("crowded-token-pricing-{}.toml", std::process::id()));
+        let _ = fs::remove_file(&path);
+        fs::write(
+            &path,
             r#"
+                [[token_pricing]]
+                model = "claude-sonnet-5"
+                input = 0.000003
+                cache_creation_input = 0.00000375
+                cache_read_input = 0.0000003
+                output = 0.000015
+            "#,
+        )
+        .unwrap();
+
+        let pricing = load_token_pricing_file(&path).unwrap();
+        assert_eq!(pricing.len(), 1);
+        assert_eq!(pricing[0].model, "claude-sonnet-5");
+        assert_eq!(pricing[0].cached_input, None);
+        fs::remove_file(&path).unwrap();
+        assert!(load_token_pricing_file(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn token_pricing_in_crowded_toml_is_rejected() {
+        assert!(
+            room_specs_from_toml(
+                r#"
                 [[rooms]]
                 command = "claude"
                 transport = "raw"
@@ -563,16 +608,11 @@ mod tests {
                 [[token_pricing]]
                 model = "claude-sonnet-5"
                 input = 0.000003
-                cache_creation_input = 0.00000375
-                cache_read_input = 0.0000003
                 output = 0.000015
             "#,
-        )
-        .unwrap();
-
-        assert_eq!(config.token_pricing.len(), 1);
-        assert_eq!(config.token_pricing[0].model, "claude-sonnet-5");
-        assert_eq!(config.token_pricing[0].cached_input, None);
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -854,6 +894,7 @@ mod tests {
             )
             .unwrap(),
             false,
+            Vec::new(),
         )
         .unwrap()
         .specs;
