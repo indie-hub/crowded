@@ -551,6 +551,7 @@ mod tests {
                         allow_control: true,
                         model: None,
                         effort: None,
+                        cost: "unknown".to_owned(),
                         headroom: true,
                         pulse_age_ms: None,
                         capabilities: Default::default(),

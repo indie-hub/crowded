@@ -9,6 +9,7 @@ pub(crate) use mcp::{
 };
 
 use std::{
+    collections::HashSet,
     env,
     ffi::{OsStr, OsString},
     fs, io,
@@ -42,12 +43,26 @@ pub(crate) struct RoomFile {
     /// Omitting the field defaults to [`DEFAULT_FUSE_LIMIT`].
     #[serde(default)]
     pub(crate) fuse_size: Option<usize>,
+    #[serde(default, rename = "token_pricing")]
+    pub(crate) token_pricing: Vec<TokenPricing>,
 }
 
 /// Config values resolved from `RoomFile` for use at runtime.
 pub(crate) struct ResolvedConfig {
     pub(crate) specs: Vec<RoomSpec>,
     pub(crate) fuse_size: usize,
+    pub(crate) token_pricing: Vec<TokenPricing>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TokenPricing {
+    pub(crate) model: String,
+    pub(crate) input: f64,
+    pub(crate) output: f64,
+    pub(crate) cached_input: Option<f64>,
+    pub(crate) cache_creation_input: Option<f64>,
+    pub(crate) cache_read_input: Option<f64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -330,6 +345,8 @@ fn room_specs_from_file(file: RoomFile, inject_shared_mcps: bool) -> io::Result<
     }
 
     let fuse_size = file.fuse_size.unwrap_or(DEFAULT_FUSE_LIMIT);
+    validate_token_pricing(&file.token_pricing)?;
+    let token_pricing = file.token_pricing.clone();
 
     let mut rooms: Vec<_> = file
         .rooms
@@ -346,7 +363,37 @@ fn room_specs_from_file(file: RoomFile, inject_shared_mcps: bool) -> io::Result<
     Ok(ResolvedConfig {
         specs: rooms,
         fuse_size,
+        token_pricing,
     })
+}
+
+fn validate_token_pricing(pricing: &[TokenPricing]) -> io::Result<()> {
+    let mut models = HashSet::new();
+    for rate in pricing {
+        if rate.model.trim().is_empty() || !models.insert(&rate.model) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "token pricing models must be non-empty and unique",
+            ));
+        }
+        if [
+            Some(rate.input),
+            Some(rate.output),
+            rate.cached_input,
+            rate.cache_creation_input,
+            rate.cache_read_input,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "token pricing values must be finite and non-negative",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -392,6 +439,7 @@ fn room_specs_skipping(skip: usize) -> io::Result<ResolvedConfig> {
                 RoomSpec::new(shell, Transport::Shell, 2),
             ],
             fuse_size: DEFAULT_FUSE_LIMIT,
+            token_pricing: Vec::new(),
         });
     }
     if guests.len() < 2 {
@@ -405,6 +453,11 @@ fn room_specs_skipping(skip: usize) -> io::Result<ResolvedConfig> {
         .as_ref()
         .and_then(|f| f.fuse_size)
         .unwrap_or(DEFAULT_FUSE_LIMIT);
+    let token_pricing = file
+        .as_ref()
+        .map(|file| file.token_pricing.clone())
+        .unwrap_or_default();
+    validate_token_pricing(&token_pricing)?;
     let mut rooms: Vec<_> = guests
         .into_iter()
         .enumerate()
@@ -421,6 +474,7 @@ fn room_specs_skipping(skip: usize) -> io::Result<ResolvedConfig> {
     Ok(ResolvedConfig {
         specs: rooms,
         fuse_size,
+        token_pricing,
     })
 }
 
@@ -492,6 +546,33 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn token_pricing_is_optional_and_model_keyed() {
+        let config = room_specs_from_toml(
+            r#"
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+
+                [[token_pricing]]
+                model = "claude-sonnet-5"
+                input = 0.000003
+                cache_creation_input = 0.00000375
+                cache_read_input = 0.0000003
+                output = 0.000015
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.token_pricing.len(), 1);
+        assert_eq!(config.token_pricing[0].model, "claude-sonnet-5");
+        assert_eq!(config.token_pricing[0].cached_input, None);
     }
 
     #[test]

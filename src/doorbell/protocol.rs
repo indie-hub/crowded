@@ -150,6 +150,8 @@ pub(crate) struct RosterRoom {
     pub(crate) allow_control: bool,
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
+    #[serde(default = "unknown_cost")]
+    pub(crate) cost: String,
     pub(crate) headroom: bool,
     /// Age of the last received Pulse hook sample, in milliseconds, when one
     /// has been received. Lets consumers tell a fresh self-report from a
@@ -161,6 +163,10 @@ pub(crate) struct RosterRoom {
     /// model catalogue. Never probed at runtime.
     #[serde(default)]
     pub(crate) capabilities: RoomCapabilities,
+}
+
+fn unknown_cost() -> String {
+    "unknown".to_owned()
 }
 
 /// Where a roster `state` came from. Kept explicit so the TUI and the JSON
@@ -519,6 +525,7 @@ mod tests {
             allow_control: true,
             model: Some("deepseek/deepseek-v4-flash".to_owned()),
             effort: Some("high".to_owned()),
+            cost: "unknown".to_owned(),
             headroom: false,
             pulse_age_ms: Some(1234),
             capabilities: RoomCapabilities {
@@ -538,6 +545,7 @@ mod tests {
         assert_eq!(value["pulse_age_ms"], 1234);
         assert_eq!(value["model"], "deepseek/deepseek-v4-flash");
         assert_eq!(value["effort"], "high");
+        assert_eq!(value["cost"], "unknown");
         assert_eq!(value["capabilities"]["controls"], true);
         assert_eq!(
             value["capabilities"]["supported_controls"],

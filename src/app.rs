@@ -24,7 +24,7 @@ use ratatui::{
 use tui_term::widget::PseudoTerminal;
 
 use crate::{
-    config::{RoomSpec, room_specs, room_specs_resumed},
+    config::{RoomSpec, TokenPricing, room_specs, room_specs_resumed},
     doorbell::{
         ControlAction, Doorbell, DoorbellEvent, PulseSource, PulseState, RosterRoom,
         SupportedControl,
@@ -705,7 +705,12 @@ impl Drop for TerminalGuard {
 pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let resolved = room_specs()?;
     let resumed = vec![false; resolved.specs.len()];
-    run_with(resolved.specs, resumed, resolved.fuse_size)
+    run_with(
+        resolved.specs,
+        resumed,
+        resolved.fuse_size,
+        resolved.token_pricing,
+    )
 }
 
 /// The `crowded resume` entry point: same room resolution as a plain
@@ -714,13 +719,19 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 pub(crate) fn run_resumed() -> Result<(), Box<dyn std::error::Error>> {
     let mut resolved = room_specs_resumed()?;
     let resumed = pane::resume_supported_specs(&mut resolved.specs);
-    run_with(resolved.specs, resumed, resolved.fuse_size)
+    run_with(
+        resolved.specs,
+        resumed,
+        resolved.fuse_size,
+        resolved.token_pricing,
+    )
 }
 
 fn run_with(
     specs: Vec<RoomSpec>,
     resumed: Vec<bool>,
     fuse_size: usize,
+    token_pricing: Vec<TokenPricing>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let room_count = specs.len();
     debug_assert_eq!(resumed.len(), room_count);
@@ -856,6 +867,14 @@ fn run_with(
                                     allow_control: pane.allows_control(),
                                     model: pane.current_model(),
                                     effort: pane.current_effort(),
+                                    cost: pane::usage_cost(
+                                        &pane.guest(),
+                                        pane.cwd(),
+                                        pane.title(),
+                                        &token_pricing,
+                                    )
+                                    .map(|cost| format!("${cost:.6}"))
+                                    .unwrap_or_else(|| "unknown".to_owned()),
                                     headroom: pane.headroom_active(),
                                     pulse_age_ms: room_pulses[index].map(|sample| {
                                         now.saturating_duration_since(sample.received_at)

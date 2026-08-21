@@ -29,13 +29,16 @@ use std::{
     env, fs, io,
     io::Write,
     path::{Path, PathBuf},
-    process,
+    process::{self, Command},
     sync::{Arc, Mutex, OnceLock, RwLock},
     thread,
     time::{Duration, Instant, SystemTime},
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::config::TokenPricing;
 
 use super::controls::{self, CliVendor};
 
@@ -174,6 +177,169 @@ pub(super) fn lookup(vendor: &str, cwd: &Path, room: &str) -> Option<String> {
     state
         .lookup(vendor, &cwd.to_string_lossy(), room)
         .map(str::to_owned)
+}
+
+pub(crate) fn usage_cost(
+    guest: &str,
+    cwd: &Path,
+    room: &str,
+    pricing: &[TokenPricing],
+) -> Option<f64> {
+    let vendor = guest.to_ascii_lowercase();
+    let session_id = lookup(&vendor, cwd, room)?;
+    if session_id == FRESH_STATE_MARKER {
+        return None;
+    }
+    usage_cost_from_home(&home_dir()?, &vendor, cwd, &session_id, pricing)
+}
+
+fn usage_cost_from_home(
+    home: &Path,
+    vendor: &str,
+    cwd: &Path,
+    session_id: &str,
+    pricing: &[TokenPricing],
+) -> Option<f64> {
+    match vendor {
+        "claude" => claude_cost(home, cwd, session_id, pricing),
+        "codex" => codex_cost(home, session_id, pricing),
+        "opencode" => opencode_cost(home, session_id),
+        _ => None,
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn pricing_for<'a>(pricing: &'a [TokenPricing], model: &str) -> Option<&'a TokenPricing> {
+    pricing.iter().find(|rate| rate.model == model)
+}
+
+fn token(value: &Value, name: &str) -> Option<f64> {
+    value.get(name)?.as_u64().map(|value| value as f64)
+}
+
+fn optional_token(value: &Value, name: &str) -> Option<f64> {
+    value
+        .get(name)
+        .map_or(Some(0.0), |value| value.as_u64().map(|value| value as f64))
+}
+
+fn priced_tokens(tokens: f64, rate: Option<f64>) -> Option<f64> {
+    (tokens == 0.0)
+        .then_some(0.0)
+        .or_else(|| rate.map(|rate| tokens * rate))
+}
+
+fn claude_cost(home: &Path, cwd: &Path, session_id: &str, pricing: &[TokenPricing]) -> Option<f64> {
+    let cwd = cwd.to_string_lossy().replace(['/', '\\'], "-");
+    let path = home
+        .join(".claude")
+        .join("projects")
+        .join(cwd)
+        .join(format!("{session_id}.jsonl"));
+    let mut cost = 0.0;
+    for line in fs::read_to_string(path).ok()?.lines() {
+        let entry: Value = serde_json::from_str(line).ok()?;
+        if entry.get("type")?.as_str()? != "assistant" {
+            continue;
+        }
+        let message = entry.get("message")?;
+        let rate = pricing_for(pricing, message.get("model")?.as_str()?)?;
+        let usage = message.get("usage")?;
+        cost += token(usage, "input_tokens")? * rate.input;
+        cost += priced_tokens(
+            optional_token(usage, "cache_creation_input_tokens")?,
+            rate.cache_creation_input,
+        )?;
+        cost += priced_tokens(
+            optional_token(usage, "cache_read_input_tokens")?,
+            rate.cache_read_input,
+        )?;
+        cost += token(usage, "output_tokens")? * rate.output;
+    }
+    Some(cost)
+}
+
+fn codex_cost(home: &Path, session_id: &str, pricing: &[TokenPricing]) -> Option<f64> {
+    let path = find_codex_rollout(&home.join(".codex").join("sessions"), session_id)?;
+    let mut model = None;
+    let mut usage = None;
+    let mut matches_session = false;
+    for line in fs::read_to_string(path).ok()?.lines() {
+        let entry: Value = serde_json::from_str(line).ok()?;
+        let payload = entry.get("payload")?;
+        match entry.get("type")?.as_str()? {
+            "session_meta" => {
+                matches_session = payload.get("id")?.as_str()? == session_id;
+                if !matches_session {
+                    return None;
+                }
+            }
+            "turn_context" => model = payload.get("model")?.as_str().map(str::to_owned),
+            "event_msg" => match payload.get("type")?.as_str()? {
+                "thread_settings_applied" => {
+                    model = payload
+                        .get("thread_settings")?
+                        .get("model")?
+                        .as_str()
+                        .map(str::to_owned);
+                }
+                "token_count" => usage = payload.get("info")?.get("total_token_usage").cloned(),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    matches_session.then_some(())?;
+    let rate = pricing_for(pricing, model.as_deref()?)?;
+    let usage = usage?;
+    let input = token(&usage, "input_tokens")?;
+    let cached = optional_token(&usage, "cached_input_tokens")?;
+    (cached <= input).then_some(())?;
+    Some(
+        (input - cached) * rate.input
+            + priced_tokens(cached, rate.cached_input)?
+            + token(&usage, "output_tokens")? * rate.output,
+    )
+}
+
+fn find_codex_rollout(directory: &Path, session_id: &str) -> Option<PathBuf> {
+    for entry in fs::read_dir(directory).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_codex_rollout(&path, session_id) {
+                return Some(found);
+            }
+        } else if path
+            .file_name()?
+            .to_string_lossy()
+            .ends_with(&format!("-{session_id}.jsonl"))
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn opencode_cost(home: &Path, session_id: &str) -> Option<f64> {
+    let database = home.join(".local/share/opencode/opencode.db");
+    let id = session_id.replace('\'', "''");
+    let output = Command::new("sqlite3")
+        .arg(database)
+        .arg(format!("SELECT cost FROM session WHERE id = '{id}';"))
+        .output()
+        .ok()?;
+    output.status.success().then_some(())?;
+    String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
 }
 
 /// The sentinel session id written by [`clear_room`] to record a durable
@@ -479,9 +645,95 @@ impl Drop for StateRootGuard {
 mod tests {
     use super::*;
 
+    fn pricing(model: &str) -> TokenPricing {
+        TokenPricing {
+            model: model.to_owned(),
+            input: 1.0,
+            output: 3.0,
+            cached_input: Some(0.25),
+            cache_creation_input: Some(2.0),
+            cache_read_input: Some(0.5),
+        }
+    }
+
+    fn usage_home(name: &str) -> PathBuf {
+        let home = env::temp_dir().join(format!("crowded-usage-{name}-{}", process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        home
+    }
+
     fn set_modified(path: &Path, time: SystemTime) {
         let file = fs::File::options().write(true).open(path).unwrap();
         file.set_modified(time).unwrap();
+    }
+
+    #[test]
+    fn claude_cost_uses_configured_model_rates_or_reports_unknown() {
+        let home = usage_home("claude");
+        let transcript = home.join(".claude/projects/-repo/session.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-5","usage":{"input_tokens":10,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":4}}}
+{"type":"user","message":{}}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            claude_cost(
+                &home,
+                Path::new("/repo"),
+                "session",
+                &[pricing("claude-sonnet-5")]
+            ),
+            Some(27.5)
+        );
+        assert_eq!(claude_cost(&home, Path::new("/repo"), "session", &[]), None);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn codex_cost_uses_only_the_last_cumulative_usage_event() {
+        let home = usage_home("codex");
+        let rollout = home.join(".codex/sessions/2026/08/21/rollout-now-session.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(
+            &rollout,
+            r#"{"type":"session_meta","payload":{"id":"session"}}
+{"type":"turn_context","payload":{"model":"gpt-5.6-terra"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10}}}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"cached_input_tokens":100,"output_tokens":20}}}}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_cost(&home, "session", &[pricing("gpt-5.6-terra")]),
+            Some(185.0)
+        );
+        assert_eq!(codex_cost(&home, "session", &[]), None);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn opencode_cost_reads_its_stored_dollar_value() {
+        if Command::new("sqlite3").arg("--version").output().is_err() {
+            return;
+        }
+        let home = usage_home("opencode");
+        let database = home.join(".local/share/opencode/opencode.db");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let setup = Command::new("sqlite3")
+            .arg(&database)
+            .arg("CREATE TABLE session (id TEXT PRIMARY KEY, cost REAL); INSERT INTO session VALUES ('session', 1.25);")
+            .output()
+            .unwrap();
+        assert!(setup.status.success());
+
+        assert_eq!(opencode_cost(&home, "session"), Some(1.25));
+        let _ = fs::remove_dir_all(home);
     }
 
     /// Regression: capture must be anchored to the fresh process spawn, not to

@@ -23,6 +23,8 @@ use crate::{
 mod controls;
 mod session_state;
 
+pub(crate) use session_state::usage_cost;
+
 const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
 // ponytail: ConPTY only needs a valid DSR here; report the parser's exact
 // cursor if a guest later depends on cursor-aware terminal negotiation.
@@ -517,6 +519,10 @@ impl Pane {
 
     pub(crate) fn vendor(&self) -> &str {
         &self.spec.vendor
+    }
+
+    pub(crate) fn cwd(&self) -> &Path {
+        &self.cwd
     }
 
     pub(crate) fn guest(&self) -> String {
