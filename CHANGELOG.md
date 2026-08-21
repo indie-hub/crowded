@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-08-21
+
+### Added
+
+- `crowded.toml` now supports a top-level `fuse_size` field controlling the Doorbell automatic-delivery fuse: omitted keeps the default of 20, and `0` disables the fuse so automatic delivery never pauses.
+
 ## [0.33.0] - 2026-08-21
 
 ### Added
