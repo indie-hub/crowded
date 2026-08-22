@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-08-22
+
+### Added
+
+- `crowded mcp list|add|remove` manages `[[mcp]]` servers in `crowded.toml` directly, the first slice of a full configuration editor. `add`/`remove` edit the file via `toml_edit`, preserving all existing comments and formatting, validate against the existing MCP rules (name charset/length, duplicates, command/url/transport combinations), and immediately re-sync the native per-client MCP files.
+
 ## [0.37.1] - 2026-08-21
 
 ### Fixed
