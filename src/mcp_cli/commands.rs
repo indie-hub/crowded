@@ -271,6 +271,13 @@ mod tests {
     #[test]
     fn add_rejects_duplicate_args() {
         assert!(
+            parse_add_args(args(&["solo", "--command", "npx", "--args", "--args", "b"])).is_err()
+        );
+    }
+
+    #[test]
+    fn add_rejects_duplicate_args_with_value_between() {
+        assert!(
             parse_add_args(args(&[
                 "solo",
                 "--command",
