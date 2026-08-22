@@ -26,7 +26,7 @@ pub(crate) enum McpTransport {
 }
 
 impl McpTransport {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Http => "http",
             Self::Sse => "sse",
@@ -40,6 +40,16 @@ pub(crate) enum McpClient {
     Claude,
     Codex,
     Opencode,
+}
+
+impl McpClient {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Opencode => "opencode",
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]

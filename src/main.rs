@@ -7,6 +7,7 @@ mod config;
 mod doorbell;
 mod initializer;
 mod mailroom;
+mod mcp_cli;
 mod pane;
 mod plugins;
 mod toolbox;
