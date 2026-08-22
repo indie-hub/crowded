@@ -98,7 +98,7 @@ pub(crate) fn add_entry(root: &Path, entry: NewMcpEntry) -> io::Result<()> {
     array.push(table);
 
     fs::write(&path, doc.to_string())?;
-    toolbox::sync(root)?;
+    toolbox::resync(root)?;
     Ok(())
 }
 
@@ -152,7 +152,7 @@ pub(crate) fn remove_entry(root: &Path, name: &str) -> io::Result<()> {
     );
 
     fs::write(&path, doc.to_string())?;
-    toolbox::sync(root)?;
+    toolbox::resync(root)?;
     Ok(())
 }
 
@@ -534,5 +534,60 @@ command = \"cmd\"
         assert_eq!(entries[0].url.as_deref(), Some("https://example.com/mcp"));
         assert_eq!(entries[0].transport, Some(McpTransport::Http));
         assert_eq!(entries[0].clients, vec![McpClient::Claude]);
+    }
+
+    #[test]
+    fn add_entry_then_remove_in_same_session_succeeds() {
+        let dir = TempDir::new().unwrap();
+        make_crowded_toml(dir.path(), "");
+
+        let first = NewMcpEntry {
+            name: "server-a".to_string(),
+            command: Some("cmd-a".to_string()),
+            args: vec![],
+            url: None,
+            transport: None,
+            clients: vec![],
+        };
+        add_entry(dir.path(), first).unwrap();
+
+        let entries_after_add = list_entries(dir.path()).unwrap();
+        assert_eq!(entries_after_add.len(), 1);
+
+        remove_entry(dir.path(), "server-a").unwrap();
+
+        let entries_after_remove = list_entries(dir.path()).unwrap();
+        assert!(entries_after_remove.is_empty());
+    }
+
+    #[test]
+    fn two_add_entries_in_same_session_succeeds() {
+        let dir = TempDir::new().unwrap();
+        make_crowded_toml(dir.path(), "");
+
+        let first = NewMcpEntry {
+            name: "server-a".to_string(),
+            command: Some("cmd-a".to_string()),
+            args: vec![],
+            url: None,
+            transport: None,
+            clients: vec![],
+        };
+        add_entry(dir.path(), first).unwrap();
+
+        let second = NewMcpEntry {
+            name: "server-b".to_string(),
+            command: Some("cmd-b".to_string()),
+            args: vec!["--flag".to_string()],
+            url: None,
+            transport: None,
+            clients: vec![],
+        };
+        add_entry(dir.path(), second).unwrap();
+
+        let entries = list_entries(dir.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "server-a");
+        assert_eq!(entries[1].name, "server-b");
     }
 }
