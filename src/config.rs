@@ -4,8 +4,8 @@ mod mcp;
 
 use mcp::codex_mcp_args;
 pub(crate) use mcp::{
-    McpClient, McpConfig, OpenCodePluginConfig, claude_mcp_config, opencode_mcp_config,
-    validate_mcp_servers, validate_opencode_plugins,
+    McpClient, McpConfig, McpTransport, OpenCodePluginConfig, claude_mcp_config,
+    opencode_mcp_config, validate_mcp_servers, validate_opencode_plugins,
 };
 
 use std::{

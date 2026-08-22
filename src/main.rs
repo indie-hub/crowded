@@ -7,6 +7,7 @@ mod config;
 mod doorbell;
 mod initializer;
 mod mailroom;
+mod mcp_cli;
 mod pane;
 mod plugins;
 mod toolbox;
@@ -26,6 +27,7 @@ Subcommands:
   roster     List rooms and their status
   check      Run pre-flight checks
   init       Initialize a new project
+  mcp        Manage shared MCP servers
   plugin     Manage plugins
   toolbox    Toolbox utilities
 ";
@@ -48,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("roster") => doorbell::roster_command(),
         Some("check") => checker::command(),
         Some("init") => initializer::command(),
+        Some("mcp") => mcp_cli::command(),
         Some("plugin") => plugins::command(),
         Some("toolbox") => toolbox::command(),
         _ => app::run(),
@@ -61,7 +64,8 @@ mod tests {
     #[test]
     fn help_text_lists_all_subcommands() {
         let expected = [
-            "send", "control", "resume", "pulse", "roster", "check", "init", "plugin", "toolbox",
+            "send", "control", "resume", "pulse", "roster", "check", "init", "mcp", "plugin",
+            "toolbox",
         ];
         for cmd in expected {
             assert!(USAGE.contains(cmd), "help text missing subcommand: {cmd}",);
