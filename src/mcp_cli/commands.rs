@@ -62,6 +62,7 @@ fn parse_add_args(args: impl IntoIterator<Item = String>) -> Result<NewMcpEntry,
     let mut transport = None;
     let mut clients = Vec::new();
     let mut entry_args = Vec::new();
+    let mut args_seen = false;
 
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -108,6 +109,10 @@ fn parse_add_args(args: impl IntoIterator<Item = String>) -> Result<NewMcpEntry,
                 }
             }
             "--args" => {
+                if args_seen {
+                    return Err("--args may appear only once".to_owned());
+                }
+                args_seen = true;
                 while args.peek().is_some_and(|next| !is_flag(next)) {
                     entry_args.push(args.next().unwrap());
                 }
@@ -261,6 +266,22 @@ mod tests {
     #[test]
     fn add_rejects_duplicate_flag() {
         assert!(parse_add_args(args(&["solo", "--command", "npx", "--command", "echo"])).is_err());
+    }
+
+    #[test]
+    fn add_rejects_duplicate_args() {
+        assert!(
+            parse_add_args(args(&[
+                "solo",
+                "--command",
+                "npx",
+                "--args",
+                "a",
+                "--args",
+                "b"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
