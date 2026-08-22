@@ -143,7 +143,7 @@ pub(crate) fn native_files_are_active_at(root: &Path) -> io::Result<bool> {
 }
 
 fn preview(root: &Path) -> io::Result<()> {
-    let state = build_plan(root)?;
+    let state = build_plan(root, false)?;
     for file in state.files {
         let action = if file.original.is_some() {
             "update"
@@ -157,7 +157,18 @@ fn preview(root: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn sync(root: &Path) -> io::Result<Vec<PathBuf>> {
-    let state = build_plan(root)?;
+    sync_inner(root, false)
+}
+
+/// Force a re-sync of native toolbox files, bypassing the already-synced guard.
+/// Used by mcp_cli after editing crowded.toml to ensure managed files reflect
+/// the current MCP configuration even when the file *set* is unchanged.
+pub(crate) fn resync(root: &Path) -> io::Result<Vec<PathBuf>> {
+    sync_inner(root, true)
+}
+
+fn sync_inner(root: &Path, force: bool) -> io::Result<Vec<PathBuf>> {
+    let state = build_plan(root, force)?;
     let staged = stage_files(&state.files)?;
     if let Err(error) = save_state(root, &state) {
         for (temporary, _) in &staged {
@@ -551,11 +562,12 @@ fn owned_array_entries(file: &ManagedFile, section: &str) -> io::Result<Vec<Valu
         .collect())
 }
 
-fn build_plan(root: &Path) -> io::Result<ToolboxState> {
+fn build_plan(root: &Path, force: bool) -> io::Result<ToolboxState> {
     let state_path = root.join(STATE_FILE);
     let old_state = if state_path.try_exists()? {
         // Allow re-sync when the state is stale (e.g. rooms added after last sync).
-        // Otherwise require explicit `toolbox remove` to avoid clobbering.
+        // Otherwise require explicit `toolbox remove` to avoid clobbering,
+        // unless the caller explicitly forces a re-sync.
         let is_stale = (|| -> io::Result<bool> {
             let state = load_state(&state_path)?;
             let config = load_room_file(&root.join("crowded.toml"))?;
@@ -572,7 +584,7 @@ fn build_plan(root: &Path) -> io::Result<ToolboxState> {
                     .all(|file| expected.contains_key(&file.path)))
         })()
         .unwrap_or(false);
-        if !is_stale {
+        if !is_stale && !force {
             return Err(invalid_input(
                 "the native toolbox is already synced; remove it before syncing again",
             ));
