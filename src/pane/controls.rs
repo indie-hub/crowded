@@ -393,11 +393,34 @@ impl Drop for HomeDirGuard {
 
 /// Claude stores transcripts at `~/.claude/projects/<sanitized-cwd>/<session
 /// id>.jsonl`; the filename stem is the session id. `sanitized-cwd` replaces
-/// every path separator with `-`, including the leading one (confirmed
-/// against real directories on this machine: `/Users/me/project` ->
-/// `-Users-me-project`).
+/// every character that is not an ASCII letter or digit with `-`, including
+/// the leading separator (confirmed against real directories on this
+/// machine: `/Users/me/project` -> `-Users-me-project`).
+///
+/// Extracted straight from Claude CLI's own bundle on a Windows box
+/// (`e.replace(/[^a-zA-Z0-9]/g,"-")`) and cross-checked byte-for-byte against
+/// every entry under `~/.claude/projects` and `~/.claude.json`'s `projects`
+/// map on that machine. A prior fix here only added `:` to a hand-picked
+/// separator list, which still missed `.` -- so a cwd with a dot anywhere in
+/// it (e.g. a Windows username like `Bruno.O`) still failed to match, and
+/// session capture silently found nothing.
+///
+/// That JS regex has no `u` flag, so it matches UTF-16 *code units*, not
+/// Unicode scalar values: a cwd containing an astral character (e.g. an
+/// emoji, encoded as a surrogate pair) gets two hyphens from Claude CLI, one
+/// per surrogate half. Iterating `char`s would collapse that to one hyphen,
+/// so this walks UTF-16 code units instead to stay byte-for-byte identical
+/// for every cwd, not just the common BMP case.
 fn claude_project_directory(cwd: &Path) -> String {
-    cwd.to_string_lossy().replace(['/', '\\', ':'], "-")
+    cwd.to_string_lossy()
+        .encode_utf16()
+        .map(|unit| match unit {
+            0x30..=0x39 | 0x41..=0x5a | 0x61..=0x7a => {
+                char::from_u32(unit as u32).expect("ASCII alphanumeric code unit is a valid char")
+            }
+            _ => '-',
+        })
+        .collect()
 }
 
 fn claude_session_id(
@@ -1024,6 +1047,38 @@ mod tests {
         assert_eq!(
             claude_project_directory(Path::new(r"C:\Users\bruno\project")),
             "C--Users-bruno-project"
+        );
+    }
+
+    #[test]
+    fn claude_project_directory_also_sanitizes_dots_in_a_windows_username() {
+        // Regression: a real Windows machine with a dotted username
+        // (`C:\Users\Bruno.O\...`) produced an on-disk project directory of
+        // `C--Users-Bruno-O-...` (the dot became a hyphen too) -- confirmed
+        // against `~/.claude/projects` and `~/.claude.json` on that machine.
+        // The earlier fix only added `:` to the replacement set and still
+        // missed `.`, so this case kept failing to match.
+        assert_eq!(
+            claude_project_directory(Path::new(r"C:\Users\Bruno.O\Development\crowded")),
+            "C--Users-Bruno-O-Development-crowded"
+        );
+        assert_eq!(
+            claude_project_directory(Path::new(r"C:\Users\Bruno.O\Development\FVR\test-crowded")),
+            "C--Users-Bruno-O-Development-FVR-test-crowded"
+        );
+    }
+
+    #[test]
+    fn claude_project_directory_matches_claude_cli_on_astral_characters() {
+        // Claude CLI's JS regex (`/[^a-zA-Z0-9]/g`) has no `u` flag, so it
+        // matches UTF-16 *code units*: an astral character like an emoji is
+        // stored as a surrogate pair and gets sanitized to two hyphens, one
+        // per surrogate half. Iterating Rust `char`s (Unicode scalar values)
+        // would collapse that to a single hyphen and mismatch Claude CLI's
+        // real directory name.
+        assert_eq!(
+            claude_project_directory(Path::new("/Users/bruno/\u{1F600}project")),
+            "-Users-bruno---project"
         );
     }
 
