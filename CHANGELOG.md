@@ -7,9 +7,11 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.38.1] - 2026-08-24
+
 ### Fixed
 
-- `claude_project_directory` still failed to match Claude CLI's real on-disk session directory on Windows for any cwd containing a `.` (e.g. a dotted username like `Bruno.O`): the prior fix only added `:` to a hand-picked separator list. Verified directly against a Windows machine's `~/.claude/projects` and `~/.claude.json`, the sanitizer now replaces every non-alphanumeric character with `-`, matching Claude CLI's own rule.
+- `claude_project_directory` still failed to match Claude CLI's real on-disk session directory on Windows for any cwd containing a `.` (e.g. a dotted username like `Bruno.O`): the prior fix only added `:` to a hand-picked separator list. Verified directly against a Windows machine's `~/.claude/projects` and `~/.claude.json`, the sanitizer now replaces every non-alphanumeric UTF-16 code unit with `-`, matching Claude CLI's own rule byte-for-byte (including astral characters, which Claude CLI's `u`-flag-less regex sanitizes per surrogate half).
 
 ## [0.38.0] - 2026-08-22
 
