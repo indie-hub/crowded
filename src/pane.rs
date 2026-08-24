@@ -221,6 +221,19 @@ const RAW_SUBMIT_DELAY: Duration = Duration::from_millis(150);
 #[cfg(windows)]
 const RAW_SUBMIT_DELAY: Duration = Duration::from_secs(1);
 
+// Windows raw-mode/ConPTY readers can consume a lone CR as a line-buffer
+// terminator without ever delivering an Enter key, so a whisper's trailing
+// submit silently drops and the note lands un-submitted. CRLF is the line
+// terminator those readers reliably recognize, so Windows emits `\r\n`;
+// Unix raw TUIs submit on a bare CR and must keep it. The submit stays a
+// separate write, RAW_SUBMIT_DELAY after the bracketed-paste end marker,
+// so it is never read as pasted content -- this constant only picks the
+// byte form that survives the reader.
+#[cfg(windows)]
+const RAW_SUBMIT_BYTES: &[u8] = b"\r\n";
+#[cfg(not(windows))]
+const RAW_SUBMIT_BYTES: &[u8] = b"\r";
+
 fn whisper_parts(
     transport: Transport,
     bracketed_paste: bool,
@@ -239,10 +252,10 @@ fn whisper_parts(
         // A native paste event keeps long agent messages together before Enter.
         Transport::Raw if bracketed_paste => (
             format!("\x1b[200~{note}\x1b[201~").into_bytes(),
-            Some(vec![b'\r']),
+            Some(RAW_SUBMIT_BYTES.to_vec()),
         ),
         // Other raw TUIs may classify a rapid prompt+Enter sequence as one paste.
-        Transport::Raw => (note.into_bytes(), Some(vec![b'\r'])),
+        Transport::Raw => (note.into_bytes(), Some(RAW_SUBMIT_BYTES.to_vec())),
     }
 }
 
@@ -802,7 +815,7 @@ mod tests {
         );
         let (body, submit) = whisper_parts(Transport::Raw, false, "Claude", "hello");
         assert_eq!(body, b"[whisper from Claude] hello");
-        assert_eq!(submit, Some(vec![b'\r']));
+        assert_eq!(submit, Some(RAW_SUBMIT_BYTES.to_vec()));
 
         let (body, submit) = whisper_parts(
             Transport::Raw,
@@ -814,7 +827,34 @@ mod tests {
             body,
             b"\x1b[200~[whisper from OpenCode \xc2\xb7 3] [task: exercise | requested role: result]\nstatus: done\x1b[201~"
         );
-        assert_eq!(submit, Some(vec![b'\r']));
+        assert_eq!(submit, Some(RAW_SUBMIT_BYTES.to_vec()));
+    }
+
+    #[test]
+    fn whisper_submit_is_a_distinct_write_after_the_paste_end_marker() {
+        let (mut pane, captured) = pane_with_capture(4, 20);
+        // Codex opts into bracketed paste, the path where the dropped
+        // submit was reported.
+        pane.spec.program = "codex".into();
+        pane.send_whisper("Room 1", "hello").unwrap();
+        let bytes = captured.lock().unwrap().clone();
+        let expected_body = b"\x1b[200~[whisper from Room 1] hello\x1b[201~";
+        assert!(
+            bytes.starts_with(expected_body),
+            "the paste body must be written first, got {:?}",
+            bytes
+        );
+        let submit = &bytes[expected_body.len()..];
+        assert_eq!(
+            submit,
+            RAW_SUBMIT_BYTES,
+            "the submit must be exactly the platform submit bytes (bare CR on Unix, CRLF on \
+             Windows), written as its own trailing write and never merged into the paste body"
+        );
+        assert!(
+            submit.starts_with(b"\r"),
+            "the submit must always lead with a carriage return"
+        );
     }
 
     #[test]
@@ -1154,6 +1194,10 @@ mod tests {
         }
         fn process_id(&self) -> Option<u32> {
             Some(1)
+        }
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
         }
     }
     impl portable_pty::ChildKiller for FakeChild {
