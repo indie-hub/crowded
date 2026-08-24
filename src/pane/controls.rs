@@ -397,7 +397,7 @@ impl Drop for HomeDirGuard {
 /// against real directories on this machine: `/Users/me/project` ->
 /// `-Users-me-project`).
 fn claude_project_directory(cwd: &Path) -> String {
-    cwd.to_string_lossy().replace(['/', '\\'], "-")
+    cwd.to_string_lossy().replace(['/', '\\', ':'], "-")
 }
 
 fn claude_session_id(
@@ -1020,6 +1020,10 @@ mod tests {
         assert_eq!(
             claude_project_directory(Path::new("/private/tmp/a")),
             "-private-tmp-a"
+        );
+        assert_eq!(
+            claude_project_directory(Path::new(r"C:\Users\bruno\project")),
+            "C--Users-bruno-project"
         );
     }
 
