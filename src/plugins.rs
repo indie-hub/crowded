@@ -937,35 +937,35 @@ fn create_skill_link(target: &Path, link: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn create_skill_link(target: &Path, link: &Path) -> io::Result<()> {
-    use std::os::windows::fs::symlink_dir;
-
-    match symlink_dir(target, link) {
-        Ok(()) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(1314) => {
-            let parent = link
-                .parent()
-                .ok_or_else(|| invalid_input("skill link has no parent"))?;
-            let target = parent.join(target);
-            let status = Command::new("powershell.exe")
-                .args([
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "New-Item -ItemType Junction -Path $env:CROWDED_SKILL_LINK -Target $env:CROWDED_SKILL_TARGET -ErrorAction Stop | Out-Null",
-                ])
-                .env("CROWDED_SKILL_LINK", link)
-                .env("CROWDED_SKILL_TARGET", target)
-                .status()?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err(io::Error::other(format!(
-                    "could not create Windows skill junction: {status}"
-                )))
-            }
-        }
-        Err(error) => Err(error),
+    // Windows directory skill links must always be junctions, never plain
+    // symbolic links. Claude Code and Codex CLI skill scanners only reliably
+    // discover junctions (especially not relative symlinks), so making the
+    // link type depend on whether the process holds the symlink privilege
+    // left some installs undiscovered. Junctions do not need that privilege,
+    // so there is no scenario where the old symlink attempt would succeed but
+    // a junction would not. Junctions also cannot be relative, so the
+    // relative `target` is resolved against the link's directory first.
+    let parent = link
+        .parent()
+        .ok_or_else(|| invalid_input("skill link has no parent"))?;
+    let target = parent.join(target);
+    let status = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "New-Item -ItemType Junction -Path $env:CROWDED_SKILL_LINK -Target $env:CROWDED_SKILL_TARGET -ErrorAction Stop | Out-Null",
+        ])
+        .env("CROWDED_SKILL_LINK", link)
+        .env("CROWDED_SKILL_TARGET", target)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "could not create Windows skill junction: {status}"
+        )))
     }
 }
 
@@ -1093,7 +1093,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_skill_links_work_without_symlink_privilege() {
+    fn windows_skill_links_are_junctions_with_absolute_targets() {
         let base = test_directory();
         let target = base.join("target");
         let link = base.join("skill-link");
@@ -1102,10 +1102,16 @@ mod tests {
 
         create_skill_link(Path::new("target"), &link).unwrap();
 
-        assert!(link.join("SKILL.md").is_file());
+        let resolved = fs::read_link(&link).unwrap();
+        // Junctions require absolute targets; the old privilege-dependent code
+        // created relative symbolic links when the symlink privilege was held,
+        // which Windows skill scanners fail to discover.
         assert!(
-            skill_link_matches(&link, &fs::read_link(&link).unwrap(), Path::new("target")).unwrap()
+            resolved.is_absolute(),
+            "Windows skill link must be a junction with an absolute target, got {resolved:?}"
         );
+        assert!(link.join("SKILL.md").is_file());
+        assert!(skill_link_matches(&link, &resolved, Path::new("target")).unwrap());
 
         remove_skill_link(&link).unwrap();
 
