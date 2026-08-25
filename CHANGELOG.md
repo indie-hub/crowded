@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-08-25
+
+### Added
+
+- The Room Pulse panel now colors each room's state word by its resolved state: offline/error render red, ready renders green, and thinking/working/starting render yellow. The focused room's title line keeps its existing cyan highlight, unaffected by the new state coloring.
+
 ## [0.38.1] - 2026-08-24
 
 ### Fixed
