@@ -662,6 +662,10 @@ impl Pane {
         Ok(())
     }
 
+    pub(crate) fn resend_whisper_submit(&mut self) -> io::Result<()> {
+        self.write_bytes(RAW_SUBMIT_BYTES)
+    }
+
     pub(crate) fn poll_exit(&mut self) -> io::Result<()> {
         self.child.poll_exit().map(|_| ())
     }
@@ -851,8 +855,7 @@ mod tests {
         );
         let submit = &bytes[expected_body.len()..];
         assert_eq!(
-            submit,
-            RAW_SUBMIT_BYTES,
+            submit, RAW_SUBMIT_BYTES,
             "the submit must be exactly the platform submit bytes (bare CR on Unix, CRLF on \
              Windows), written as its own trailing write and never merged into the paste body"
         );

@@ -688,8 +688,14 @@ fn refresh_pulse_cost(
     }
 }
 
+struct PendingSubmit<'a> {
+    queue: &'a mut VecDeque<(Instant, usize, bool)>,
+    now: Instant,
+}
+
 fn inject_ready_pending(
     pending: &mut VecDeque<(u64, usize)>,
+    submit: PendingSubmit<'_>,
     mailroom: &mut Mailroom,
     panes: &mut [Pane],
     gates: &mut [DeliveryGate],
@@ -713,6 +719,7 @@ fn inject_ready_pending(
         match mailroom.inject(id, &mut panes[target]) {
             Ok(()) => {
                 gates[target].message_sent();
+                submit.queue.push_back((submit.now, target, false));
                 fuse.record();
                 injected += 1;
             }
@@ -720,6 +727,36 @@ fn inject_ready_pending(
         }
     }
     (injected, failed)
+}
+
+fn resend_whisper_submits(
+    pending: &mut VecDeque<(Instant, usize, bool)>,
+    panes: &mut [Pane],
+    input_ready: &[bool],
+    now: Instant,
+) -> io::Result<()> {
+    for _ in 0..pending.len() {
+        let Some((injected_at, target, saw_busy)) = pending.pop_front() else {
+            break;
+        };
+        if !saw_busy && input_ready[target] {
+            continue;
+        }
+        if resend_whisper_submit_due(
+            saw_busy,
+            input_ready[target],
+            now.duration_since(injected_at),
+        ) {
+            panes[target].resend_whisper_submit()?;
+            continue;
+        }
+        pending.push_back((injected_at, target, true));
+    }
+    Ok(())
+}
+
+fn resend_whisper_submit_due(saw_busy: bool, input_ready: bool, waited: Duration) -> bool {
+    saw_busy && (input_ready || waited >= INTRO_READINESS_CEILING)
 }
 
 fn pane_size(outer: Rect) -> PtySize {
@@ -906,6 +943,7 @@ fn run_with(
     let mut fuse = DeliveryFuse::new(fuse_size);
     let mut delivery_paused = false;
     let mut pending = VecDeque::<(u64, usize)>::new();
+    let mut submit_pending = VecDeque::<(Instant, usize, bool)>::new();
     let mut room_pulses = vec![None::<PulseSample>; room_count];
     let mut pulse_costs = vec![None::<(Instant, String)>; room_count];
     // Holds the event that ended a wheel burst, so draining never discards it,
@@ -930,6 +968,7 @@ fn run_with(
                 pane.automation_input_ready(output_is_quiet)
             })
             .collect();
+        resend_whisper_submits(&mut submit_pending, &mut panes, &input_ready, now)?;
         for index in 0..room_count {
             delivery_gates[index].observe(input_ready[index]);
             let waited = now.duration_since(spawned_at[index]);
@@ -962,6 +1001,10 @@ fn run_with(
         if !delivery_paused {
             let (injected, failed) = inject_ready_pending(
                 &mut pending,
+                PendingSubmit {
+                    queue: &mut submit_pending,
+                    now,
+                },
                 &mut mailroom,
                 &mut panes,
                 &mut delivery_gates,
@@ -1124,6 +1167,7 @@ fn run_with(
                     Ok(()) => {
                         envelope.reply_injected(id);
                         delivery_gates[envelope.to].message_sent();
+                        submit_pending.push_back((now, envelope.to, false));
                         fuse.record();
                         if fuse.is_tripped() {
                             delivery_paused = true;
@@ -1454,6 +1498,7 @@ fn run_with(
                                             notice = Some(match result {
                                                 Ok(()) => {
                                                     delivery_gates[target].message_sent();
+                                                    submit_pending.push_back((now, target, false));
                                                     format!("Envelope #{id:04} injected")
                                                 }
                                                 Err(error) => {
@@ -2253,6 +2298,22 @@ mod tests {
         gate.observe(false);
         gate.observe(true);
         assert!(gate.can_deliver(true));
+    }
+
+    #[test]
+    fn whisper_submit_resend_waits_for_busy_then_ready_or_ceiling() {
+        assert!(!resend_whisper_submit_due(false, true, Duration::ZERO));
+        assert!(!resend_whisper_submit_due(
+            true,
+            false,
+            Duration::from_secs(14)
+        ));
+        assert!(resend_whisper_submit_due(true, true, Duration::ZERO));
+        assert!(resend_whisper_submit_due(
+            true,
+            false,
+            INTRO_READINESS_CEILING,
+        ));
     }
 
     #[test]
