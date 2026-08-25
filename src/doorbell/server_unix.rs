@@ -555,6 +555,7 @@ mod tests {
                         headroom: true,
                         pulse_age_ms: None,
                         capabilities: Default::default(),
+                        scheduling: None,
                     }]);
                     break;
                 }

@@ -8,6 +8,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::RoomScheduling;
+
 pub(super) const MAX_WIRE_BYTES: usize = 2 * 1024 * 1024;
 pub(super) const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_ID_BYTES: usize = 128;
@@ -163,6 +165,8 @@ pub(crate) struct RosterRoom {
     /// model catalogue. Never probed at runtime.
     #[serde(default)]
     pub(crate) capabilities: RoomCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) scheduling: Option<RoomScheduling>,
 }
 
 fn unknown_cost() -> String {
@@ -527,6 +531,7 @@ mod tests {
                 effort_levels: Vec::new(),
                 model_catalogue: ModelCatalogue::Unknown,
             },
+            scheduling: None,
         };
         let value = serde_json::to_value(&room).unwrap();
         assert_eq!(value["state"], "ready");
@@ -545,6 +550,48 @@ mod tests {
             serde_json::json!([])
         );
         assert_eq!(value["capabilities"]["model_catalogue"], "unknown");
+        assert!(value.get("scheduling").is_none());
+    }
+
+    #[test]
+    fn roster_scheduling_serializes_separately_from_capabilities() {
+        let room = RosterRoom {
+            room: 1,
+            name: "Builder".to_owned(),
+            guest: "codex".to_owned(),
+            vendor: "openai".to_owned(),
+            transport: "raw".to_owned(),
+            state: PulseState::Ready,
+            state_source: PulseSource::Hook,
+            allow_control: true,
+            model: None,
+            effort: None,
+            cost: "unknown".to_owned(),
+            headroom: false,
+            pulse_age_ms: None,
+            capabilities: RoomCapabilities::default(),
+            scheduling: Some(RoomScheduling {
+                model_tier: Some("balanced".to_owned()),
+                cost_tier: Some("medium".to_owned()),
+                capabilities: vec!["implement".to_owned(), "validate".to_owned()],
+            }),
+        };
+        let value = serde_json::to_value(&room).unwrap();
+        assert_eq!(value["scheduling"]["model_tier"], "balanced");
+        assert_eq!(value["scheduling"]["cost_tier"], "medium");
+        assert_eq!(
+            value["scheduling"]["capabilities"],
+            serde_json::json!(["implement", "validate"])
+        );
+        assert_eq!(
+            value["capabilities"],
+            serde_json::json!({
+                "controls": false,
+                "supported_controls": [],
+                "effort_levels": [],
+                "model_catalogue": "unknown",
+            })
+        );
     }
 
     #[test]

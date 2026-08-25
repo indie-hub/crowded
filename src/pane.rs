@@ -16,7 +16,7 @@ use tui_term::vt100::{Parser, Screen};
 
 use crate::{
     command::{ResolvedCommand, headroom_on_path},
-    config::{RoomSpec, Transport},
+    config::{RoomScheduling, RoomSpec, Transport},
     doorbell::RoomCapabilities,
 };
 
@@ -722,6 +722,10 @@ impl Pane {
         controls::capabilities(&self.spec)
     }
 
+    pub(crate) fn scheduling(&self) -> Option<RoomScheduling> {
+        self.spec.scheduling.clone()
+    }
+
     fn reconfigure<T>(
         &mut self,
         size: PtySize,
@@ -779,6 +783,7 @@ mod tests {
             variables: Vec::new(),
             allow_control: true,
             use_headroom: false,
+            scheduling: None,
             headroom_args: Vec::new(),
         }
     }

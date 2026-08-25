@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -109,6 +109,18 @@ pub(crate) struct RoomConfig {
     pub(crate) use_headroom: bool,
     #[serde(default)]
     headroom_args: Vec<String>,
+    model_tier: Option<String>,
+    cost_tier: Option<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct RoomScheduling {
+    pub(crate) model_tier: Option<String>,
+    pub(crate) cost_tier: Option<String>,
+    #[serde(default)]
+    pub(crate) capabilities: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -123,6 +135,7 @@ pub(crate) struct RoomSpec {
     pub(crate) variables: Vec<(OsString, OsString)>,
     pub(crate) allow_control: bool,
     pub(crate) use_headroom: bool,
+    pub(crate) scheduling: Option<RoomScheduling>,
     /// Args for the `headroom` wrapper itself (e.g. its own flags), placed
     /// after the wrapped program name and before the program's own args:
     /// `headroom wrap <program> <headroom_args...> <args...>`. Ignored when
@@ -147,6 +160,7 @@ impl RoomSpec {
             variables: Vec::new(),
             allow_control: false,
             use_headroom: false,
+            scheduling: None,
             headroom_args: Vec::new(),
         }
     }
@@ -171,6 +185,8 @@ impl RoomSpec {
             ));
         }
         let vendor = configured_vendor(program.as_os_str(), config.vendor.as_deref())?;
+        let scheduling =
+            configured_scheduling(config.model_tier, config.cost_tier, config.capabilities)?;
 
         Ok(Self {
             name: name.to_owned(),
@@ -183,6 +199,7 @@ impl RoomSpec {
             variables: Vec::new(),
             allow_control: config.allow_control,
             use_headroom: config.use_headroom,
+            scheduling,
             headroom_args: config.headroom_args.into_iter().map(Into::into).collect(),
         })
     }
@@ -308,6 +325,49 @@ fn configured_vendor(program: &OsStr, configured: Option<&str>) -> io::Result<St
         ));
     }
     Ok(vendor)
+}
+
+fn configured_scheduling(
+    model_tier: Option<String>,
+    cost_tier: Option<String>,
+    capabilities: Vec<String>,
+) -> io::Result<Option<RoomScheduling>> {
+    validate_scheduling_value(
+        model_tier.as_deref(),
+        "model_tier",
+        &["fast", "balanced", "deep"],
+    )?;
+    validate_scheduling_value(
+        cost_tier.as_deref(),
+        "cost_tier",
+        &["low", "medium", "high"],
+    )?;
+    for capability in &capabilities {
+        validate_scheduling_value(
+            Some(capability),
+            "capabilities",
+            &["produce", "implement", "validate", "qa", "audit"],
+        )?;
+    }
+    if model_tier.is_none() && cost_tier.is_none() && capabilities.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(RoomScheduling {
+            model_tier,
+            cost_tier,
+            capabilities,
+        }))
+    }
+}
+
+fn validate_scheduling_value(value: Option<&str>, field: &str, allowed: &[&str]) -> io::Result<()> {
+    if value.is_none_or(|value| allowed.contains(&value)) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("room {field} must be one of {}", allowed.join(", ")),
+    ))
 }
 
 fn parse_room_file(text: &str) -> io::Result<RoomFile> {
@@ -512,6 +572,53 @@ mod tests {
         assert!(!guest.use_headroom);
         assert!(guest.headroom_args.is_empty());
         assert_eq!(guest.title, "codex · 2");
+    }
+
+    #[test]
+    fn room_scheduling_parses_and_omits_empty_metadata() {
+        let rooms = room_specs_from_toml(
+            r#"
+[[rooms]]
+command = "codex"
+transport = "raw"
+model_tier = "balanced"
+cost_tier = "medium"
+capabilities = ["implement", "qa"]
+
+[[rooms]]
+command = "claude"
+transport = "raw"
+"#,
+        )
+        .unwrap()
+        .specs;
+        assert_eq!(
+            rooms[0].scheduling,
+            Some(RoomScheduling {
+                model_tier: Some("balanced".to_owned()),
+                cost_tier: Some("medium".to_owned()),
+                capabilities: vec!["implement".to_owned(), "qa".to_owned()],
+            })
+        );
+        assert_eq!(rooms[1].scheduling, None);
+    }
+
+    #[test]
+    fn invalid_room_scheduling_values_are_rejected() {
+        for (field, name) in [
+            ("model_tier = \"slow\"", "model_tier"),
+            ("cost_tier = \"free\"", "cost_tier"),
+            ("capabilities = [\"deploy\"]", "capabilities"),
+        ] {
+            let result = room_specs_from_toml(&format!(
+                "[[rooms]]\ncommand = \"codex\"\ntransport = \"raw\"\n{field}\n\n[[rooms]]\ncommand = \"claude\"\ntransport = \"raw\""
+            ));
+            let Err(error) = result else {
+                panic!("invalid {field} should fail");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains(name));
+        }
     }
 
     #[test]

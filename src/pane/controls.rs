@@ -928,6 +928,7 @@ mod tests {
             variables: Vec::new(),
             allow_control: false,
             use_headroom: false,
+            scheduling: None,
             headroom_args: Vec::new(),
         }
     }
@@ -1430,6 +1431,7 @@ mod tests {
             variables: Vec::new(),
             allow_control: true,
             use_headroom: false,
+            scheduling: None,
             headroom_args: Vec::new(),
         };
         let room4 = RoomSpec {
@@ -1443,6 +1445,7 @@ mod tests {
             variables: Vec::new(),
             allow_control: true,
             use_headroom: false,
+            scheduling: None,
             headroom_args: Vec::new(),
         };
 
@@ -1531,6 +1534,7 @@ mod tests {
             variables: Vec::new(),
             allow_control: true,
             use_headroom: false,
+            scheduling: None,
             headroom_args: Vec::new(),
         };
         let mut specs = [spec("OpenCode \u{00b7} 3"), spec("OpenCode \u{00b7} 4")];
@@ -1598,6 +1602,7 @@ mod tests {
             variables: Vec::new(),
             allow_control: true,
             use_headroom: false,
+            scheduling: None,
             headroom_args: Vec::new(),
         }
     }

@@ -995,6 +995,7 @@ fn run_with(
                                             as u64
                                     }),
                                     capabilities: pane.capabilities(),
+                                    scheduling: pane.scheduling(),
                                 }
                             })
                             .collect(),

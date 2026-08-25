@@ -105,6 +105,9 @@ command = "claude"
 vendor = "anthropic"
 transport = "raw"
 allow_control = true
+model_tier = "balanced" # fast | balanced | deep
+cost_tier = "medium" # low | medium | high
+capabilities = ["implement", "validate"] # produce | implement | validate | qa | audit
 
 [[rooms]]
 name = "Codex"
