@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-08-25
+
+### Added
+
+- `crowded.toml` room entries can now declare optional scheduling metadata: `model_tier` (`fast`, `balanced`, or `deep`), `cost_tier` (`low`, `medium`, or `high`), and `capabilities` (any of `produce`, `implement`, `validate`, `qa`, `audit`). Values are validated at config load; omitting them is fully backward compatible. `crowded roster --json` exposes the resolved values per room under a new `scheduling` object, kept separate from the existing `capabilities` adapter-feature-matrix field.
+
 ## [0.39.0] - 2026-08-25
 
 ### Added
