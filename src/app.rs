@@ -594,6 +594,16 @@ fn pulse_total(costs: &[Option<(Instant, String)>], captured: &[bool]) -> Option
 }
 
 /// Render the full Room Pulse line list: each room's title and state line, a
+fn resolve_state_color(state_str: &str) -> Option<Color> {
+    let word = state_str.split_whitespace().next()?;
+    match word {
+        "offline" | "error" => Some(Color::Red),
+        "ready" => Some(Color::Green),
+        "thinking" | "working" | "starting" => Some(Color::Yellow),
+        _ => None,
+    }
+}
+
 /// blank separator between rooms, and the optional Total line. `costs` holds
 /// one optional cost string per room (the rendered `$...` or "unknown" figure
 /// produced by the cost cache). `focused` selects the cyan-highlighted room,
@@ -624,7 +634,12 @@ fn render_pulse_lines(
             .unwrap_or_default();
         let style = pulse_entry_style(index, focused);
         lines.push(Line::styled(title, style));
-        lines.push(Line::styled(format!("  {}{cost}", states[index]), style));
+        let state_style =
+            resolve_state_color(states[index]).map_or(Style::default(), |c| Style::default().fg(c));
+        lines.push(Line::styled(
+            format!("  {}{cost}", states[index]),
+            state_style,
+        ));
     }
     if let Some(total) = pulse_total(costs, sessions) {
         lines.push(Line::styled(total, Style::default()));
@@ -2006,6 +2021,101 @@ mod tests {
         assert_eq!(pulse_entry_style(1, 1), Style::default().fg(Color::Cyan));
         assert_eq!(pulse_entry_style(0, 1), Style::default());
         assert_eq!(pulse_entry_style(2, 1), Style::default());
+    }
+
+    fn state_line_style(lines: &[Line], room_index: usize) -> Style {
+        let offset = if room_index > 0 { room_index } else { 0 };
+        let idx = room_index * 2 + offset;
+        lines.get(idx + 1).map_or(Style::default(), |l| l.style)
+    }
+
+    #[test]
+    fn render_pulse_state_color_offline_red() {
+        let lines = render_pulse_lines(
+            &["A · 1", "B · 2"],
+            &[false, false],
+            &[false, false],
+            &["offline", "ready"],
+            &[None, None],
+            1,
+        );
+        assert_eq!(state_line_style(&lines, 0), Style::default().fg(Color::Red));
+    }
+
+    #[test]
+    fn render_pulse_state_color_error_red() {
+        let lines = render_pulse_lines(&["A · 1"], &[false], &[false], &["error · 3s"], &[None], 1);
+        assert_eq!(state_line_style(&lines, 0), Style::default().fg(Color::Red));
+    }
+
+    #[test]
+    fn render_pulse_state_color_ready_green() {
+        let lines = render_pulse_lines(&["A · 1"], &[false], &[true], &["ready · 2s"], &[None], 1);
+        assert_eq!(
+            state_line_style(&lines, 0),
+            Style::default().fg(Color::Green)
+        );
+    }
+
+    #[test]
+    fn render_pulse_state_color_thinking_yellow() {
+        let lines = render_pulse_lines(
+            &["A · 1"],
+            &[false],
+            &[false],
+            &["thinking · 5s"],
+            &[None],
+            1,
+        );
+        assert_eq!(
+            state_line_style(&lines, 0),
+            Style::default().fg(Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn render_pulse_state_color_working_yellow() {
+        let lines = render_pulse_lines(&["A · 1"], &[false], &[false], &["working"], &[None], 1);
+        assert_eq!(
+            state_line_style(&lines, 0),
+            Style::default().fg(Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn render_pulse_state_color_starting_yellow() {
+        let lines = render_pulse_lines(
+            &["A · 1"],
+            &[false],
+            &[false],
+            &["starting · 1s"],
+            &[None],
+            1,
+        );
+        assert_eq!(
+            state_line_style(&lines, 0),
+            Style::default().fg(Color::Yellow)
+        );
+    }
+
+    #[test]
+    fn render_pulse_state_color_unknown_unstyled() {
+        let lines = render_pulse_lines(&["A · 1"], &[false], &[false], &["bogus"], &[None], 1);
+        assert_eq!(state_line_style(&lines, 0), Style::default());
+    }
+
+    #[test]
+    fn render_pulse_focused_title_stays_cyan() {
+        let lines = render_pulse_lines(
+            &["A · 1", "B · 2"],
+            &[false, false],
+            &[false, false],
+            &["offline", "ready"],
+            &[None, None],
+            0,
+        );
+        assert_eq!(lines[0].style, Style::default().fg(Color::Cyan));
+        assert_eq!(lines[1].style, Style::default().fg(Color::Red));
     }
 
     #[test]
