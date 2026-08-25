@@ -1,9 +1,13 @@
 //! Doorbell command-line clients.
 
 use std::{
-    env, process,
+    env,
+    io::{self, IsTerminal},
+    process,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+use serde::Deserialize;
 
 #[cfg(unix)]
 use super::client_unix::send_request;
@@ -198,6 +202,7 @@ pub(crate) fn pulse_command() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let mut model: Option<String> = None;
+    let mut from_hook = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--model" => {
@@ -207,8 +212,19 @@ pub(crate) fn pulse_command() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 model = Some(value);
             }
+            "--hook-stdin" => from_hook = true,
             _ => return Err(PULSE_USAGE.into()),
         }
+    }
+    if from_hook {
+        if model.is_some() {
+            return Err("--model and --hook-stdin cannot be combined".into());
+        }
+        model = if io::stdin().is_terminal() {
+            None
+        } else {
+            hook_payload_model(io::stdin().lock())
+        };
     }
     let token = env::var("CROWDED_TOKEN").map_err(|_| "CROWDED_TOKEN is not set")?;
     let room = env::var("CROWDED_ROOM").unwrap_or_else(|_| "external".to_owned());
@@ -222,8 +238,33 @@ pub(crate) fn pulse_command() -> Result<(), Box<dyn std::error::Error>> {
     response.into_result("Doorbell rejected pulse")
 }
 
-const PULSE_USAGE: &str =
-    "usage: crowded pulse starting|thinking|working|ready|error|offline [--model MODEL]";
+const PULSE_USAGE: &str = "usage: crowded pulse starting|thinking|working|ready|error|offline [--model MODEL | --hook-stdin]";
+
+/// A permissive view of a vendor hook payload: the only field the pulse hook
+/// reads is the optional active `model`, when the runtime supplies it. Unknown
+/// fields are ignored so the same reader works for Claude, Codex, and any
+/// future hook shape.
+#[derive(Deserialize)]
+struct HookPayload {
+    model: Option<String>,
+}
+
+/// Reads a vendor hook JSON payload and returns its `model` field when present
+/// and usable, so a generated hook command can hand the runtime-reported model
+/// to `crowded pulse --hook-stdin` without shell-side JSON parsing. Returns
+/// `None` when the input is not JSON, carries no model, or the model is not
+/// a usable slug; the pulse then degrades to the plain no-model report.
+fn hook_payload_model<R: io::Read>(mut input: R) -> Option<String> {
+    let mut text = String::new();
+    input.read_to_string(&mut text).ok()?;
+    let payload: HookPayload = serde_json::from_str(&text).ok()?;
+    payload.model.filter(|model| {
+        !model.is_empty()
+            && model.len() <= MAX_MODEL_BYTES
+            && !model.starts_with('-')
+            && !model.chars().any(char::is_control)
+    })
+}
 
 pub(crate) fn roster_command() -> Result<(), Box<dyn std::error::Error>> {
     match (env::args().nth(2).as_deref(), env::args().nth(3)) {
@@ -248,5 +289,51 @@ impl WireResponse {
         } else {
             Err(self.error.unwrap_or_else(|| fallback.to_owned()).into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_payload_model_extracts_the_active_model_when_present() {
+        assert_eq!(
+            hook_payload_model(
+                br#"{"session_id":"s","hook_event_name":"PreToolUse","model":"o4-mini"}"#
+                    .as_slice()
+            ),
+            Some("o4-mini".to_owned())
+        );
+        assert_eq!(
+            hook_payload_model(br#"{"model":"deepseek/deepseek-v4-flash"}"#.as_slice()),
+            Some("deepseek/deepseek-v4-flash".to_owned())
+        );
+    }
+
+    #[test]
+    fn hook_payload_model_degrades_when_the_payload_carries_no_usable_model() {
+        assert_eq!(hook_payload_model(br#"{}"#.as_slice()), None);
+        assert_eq!(
+            hook_payload_model(br#"{"session_id":"s"}"#.as_slice()),
+            None
+        );
+        assert_eq!(hook_payload_model(br#"{"model":""}"#.as_slice()), None);
+        assert_eq!(hook_payload_model(b"not json".as_slice()), None);
+        assert_eq!(hook_payload_model(b"".as_slice()), None);
+    }
+
+    #[test]
+    fn hook_payload_model_rejects_a_model_that_would_fail_server_validation() {
+        assert_eq!(
+            hook_payload_model(br#"{"model":"-startswith-dash"}"#.as_slice()),
+            None
+        );
+        assert_eq!(
+            hook_payload_model(br#"{"model":"has\ncontrol"}"#.as_slice()),
+            None
+        );
+        let oversized = format!(r#"{{"model":"{}"}}"#, "x".repeat(129));
+        assert_eq!(hook_payload_model(oversized.as_bytes()), None);
     }
 }

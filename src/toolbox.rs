@@ -830,13 +830,18 @@ fn merge_hooks(original: Option<&str>, path: &Path, windows_command: bool) -> io
         ("Stop", "ready"),
         ("SessionEnd", "offline"),
     ] {
+        // `--hook-stdin` lets the pulse read the active model straight off the
+        // hook JSON payload when the vendor runtime supplies one (Codex always
+        // does; Claude only on SessionStart), while degrading to a plain pulse
+        // when the payload carries no model field.
         let mut hook = serde_json::json!({
             "type": "command",
-            "command": format!("\"$CROWDED_BIN\" pulse {state}"),
+            "command": format!("\"$CROWDED_BIN\" pulse {state} --hook-stdin"),
             "timeout": 3
         });
         if windows_command {
-            hook["commandWindows"] = Value::String(format!("& \"$env:CROWDED_BIN\" pulse {state}"));
+            hook["commandWindows"] =
+                Value::String(format!("& \"$env:CROWDED_BIN\" pulse {state} --hook-stdin"));
         }
         let entry = serde_json::json!({ "hooks": [hook] });
         let handlers = hooks
@@ -863,24 +868,32 @@ fn merge_hooks(original: Option<&str>, path: &Path, windows_command: bool) -> io
     Ok(output)
 }
 
-const OPENCODE_PULSE_PLUGIN: &str = r#"const pulse = async (state) => {
+const OPENCODE_PULSE_PLUGIN: &str = r#"const pulse = async (state, model) => {
   const crowded = process.env.CROWDED_BIN
   if (!crowded) return
-  await Bun.spawn([crowded, "pulse", state], {
+  const args = [crowded, "pulse", state]
+  if (model) args.push("--model", model)
+  await Bun.spawn(args, {
     stdout: "ignore",
     stderr: "ignore",
   }).exited
 }
 
+let currentModel = null
+
 export const CrowdedPulse = async () => {
   await pulse("starting")
   return {
-    "chat.message": async () => pulse("thinking"),
-    "tool.execute.before": async () => pulse("working"),
+    "chat.message": async (input) => {
+      const model = input.model
+      currentModel = model ? `${model.providerID}/${model.modelID}` : null
+      await pulse("thinking", currentModel)
+    },
+    "tool.execute.before": async () => pulse("working", currentModel),
     event: async ({ event }) => {
-      if (event.type === "session.idle") await pulse("ready")
-      if (event.type === "session.error") await pulse("error")
-      if (event.type === "session.deleted") await pulse("offline")
+      if (event.type === "session.idle") await pulse("ready", currentModel)
+      if (event.type === "session.error") await pulse("error", currentModel)
+      if (event.type === "session.deleted") await pulse("offline", currentModel)
     },
   }
 }
@@ -1310,7 +1323,7 @@ mod tests {
         assert_eq!(claude_hooks["keep"], true);
         assert_eq!(
             claude_hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-            "\"$CROWDED_BIN\" pulse working"
+            "\"$CROWDED_BIN\" pulse working --hook-stdin"
         );
         assert!(
             claude_hooks["hooks"]["PreToolUse"][0]["hooks"][0]
@@ -1335,12 +1348,17 @@ mod tests {
                 .unwrap();
         assert_eq!(
             codex_hooks["hooks"]["PreToolUse"][0]["hooks"][0]["commandWindows"],
-            "& \"$env:CROWDED_BIN\" pulse working"
+            "& \"$env:CROWDED_BIN\" pulse working --hook-stdin"
         );
         assert!(
             fs::read_to_string(root.join(".opencode/plugins/crowded-pulse.js"))
                 .unwrap()
                 .contains("session.idle")
+        );
+        assert!(
+            fs::read_to_string(root.join(".opencode/plugins/crowded-pulse.js"))
+                .unwrap()
+                .contains("providerID")
         );
         let mut rewritten: Value =
             serde_json::from_str(&fs::read_to_string(root.join("opencode.json")).unwrap()).unwrap();
