@@ -7,6 +7,18 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-08-25
+
+### Added
+
+- `crowded roster --json` and the welcome roster line now show a room's self-reported model, even when the operator never ran `control model`. The hook pulse wire carries an optional model field, `crowded pulse <state> --model` forwards it, and a fresh self-report fills an unconfigured value while `control model` still wins as an explicit override.
+- Real Claude, Codex, and OpenCode hooks now populate that self-report automatically: `crowded pulse <state> --hook-stdin` reads the vendor hook's stdin JSON and extracts a model field when present (Codex: every hook event; Claude: `SessionStart` only, not guaranteed; OpenCode: the plugin `chat.message` hook), degrading cleanly to a plain pulse otherwise.
+
+### Fixed
+
+- A whisper injected into a room whose CLI had not finished starting could land as typed-but-unsubmitted text: the injection path wrote the body then submitted after a flat delay with no readiness check. Mailroom injection now resends exactly one Enter once the target becomes ready or a bounded ceiling is reached, and never double-submits an already-ready pane.
+- Windows plugin skill links (`.claude/skills/`, `.agents/skills/`, `.opencode/skills/`) are now always created as junctions with an absolute target. The previous logic attempted a plain symbolic link first and only fell back to a junction on a symlink-privilege failure, so whether a plugin's skills were discoverable by Claude Code and Codex CLI on Windows depended on the host machine's ambient privilege state at install time rather than being reliable by design.
+
 ## [0.40.0] - 2026-08-25
 
 ### Added
