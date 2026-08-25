@@ -185,19 +185,31 @@ pub(crate) fn control_command() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub(crate) fn pulse_command() -> Result<(), Box<dyn std::error::Error>> {
-    let state = match (env::args().nth(2).as_deref(), env::args().nth(3)) {
-        (Some("starting"), None) => PulseState::Starting,
-        (Some("thinking"), None) => PulseState::Thinking,
-        (Some("working"), None) => PulseState::Working,
-        (Some("ready"), None) => PulseState::Ready,
-        (Some("error"), None) => PulseState::Error,
-        (Some("offline"), None) => PulseState::Offline,
+    let mut args = env::args().skip(2);
+    let state = match args.next().as_deref() {
+        Some("starting") => PulseState::Starting,
+        Some("thinking") => PulseState::Thinking,
+        Some("working") => PulseState::Working,
+        Some("ready") => PulseState::Ready,
+        Some("error") => PulseState::Error,
+        Some("offline") => PulseState::Offline,
         _ => {
-            return Err(
-                "usage: crowded pulse starting|thinking|working|ready|error|offline".into(),
-            );
+            return Err(PULSE_USAGE.into());
         }
     };
+    let mut model: Option<String> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--model" => {
+                let value = args.next().ok_or(PULSE_USAGE)?;
+                if value.is_empty() {
+                    return Err(PULSE_USAGE.into());
+                }
+                model = Some(value);
+            }
+            _ => return Err(PULSE_USAGE.into()),
+        }
+    }
     let token = env::var("CROWDED_TOKEN").map_err(|_| "CROWDED_TOKEN is not set")?;
     let room = env::var("CROWDED_ROOM").unwrap_or_else(|_| "external".to_owned());
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -205,9 +217,13 @@ pub(crate) fn pulse_command() -> Result<(), Box<dyn std::error::Error>> {
         token,
         id: format!("{room}-pulse-{}-{now}", process::id()),
         state,
+        model,
     }))?;
     response.into_result("Doorbell rejected pulse")
 }
+
+const PULSE_USAGE: &str =
+    "usage: crowded pulse starting|thinking|working|ready|error|offline [--model MODEL]";
 
 pub(crate) fn roster_command() -> Result<(), Box<dyn std::error::Error>> {
     match (env::args().nth(2).as_deref(), env::args().nth(3)) {

@@ -192,6 +192,7 @@ fn listener_loop(
                                     match events.try_send(DoorbellEvent::Pulse(DoorbellPulse {
                                         from,
                                         state: request.state,
+                                        model: request.model,
                                     })) {
                                         Ok(()) => {
                                             remember_id(request.id, &mut seen, &mut seen_order);
@@ -509,6 +510,7 @@ mod tests {
             token: "left".to_owned(),
             id: "pulse-1".to_owned(),
             state: PulseState::Working,
+            model: None,
         };
         assert_eq!(
             validate_pulse(&request, &["left".to_owned(), "right".to_owned()]),

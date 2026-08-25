@@ -18,6 +18,7 @@ pub(super) const MAX_HOPS: u8 = 8;
 pub(super) const MAX_MESSAGES_PER_SECOND: usize = 5;
 pub(super) const EVENT_QUEUE_CAPACITY: usize = 100;
 pub(super) const DEDUPE_CAPACITY: usize = 256;
+pub(super) const MAX_MODEL_BYTES: usize = 128;
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum WireRequest {
@@ -46,6 +47,10 @@ pub(super) struct PulseRequest {
     pub(super) token: String,
     pub(super) id: String,
     pub(super) state: PulseState,
+    /// Optional self-reported model the hook is actually running, so the
+    /// roster can show it even when the operator never set `control model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) model: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -296,6 +301,7 @@ pub(crate) struct DoorbellEnvelope {
 pub(crate) struct DoorbellPulse {
     pub(crate) from: usize,
     pub(crate) state: PulseState,
+    pub(crate) model: Option<String>,
 }
 
 pub(crate) struct DoorbellControl {
@@ -451,6 +457,17 @@ fn validate_identity(
 }
 
 pub(super) fn validate_pulse(request: &PulseRequest, tokens: &[String]) -> Result<usize, String> {
+    if let Some(model) = request.model.as_deref()
+        && (model.is_empty()
+            || model.len() > MAX_MODEL_BYTES
+            || model.starts_with('-')
+            || model.chars().any(char::is_control))
+    {
+        return Err(
+            "model must contain 1..=128 bytes, must not start with `-`, and must not contain controls"
+                .to_owned(),
+        );
+    }
     validate_identity(&request.token, &request.id, "pulse", tokens)
 }
 

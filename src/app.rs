@@ -334,15 +334,18 @@ fn house_rules(room: usize, roster: &str, fuse_limit: usize) -> String {
 /// the numeric room) plus the model and effort it is configured with. Built
 /// from the live pane accessors at each intro instead of frozen at startup,
 /// so a room reconfigured by a peer control announces what the Doorbell
-/// roster JSON would report now.
-fn welcome_roster(panes: &[Pane]) -> String {
+/// roster JSON would report now. The effective model resolves a fresh hook
+/// self-report against the configured value the same way `roster --json` does.
+fn welcome_roster(panes: &[Pane], pulses: &[Option<PulseSample>], now: Instant) -> String {
     panes
         .iter()
-        .map(|pane| {
+        .enumerate()
+        .map(|(index, pane)| {
             let controls = &pane.capabilities().supported_controls;
             roster_entry(
                 pane.title(),
-                pane.current_model().as_deref(),
+                effective_model(pane.current_model().as_deref(), pulses[index].as_ref(), now)
+                    .as_deref(),
                 controls.contains(&SupportedControl::Model),
                 pane.current_effort().as_deref(),
                 controls.contains(&SupportedControl::Effort),
@@ -392,23 +395,46 @@ fn message_with_hat(task: Option<&str>, role: Option<&str>, body: &str) -> Strin
 }
 
 /// A self-reported hook pulse timestamped at Doorbell receipt, so the roster
-/// resolver can tell a live transient state from a stale one.
-#[derive(Clone, Copy)]
+/// resolver can tell a live transient state from a stale one. Carries the
+/// optional model the hook reports it is running, which shares the same
+/// freshness window as the state it arrived with.
+#[derive(Clone)]
 struct PulseSample {
     state: PulseState,
+    model: Option<String>,
     received_at: Instant,
 }
 
 impl PulseSample {
-    fn now(state: PulseState) -> Self {
+    fn now(state: PulseState, model: Option<String>) -> Self {
         Self {
             state,
+            model,
             received_at: Instant::now(),
         }
     }
 
     fn is_stale(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.received_at) > PULSE_FRESHNESS_WINDOW
+    }
+}
+
+/// The model a room is effectively running. The operator `control model` is an
+/// explicit override and always wins; otherwise a fresh hook self-report of
+/// model (one that arrived inside the pulse freshness window) fills the gap
+/// when the operator left the model unconfigured. A stale or absent self-report
+/// leaves the configured value untouched, so guests that never send a model
+/// keep reporting null/unconfigured.
+fn effective_model(
+    configured: Option<&str>,
+    pulse: Option<&PulseSample>,
+    now: Instant,
+) -> Option<String> {
+    match configured {
+        Some(model) => Some(model.to_owned()),
+        None => pulse
+            .filter(|sample| !sample.is_stale(now))
+            .and_then(|sample| sample.model.clone()),
     }
 }
 
@@ -519,7 +545,7 @@ fn pulse_label(
     } else if !pane.needs_intro() {
         "terminal".to_owned()
     } else {
-        let resolved = roster_state(true, gate, input_ready, pulse, now);
+        let resolved = roster_state(true, gate, input_ready, pulse.clone(), now);
         let hook_age = pulse
             .filter(|_| resolved.source == PulseSource::Hook)
             .map(|sample| now.saturating_duration_since(sample.received_at));
@@ -912,7 +938,7 @@ fn run_with(
                 waited,
                 INTRO_READINESS_CEILING,
             ) {
-                let roster = welcome_roster(&panes);
+                let roster = welcome_roster(&panes, &room_pulses, now);
                 match panes[index].send_whisper(
                     "The Crowded Room",
                     &house_rules(index + 1, &roster, fuse_size),
@@ -966,7 +992,7 @@ fn run_with(
                                     pane.is_online(),
                                     delivery_gates[index],
                                     input_ready[index],
-                                    room_pulses[index],
+                                    room_pulses[index].clone(),
                                     now,
                                 );
                                 RosterRoom {
@@ -978,7 +1004,11 @@ fn run_with(
                                     state: resolved.state,
                                     state_source: resolved.source,
                                     allow_control: pane.allows_control(),
-                                    model: pane.current_model(),
+                                    model: effective_model(
+                                        pane.current_model().as_deref(),
+                                        room_pulses[index].as_ref(),
+                                        now,
+                                    ),
                                     effort: pane.current_effort(),
                                     cost: pane::usage_cost(
                                         &pane.guest(),
@@ -989,7 +1019,7 @@ fn run_with(
                                     .map(|cost| format!("${cost:.6}"))
                                     .unwrap_or_else(|| "unknown".to_owned()),
                                     headroom: pane.headroom_active(),
-                                    pulse_age_ms: room_pulses[index].map(|sample| {
+                                    pulse_age_ms: room_pulses[index].as_ref().map(|sample| {
                                         now.saturating_duration_since(sample.received_at)
                                             .as_millis()
                                             as u64
@@ -1005,7 +1035,7 @@ fn run_with(
                 DoorbellEvent::Pulse(pulse) => {
                     // Timestamp the sample at Doorbell receipt so the freshness
                     // resolver can tell a live transient state from a stale one.
-                    room_pulses[pulse.from] = Some(PulseSample::now(pulse.state));
+                    room_pulses[pulse.from] = Some(PulseSample::now(pulse.state, pulse.model));
                     continue;
                 }
                 DoorbellEvent::Control(control) => {
@@ -1047,7 +1077,7 @@ fn run_with(
                             spawned_at[control.to] = Instant::now();
                             room_pulses[control.to] = match &control.action {
                                 ControlAction::Resume => None,
-                                _ => Some(PulseSample::now(PulseState::Starting)),
+                                _ => Some(PulseSample::now(PulseState::Starting, None)),
                             };
                             control.reply_applied();
                             notice = Some(format!("{source} told {target} to {label}"));
@@ -1171,7 +1201,7 @@ fn run_with(
                         pane,
                         delivery_gates[index],
                         input_ready[index],
-                        room_pulses[index],
+                        room_pulses[index].clone(),
                         now,
                     )
                 })
@@ -1341,7 +1371,7 @@ fn run_with(
                         && key.kind == KeyEventKind::Press
                         && matches!(&input_mode, InputMode::Normal) =>
                 {
-                    let roster = welcome_roster(&panes);
+                    let roster = welcome_roster(&panes, &room_pulses, now);
                     match panes[focused].send_whisper(
                         "The Crowded Room",
                         &house_rules(focused + 1, &roster, fuse_size),
@@ -1377,7 +1407,8 @@ fn run_with(
                                 DeliveryGate::new(panes[focused].needs_intro());
                             last_output[focused] = None;
                             spawned_at[focused] = Instant::now();
-                            room_pulses[focused] = Some(PulseSample::now(PulseState::Starting));
+                            room_pulses[focused] =
+                                Some(PulseSample::now(PulseState::Starting, None));
                             notice = Some(format!("{} restarted", panes[focused].title()));
                         }
                         Err(error) => {
@@ -1680,14 +1711,66 @@ mod tests {
     }
 
     fn sample(state: PulseState) -> PulseSample {
-        PulseSample::now(state)
+        PulseSample::now(state, None)
+    }
+
+    fn sample_with_model(state: PulseState, model: &str) -> PulseSample {
+        PulseSample::now(state, Some(model.to_owned()))
     }
 
     fn stale_sample(state: PulseState) -> PulseSample {
         PulseSample {
             state,
+            model: None,
             received_at: Instant::now() - PULSE_FRESHNESS_WINDOW - Duration::from_secs(1),
         }
+    }
+
+    fn stale_sample_with_model(state: PulseState, model: &str) -> PulseSample {
+        PulseSample {
+            state,
+            model: Some(model.to_owned()),
+            received_at: Instant::now() - PULSE_FRESHNESS_WINDOW - Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn effective_model_prefers_fresh_self_report_and_keeps_control_override() {
+        let now = Instant::now();
+        // A fresh hook self-report of model beats an unconfigured operator value.
+        assert_eq!(
+            effective_model(
+                None,
+                Some(&sample_with_model(PulseState::Working, "m1")),
+                now
+            ),
+            Some("m1".to_owned())
+        );
+        // A stale self-report does not override; it is ignored.
+        assert_eq!(
+            effective_model(
+                None,
+                Some(&stale_sample_with_model(PulseState::Working, "m1")),
+                now
+            ),
+            None
+        );
+        // The operator control model wins as an explicit override even against
+        // a fresh self-report.
+        assert_eq!(
+            effective_model(
+                Some("configured"),
+                Some(&sample_with_model(PulseState::Working, "m1")),
+                now
+            ),
+            Some("configured".to_owned())
+        );
+        // No self-report model and no configured value stays null/unconfigured.
+        assert_eq!(effective_model(None, None, now), None);
+        assert_eq!(
+            effective_model(None, Some(&sample(PulseState::Ready)), now),
+            None
+        );
     }
 
     #[test]

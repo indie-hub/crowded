@@ -316,6 +316,7 @@ fn listener_loop(
                         Ok(from) => match events.try_send(DoorbellEvent::Pulse(DoorbellPulse {
                             from,
                             state: request.state,
+                            model: request.model,
                         })) {
                             Ok(()) => {
                                 remember_id(request.id, &mut seen, &mut seen_order);
