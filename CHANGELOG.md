@@ -7,6 +7,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-08-26
+
+### Added
+
+- A config overlay (`F1`) shows the loaded `crowded.toml` rooms and lets `fuse_size` be edited inline. Saving parses the input, persists it back to `crowded.toml` with `toml_edit` (preserving every other section), and applies the new limit to the running delivery fuse immediately, with no restart. Invalid input shows an inline error and leaves the file untouched. First slice of a Configuration UI; more fields and sections follow in later work.
+
 ## [0.41.0] - 2026-08-25
 
 ### Added
