@@ -21,7 +21,8 @@ use crate::{
 };
 
 mod controls;
-mod session_state;
+
+pub(crate) mod session_state;
 
 pub(crate) use session_state::usage_cost;
 

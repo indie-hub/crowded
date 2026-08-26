@@ -317,6 +317,7 @@ fn listener_loop(
                             from,
                             state: request.state,
                             model: request.model,
+                            detail: request.detail,
                         })) {
                             Ok(()) => {
                                 remember_id(request.id, &mut seen, &mut seen_order);

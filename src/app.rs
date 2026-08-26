@@ -36,6 +36,7 @@ use crate::{
     },
     mailroom::Mailroom,
     pane::{self, Pane},
+    room_detail::{RoomDetail, apply_detail_event, collect_detail},
 };
 
 enum InputMode {
@@ -43,6 +44,12 @@ enum InputMode {
     Composing(String),
     MailLog,
     Config(Box<ConfigOverlayState>),
+    Detail(RoomDetailView),
+}
+
+struct RoomDetailView {
+    room: usize,
+    detail: RoomDetail,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1068,6 +1075,24 @@ fn save_config_state(
     true
 }
 
+/// Gather the detail for one room. Claude Code rooms report through hook
+/// pulses accumulated in `room_details`; OpenCode and Codex are read from
+/// their persisted artifacts on demand. The view renders either source
+/// uniformly, with no liveness or freshness distinction.
+fn detail_for_room(index: usize, panes: &[Pane], room_details: &[RoomDetail]) -> RoomDetail {
+    let pane = &panes[index];
+    let guest = pane.guest();
+    if guest == "claude" {
+        return room_details[index].clone();
+    }
+    let session_id =
+        pane::session_state::lookup(&guest.to_ascii_lowercase(), pane.cwd(), pane.title());
+    let Some(session_id) = session_id else {
+        return RoomDetail::default();
+    };
+    collect_detail(&guest, pane.cwd(), &session_id).unwrap_or_default()
+}
+
 // This guard owns the changes we make to the *parent* terminal. Rust calls
 // `Drop::drop` automatically when the value leaves scope, including after `?`.
 struct TerminalGuard {
@@ -1189,6 +1214,7 @@ fn run_with(
     let mut pending = VecDeque::<(u64, usize)>::new();
     let mut submit_pending = VecDeque::<(Instant, usize, bool)>::new();
     let mut room_pulses = vec![None::<PulseSample>; room_count];
+    let mut room_details = vec![RoomDetail::default(); room_count];
     let mut pulse_costs = vec![None::<(Instant, String)>; room_count];
     // Holds the event that ended a wheel burst, so draining never discards it,
     // and any key run handed back by the torn-report filter.
@@ -1323,6 +1349,11 @@ fn run_with(
                     // Timestamp the sample at Doorbell receipt so the freshness
                     // resolver can tell a live transient state from a stale one.
                     room_pulses[pulse.from] = Some(PulseSample::now(pulse.state, pulse.model));
+                    if let Some(events) = pulse.detail {
+                        for event in events {
+                            apply_detail_event(&mut room_details[pulse.from], event);
+                        }
+                    }
                     continue;
                 }
                 DoorbellEvent::Control(control) => {
@@ -1571,11 +1602,22 @@ fn run_with(
                         format!(" Config room {} • Enter: save • Esc: cancel ", state.selected + 1)
                     }
                 }
+                InputMode::Detail(view) => {
+                    let sub_agents = view.detail.sub_agents.len();
+                    let todos = view.detail.todos.len();
+                    format!(
+                        " {} detail: {} sub-agent(s), {} todo(s) • d or Esc: close ",
+                        panes[view.room].title(),
+                        sub_agents,
+                        todos
+                    )
+                }
             };
             let status_style = match (&input_mode, notice.is_some()) {
                 (InputMode::Composing(_), _) => Style::default().fg(Color::Yellow),
                 (InputMode::MailLog, _) => Style::default().fg(Color::Cyan),
                 (InputMode::Config(_), _) => Style::default().fg(Color::Yellow),
+                (InputMode::Detail(_), _) => Style::default().fg(Color::Cyan),
                 (InputMode::Normal, true) => Style::default().fg(Color::Yellow),
                 (InputMode::Normal, false) => Style::default().fg(Color::DarkGray),
             };
@@ -1679,6 +1721,49 @@ fn run_with(
                     popup,
                 );
             }
+
+            if let InputMode::Detail(view) = &input_mode {
+                let popup = config_popup_area(frame.area());
+                frame.render_widget(Clear, popup);
+                let mut lines: Vec<Line> = Vec::new();
+                lines.push(Line::from(format!(" {} detail:", panes[view.room].title())));
+                lines.push(Line::from(" Sub-agents:"));
+                if view.detail.sub_agents.is_empty() {
+                    lines.push(Line::from("   (none)"));
+                }
+                for agent in &view.detail.sub_agents {
+                    let identity = if agent.id.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", agent.id)
+                    };
+                    lines.push(Line::from(format!(
+                        "   [{}] {}{identity}",
+                        agent.status, agent.kind
+                    )));
+                }
+                lines.push(Line::from(" Todos:"));
+                if view.detail.todos.is_empty() {
+                    lines.push(Line::from("   (none)"));
+                }
+                for todo in &view.detail.todos {
+                    lines.push(Line::from(format!(
+                        "   [{}] {}",
+                        todo.status, todo.content
+                    )));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(" d or Esc: close "));
+                frame.render_widget(
+                    Paragraph::new(Text::from(lines))
+                        .block(Block::bordered().title(format!(
+                            " {} detail ",
+                            panes[view.room].title()
+                        )))
+                        .wrap(Wrap { trim: false }),
+                    popup,
+                );
+            }
         })?;
         for pane in &mut panes {
             pane.restore_scroll();
@@ -1722,12 +1807,16 @@ fn run_with(
                 Event::Key(key)
                     if key.code == KeyCode::F(2)
                         && key.kind == KeyEventKind::Press
-                        && !matches!(&input_mode, InputMode::Composing(_) | InputMode::Config(_)) =>
+                        && !matches!(
+                            &input_mode,
+                            InputMode::Composing(_) | InputMode::Config(_) | InputMode::Detail(_)
+                        ) =>
                 {
                     input_mode = match input_mode {
                         InputMode::MailLog => InputMode::Normal,
                         InputMode::Normal => InputMode::MailLog,
                         InputMode::Config(_) => unreachable!(),
+                        InputMode::Detail(_) => unreachable!(),
                         InputMode::Composing(_) => unreachable!(),
                     };
                     notice = None;
@@ -1735,7 +1824,7 @@ fn run_with(
                 Event::Key(key)
                     if key.code == KeyCode::F(1)
                         && key.kind == KeyEventKind::Press
-                        && !matches!(&input_mode, InputMode::Composing(_)) =>
+                        && !matches!(&input_mode, InputMode::Composing(_) | InputMode::Detail(_)) =>
                 {
                     input_mode = match input_mode {
                         InputMode::Config(_) => InputMode::Normal,
@@ -1745,6 +1834,7 @@ fn run_with(
                         InputMode::MailLog => {
                             InputMode::Config(Box::new(ConfigOverlayState::new(&panes, 0, fuse_size)))
                         }
+                        InputMode::Detail(_) => unreachable!(),
                         InputMode::Composing(_) => unreachable!(),
                     };
                     notice = None;
@@ -1820,6 +1910,18 @@ fn run_with(
                             ));
                         }
                     }
+                }
+                Event::Key(key)
+                    if key.code == KeyCode::Char('d')
+                        && key.modifiers == KeyModifiers::NONE
+                        && key.kind == KeyEventKind::Press
+                        && matches!(&input_mode, InputMode::Normal) =>
+                {
+                    input_mode = InputMode::Detail(RoomDetailView {
+                        room: focused,
+                        detail: detail_for_room(focused, &panes, &room_details),
+                    });
+                    notice = None;
                 }
                 Event::Key(key) => match &mut input_mode {
                     InputMode::Composing(message) => {
@@ -1971,6 +2073,20 @@ fn run_with(
                                     ) =>
                                 {
                                     state.edit(|input| input.push(ch));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    InputMode::Detail(_view) => {
+                        if matches!(key.kind, KeyEventKind::Press) {
+                            match key.code {
+                                KeyCode::Esc
+                                | KeyCode::Char('d')
+                                    if key.modifiers == KeyModifiers::NONE =>
+                                {
+                                    input_mode = InputMode::Normal;
+                                    notice = None;
                                 }
                                 _ => {}
                             }

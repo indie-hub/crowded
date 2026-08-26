@@ -193,6 +193,7 @@ fn listener_loop(
                                         from,
                                         state: request.state,
                                         model: request.model,
+                                        detail: request.detail,
                                     })) {
                                         Ok(()) => {
                                             remember_id(request.id, &mut seen, &mut seen_order);
@@ -511,6 +512,7 @@ mod tests {
             id: "pulse-1".to_owned(),
             state: PulseState::Working,
             model: None,
+            detail: None,
         };
         assert_eq!(
             validate_pulse(&request, &["left".to_owned(), "right".to_owned()]),

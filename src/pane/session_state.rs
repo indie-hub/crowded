@@ -172,7 +172,7 @@ impl SessionState {
 /// Look up the exact session id captured for `(vendor, cwd, room)`. Best-effort:
 /// a missing file, a parse/version problem, or a missing entry all mean
 /// `None`, and `crowded resume` falls back to today's most-recent form.
-pub(super) fn lookup(vendor: &str, cwd: &Path, room: &str) -> Option<String> {
+pub(crate) fn lookup(vendor: &str, cwd: &Path, room: &str) -> Option<String> {
     let state = load_state().ok()?;
     state
         .lookup(vendor, &cwd.to_string_lossy(), room)

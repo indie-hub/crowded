@@ -9,6 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::config::RoomScheduling;
+use crate::room_detail::DetailEvent;
 
 pub(super) const MAX_WIRE_BYTES: usize = 2 * 1024 * 1024;
 pub(super) const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -51,6 +52,10 @@ pub(super) struct PulseRequest {
     /// roster can show it even when the operator never set `control model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) model: Option<String>,
+    /// Optional incremental sub-agent/todo events parsed from a vendor hook
+    /// payload, so a room's internal detail can be tracked in real time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) detail: Option<Vec<DetailEvent>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -302,6 +307,7 @@ pub(crate) struct DoorbellPulse {
     pub(crate) from: usize,
     pub(crate) state: PulseState,
     pub(crate) model: Option<String>,
+    pub(crate) detail: Option<Vec<DetailEvent>>,
 }
 
 pub(crate) struct DoorbellControl {
@@ -468,7 +474,37 @@ pub(super) fn validate_pulse(request: &PulseRequest, tokens: &[String]) -> Resul
                 .to_owned(),
         );
     }
+    if let Some(events) = &request.detail {
+        for event in events {
+            validate_detail_event(event)?;
+        }
+    }
     validate_identity(&request.token, &request.id, "pulse", tokens)
+}
+
+fn validate_detail_event(event: &DetailEvent) -> Result<(), String> {
+    const MAX_DETAIL_BYTES: usize = 512;
+    let mut fields = Vec::new();
+    match event {
+        DetailEvent::SubAgentStarted { id, kind } => {
+            fields.push(id);
+            fields.push(kind);
+        }
+        DetailEvent::SubAgentStopped { id } => fields.push(id),
+        DetailEvent::TodoUpsert { id, content, status } => {
+            fields.push(id);
+            fields.push(content);
+            fields.push(status);
+        }
+    }
+    if fields.iter().any(|field| {
+        field.len() > MAX_DETAIL_BYTES || field.chars().any(char::is_control)
+    }) {
+        return Err(format!(
+            "detail fields must contain 0..={MAX_DETAIL_BYTES} bytes without control characters"
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn validate_roster(
@@ -647,5 +683,36 @@ mod tests {
         .map(|effort| effort.label())
         .collect::<Vec<_>>();
         assert_eq!(labels, ["low", "medium", "high", "xhigh", "max"]);
+    }
+
+    #[test]
+    fn pulse_validation_accepts_hook_detail_and_rejects_oversized_fields() {
+        let request = PulseRequest {
+            token: "left".to_owned(),
+            id: "pulse-detail".to_owned(),
+            state: PulseState::Working,
+            model: None,
+            detail: Some(vec![DetailEvent::SubAgentStarted {
+                id: "a1".to_owned(),
+                kind: "Task".to_owned(),
+            }]),
+        };
+        assert_eq!(
+            validate_pulse(&request, &["left".to_owned(), "right".to_owned()]),
+            Ok(0)
+        );
+
+        let oversized = PulseRequest {
+            token: "left".to_owned(),
+            id: "pulse-oversized".to_owned(),
+            state: PulseState::Working,
+            model: None,
+            detail: Some(vec![DetailEvent::TodoUpsert {
+                id: "t".to_owned(),
+                content: "x".repeat(513),
+                status: "pending".to_owned(),
+            }]),
+        };
+        assert!(validate_pulse(&oversized, &["left".to_owned(), "right".to_owned()]).is_err());
     }
 }

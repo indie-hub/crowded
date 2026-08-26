@@ -2,12 +2,14 @@
 
 use std::{
     env,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Read},
     process,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::Deserialize;
+
+use crate::room_detail::DetailEvent;
 
 #[cfg(unix)]
 use super::client_unix::send_request;
@@ -202,6 +204,7 @@ pub(crate) fn pulse_command() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let mut model: Option<String> = None;
+    let mut detail = None;
     let mut from_hook = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -220,11 +223,14 @@ pub(crate) fn pulse_command() -> Result<(), Box<dyn std::error::Error>> {
         if model.is_some() {
             return Err("--model and --hook-stdin cannot be combined".into());
         }
-        model = if io::stdin().is_terminal() {
-            None
-        } else {
-            hook_payload_model(io::stdin().lock())
-        };
+        let mut text = String::new();
+        let captured = (!io::stdin().is_terminal())
+            .then(|| io::stdin().read_to_string(&mut text).ok().map(|_| &text))
+            .flatten();
+        if let Some(text) = captured {
+            model = hook_payload_model(text.as_bytes());
+            detail = Some(hook_payload_detail(text.as_bytes()));
+        }
     }
     let token = env::var("CROWDED_TOKEN").map_err(|_| "CROWDED_TOKEN is not set")?;
     let room = env::var("CROWDED_ROOM").unwrap_or_else(|_| "external".to_owned());
@@ -234,19 +240,33 @@ pub(crate) fn pulse_command() -> Result<(), Box<dyn std::error::Error>> {
         id: format!("{room}-pulse-{}-{now}", process::id()),
         state,
         model,
+        detail,
     }))?;
     response.into_result("Doorbell rejected pulse")
 }
 
 const PULSE_USAGE: &str = "usage: crowded pulse starting|thinking|working|ready|error|offline [--model MODEL | --hook-stdin]";
 
-/// A permissive view of a vendor hook payload: the only field the pulse hook
-/// reads is the optional active `model`, when the runtime supplies it. Unknown
-/// fields are ignored so the same reader works for Claude, Codex, and any
-/// future hook shape.
+/// A permissive view of a vendor hook payload: the pulse hook reads the
+/// optional active `model`, plus Claude Code's sub-agent and todo events when
+/// the runtime supplies them. Unknown fields are ignored so the same reader
+/// works for Claude, Codex, and any future hook shape.
 #[derive(Deserialize)]
 struct HookPayload {
     model: Option<String>,
+    hook_event_name: Option<String>,
+    agent_id: Option<String>,
+    agent_type: Option<String>,
+    task_id: Option<String>,
+    task_subject: Option<String>,
+    todo: Option<String>,
+    status: Option<String>,
+    tool_input: Option<HookToolInput>,
+}
+
+#[derive(Deserialize)]
+struct HookToolInput {
+    task: Option<String>,
 }
 
 /// Reads a vendor hook JSON payload and returns its `model` field when present
@@ -264,6 +284,81 @@ fn hook_payload_model<R: io::Read>(mut input: R) -> Option<String> {
             && !model.starts_with('-')
             && !model.chars().any(char::is_control)
     })
+}
+
+/// Reads a vendor hook JSON payload and returns the sub-agent/todo events it
+/// describes. Claude Code emits `SubagentStart`/`SubagentStop` and
+/// `TaskCreate`/`TaskUpdate`/`TodoWrite`; every other event name or payload
+/// yields an empty list.
+fn hook_payload_detail<R: io::Read>(mut input: R) -> Vec<DetailEvent> {
+    let mut text = String::new();
+    if input.read_to_string(&mut text).is_err() {
+        return Vec::new();
+    }
+    let Ok(payload) = serde_json::from_str::<HookPayload>(&text) else {
+        return Vec::new();
+    };
+    hook_detail_events(&payload)
+}
+
+fn hook_detail_events(payload: &HookPayload) -> Vec<DetailEvent> {
+    let mut events = Vec::new();
+    match payload.hook_event_name.as_deref() {
+        Some("SubagentStart") => {
+            if let Some(id) = payload.agent_id.as_deref() {
+                events.push(DetailEvent::SubAgentStarted {
+                    id: id.to_owned(),
+                    kind: payload
+                        .agent_type
+                        .clone()
+                        .unwrap_or_else(|| "task".to_owned()),
+                });
+            }
+        }
+        Some("SubagentStop") => {
+            if let Some(id) = payload.agent_id.as_deref() {
+                events.push(DetailEvent::SubAgentStopped { id: id.to_owned() });
+            }
+        }
+        Some("TaskCreate") | Some("TaskUpdate") => {
+            let id = payload
+                .task_id
+                .clone()
+                .or_else(|| payload.agent_id.clone())
+                .unwrap_or_default();
+            if !id.is_empty() {
+                let content = payload
+                    .task_subject
+                    .clone()
+                    .or_else(|| payload.todo.clone())
+                    .or_else(|| {
+                        payload
+                            .tool_input
+                            .as_ref()
+                            .and_then(|input| input.task.clone())
+                    })
+                    .unwrap_or_default();
+                let status = payload
+                    .status
+                    .clone()
+                    .unwrap_or_else(|| "pending".to_owned());
+                events.push(DetailEvent::TodoUpsert { id, content, status });
+            }
+        }
+        Some("TodoWrite") => {
+            let content = payload.todo.clone().unwrap_or_default();
+            if !content.is_empty() {
+                let status = payload
+                    .status
+                    .clone()
+                    .unwrap_or_else(|| "pending".to_owned());
+                let id = payload.task_id.clone().unwrap_or_else(|| content.clone());
+                events.push(DetailEvent::TodoUpsert { id, content, status });
+            }
+        }
+        _ => {}
+    }
+    events
 }
 
 pub(crate) fn roster_command() -> Result<(), Box<dyn std::error::Error>> {
@@ -335,5 +430,94 @@ mod tests {
         );
         let oversized = format!(r#"{{"model":"{}"}}"#, "x".repeat(129));
         assert_eq!(hook_payload_model(oversized.as_bytes()), None);
+    }
+
+    #[test]
+    fn hook_payload_detail_extracts_sub_agent_and_todo_events() {
+        assert_eq!(
+            hook_payload_detail(
+                br#"{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Task"}"#
+                    .as_slice()
+            ),
+            vec![DetailEvent::SubAgentStarted {
+                id: "a1".to_owned(),
+                kind: "Task".to_owned()
+            }]
+        );
+        assert_eq!(
+            hook_payload_detail(
+                br#"{"hook_event_name":"SubagentStop","agent_id":"a1"}"#.as_slice()
+            ),
+            vec![DetailEvent::SubAgentStopped {
+                id: "a1".to_owned()
+            }]
+        );
+        assert_eq!(
+            hook_payload_detail(
+                br#"{"hook_event_name":"TodoWrite","todo":"Ship it","status":"in_progress"}"#
+                    .as_slice()
+            ),
+            vec![DetailEvent::TodoUpsert {
+                id: "Ship it".to_owned(),
+                content: "Ship it".to_owned(),
+                status: "in_progress".to_owned()
+            }]
+        );
+        assert_eq!(
+            hook_payload_detail(
+                br#"{"hook_event_name":"TaskCreate","task_id":"t9","task_subject":"Design"}"#
+                    .as_slice()
+            ),
+            vec![DetailEvent::TodoUpsert {
+                id: "t9".to_owned(),
+                content: "Design".to_owned(),
+                status: "pending".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn hook_payload_detail_ignores_unrelated_and_malformed_payloads() {
+        assert_eq!(
+            hook_payload_detail(br#"{"hook_event_name":"PreToolUse","model":"o4-mini"}"#.as_slice()),
+            Vec::<DetailEvent>::new()
+        );
+        assert_eq!(hook_payload_detail(br#"{}"#.as_slice()), Vec::new());
+        assert_eq!(hook_payload_detail(b"not json".as_slice()), Vec::new());
+        assert_eq!(hook_payload_detail(b"".as_slice()), Vec::new());
+        // A SubagentStart without an id carries no usable event.
+        assert_eq!(
+            hook_payload_detail(
+                br#"{"hook_event_name":"SubagentStart","agent_type":"Task"}"#.as_slice()
+            ),
+            Vec::<DetailEvent>::new()
+        );
+    }
+
+    #[test]
+    fn hook_payload_model_and_detail_read_the_same_payload() {
+        let payload = br#"{"hook_event_name":"SubagentStart","agent_id":"a1","model":"o4-mini"}"#;
+        assert_eq!(hook_payload_model(payload.as_slice()), Some("o4-mini".to_owned()));
+        assert_eq!(hook_payload_detail(payload.as_slice()).len(), 1);
+    }
+
+    #[test]
+    fn applying_hooked_events_builds_the_room_detail() {
+        let mut detail = crate::room_detail::RoomDetail::default();
+        for event in hook_payload_detail(
+            br#"{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Task"}"#
+                .as_slice(),
+        ) {
+            crate::room_detail::apply_detail_event(&mut detail, event);
+        }
+        for event in hook_payload_detail(
+            br#"{"hook_event_name":"TodoWrite","todo":"Build","status":"completed"}"#.as_slice(),
+        ) {
+            crate::room_detail::apply_detail_event(&mut detail, event);
+        }
+        assert_eq!(detail.sub_agents.len(), 1);
+        assert_eq!(detail.sub_agents[0].kind, "Task");
+        assert_eq!(detail.todos.len(), 1);
+        assert_eq!(detail.todos[0].content, "Build");
     }
 }

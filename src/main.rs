@@ -10,6 +10,7 @@ mod mailroom;
 mod mcp_cli;
 mod pane;
 mod plugins;
+mod room_detail;
 mod toolbox;
 
 const USAGE: &str = "\
