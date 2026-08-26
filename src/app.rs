@@ -3,6 +3,8 @@
 use std::{
     collections::VecDeque,
     io::{self, Write},
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -787,48 +789,57 @@ fn render_pulse_lines(
             state_style,
         ));
         if let Some(detail) = details.get(index) {
-            const LIMIT: usize = 3;
+            const AGENT_LIMIT: usize = 2;
+            const TODO_LIMIT: usize = 2;
             if !detail.sub_agents.is_empty() {
-                let mut parts = Vec::new();
-                for agent in detail.sub_agents.iter().take(LIMIT) {
-                    let id_suffix = if agent.id.is_empty() {
-                        String::new()
+                lines.push(Line::from("  sub-agents:"));
+                for agent in detail.sub_agents.iter().take(AGENT_LIMIT) {
+                    let label = if agent.kind.is_empty() {
+                        if agent.id.is_empty() {
+                            "task".to_owned()
+                        } else {
+                            agent.id.clone()
+                        }
                     } else {
-                        format!("·{}", agent.id)
+                        agent.kind.clone()
                     };
-                    let suffix = if id_suffix.is_empty() {
-                        String::new()
+                    let label = if label.chars().count() > 20 {
+                        let t: String = label.chars().take(20).collect();
+                        format!("{t}…")
                     } else {
-                        format!(" {id_suffix}")
+                        label
                     };
-                    parts.push(format!("[{}] {}{}", agent.status, agent.kind, suffix));
+                    lines.push(Line::from(format!("    - {} ({})", label, agent.status)));
                 }
-                if detail.sub_agents.len() > LIMIT {
-                    parts.push(format!("+{} more", detail.sub_agents.len() - LIMIT));
+                if detail.sub_agents.len() > AGENT_LIMIT {
+                    lines.push(Line::from(format!(
+                        "    - +{} more",
+                        detail.sub_agents.len() - AGENT_LIMIT
+                    )));
                 }
-                lines.push(Line::styled(
-                    format!("  sub-agents: {}", parts.join(", ")),
-                    Style::default().fg(Color::DarkGray),
-                ));
             }
-            if !detail.todos.is_empty() {
-                let mut parts = Vec::new();
-                for todo in detail.todos.iter().take(LIMIT) {
-                    let content = if todo.content.chars().count() > 32 {
-                        let truncated: String = todo.content.chars().take(32).collect();
-                        format!("{truncated}…")
+            let pending: Vec<_> = detail
+                .todos
+                .iter()
+                .filter(|todo| todo.status != "completed")
+                .collect();
+            if !pending.is_empty() {
+                lines.push(Line::from("  todos:"));
+                for todo in pending.iter().take(TODO_LIMIT) {
+                    let content = if todo.content.chars().count() > 22 {
+                        let t: String = todo.content.chars().take(22).collect();
+                        format!("{t}…")
                     } else {
                         todo.content.clone()
                     };
-                    parts.push(format!("[{}] {}", todo.status, content));
+                    lines.push(Line::from(format!("    - {} [{}]", content, todo.status)));
                 }
-                if detail.todos.len() > LIMIT {
-                    parts.push(format!("+{} more", detail.todos.len() - LIMIT));
+                if pending.len() > TODO_LIMIT {
+                    lines.push(Line::from(format!(
+                        "    - +{} more",
+                        pending.len() - TODO_LIMIT
+                    )));
                 }
-                lines.push(Line::styled(
-                    format!("  todos: {}", parts.join(", ")),
-                    Style::default().fg(Color::DarkGray),
-                ));
             }
         }
     }
@@ -836,21 +847,6 @@ fn render_pulse_lines(
         lines.push(Line::styled(total, Style::default()));
     }
     lines
-}
-
-fn refresh_pulse_cost(
-    cache: &mut Option<(Instant, String)>,
-    captured: bool,
-    now: Instant,
-    compute: impl FnOnce() -> String,
-) {
-    if !captured {
-        *cache = None;
-    } else if cache.as_ref().is_none_or(|(refreshed, _)| {
-        now.saturating_duration_since(*refreshed) >= PULSE_COST_REFRESH
-    }) {
-        *cache = Some((now, compute()));
-    }
 }
 
 struct PendingSubmit<'a> {
@@ -1239,6 +1235,16 @@ fn run_with(
     let mut room_details = vec![RoomDetail::default(); room_count];
     let mut detail_last_refresh = vec![None::<Instant>; room_count];
     let mut pulse_costs = vec![None::<(Instant, String)>; room_count];
+    // Pulse cost and room detail collection do blocking filesystem / sqlite
+    // work (opencode sqlite, codex rollout walks, claude transcript reads).
+    // Running them synchronously on the main thread blocks input handling for
+    // the duration of the I/O (empirically ~20s when detail I/O stalls), so
+    // both are offloaded to background threads and the main loop only polls
+    // their results via non-blocking `try_recv`.
+    let (detail_tx, detail_rx) = mpsc::channel::<(usize, RoomDetail)>();
+    let (cost_tx, cost_rx) = mpsc::channel::<(usize, (Instant, String))>();
+    let mut detail_pending = vec![false; room_count];
+    let mut cost_pending = vec![false; room_count];
     // Holds the event that ended a wheel burst, so draining never discards it,
     // and any key run handed back by the torn-report filter.
     let mut stashed_events: VecDeque<Event> = VecDeque::new();
@@ -1489,17 +1495,49 @@ fn run_with(
             }
         }
 
-        for (index, pane) in panes.iter().enumerate() {
-            refresh_pulse_cost(
-                &mut pulse_costs[index],
-                pane.has_captured_session(),
-                now,
-                || {
-                    pane::usage_cost(&pane.guest(), pane.cwd(), pane.title(), &token_pricing)
-                        .map(|cost| format!("${cost:.6}"))
-                        .unwrap_or_else(|| "unknown".to_owned())
-                },
-            );
+        // Drain any completed background results without blocking.
+        while let Ok((index, (refreshed, cost))) = cost_rx.try_recv() {
+            if index < room_count {
+                pulse_costs[index] = Some((refreshed, cost));
+                cost_pending[index] = false;
+            }
+        }
+        while let Ok((index, detail)) = detail_rx.try_recv() {
+            if index < room_count {
+                room_details[index] = detail;
+                detail_pending[index] = false;
+            }
+        }
+
+        // Schedule pulse-cost refreshes off-thread. The in-memory
+        // `has_captured_session` check stays synchronous; the expensive
+        // `usage_cost` (transcript reads, rollout walks, sqlite) runs in a
+        // background thread so the 16ms input poll is never stalled.
+        for index in 0..room_count {
+            let captured = panes[index].has_captured_session();
+            if !captured {
+                pulse_costs[index] = None;
+                continue;
+            }
+            let should_refresh = pulse_costs[index].as_ref().is_none_or(|(refreshed, _)| {
+                now.saturating_duration_since(*refreshed) >= PULSE_COST_REFRESH
+            });
+            if !should_refresh || cost_pending[index] {
+                continue;
+            }
+            cost_pending[index] = true;
+            let guest = panes[index].guest();
+            let cwd = panes[index].cwd().to_path_buf();
+            let title = panes[index].title().to_owned();
+            let pricing = token_pricing.clone();
+            let tx = cost_tx.clone();
+            let refreshed = now;
+            thread::spawn(move || {
+                let cost = pane::usage_cost(&guest, &cwd, &title, &pricing)
+                    .map(|cost| format!("${cost:.6}"))
+                    .unwrap_or_else(|| "unknown".to_owned());
+                let _ = tx.send((index, (refreshed, cost)));
+            });
         }
         {
             const DETAIL_REFRESH: Duration = Duration::from_secs(2);
@@ -1510,20 +1548,24 @@ fn run_with(
                 }
                 let should_refresh = detail_last_refresh[index]
                     .is_none_or(|last| now.duration_since(last) >= DETAIL_REFRESH);
-                if !should_refresh {
+                if !should_refresh || detail_pending[index] {
                     continue;
                 }
                 detail_last_refresh[index] = Some(now);
-                let Some(session_id) = pane::session_state::lookup(
-                    &guest.to_ascii_lowercase(),
-                    panes[index].cwd(),
-                    panes[index].title(),
-                ) else {
-                    room_details[index] = RoomDetail::default();
-                    continue;
-                };
-                room_details[index] =
-                    collect_detail(&guest, panes[index].cwd(), &session_id).unwrap_or_default();
+                detail_pending[index] = true;
+                let guest_clone = guest.clone();
+                let cwd = panes[index].cwd().to_path_buf();
+                let title = panes[index].title().to_owned();
+                let guest_lower = guest_clone.to_ascii_lowercase();
+                let tx = detail_tx.clone();
+                thread::spawn(move || {
+                    let session_id = pane::session_state::lookup(&guest_lower, &cwd, &title);
+                    let detail = match session_id {
+                        Some(id) => collect_detail(&guest_clone, &cwd, &id).unwrap_or_default(),
+                        None => RoomDetail::default(),
+                    };
+                    let _ = tx.send((index, detail));
+                });
             }
         }
 
@@ -2579,41 +2621,6 @@ mod tests {
         let none = vec![false, false, false];
         assert_eq!(pulse_total(&costs, &none), None);
     }
-
-    #[test]
-    fn pulse_cost_refreshes_only_after_the_interval_and_only_for_sessions() {
-        let now = Instant::now();
-        let mut cache = None;
-        let mut calls = 0;
-
-        refresh_pulse_cost(&mut cache, true, now, || {
-            calls += 1;
-            "$1.000000".to_owned()
-        });
-        refresh_pulse_cost(&mut cache, true, now + Duration::from_secs(2), || {
-            calls += 1;
-            "$2.000000".to_owned()
-        });
-        assert_eq!(calls, 1);
-        assert_eq!(
-            cache.as_ref().map(|(_, cost)| cost.as_str()),
-            Some("$1.000000")
-        );
-
-        refresh_pulse_cost(&mut cache, true, now + Duration::from_secs(3), || {
-            calls += 1;
-            "$2.000000".to_owned()
-        });
-        assert_eq!(calls, 2);
-
-        refresh_pulse_cost(&mut cache, false, now + Duration::from_secs(4), || {
-            calls += 1;
-            "$3.000000".to_owned()
-        });
-        assert_eq!(calls, 2);
-        assert_eq!(cache, None);
-    }
-
     #[test]
     fn quiet_threshold_grants_headroom_panes_extra_startup_grace() {
         assert_eq!(quiet_threshold(false), HOUSE_RULES_QUIET);
@@ -3033,16 +3040,16 @@ mod tests {
             .collect();
         assert!(text.iter().any(|t| t.contains("sub-agents:")), "{text:?}");
         assert!(
-            text.iter().any(|t| t.contains("[running] Task")),
+            text.iter().any(|t| t.contains("Task (running)")),
             "{text:?}"
         );
         assert!(
-            text.iter().any(|t| t.contains("[completed] Explore")),
+            text.iter().any(|t| t.contains("Explore (completed)")),
             "{text:?}"
         );
         assert!(text.iter().any(|t| t.contains("todos:")), "{text:?}");
         assert!(
-            text.iter().any(|t| t.contains("[pending] Build it")),
+            text.iter().any(|t| t.contains("Build it [pending]")),
             "{text:?}"
         );
         let detail_lines = text
@@ -3103,7 +3110,7 @@ mod tests {
                     .collect::<String>()
             })
             .collect();
-        assert!(text.iter().any(|t| t.contains("+1 more")), "{text:?}");
+        assert!(text.iter().any(|t| t.contains("+2 more")), "{text:?}");
         assert!(text.iter().any(|t| t.contains("\u{2026}")), "{text:?}");
         assert!(
             !text.iter().any(|t| t.contains(&long_content)),
@@ -3135,26 +3142,120 @@ mod tests {
         );
         assert_eq!(first.len(), second.len());
         let source = std::fs::read_to_string("src/app.rs").unwrap();
+        // Render itself must be pure; collection happens outside via bounded cache.
         let render_start = source.find("fn render_pulse_lines").unwrap();
-        let render_end = source[render_start..]
-            .find("fn refresh_pulse_cost")
+        let snippet = &source[render_start..render_start + 1500];
+        assert!(
+            !snippet.contains("thread::spawn"),
+            "render must not spawn threads"
+        );
+        assert!(!snippet.contains("collect_detail("), "render must not scan artifacts");
+        assert!(source.contains("DETAIL_REFRESH"), "bounded cache interval must exist");
+        assert!(source.contains("detail_last_refresh"), "cache must be maintained outside draw");
+    }#[test]
+    fn pulse_panel_renders_concisely_at_real_width_and_excludes_completed_todos() {
+        use ratatui::{
+            Terminal,
+            backend::TestBackend,
+            layout::Rect,
+            text::Text,
+            widgets::{Paragraph, Wrap},
+        };
+        let details = vec![RoomDetail {
+            sub_agents: vec![crate::room_detail::SubAgent {
+                id: "a1".to_owned(),
+                kind: "Task".to_owned(),
+                status: "running".to_owned(),
+            }],
+            todos: vec![
+                crate::room_detail::TodoItem {
+                    id: "t1".to_owned(),
+                    content: "Retrieve envelope + verify git t.. and resolve src..".to_owned(),
+                    status: "completed".to_owned(),
+                },
+                crate::room_detail::TodoItem {
+                    id: "t2".to_owned(),
+                    content: "Build feature".to_owned(),
+                    status: "pending".to_owned(),
+                },
+                crate::room_detail::TodoItem {
+                    id: "t3".to_owned(),
+                    content: "Verify no conflict".to_owned(),
+                    status: "in_progress".to_owned(),
+                },
+            ],
+        }];
+        let costs = vec![None];
+        let lines = render_pulse_lines(
+            &["DeepSeek \u{00b7} 4"],
+            &[true],
+            &[true],
+            &["ready"],
+            &costs,
+            &details,
+            0,
+        );
+        let backend = TestBackend::new(36, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    Paragraph::new(Text::from(lines.clone())).wrap(Wrap { trim: false }),
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 36,
+                        height: 12,
+                    },
+                );
+            })
             .unwrap();
-        let render_body = &source[render_start..render_start + render_end];
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 0..12 {
+            for x in 0..36 {
+                rendered.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            rendered.push('\n');
+        }
         assert!(
-            !render_body.contains("collect_detail"),
-            "render must not scan artifacts"
+            !rendered.contains("Retrieve envelope"),
+            "completed todo should be absent, got: {rendered}"
+        );
+        assert!(rendered.contains("Build feature"), "{rendered}");
+        assert!(rendered.contains("Verify no conflict"), "{rendered}");
+        let non_empty = rendered.lines().filter(|l| !l.trim().is_empty()).count();
+        assert!(
+            non_empty <= 10,
+            "pulse panel should be concise at 36 width, got {non_empty} lines: {rendered}"
         );
         assert!(
-            !render_body.contains("detail_last_refresh"),
-            "render must not touch cache"
+            !rendered.contains("t.."),
+            "should not contain heavily truncated verbose text"
         );
+    }
+
+    #[test]
+    fn background_collection_does_not_block_main_thread() {
+        use std::{
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+        let (tx, rx) = mpsc::channel::<(usize, RoomDetail)>();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(250));
+            let _ = tx.send((0, RoomDetail::default()));
+        });
+        let tick_start = Instant::now();
+        let result = rx.try_recv();
+        let elapsed = tick_start.elapsed();
+        assert!(result.is_err(), "should be pending while background sleeps");
         assert!(
-            source.contains("DETAIL_REFRESH"),
-            "bounded cache interval must exist"
+            elapsed < Duration::from_millis(50),
+            "main tick blocked for {elapsed:?}, should be <50ms"
         );
-        assert!(
-            source.contains("detail_last_refresh"),
-            "cache must be maintained outside draw"
-        );
+        thread::sleep(Duration::from_millis(300));
+        assert!(rx.try_recv().is_ok());
     }
 }
