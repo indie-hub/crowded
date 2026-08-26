@@ -24,7 +24,10 @@ use ratatui::{
 use tui_term::widget::PseudoTerminal;
 
 use crate::{
-    config::{RoomSpec, TokenPricing, room_specs, room_specs_resumed},
+    config::{
+        RoomSpec, TokenPricing, crowded_toml_path, parse_fuse_size_input, persist_fuse_size,
+        room_specs, room_specs_resumed,
+    },
     doorbell::{
         ControlAction, Doorbell, DoorbellEvent, PulseSource, PulseState, RosterRoom,
         SupportedControl,
@@ -37,6 +40,12 @@ enum InputMode {
     Normal,
     Composing(String),
     MailLog,
+    Config(ConfigOverlayState),
+}
+
+struct ConfigOverlayState {
+    fuse_input: String,
+    error: Option<String>,
 }
 
 #[cfg(not(windows))]
@@ -296,6 +305,13 @@ impl DeliveryFuse {
 
     fn reset(&mut self) {
         self.used = 0;
+    }
+
+    fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
+        if self.limit != 0 && self.used > self.limit {
+            self.used = self.limit;
+        }
     }
 }
 
@@ -824,6 +840,22 @@ fn mail_popup_area(area: Rect) -> Rect {
     popup
 }
 
+fn config_popup_area(area: Rect) -> Rect {
+    let [_, middle, _] = Layout::vertical([
+        Constraint::Percentage(20),
+        Constraint::Percentage(60),
+        Constraint::Percentage(20),
+    ])
+    .areas(area);
+    let [_, popup, _] = Layout::horizontal([
+        Constraint::Percentage(15),
+        Constraint::Percentage(70),
+        Constraint::Percentage(15),
+    ])
+    .areas(middle);
+    popup
+}
+
 // This guard owns the changes we make to the *parent* terminal. Rust calls
 // `Drop::drop` automatically when the value leaves scope, including after `?`.
 struct TerminalGuard {
@@ -905,7 +937,7 @@ pub(crate) fn run_resumed() -> Result<(), Box<dyn std::error::Error>> {
 fn run_with(
     specs: Vec<RoomSpec>,
     resumed: Vec<bool>,
-    fuse_size: usize,
+    mut fuse_size: usize,
     token_pricing: Vec<TokenPricing>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let room_count = specs.len();
@@ -1284,7 +1316,7 @@ fn run_with(
                         )
                     } else {
                         format!(
-                            " Tab focus | ^W whisper | F2 mail | F3 pause | F4 intro | {}/{} | ^Q quit ",
+                            " F1 config | Tab focus | ^W whisper | F2 mail | F3 pause | F4 intro | {}/{} | ^Q quit ",
                             fuse.remaining(),
                             fuse.limit
                         )
@@ -1320,10 +1352,18 @@ fn run_with(
                     fuse.limit,
                     doorbell.path().display()
                 ),
+                InputMode::Config(state) => {
+                    if let Some(err) = &state.error {
+                        format!(" Config: fuse_size={}_ • Error: {err} • Enter: save • Esc: cancel ", state.fuse_input)
+                    } else {
+                        format!(" Config: fuse_size={}_ • Enter: save • Esc: cancel ", state.fuse_input)
+                    }
+                }
             };
             let status_style = match (&input_mode, notice.is_some()) {
                 (InputMode::Composing(_), _) => Style::default().fg(Color::Yellow),
                 (InputMode::MailLog, _) => Style::default().fg(Color::Cyan),
+                (InputMode::Config(_), _) => Style::default().fg(Color::Yellow),
                 (InputMode::Normal, true) => Style::default().fg(Color::Yellow),
                 (InputMode::Normal, false) => Style::default().fg(Color::DarkGray),
             };
@@ -1335,6 +1375,39 @@ fn run_with(
                 frame.render_widget(
                     Paragraph::new(mailroom.summary())
                         .block(Block::bordered().title(" Mailroom "))
+                        .wrap(Wrap { trim: false }),
+                    popup,
+                );
+            }
+
+            if let InputMode::Config(state) = &input_mode {
+                let popup = config_popup_area(frame.area());
+                frame.render_widget(Clear, popup);
+                let rooms_text: Vec<String> = panes
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, pane)| {
+                        format!(" {}: {} ({})", idx + 1, pane.title(), pane.name())
+                    })
+                    .collect();
+                let mut lines: Vec<Line> = Vec::new();
+                lines.push(Line::from(" Loaded rooms from crowded.toml:"));
+                for room in &rooms_text {
+                    lines.push(Line::from(room.clone()));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(format!(" fuse_size = {}_", state.fuse_input)));
+                if let Some(err) = &state.error {
+                    lines.push(Line::styled(
+                        format!(" Error: {err}"),
+                        Style::default().fg(Color::Red),
+                    ));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(" Enter: save • Esc: cancel • F1: close "));
+                frame.render_widget(
+                    Paragraph::new(Text::from(lines))
+                        .block(Block::bordered().title(" Config (F1) "))
                         .wrap(Wrap { trim: false }),
                     popup,
                 );
@@ -1382,11 +1455,31 @@ fn run_with(
                 Event::Key(key)
                     if key.code == KeyCode::F(2)
                         && key.kind == KeyEventKind::Press
-                        && !matches!(&input_mode, InputMode::Composing(_)) =>
+                        && !matches!(&input_mode, InputMode::Composing(_) | InputMode::Config(_)) =>
                 {
                     input_mode = match input_mode {
                         InputMode::MailLog => InputMode::Normal,
                         InputMode::Normal => InputMode::MailLog,
+                        InputMode::Config(_) => unreachable!(),
+                        InputMode::Composing(_) => unreachable!(),
+                    };
+                    notice = None;
+                }
+                Event::Key(key)
+                    if key.code == KeyCode::F(1)
+                        && key.kind == KeyEventKind::Press
+                        && !matches!(&input_mode, InputMode::Composing(_)) =>
+                {
+                    input_mode = match input_mode {
+                        InputMode::Config(_) => InputMode::Normal,
+                        InputMode::Normal => InputMode::Config(ConfigOverlayState {
+                            fuse_input: fuse_size.to_string(),
+                            error: None,
+                        }),
+                        InputMode::MailLog => InputMode::Config(ConfigOverlayState {
+                            fuse_input: fuse_size.to_string(),
+                            error: None,
+                        }),
                         InputMode::Composing(_) => unreachable!(),
                     };
                     notice = None;
@@ -1394,7 +1487,7 @@ fn run_with(
                 Event::Key(key)
                     if key.code == KeyCode::F(3)
                         && key.kind == KeyEventKind::Press
-                        && !matches!(&input_mode, InputMode::Composing(_)) =>
+                        && !matches!(&input_mode, InputMode::Composing(_) | InputMode::Config(_)) =>
                 {
                     if delivery_paused {
                         if fuse.is_tripped() {
@@ -1567,6 +1660,53 @@ fn run_with(
                     InputMode::MailLog => {
                         if key.code == KeyCode::Esc && key.kind == KeyEventKind::Press {
                             input_mode = InputMode::Normal;
+                        }
+                    }
+                    InputMode::Config(state) => {
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                            match key.code {
+                                KeyCode::Esc if key.kind == KeyEventKind::Press => {
+                                    input_mode = InputMode::Normal;
+                                    notice = None;
+                                }
+                                KeyCode::Enter if key.kind == KeyEventKind::Press => {
+                                    match parse_fuse_size_input(&state.fuse_input) {
+                                        Ok(new_size) => {
+                                            let path = crowded_toml_path();
+                                            match persist_fuse_size(&path, new_size) {
+                                                Ok(()) => {
+                                                    fuse.set_limit(new_size);
+                                                    fuse_size = new_size;
+                                                    input_mode = InputMode::Normal;
+                                                    notice = Some(format!(
+                                                        "fuse_size updated to {new_size}"
+                                                    ));
+                                                }
+                                                Err(error) => {
+                                                    state.error = Some(error.to_string());
+                                                }
+                                            }
+                                        }
+                                        Err(msg) => {
+                                            state.error = Some(msg);
+                                        }
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    state.fuse_input.pop();
+                                    state.error = None;
+                                }
+                                KeyCode::Char(ch)
+                                    if matches!(
+                                        key.modifiers,
+                                        KeyModifiers::NONE | KeyModifiers::SHIFT
+                                    ) =>
+                                {
+                                    state.fuse_input.push(ch);
+                                    state.error = None;
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 },

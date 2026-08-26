@@ -27,6 +27,7 @@ pub(crate) enum Transport {
 
 pub(crate) const DEFAULT_FUSE_LIMIT: usize = 20;
 const TOKEN_PRICING_FILE: &str = "token_pricing.toml";
+pub(crate) const CROWDED_TOML: &str = "crowded.toml";
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -447,6 +448,40 @@ fn room_specs_from_file(
         fuse_size,
         token_pricing,
     })
+}
+
+pub(crate) fn parse_fuse_size_input(input: &str) -> Result<usize, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("fuse_size cannot be empty".to_owned());
+    }
+    trimmed.parse::<usize>().map_err(|_| {
+        format!("fuse_size must be a non-negative integer, got '{trimmed}'")
+    })
+}
+
+pub(crate) fn persist_fuse_size(path: &Path, new_size: usize) -> io::Result<()> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let mut doc = if text.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        text.parse::<toml_edit::DocumentMut>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid {CROWDED_TOML}: {error}"),
+            )
+        })?
+    };
+    doc["fuse_size"] = toml_edit::value(new_size as i64);
+    fs::write(path, doc.to_string())
+}
+
+pub(crate) fn crowded_toml_path() -> PathBuf {
+    PathBuf::from(CROWDED_TOML)
 }
 
 fn validate_token_pricing(pricing: &[TokenPricing]) -> io::Result<()> {
@@ -1089,5 +1124,96 @@ transport = "raw"
         )
         .unwrap();
         assert_eq!(config.fuse_size, 0);
+    }
+
+    #[test]
+    fn parse_fuse_size_input_accepts_zero_and_positive() {
+        assert_eq!(parse_fuse_size_input("0").unwrap(), 0);
+        assert_eq!(parse_fuse_size_input("20").unwrap(), 20);
+        assert_eq!(parse_fuse_size_input("  10  ").unwrap(), 10);
+    }
+
+    #[test]
+    fn parse_fuse_size_input_rejects_non_numeric() {
+        assert!(parse_fuse_size_input("abc").is_err());
+        assert!(parse_fuse_size_input("12.3").is_err());
+        assert!(parse_fuse_size_input("").is_err());
+        assert!(parse_fuse_size_input("-1").is_err());
+        let err = parse_fuse_size_input("not-a-number").unwrap_err();
+        assert!(err.contains("non-negative integer"));
+    }
+
+    #[test]
+    fn persist_fuse_size_round_trip_preserves_other_sections() {
+        let dir = env::temp_dir().join(format!(
+            "crowded-fuse-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("crowded.toml");
+        let initial = r#"fuse_size = 20
+
+[[rooms]]
+command = "claude"
+transport = "raw"
+
+[[rooms]]
+command = "codex"
+transport = "raw"
+
+[[mcp]]
+name = "memory"
+command = "basic-memory"
+"#;
+        fs::write(&path, initial).unwrap();
+
+        persist_fuse_size(&path, 5).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("fuse_size = 5"));
+        assert!(updated.contains("[[mcp]]"));
+        assert!(updated.contains("[[rooms]]"));
+        let parsed: RoomFile = toml::from_str(&updated).unwrap();
+        assert_eq!(parsed.fuse_size, Some(5));
+
+        // 0 = unlimited must persist correctly
+        persist_fuse_size(&path, 0).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("fuse_size = 0"));
+        let parsed: RoomFile = toml::from_str(&updated).unwrap();
+        assert_eq!(parsed.fuse_size, Some(0));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn persist_fuse_size_leaves_file_unchanged_on_invalid_input() {
+        let dir = env::temp_dir().join(format!(
+            "crowded-fuse-invalid-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("crowded.toml");
+        let initial = r#"fuse_size = 20
+
+[[rooms]]
+command = "claude"
+transport = "raw"
+
+[[rooms]]
+command = "codex"
+transport = "raw"
+"#;
+        fs::write(&path, initial).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        // Simulate validation failure: do NOT call persist_fuse_size
+        let err = parse_fuse_size_input("abc");
+        assert!(err.is_err());
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
     }
 }
