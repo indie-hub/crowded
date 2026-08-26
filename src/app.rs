@@ -174,6 +174,69 @@ const INTRO_READINESS_CEILING: Duration = Duration::from_secs(15);
 // small fixed step.
 const WHEEL_SCROLL_STEP: usize = 3;
 const PULSE_COST_REFRESH: Duration = Duration::from_secs(3);
+const DETAIL_REFRESH: Duration = Duration::from_secs(2);
+
+pub(crate) fn schedule_detail_collection(
+    index: usize,
+    guest: &str,
+    cwd: &std::path::Path,
+    title: &str,
+    now: Instant,
+    last_refresh: &mut Option<Instant>,
+    pending: &mut bool,
+    tx: std::sync::mpsc::Sender<(usize, RoomDetail)>,
+    collect: impl FnOnce(String, std::path::PathBuf, String) -> RoomDetail + Send + 'static,
+) -> bool {
+    if guest == "claude" {
+        return false;
+    }
+    let should_refresh = last_refresh
+        .as_ref()
+        .is_none_or(|last| now.duration_since(*last) >= DETAIL_REFRESH);
+    if !should_refresh || *pending {
+        return false;
+    }
+    *last_refresh = Some(now);
+    *pending = true;
+    let guest_clone = guest.to_owned();
+    let cwd_owned = cwd.to_path_buf();
+    let title_owned = title.to_owned();
+    let tx_clone = tx.clone();
+    thread::spawn(move || {
+        let detail = collect(guest_clone, cwd_owned, title_owned);
+        let _ = tx_clone.send((index, detail));
+    });
+    true
+}
+
+pub(crate) fn schedule_cost_collection(
+    index: usize,
+    guest: String,
+    cwd: std::path::PathBuf,
+    title: String,
+    pricing: Vec<TokenPricing>,
+    now: Instant,
+    cache: &mut Option<(Instant, String)>,
+    pending: &mut bool,
+    tx: std::sync::mpsc::Sender<(usize, (Instant, String))>,
+    collect: impl FnOnce(String, std::path::PathBuf, String, Vec<TokenPricing>) -> String
+    + Send
+    + 'static,
+) -> bool {
+    let should_refresh = cache
+        .as_ref()
+        .is_none_or(|(last, _)| now.saturating_duration_since(*last) >= PULSE_COST_REFRESH);
+    if !should_refresh || *pending {
+        return false;
+    }
+    *pending = true;
+    let tx_clone = tx.clone();
+    thread::spawn(move || {
+        let cost = collect(guest, cwd, title, pricing);
+        let _ = tx_clone.send((index, (now, cost)));
+    });
+    true
+}
 
 // Button-event reporting (`?1000h`) plus SGR encoding (`?1006h`), and
 // deliberately not `?1002h`/`?1003h`. Crossterm's `EnableMouseCapture` turns
@@ -1519,53 +1582,50 @@ fn run_with(
                 pulse_costs[index] = None;
                 continue;
             }
-            let should_refresh = pulse_costs[index].as_ref().is_none_or(|(refreshed, _)| {
-                now.saturating_duration_since(*refreshed) >= PULSE_COST_REFRESH
-            });
-            if !should_refresh || cost_pending[index] {
-                continue;
-            }
-            cost_pending[index] = true;
-            let guest = panes[index].guest();
+            let guest = panes[index].guest().to_owned();
             let cwd = panes[index].cwd().to_path_buf();
             let title = panes[index].title().to_owned();
             let pricing = token_pricing.clone();
-            let tx = cost_tx.clone();
-            let refreshed = now;
-            thread::spawn(move || {
-                let cost = pane::usage_cost(&guest, &cwd, &title, &pricing)
-                    .map(|cost| format!("${cost:.6}"))
-                    .unwrap_or_else(|| "unknown".to_owned());
-                let _ = tx.send((index, (refreshed, cost)));
-            });
+            schedule_cost_collection(
+                index,
+                guest,
+                cwd,
+                title,
+                pricing,
+                now,
+                &mut pulse_costs[index],
+                &mut cost_pending[index],
+                cost_tx.clone(),
+                |g, c, t, p| {
+                    pane::usage_cost(&g, &c, &t, &p)
+                        .map(|cost| format!("${cost:.6}"))
+                        .unwrap_or_else(|| "unknown".to_owned())
+                },
+            );
         }
         {
-            const DETAIL_REFRESH: Duration = Duration::from_secs(2);
             for index in 0..room_count {
-                let guest = panes[index].guest();
-                if guest == "claude" {
-                    continue;
-                }
-                let should_refresh = detail_last_refresh[index]
-                    .is_none_or(|last| now.duration_since(last) >= DETAIL_REFRESH);
-                if !should_refresh || detail_pending[index] {
-                    continue;
-                }
-                detail_last_refresh[index] = Some(now);
-                detail_pending[index] = true;
-                let guest_clone = guest.clone();
+                let guest = panes[index].guest().to_owned();
                 let cwd = panes[index].cwd().to_path_buf();
                 let title = panes[index].title().to_owned();
-                let guest_lower = guest_clone.to_ascii_lowercase();
-                let tx = detail_tx.clone();
-                thread::spawn(move || {
-                    let session_id = pane::session_state::lookup(&guest_lower, &cwd, &title);
-                    let detail = match session_id {
-                        Some(id) => collect_detail(&guest_clone, &cwd, &id).unwrap_or_default(),
-                        None => RoomDetail::default(),
-                    };
-                    let _ = tx.send((index, detail));
-                });
+                schedule_detail_collection(
+                    index,
+                    &guest,
+                    &cwd,
+                    &title,
+                    now,
+                    &mut detail_last_refresh[index],
+                    &mut detail_pending[index],
+                    detail_tx.clone(),
+                    |g, c, t| {
+                        let lower = g.to_ascii_lowercase();
+                        let sid = pane::session_state::lookup(&lower, &c, &t);
+                        match sid {
+                            Some(id) => collect_detail(&g, &c, &id).unwrap_or_default(),
+                            None => RoomDetail::default(),
+                        }
+                    },
+                );
             }
         }
 
@@ -3149,10 +3209,20 @@ mod tests {
             !snippet.contains("thread::spawn"),
             "render must not spawn threads"
         );
-        assert!(!snippet.contains("collect_detail("), "render must not scan artifacts");
-        assert!(source.contains("DETAIL_REFRESH"), "bounded cache interval must exist");
-        assert!(source.contains("detail_last_refresh"), "cache must be maintained outside draw");
-    }#[test]
+        assert!(
+            !snippet.contains("collect_detail("),
+            "render must not scan artifacts"
+        );
+        assert!(
+            source.contains("DETAIL_REFRESH"),
+            "bounded cache interval must exist"
+        );
+        assert!(
+            source.contains("detail_last_refresh"),
+            "cache must be maintained outside draw"
+        );
+    }
+    #[test]
     fn pulse_panel_renders_concisely_at_real_width_and_excludes_completed_todos() {
         use ratatui::{
             Terminal,
@@ -3238,24 +3308,85 @@ mod tests {
     #[test]
     fn background_collection_does_not_block_main_thread() {
         use std::{
+            path::Path,
             sync::mpsc,
             thread,
             time::{Duration, Instant},
         };
         let (tx, rx) = mpsc::channel::<(usize, RoomDetail)>();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(250));
-            let _ = tx.send((0, RoomDetail::default()));
-        });
-        let tick_start = Instant::now();
-        let result = rx.try_recv();
-        let elapsed = tick_start.elapsed();
-        assert!(result.is_err(), "should be pending while background sleeps");
+        let mut last_refresh = None;
+        let mut pending = false;
+        let now = Instant::now();
+        let start = Instant::now();
+        let scheduled = super::schedule_detail_collection(
+            0,
+            "codex",
+            Path::new("/tmp"),
+            "Codex \u{00b7} 2",
+            now,
+            &mut last_refresh,
+            &mut pending,
+            tx.clone(),
+            |guest, _cwd, title| {
+                thread::sleep(Duration::from_millis(250));
+                assert_eq!(guest, "codex");
+                assert_eq!(title, "Codex \u{00b7} 2");
+                RoomDetail {
+                    sub_agents: vec![crate::room_detail::SubAgent {
+                        id: "slow".to_owned(),
+                        kind: "Task".to_owned(),
+                        status: "running".to_owned(),
+                    }],
+                    todos: vec![],
+                }
+            },
+        );
+        assert!(scheduled, "should schedule");
+        let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_millis(50),
-            "main tick blocked for {elapsed:?}, should be <50ms"
+            "scheduler blocked for {elapsed:?}, should be <50ms even with 250ms collector"
         );
+        assert!(
+            rx.try_recv().is_err(),
+            "should be pending while background sleeps"
+        );
+        // Pending must block a second immediate schedule
+        let mut last2 = last_refresh;
+        let mut pending2 = pending;
+        let scheduled2 = super::schedule_detail_collection(
+            0,
+            "codex",
+            Path::new("/tmp"),
+            "Codex \u{00b7} 2",
+            now,
+            &mut last2,
+            &mut pending2,
+            tx.clone(),
+            |_, _, _| panic!("should not be called while pending"),
+        );
+        assert!(!scheduled2, "should not reschedule while pending");
         thread::sleep(Duration::from_millis(300));
-        assert!(rx.try_recv().is_ok());
+        let (idx, detail) = rx.try_recv().expect("background should have completed");
+        assert_eq!(idx, 0);
+        assert_eq!(detail.sub_agents[0].id, "slow");
+        // Simulate main loop clearing pending after recv
+        pending = false;
+        let later = now + Duration::from_secs(3);
+        let scheduled3 = super::schedule_detail_collection(
+            0,
+            "codex",
+            Path::new("/tmp"),
+            "Codex \u{00b7} 2",
+            later,
+            &mut last_refresh,
+            &mut pending,
+            tx,
+            |_, _, _| RoomDetail::default(),
+        );
+        assert!(
+            scheduled3,
+            "should reschedule after interval and pending cleared"
+        );
     }
 }
