@@ -19,6 +19,7 @@ target
 
 # Machine-local room profiles
 /crowded.toml
+/token_pricing.toml
 /.crowded/
 # Machine-local Headroom stores and captured session dump
 /.headroom/
