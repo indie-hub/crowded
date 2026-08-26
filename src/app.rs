@@ -25,7 +25,9 @@ use tui_term::widget::PseudoTerminal;
 
 use crate::{
     config::{
-        RoomSpec, TokenPricing, crowded_toml_path, parse_fuse_size_input, persist_fuse_size,
+        RoomFieldUpdate, RoomScheduling, RoomSpec, TokenPricing, crowded_toml_path,
+        parse_allow_control_input, parse_capabilities_input, parse_cost_tier_input,
+        parse_fuse_size_input, parse_model_tier_input, persist_fuse_size, persist_room_fields,
         room_specs, room_specs_resumed,
     },
     doorbell::{
@@ -40,12 +42,112 @@ enum InputMode {
     Normal,
     Composing(String),
     MailLog,
-    Config(ConfigOverlayState),
+    Config(Box<ConfigOverlayState>),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ConfigField {
+    FuseSize,
+    AllowControl,
+    ModelTier,
+    CostTier,
+    Capabilities,
+}
+
+impl ConfigField {
+    fn next(self) -> Self {
+        match self {
+            ConfigField::FuseSize => ConfigField::AllowControl,
+            ConfigField::AllowControl => ConfigField::ModelTier,
+            ConfigField::ModelTier => ConfigField::CostTier,
+            ConfigField::CostTier => ConfigField::Capabilities,
+            ConfigField::Capabilities => ConfigField::FuseSize,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            ConfigField::FuseSize => ConfigField::Capabilities,
+            ConfigField::AllowControl => ConfigField::FuseSize,
+            ConfigField::ModelTier => ConfigField::AllowControl,
+            ConfigField::CostTier => ConfigField::ModelTier,
+            ConfigField::Capabilities => ConfigField::CostTier,
+        }
+    }
 }
 
 struct ConfigOverlayState {
     fuse_input: String,
+    fuse_original: usize,
+    selected: usize,
+    field: ConfigField,
+    allow_input: String,
+    allow_original: String,
+    tier_input: String,
+    tier_original: String,
+    cost_input: String,
+    cost_original: String,
+    caps_input: String,
+    caps_original: String,
     error: Option<String>,
+}
+
+impl ConfigOverlayState {
+    fn new(panes: &[Pane], selected: usize, fuse_size: usize) -> Self {
+        let mut state = Self {
+            fuse_input: fuse_size.to_string(),
+            fuse_original: fuse_size,
+            selected,
+            field: ConfigField::FuseSize,
+            allow_input: String::new(),
+            allow_original: String::new(),
+            tier_input: String::new(),
+            tier_original: String::new(),
+            cost_input: String::new(),
+            cost_original: String::new(),
+            caps_input: String::new(),
+            caps_original: String::new(),
+            error: None,
+        };
+        state.resync(panes);
+        state
+    }
+
+    fn resync(&mut self, panes: &[Pane]) {
+        let pane = &panes[self.selected];
+        let scheduling = pane.scheduling();
+        let tier = scheduling
+            .as_ref()
+            .and_then(|entry| entry.model_tier.as_deref())
+            .unwrap_or_default();
+        let cost = scheduling
+            .as_ref()
+            .and_then(|entry| entry.cost_tier.as_deref())
+            .unwrap_or_default();
+        let caps = scheduling
+            .as_ref()
+            .map(|entry| entry.capabilities.join(", "))
+            .unwrap_or_default();
+        self.allow_input = pane.allows_control().to_string();
+        self.allow_original = self.allow_input.clone();
+        self.tier_input = tier.to_owned();
+        self.tier_original = self.tier_input.clone();
+        self.cost_input = cost.to_owned();
+        self.cost_original = self.cost_input.clone();
+        self.caps_input = caps;
+        self.caps_original = self.caps_input.clone();
+    }
+
+    fn edit(&mut self, mutate: impl FnOnce(&mut String)) {
+        match self.field {
+            ConfigField::FuseSize => mutate(&mut self.fuse_input),
+            ConfigField::AllowControl => mutate(&mut self.allow_input),
+            ConfigField::ModelTier => mutate(&mut self.tier_input),
+            ConfigField::CostTier => mutate(&mut self.cost_input),
+            ConfigField::Capabilities => mutate(&mut self.caps_input),
+        }
+        self.error = None;
+    }
 }
 
 #[cfg(not(windows))]
@@ -856,6 +958,116 @@ fn config_popup_area(area: Rect) -> Rect {
     popup
 }
 
+/// Validate and persist the config overlay's edited fields for the selected
+/// room. Changed fields are validated first so any invalid value leaves the
+/// file untouched; nothing is written when no field changed. Returns `true`
+/// when the overlay should close.
+fn save_config_state(
+    state: &mut ConfigOverlayState,
+    panes: &mut [Pane],
+    fuse: &mut DeliveryFuse,
+    fuse_size: &mut usize,
+    notice: &mut Option<String>,
+) -> bool {
+    let new_size = match parse_fuse_size_input(&state.fuse_input) {
+        Ok(value) => value,
+        Err(msg) => {
+            state.error = Some(msg);
+            return false;
+        }
+    };
+    let allow_changed = state.allow_input.trim() != state.allow_original;
+    let tier_changed = state.tier_input.trim() != state.tier_original;
+    let cost_changed = state.cost_input.trim() != state.cost_original;
+    let caps_changed = state.caps_input.trim() != state.caps_original;
+
+    let allow = if allow_changed {
+        match parse_allow_control_input(&state.allow_input) {
+            Ok(value) => Some(value),
+            Err(msg) => {
+                state.error = Some(msg);
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    let tier = if tier_changed {
+        match parse_model_tier_input(&state.tier_input) {
+            Ok(value) => Some(value),
+            Err(msg) => {
+                state.error = Some(msg);
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    let cost = if cost_changed {
+        match parse_cost_tier_input(&state.cost_input) {
+            Ok(value) => Some(value),
+            Err(msg) => {
+                state.error = Some(msg);
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    let caps = if caps_changed {
+        match parse_capabilities_input(&state.caps_input) {
+            Ok(value) => Some(value),
+            Err(msg) => {
+                state.error = Some(msg);
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+
+    let updates = RoomFieldUpdate {
+        allow_control: allow,
+        model_tier: tier.clone(),
+        cost_tier: cost.clone(),
+        capabilities: caps.clone(),
+    };
+    let fuse_changed = new_size != state.fuse_original;
+
+    let path = crowded_toml_path();
+    if fuse_changed {
+        if let Err(error) = persist_fuse_size(&path, new_size) {
+            state.error = Some(error.to_string());
+            return false;
+        }
+        fuse.set_limit(new_size);
+        *fuse_size = new_size;
+    }
+    if !updates.is_empty() {
+        if let Err(error) = persist_room_fields(&path, state.selected, &updates) {
+            state.error = Some(error.to_string());
+            return false;
+        }
+        if let Some(value) = updates.allow_control {
+            panes[state.selected].set_allow_control(value);
+        }
+        if tier.is_some() || cost.is_some() || caps.is_some() {
+            let existing = panes[state.selected].scheduling().unwrap_or_default();
+            panes[state.selected].set_scheduling(RoomScheduling {
+                model_tier: tier.or(existing.model_tier),
+                cost_tier: cost.or(existing.cost_tier),
+                capabilities: caps.unwrap_or(existing.capabilities),
+            });
+        }
+    }
+    *notice = Some(if !fuse_changed && updates.is_empty() {
+        "no config changes to save".to_owned()
+    } else {
+        format!("room {} config saved", state.selected + 1)
+    });
+    true
+}
+
 // This guard owns the changes we make to the *parent* terminal. Rust calls
 // `Drop::drop` automatically when the value leaves scope, including after `?`.
 struct TerminalGuard {
@@ -1354,9 +1566,9 @@ fn run_with(
                 ),
                 InputMode::Config(state) => {
                     if let Some(err) = &state.error {
-                        format!(" Config: fuse_size={}_ • Error: {err} • Enter: save • Esc: cancel ", state.fuse_input)
+                        format!(" Config room {} • Error: {err} • Enter: save • Esc: cancel ", state.selected + 1)
                     } else {
-                        format!(" Config: fuse_size={}_ • Enter: save • Esc: cancel ", state.fuse_input)
+                        format!(" Config room {} • Enter: save • Esc: cancel ", state.selected + 1)
                     }
                 }
             };
@@ -1383,20 +1595,73 @@ fn run_with(
             if let InputMode::Config(state) = &input_mode {
                 let popup = config_popup_area(frame.area());
                 frame.render_widget(Clear, popup);
-                let rooms_text: Vec<String> = panes
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, pane)| {
-                        format!(" {}: {} ({})", idx + 1, pane.title(), pane.name())
-                    })
-                    .collect();
                 let mut lines: Vec<Line> = Vec::new();
                 lines.push(Line::from(" Loaded rooms from crowded.toml:"));
-                for room in &rooms_text {
-                    lines.push(Line::from(room.clone()));
+                for (idx, pane) in panes.iter().enumerate() {
+                    let scheduling = pane.scheduling();
+                    let tier = scheduling
+                        .as_ref()
+                        .and_then(|entry| entry.model_tier.as_deref())
+                        .unwrap_or("-");
+                    let cost = scheduling
+                        .as_ref()
+                        .and_then(|entry| entry.cost_tier.as_deref())
+                        .unwrap_or("-");
+                    let caps = scheduling
+                        .as_ref()
+                        .map(|entry| {
+                            if entry.capabilities.is_empty() {
+                                "-".to_owned()
+                            } else {
+                                entry.capabilities.join(",")
+                            }
+                        })
+                        .unwrap_or_else(|| "-".to_owned());
+                    let marker = if idx == state.selected { ">" } else { " " };
+                    lines.push(Line::from(format!(
+                        " {marker} {}: {}  allow={} tier={} cost={} caps={}",
+                        idx + 1,
+                        pane.name(),
+                        pane.allows_control(),
+                        tier,
+                        cost,
+                        caps
+                    )));
                 }
                 lines.push(Line::from(""));
-                lines.push(Line::from(format!(" fuse_size = {}_", state.fuse_input)));
+                lines.push(Line::from(format!(
+                    " Editing room {}:",
+                    state.selected + 1
+                )));
+                let fields = [
+                    (ConfigField::FuseSize, format!(" fuse_size = {}_", state.fuse_input)),
+                    (
+                        ConfigField::AllowControl,
+                        format!(" allow_control = {}_", state.allow_input),
+                    ),
+                    (
+                        ConfigField::ModelTier,
+                        format!(" model_tier = {}_", state.tier_input),
+                    ),
+                    (
+                        ConfigField::CostTier,
+                        format!(" cost_tier = {}_", state.cost_input),
+                    ),
+                    (
+                        ConfigField::Capabilities,
+                        format!(" capabilities = {}_", state.caps_input),
+                    ),
+                ];
+                for (field, text) in fields {
+                    if field == state.field {
+                        lines.push(Line::styled(
+                            text,
+                            Style::default().fg(Color::Cyan),
+                        ));
+                    } else {
+                        lines.push(Line::from(text));
+                    }
+                }
                 if let Some(err) = &state.error {
                     lines.push(Line::styled(
                         format!(" Error: {err}"),
@@ -1404,7 +1669,9 @@ fn run_with(
                     ));
                 }
                 lines.push(Line::from(""));
-                lines.push(Line::from(" Enter: save • Esc: cancel • F1: close "));
+                lines.push(Line::from(
+                    " Tab: room • ↑/↓: field • type: edit • Enter: save • Esc: cancel • F1: close ",
+                ));
                 frame.render_widget(
                     Paragraph::new(Text::from(lines))
                         .block(Block::bordered().title(" Config (F1) "))
@@ -1472,14 +1739,12 @@ fn run_with(
                 {
                     input_mode = match input_mode {
                         InputMode::Config(_) => InputMode::Normal,
-                        InputMode::Normal => InputMode::Config(ConfigOverlayState {
-                            fuse_input: fuse_size.to_string(),
-                            error: None,
-                        }),
-                        InputMode::MailLog => InputMode::Config(ConfigOverlayState {
-                            fuse_input: fuse_size.to_string(),
-                            error: None,
-                        }),
+                        InputMode::Normal => {
+                            InputMode::Config(Box::new(ConfigOverlayState::new(&panes, 0, fuse_size)))
+                        }
+                        InputMode::MailLog => {
+                            InputMode::Config(Box::new(ConfigOverlayState::new(&panes, 0, fuse_size)))
+                        }
                         InputMode::Composing(_) => unreachable!(),
                     };
                     notice = None;
@@ -1670,31 +1935,34 @@ fn run_with(
                                     notice = None;
                                 }
                                 KeyCode::Enter if key.kind == KeyEventKind::Press => {
-                                    match parse_fuse_size_input(&state.fuse_input) {
-                                        Ok(new_size) => {
-                                            let path = crowded_toml_path();
-                                            match persist_fuse_size(&path, new_size) {
-                                                Ok(()) => {
-                                                    fuse.set_limit(new_size);
-                                                    fuse_size = new_size;
-                                                    input_mode = InputMode::Normal;
-                                                    notice = Some(format!(
-                                                        "fuse_size updated to {new_size}"
-                                                    ));
-                                                }
-                                                Err(error) => {
-                                                    state.error = Some(error.to_string());
-                                                }
-                                            }
-                                        }
-                                        Err(msg) => {
-                                            state.error = Some(msg);
-                                        }
+                                    let saved = save_config_state(
+                                        state,
+                                        &mut panes,
+                                        &mut fuse,
+                                        &mut fuse_size,
+                                        &mut notice,
+                                    );
+                                    if saved {
+                                        input_mode = InputMode::Normal;
                                     }
                                 }
-                                KeyCode::Backspace => {
-                                    state.fuse_input.pop();
+                                KeyCode::Tab if key.kind == KeyEventKind::Press => {
+                                    state.selected = (state.selected + 1) % panes.len();
                                     state.error = None;
+                                    state.resync(&panes);
+                                }
+                                KeyCode::Up if key.kind == KeyEventKind::Press => {
+                                    state.field = state.field.prev();
+                                    state.error = None;
+                                }
+                                KeyCode::Down if key.kind == KeyEventKind::Press => {
+                                    state.field = state.field.next();
+                                    state.error = None;
+                                }
+                                KeyCode::Backspace => {
+                                    state.edit(|input| {
+                                        input.pop();
+                                    });
                                 }
                                 KeyCode::Char(ch)
                                     if matches!(
@@ -1702,8 +1970,7 @@ fn run_with(
                                         KeyModifiers::NONE | KeyModifiers::SHIFT
                                     ) =>
                                 {
-                                    state.fuse_input.push(ch);
-                                    state.error = None;
+                                    state.edit(|input| input.push(ch));
                                 }
                                 _ => {}
                             }

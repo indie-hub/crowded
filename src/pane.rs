@@ -566,6 +566,18 @@ impl Pane {
         self.spec.allow_control
     }
 
+    /// Update `allow_control` in place so the change applies to the live pane
+    /// without a respawn; `allows_control` reads `spec.allow_control` directly.
+    pub(crate) fn set_allow_control(&mut self, value: bool) {
+        self.spec.allow_control = value;
+    }
+
+    /// Replace the scheduling metadata in place so the config overlay stays
+    /// consistent with what was persisted.
+    pub(crate) fn set_scheduling(&mut self, scheduling: RoomScheduling) {
+        self.spec.scheduling = Some(scheduling);
+    }
+
     pub(crate) fn headroom_active(&self) -> bool {
         self.headroom_active
     }

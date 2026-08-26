@@ -480,6 +480,124 @@ pub(crate) fn persist_fuse_size(path: &Path, new_size: usize) -> io::Result<()> 
     fs::write(path, doc.to_string())
 }
 
+pub(crate) fn parse_allow_control_input(input: &str) -> Result<bool, String> {
+    match input.trim() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        other => Err(format!("allow_control must be true or false, got '{other}'")),
+    }
+}
+
+pub(crate) fn parse_model_tier_input(input: &str) -> Result<String, String> {
+    parse_scheduling_enum_input("model_tier", input, &["fast", "balanced", "deep"])
+}
+
+pub(crate) fn parse_cost_tier_input(input: &str) -> Result<String, String> {
+    parse_scheduling_enum_input("cost_tier", input, &["low", "medium", "high"])
+}
+
+fn parse_scheduling_enum_input(field: &str, input: &str, allowed: &[&str]) -> Result<String, String> {
+    let trimmed = input.trim();
+    if allowed.contains(&trimmed) {
+        Ok(trimmed.to_owned())
+    } else {
+        Err(format!("room {field} must be one of {}", allowed.join(", ")))
+    }
+}
+
+pub(crate) fn parse_capabilities_input(input: &str) -> Result<Vec<String>, String> {
+    const ALLOWED: [&str; 5] = ["produce", "implement", "validate", "qa", "audit"];
+    let mut capabilities = Vec::new();
+    for part in input.split(',') {
+        let capability = part.trim();
+        if capability.is_empty() {
+            continue;
+        }
+        if !ALLOWED.contains(&capability) {
+            return Err(format!(
+                "capability '{capability}' invalid; must be one of {}",
+                ALLOWED.join(", ")
+            ));
+        }
+        capabilities.push(capability.to_owned());
+    }
+    Ok(capabilities)
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RoomFieldUpdate {
+    pub(crate) allow_control: Option<bool>,
+    pub(crate) model_tier: Option<String>,
+    pub(crate) cost_tier: Option<String>,
+    pub(crate) capabilities: Option<Vec<String>>,
+}
+
+impl RoomFieldUpdate {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.allow_control.is_none()
+            && self.model_tier.is_none()
+            && self.cost_tier.is_none()
+            && self.capabilities.is_none()
+    }
+}
+
+/// Persist per-room scheduling fields, mirroring [`persist_fuse_size`]'s
+/// parse-or-create, set-the-touched-field, write-back shape so unrelated
+/// content in the document is preserved byte-for-byte.
+pub(crate) fn persist_room_fields(
+    path: &Path,
+    room_index: usize,
+    updates: &RoomFieldUpdate,
+) -> io::Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let mut doc = if text.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        text.parse::<toml_edit::DocumentMut>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid {CROWDED_TOML}: {error}"),
+            )
+        })?
+    };
+    let rooms = doc["rooms"].as_array_of_tables_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "crowded.toml has no [[rooms]] table",
+        )
+    })?;
+    let room = rooms.get_mut(room_index).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("room {} not found", room_index + 1),
+        )
+    })?;
+    if let Some(value) = updates.allow_control {
+        room["allow_control"] = toml_edit::value(value);
+    }
+    if let Some(value) = &updates.model_tier {
+        room["model_tier"] = toml_edit::value(value.as_str());
+    }
+    if let Some(value) = &updates.cost_tier {
+        room["cost_tier"] = toml_edit::value(value.as_str());
+    }
+    if let Some(capabilities) = &updates.capabilities {
+        let mut array = toml_edit::Array::new();
+        for capability in capabilities {
+            array.push(capability.as_str());
+        }
+        room["capabilities"] = toml_edit::value(array);
+    }
+    fs::write(path, doc.to_string())
+}
+
 pub(crate) fn crowded_toml_path() -> PathBuf {
     PathBuf::from(CROWDED_TOML)
 }
@@ -1210,6 +1328,157 @@ transport = "raw"
         // Simulate validation failure: do NOT call persist_fuse_size
         let err = parse_fuse_size_input("abc");
         assert!(err.is_err());
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn parse_room_field_inputs_accept_valid_values() {
+        assert!(parse_allow_control_input("true").unwrap());
+        assert!(!parse_allow_control_input("false").unwrap());
+        assert_eq!(parse_model_tier_input(" deep ").unwrap(), "deep");
+        assert_eq!(parse_cost_tier_input("low").unwrap(), "low");
+        assert_eq!(
+            parse_capabilities_input("produce, validate,qa").unwrap(),
+            vec!["produce".to_owned(), "validate".to_owned(), "qa".to_owned()]
+        );
+        assert!(parse_capabilities_input("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_room_field_inputs_reject_invalid_values() {
+        assert!(parse_allow_control_input("maybe").is_err());
+        assert!(parse_model_tier_input("ultra").is_err());
+        assert!(parse_cost_tier_input("expensive").is_err());
+        assert!(parse_capabilities_input("bogus").is_err());
+    }
+
+    #[test]
+    fn persist_room_fields_round_trip_preserves_other_sections() {
+        let dir = env::temp_dir().join(format!(
+            "crowded-room-fields-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("crowded.toml");
+        let initial = r#"fuse_size = 20
+
+[[rooms]]
+command = "claude"
+transport = "raw"
+
+[[rooms]]
+command = "codex"
+transport = "raw"
+model_tier = "fast"
+cost_tier = "low"
+capabilities = ["implement"]
+
+[[mcp]]
+name = "memory"
+command = "basic-memory"
+"#;
+        fs::write(&path, initial).unwrap();
+
+        let updates = RoomFieldUpdate {
+            allow_control: Some(true),
+            model_tier: Some("balanced".to_owned()),
+            cost_tier: Some("medium".to_owned()),
+            capabilities: Some(vec!["produce".to_owned(), "qa".to_owned()]),
+        };
+        persist_room_fields(&path, 0, &updates).unwrap();
+
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("allow_control = true"));
+        assert!(updated.contains("model_tier = \"balanced\""));
+        assert!(updated.contains("cost_tier = \"medium\""));
+        assert!(updated.contains("capabilities = [\"produce\", \"qa\"]"));
+        // Unrelated content is preserved.
+        assert!(updated.contains("fuse_size = 20"));
+        assert!(updated.contains("[[mcp]]"));
+        // The untouched room keeps its original scheduling.
+        assert!(updated.contains("model_tier = \"fast\""));
+        assert!(updated.contains("capabilities = [\"implement\"]"));
+        let parsed: RoomFile = toml::from_str(&updated).unwrap();
+        assert!(parsed.rooms[0].allow_control);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn persist_room_fields_only_touches_the_indexed_room() {
+        let dir = env::temp_dir().join(format!(
+            "crowded-room-touch-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("crowded.toml");
+        let initial = r#"[[rooms]]
+command = "claude"
+transport = "raw"
+
+[[rooms]]
+command = "codex"
+transport = "raw"
+allow_control = true
+"#;
+        fs::write(&path, initial).unwrap();
+
+        persist_room_fields(
+            &path,
+            1,
+            &RoomFieldUpdate {
+                allow_control: Some(false),
+                ..RoomFieldUpdate::default()
+            },
+        )
+        .unwrap();
+
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("allow_control = false"));
+        assert_eq!(updated.matches("allow_control").count(), 1);
+        assert!(updated.contains("command = \"claude\""));
+        let parsed: RoomFile = toml::from_str(&updated).unwrap();
+        assert!(!parsed.rooms[1].allow_control);
+        assert!(!parsed.rooms[0].allow_control);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn persist_room_fields_out_of_range_room_leaves_file_unchanged() {
+        let dir = env::temp_dir().join(format!(
+            "crowded-room-range-{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("crowded.toml");
+        let initial = r#"[[rooms]]
+command = "claude"
+transport = "raw"
+
+[[rooms]]
+command = "codex"
+transport = "raw"
+"#;
+        fs::write(&path, initial).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        let err = persist_room_fields(
+            &path,
+            5,
+            &RoomFieldUpdate {
+                allow_control: Some(true),
+                ..RoomFieldUpdate::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("room 6 not found"));
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(before, after);
 
