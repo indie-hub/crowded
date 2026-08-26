@@ -44,12 +44,6 @@ enum InputMode {
     Composing(String),
     MailLog,
     Config(Box<ConfigOverlayState>),
-    Detail(RoomDetailView),
-}
-
-struct RoomDetailView {
-    room: usize,
-    detail: RoomDetail,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -765,6 +759,7 @@ fn render_pulse_lines(
     sessions: &[bool],
     states: &[&str],
     costs: &[Option<(Instant, String)>],
+    details: &[RoomDetail],
     focused: usize,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
@@ -791,6 +786,51 @@ fn render_pulse_lines(
             format!("  {}{cost}", states[index]),
             state_style,
         ));
+        if let Some(detail) = details.get(index) {
+            const LIMIT: usize = 3;
+            if !detail.sub_agents.is_empty() {
+                let mut parts = Vec::new();
+                for agent in detail.sub_agents.iter().take(LIMIT) {
+                    let id_suffix = if agent.id.is_empty() {
+                        String::new()
+                    } else {
+                        format!("·{}", agent.id)
+                    };
+                    let suffix = if id_suffix.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {id_suffix}")
+                    };
+                    parts.push(format!("[{}] {}{}", agent.status, agent.kind, suffix));
+                }
+                if detail.sub_agents.len() > LIMIT {
+                    parts.push(format!("+{} more", detail.sub_agents.len() - LIMIT));
+                }
+                lines.push(Line::styled(
+                    format!("  sub-agents: {}", parts.join(", ")),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if !detail.todos.is_empty() {
+                let mut parts = Vec::new();
+                for todo in detail.todos.iter().take(LIMIT) {
+                    let content = if todo.content.chars().count() > 32 {
+                        let truncated: String = todo.content.chars().take(32).collect();
+                        format!("{truncated}…")
+                    } else {
+                        todo.content.clone()
+                    };
+                    parts.push(format!("[{}] {}", todo.status, content));
+                }
+                if detail.todos.len() > LIMIT {
+                    parts.push(format!("+{} more", detail.todos.len() - LIMIT));
+                }
+                lines.push(Line::styled(
+                    format!("  todos: {}", parts.join(", ")),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
     }
     if let Some(total) = pulse_total(costs, sessions) {
         lines.push(Line::styled(total, Style::default()));
@@ -1075,24 +1115,6 @@ fn save_config_state(
     true
 }
 
-/// Gather the detail for one room. Claude Code rooms report through hook
-/// pulses accumulated in `room_details`; OpenCode and Codex are read from
-/// their persisted artifacts on demand. The view renders either source
-/// uniformly, with no liveness or freshness distinction.
-fn detail_for_room(index: usize, panes: &[Pane], room_details: &[RoomDetail]) -> RoomDetail {
-    let pane = &panes[index];
-    let guest = pane.guest();
-    if guest == "claude" {
-        return room_details[index].clone();
-    }
-    let session_id =
-        pane::session_state::lookup(&guest.to_ascii_lowercase(), pane.cwd(), pane.title());
-    let Some(session_id) = session_id else {
-        return RoomDetail::default();
-    };
-    collect_detail(&guest, pane.cwd(), &session_id).unwrap_or_default()
-}
-
 // This guard owns the changes we make to the *parent* terminal. Rust calls
 // `Drop::drop` automatically when the value leaves scope, including after `?`.
 struct TerminalGuard {
@@ -1215,6 +1237,7 @@ fn run_with(
     let mut submit_pending = VecDeque::<(Instant, usize, bool)>::new();
     let mut room_pulses = vec![None::<PulseSample>; room_count];
     let mut room_details = vec![RoomDetail::default(); room_count];
+    let mut detail_last_refresh = vec![None::<Instant>; room_count];
     let mut pulse_costs = vec![None::<(Instant, String)>; room_count];
     // Holds the event that ended a wheel burst, so draining never discards it,
     // and any key run handed back by the torn-report filter.
@@ -1478,6 +1501,31 @@ fn run_with(
                 },
             );
         }
+        {
+            const DETAIL_REFRESH: Duration = Duration::from_secs(2);
+            for index in 0..room_count {
+                let guest = panes[index].guest();
+                if guest == "claude" {
+                    continue;
+                }
+                let should_refresh = detail_last_refresh[index]
+                    .is_none_or(|last| now.duration_since(last) >= DETAIL_REFRESH);
+                if !should_refresh {
+                    continue;
+                }
+                detail_last_refresh[index] = Some(now);
+                let Some(session_id) = pane::session_state::lookup(
+                    &guest.to_ascii_lowercase(),
+                    panes[index].cwd(),
+                    panes[index].title(),
+                ) else {
+                    room_details[index] = RoomDetail::default();
+                    continue;
+                };
+                room_details[index] =
+                    collect_detail(&guest, panes[index].cwd(), &session_id).unwrap_or_default();
+            }
+        }
 
         for pane in &mut panes {
             pane.apply_scroll();
@@ -1532,6 +1580,7 @@ fn run_with(
                 &sessions,
                 &states,
                 &pulse_costs,
+                &room_details,
                 focused,
             );
             frame.render_widget(
@@ -1602,22 +1651,12 @@ fn run_with(
                         format!(" Config room {} • Enter: save • Esc: cancel ", state.selected + 1)
                     }
                 }
-                InputMode::Detail(view) => {
-                    let sub_agents = view.detail.sub_agents.len();
-                    let todos = view.detail.todos.len();
-                    format!(
-                        " {} detail: {} sub-agent(s), {} todo(s) • d or Esc: close ",
-                        panes[view.room].title(),
-                        sub_agents,
-                        todos
-                    )
-                }
+
             };
             let status_style = match (&input_mode, notice.is_some()) {
                 (InputMode::Composing(_), _) => Style::default().fg(Color::Yellow),
                 (InputMode::MailLog, _) => Style::default().fg(Color::Cyan),
                 (InputMode::Config(_), _) => Style::default().fg(Color::Yellow),
-                (InputMode::Detail(_), _) => Style::default().fg(Color::Cyan),
                 (InputMode::Normal, true) => Style::default().fg(Color::Yellow),
                 (InputMode::Normal, false) => Style::default().fg(Color::DarkGray),
             };
@@ -1722,48 +1761,7 @@ fn run_with(
                 );
             }
 
-            if let InputMode::Detail(view) = &input_mode {
-                let popup = config_popup_area(frame.area());
-                frame.render_widget(Clear, popup);
-                let mut lines: Vec<Line> = Vec::new();
-                lines.push(Line::from(format!(" {} detail:", panes[view.room].title())));
-                lines.push(Line::from(" Sub-agents:"));
-                if view.detail.sub_agents.is_empty() {
-                    lines.push(Line::from("   (none)"));
-                }
-                for agent in &view.detail.sub_agents {
-                    let identity = if agent.id.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" · {}", agent.id)
-                    };
-                    lines.push(Line::from(format!(
-                        "   [{}] {}{identity}",
-                        agent.status, agent.kind
-                    )));
-                }
-                lines.push(Line::from(" Todos:"));
-                if view.detail.todos.is_empty() {
-                    lines.push(Line::from("   (none)"));
-                }
-                for todo in &view.detail.todos {
-                    lines.push(Line::from(format!(
-                        "   [{}] {}",
-                        todo.status, todo.content
-                    )));
-                }
-                lines.push(Line::from(""));
-                lines.push(Line::from(" d or Esc: close "));
-                frame.render_widget(
-                    Paragraph::new(Text::from(lines))
-                        .block(Block::bordered().title(format!(
-                            " {} detail ",
-                            panes[view.room].title()
-                        )))
-                        .wrap(Wrap { trim: false }),
-                    popup,
-                );
-            }
+
         })?;
         for pane in &mut panes {
             pane.restore_scroll();
@@ -1809,14 +1807,13 @@ fn run_with(
                         && key.kind == KeyEventKind::Press
                         && !matches!(
                             &input_mode,
-                            InputMode::Composing(_) | InputMode::Config(_) | InputMode::Detail(_)
+                            InputMode::Composing(_) | InputMode::Config(_)
                         ) =>
                 {
                     input_mode = match input_mode {
                         InputMode::MailLog => InputMode::Normal,
                         InputMode::Normal => InputMode::MailLog,
                         InputMode::Config(_) => unreachable!(),
-                        InputMode::Detail(_) => unreachable!(),
                         InputMode::Composing(_) => unreachable!(),
                     };
                     notice = None;
@@ -1824,17 +1821,16 @@ fn run_with(
                 Event::Key(key)
                     if key.code == KeyCode::F(1)
                         && key.kind == KeyEventKind::Press
-                        && !matches!(&input_mode, InputMode::Composing(_) | InputMode::Detail(_)) =>
+                        && !matches!(&input_mode, InputMode::Composing(_)) =>
                 {
                     input_mode = match input_mode {
                         InputMode::Config(_) => InputMode::Normal,
-                        InputMode::Normal => {
-                            InputMode::Config(Box::new(ConfigOverlayState::new(&panes, 0, fuse_size)))
-                        }
-                        InputMode::MailLog => {
-                            InputMode::Config(Box::new(ConfigOverlayState::new(&panes, 0, fuse_size)))
-                        }
-                        InputMode::Detail(_) => unreachable!(),
+                        InputMode::Normal => InputMode::Config(Box::new(ConfigOverlayState::new(
+                            &panes, 0, fuse_size,
+                        ))),
+                        InputMode::MailLog => InputMode::Config(Box::new(ConfigOverlayState::new(
+                            &panes, 0, fuse_size,
+                        ))),
                         InputMode::Composing(_) => unreachable!(),
                     };
                     notice = None;
@@ -1842,7 +1838,10 @@ fn run_with(
                 Event::Key(key)
                     if key.code == KeyCode::F(3)
                         && key.kind == KeyEventKind::Press
-                        && !matches!(&input_mode, InputMode::Composing(_) | InputMode::Config(_)) =>
+                        && !matches!(
+                            &input_mode,
+                            InputMode::Composing(_) | InputMode::Config(_)
+                        ) =>
                 {
                     if delivery_paused {
                         if fuse.is_tripped() {
@@ -1911,18 +1910,7 @@ fn run_with(
                         }
                     }
                 }
-                Event::Key(key)
-                    if key.code == KeyCode::Char('d')
-                        && key.modifiers == KeyModifiers::NONE
-                        && key.kind == KeyEventKind::Press
-                        && matches!(&input_mode, InputMode::Normal) =>
-                {
-                    input_mode = InputMode::Detail(RoomDetailView {
-                        room: focused,
-                        detail: detail_for_room(focused, &panes, &room_details),
-                    });
-                    notice = None;
-                }
+
                 Event::Key(key) => match &mut input_mode {
                     InputMode::Composing(message) => {
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -2073,20 +2061,6 @@ fn run_with(
                                     ) =>
                                 {
                                     state.edit(|input| input.push(ch));
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    InputMode::Detail(_view) => {
-                        if matches!(key.kind, KeyEventKind::Press) {
-                            match key.code {
-                                KeyCode::Esc
-                                | KeyCode::Char('d')
-                                    if key.modifiers == KeyModifiers::NONE =>
-                                {
-                                    input_mode = InputMode::Normal;
-                                    notice = None;
                                 }
                                 _ => {}
                             }
@@ -2542,6 +2516,7 @@ mod tests {
             &[true, true, true],
             &["ready · 5s", "thinking · 8s", "working"],
             &costs,
+            &[],
             0,
         );
         let text: Vec<String> = lines.iter().map(line_text).collect();
@@ -2689,6 +2664,7 @@ mod tests {
             &[false, false],
             &["offline", "ready"],
             &[None, None],
+            &[],
             1,
         );
         assert_eq!(state_line_style(&lines, 0), Style::default().fg(Color::Red));
@@ -2696,13 +2672,29 @@ mod tests {
 
     #[test]
     fn render_pulse_state_color_error_red() {
-        let lines = render_pulse_lines(&["A · 1"], &[false], &[false], &["error · 3s"], &[None], 1);
+        let lines = render_pulse_lines(
+            &["A · 1"],
+            &[false],
+            &[false],
+            &["error · 3s"],
+            &[None],
+            &[],
+            1,
+        );
         assert_eq!(state_line_style(&lines, 0), Style::default().fg(Color::Red));
     }
 
     #[test]
     fn render_pulse_state_color_ready_green() {
-        let lines = render_pulse_lines(&["A · 1"], &[false], &[true], &["ready · 2s"], &[None], 1);
+        let lines = render_pulse_lines(
+            &["A · 1"],
+            &[false],
+            &[true],
+            &["ready · 2s"],
+            &[None],
+            &[],
+            1,
+        );
         assert_eq!(
             state_line_style(&lines, 0),
             Style::default().fg(Color::Green)
@@ -2717,6 +2709,7 @@ mod tests {
             &[false],
             &["thinking · 5s"],
             &[None],
+            &[],
             1,
         );
         assert_eq!(
@@ -2727,7 +2720,15 @@ mod tests {
 
     #[test]
     fn render_pulse_state_color_working_yellow() {
-        let lines = render_pulse_lines(&["A · 1"], &[false], &[false], &["working"], &[None], 1);
+        let lines = render_pulse_lines(
+            &["A · 1"],
+            &[false],
+            &[false],
+            &["working"],
+            &[None],
+            &[],
+            1,
+        );
         assert_eq!(
             state_line_style(&lines, 0),
             Style::default().fg(Color::Yellow)
@@ -2742,6 +2743,7 @@ mod tests {
             &[false],
             &["starting · 1s"],
             &[None],
+            &[],
             1,
         );
         assert_eq!(
@@ -2752,7 +2754,7 @@ mod tests {
 
     #[test]
     fn render_pulse_state_color_unknown_unstyled() {
-        let lines = render_pulse_lines(&["A · 1"], &[false], &[false], &["bogus"], &[None], 1);
+        let lines = render_pulse_lines(&["A · 1"], &[false], &[false], &["bogus"], &[None], &[], 1);
         assert_eq!(state_line_style(&lines, 0), Style::default());
     }
 
@@ -2764,6 +2766,7 @@ mod tests {
             &[false, false],
             &["offline", "ready"],
             &[None, None],
+            &[],
             0,
         );
         assert_eq!(lines[0].style, Style::default().fg(Color::Cyan));
@@ -2963,5 +2966,195 @@ mod tests {
     #[test]
     fn a_resume_that_started_fresh_still_takes_the_intro() {
         assert_eq!(gate_after_control(true, false), DeliveryGate::AwaitingIntro);
+    }
+
+    #[test]
+    fn normal_mode_d_is_not_intercepted_as_detail_shortcut() {
+        let source = std::fs::read_to_string("src/app.rs").unwrap();
+        let detail_variant = format!("{}::{}", "InputMode", "Detail");
+        assert!(
+            !source.contains(&detail_variant),
+            "Detail input mode must have been removed"
+        );
+        let view = format!("{}View", "RoomDetail");
+        assert!(
+            !source.contains(&view),
+            "Detail view type must have been removed with the modal"
+        );
+        let helper = format!("{}_{}", "detail", "for_room");
+        assert!(
+            !source.contains(&helper),
+            "on-demand helper must be gone (replaced by cached refresh)"
+        );
+    }
+
+    #[test]
+    fn render_pulse_lines_renders_inline_detail_concisely() {
+        let details = vec![
+            RoomDetail {
+                sub_agents: vec![
+                    crate::room_detail::SubAgent {
+                        id: "a1".to_owned(),
+                        kind: "Task".to_owned(),
+                        status: "running".to_owned(),
+                    },
+                    crate::room_detail::SubAgent {
+                        id: "a2".to_owned(),
+                        kind: "Explore".to_owned(),
+                        status: "completed".to_owned(),
+                    },
+                ],
+                todos: vec![crate::room_detail::TodoItem {
+                    id: "t1".to_owned(),
+                    content: "Build it".to_owned(),
+                    status: "pending".to_owned(),
+                }],
+            },
+            RoomDetail::default(),
+        ];
+        let costs = vec![None, None];
+        let lines = render_pulse_lines(
+            &["Claude \u{00b7} 1", "Codex \u{00b7} 2"],
+            &[false, false],
+            &[true, true],
+            &["ready", "working"],
+            &costs,
+            &details,
+            0,
+        );
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(text.iter().any(|t| t.contains("sub-agents:")), "{text:?}");
+        assert!(
+            text.iter().any(|t| t.contains("[running] Task")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|t| t.contains("[completed] Explore")),
+            "{text:?}"
+        );
+        assert!(text.iter().any(|t| t.contains("todos:")), "{text:?}");
+        assert!(
+            text.iter().any(|t| t.contains("[pending] Build it")),
+            "{text:?}"
+        );
+        let detail_lines = text
+            .iter()
+            .filter(|t| t.contains("sub-agents:") || t.contains("todos:"))
+            .count();
+        assert_eq!(detail_lines, 2);
+    }
+
+    #[test]
+    fn render_pulse_lines_truncates_narrow_detail() {
+        let long_content = "a".repeat(50);
+        let details = vec![RoomDetail {
+            sub_agents: vec![
+                crate::room_detail::SubAgent {
+                    id: "a1".to_owned(),
+                    kind: "Task".to_owned(),
+                    status: "running".to_owned(),
+                },
+                crate::room_detail::SubAgent {
+                    id: "a2".to_owned(),
+                    kind: "Task".to_owned(),
+                    status: "running".to_owned(),
+                },
+                crate::room_detail::SubAgent {
+                    id: "a3".to_owned(),
+                    kind: "Task".to_owned(),
+                    status: "running".to_owned(),
+                },
+                crate::room_detail::SubAgent {
+                    id: "a4".to_owned(),
+                    kind: "Task".to_owned(),
+                    status: "running".to_owned(),
+                },
+            ],
+            todos: vec![crate::room_detail::TodoItem {
+                id: "t1".to_owned(),
+                content: long_content.clone(),
+                status: "pending".to_owned(),
+            }],
+        }];
+        let costs = vec![None];
+        let lines = render_pulse_lines(
+            &["Claude \u{00b7} 1"],
+            &[false],
+            &[true],
+            &["ready"],
+            &costs,
+            &details,
+            0,
+        );
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(text.iter().any(|t| t.contains("+1 more")), "{text:?}");
+        assert!(text.iter().any(|t| t.contains("\u{2026}")), "{text:?}");
+        assert!(
+            !text.iter().any(|t| t.contains(&long_content)),
+            "should be truncated"
+        );
+    }
+
+    #[test]
+    fn detail_collection_is_cached_outside_render_path() {
+        let details = vec![RoomDetail::default()];
+        let costs = vec![None];
+        let first = render_pulse_lines(
+            &["Claude \u{00b7} 1"],
+            &[false],
+            &[true],
+            &["ready"],
+            &costs,
+            &details,
+            0,
+        );
+        let second = render_pulse_lines(
+            &["Claude \u{00b7} 1"],
+            &[false],
+            &[true],
+            &["ready"],
+            &costs,
+            &details,
+            0,
+        );
+        assert_eq!(first.len(), second.len());
+        let source = std::fs::read_to_string("src/app.rs").unwrap();
+        let render_start = source.find("fn render_pulse_lines").unwrap();
+        let render_end = source[render_start..]
+            .find("fn refresh_pulse_cost")
+            .unwrap();
+        let render_body = &source[render_start..render_start + render_end];
+        assert!(
+            !render_body.contains("collect_detail"),
+            "render must not scan artifacts"
+        );
+        assert!(
+            !render_body.contains("detail_last_refresh"),
+            "render must not touch cache"
+        );
+        assert!(
+            source.contains("DETAIL_REFRESH"),
+            "bounded cache interval must exist"
+        );
+        assert!(
+            source.contains("detail_last_refresh"),
+            "cache must be maintained outside draw"
+        );
     }
 }

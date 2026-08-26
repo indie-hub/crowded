@@ -5,8 +5,7 @@
 //! distinction.
 
 use std::{
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -37,9 +36,18 @@ pub(crate) struct TodoItem {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "event", content = "value", rename_all = "snake_case")]
 pub(crate) enum DetailEvent {
-    SubAgentStarted { id: String, kind: String },
-    SubAgentStopped { id: String },
-    TodoUpsert { id: String, content: String, status: String },
+    SubAgentStarted {
+        id: String,
+        kind: String,
+    },
+    SubAgentStopped {
+        id: String,
+    },
+    TodoUpsert {
+        id: String,
+        content: String,
+        status: String,
+    },
 }
 
 /// Apply one hook-driven event to a room's accumulated detail. Sub-agents
@@ -69,12 +77,20 @@ pub(crate) fn apply_detail_event(detail: &mut RoomDetail, event: DetailEvent) {
                 });
             }
         }
-        DetailEvent::TodoUpsert { id, content, status } => {
+        DetailEvent::TodoUpsert {
+            id,
+            content,
+            status,
+        } => {
             if let Some(todo) = detail.todos.iter_mut().find(|todo| todo.id == id) {
                 todo.content = content;
                 todo.status = status;
             } else {
-                detail.todos.push(TodoItem { id, content, status });
+                detail.todos.push(TodoItem {
+                    id,
+                    content,
+                    status,
+                });
             }
         }
     }
@@ -120,10 +136,7 @@ fn opencode_detail(_cwd: &Path, session_id: &str) -> Option<RoomDetail> {
             continue;
         }
         sub_agents.push(SubAgent {
-            id: metadata
-                .get("sessionId")?
-                .as_str()?
-                .to_owned(),
+            id: metadata.get("sessionId")?.as_str()?.to_owned(),
             kind: "task".to_owned(),
             status: state
                 .get("status")
@@ -250,11 +263,7 @@ fn codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
     let id = payload
         .get("id")
         .and_then(|value| value.as_str())
-        .or_else(|| {
-            payload
-                .get("session_id")
-                .and_then(|value| value.as_str())
-        })?
+        .or_else(|| payload.get("session_id").and_then(|value| value.as_str()))?
         .to_owned();
     let spawn = payload.pointer("/source/subagent/thread_spawn");
     Some(CodexSessionMeta {
@@ -304,7 +313,9 @@ fn find_rollouts(directory: &Path) -> Vec<PathBuf> {
         } else if path
             .file_name()
             .is_some_and(|name| name.to_string_lossy().starts_with("rollout-"))
-            && path.extension().is_some_and(|extension| extension == "jsonl")
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
         {
             found.push(path);
         }
@@ -499,9 +510,7 @@ mod tests {
             return;
         }
         let guard = HomeDirGuard::isolated();
-        let database = guard
-            .path()
-            .join(".local/share/opencode/opencode.db");
+        let database = guard.path().join(".local/share/opencode/opencode.db");
         fs::create_dir_all(database.parent().unwrap()).unwrap();
         let setup = Command::new("sqlite3")
             .arg(&database)

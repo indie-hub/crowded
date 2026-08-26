@@ -455,9 +455,9 @@ pub(crate) fn parse_fuse_size_input(input: &str) -> Result<usize, String> {
     if trimmed.is_empty() {
         return Err("fuse_size cannot be empty".to_owned());
     }
-    trimmed.parse::<usize>().map_err(|_| {
-        format!("fuse_size must be a non-negative integer, got '{trimmed}'")
-    })
+    trimmed
+        .parse::<usize>()
+        .map_err(|_| format!("fuse_size must be a non-negative integer, got '{trimmed}'"))
 }
 
 pub(crate) fn persist_fuse_size(path: &Path, new_size: usize) -> io::Result<()> {
@@ -484,7 +484,9 @@ pub(crate) fn parse_allow_control_input(input: &str) -> Result<bool, String> {
     match input.trim() {
         "true" | "1" => Ok(true),
         "false" | "0" => Ok(false),
-        other => Err(format!("allow_control must be true or false, got '{other}'")),
+        other => Err(format!(
+            "allow_control must be true or false, got '{other}'"
+        )),
     }
 }
 
@@ -496,12 +498,19 @@ pub(crate) fn parse_cost_tier_input(input: &str) -> Result<String, String> {
     parse_scheduling_enum_input("cost_tier", input, &["low", "medium", "high"])
 }
 
-fn parse_scheduling_enum_input(field: &str, input: &str, allowed: &[&str]) -> Result<String, String> {
+fn parse_scheduling_enum_input(
+    field: &str,
+    input: &str,
+    allowed: &[&str],
+) -> Result<String, String> {
     let trimmed = input.trim();
     if allowed.contains(&trimmed) {
         Ok(trimmed.to_owned())
     } else {
-        Err(format!("room {field} must be one of {}", allowed.join(", ")))
+        Err(format!(
+            "room {field} must be one of {}",
+            allowed.join(", ")
+        ))
     }
 }
 
@@ -1263,10 +1272,7 @@ transport = "raw"
 
     #[test]
     fn persist_fuse_size_round_trip_preserves_other_sections() {
-        let dir = env::temp_dir().join(format!(
-            "crowded-fuse-test-{}",
-            std::process::id()
-        ));
+        let dir = env::temp_dir().join(format!("crowded-fuse-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("crowded.toml");
         let initial = r#"fuse_size = 20
@@ -1306,10 +1312,7 @@ command = "basic-memory"
 
     #[test]
     fn persist_fuse_size_leaves_file_unchanged_on_invalid_input() {
-        let dir = env::temp_dir().join(format!(
-            "crowded-fuse-invalid-{}",
-            std::process::id()
-        ));
+        let dir = env::temp_dir().join(format!("crowded-fuse-invalid-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("crowded.toml");
         let initial = r#"fuse_size = 20
@@ -1358,10 +1361,7 @@ transport = "raw"
 
     #[test]
     fn persist_room_fields_round_trip_preserves_other_sections() {
-        let dir = env::temp_dir().join(format!(
-            "crowded-room-fields-{}",
-            std::process::id()
-        ));
+        let dir = env::temp_dir().join(format!("crowded-room-fields-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("crowded.toml");
         let initial = r#"fuse_size = 20
@@ -1411,10 +1411,7 @@ command = "basic-memory"
 
     #[test]
     fn persist_room_fields_only_touches_the_indexed_room() {
-        let dir = env::temp_dir().join(format!(
-            "crowded-room-touch-{}",
-            std::process::id()
-        ));
+        let dir = env::temp_dir().join(format!("crowded-room-touch-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("crowded.toml");
         let initial = r#"[[rooms]]
@@ -1452,10 +1449,7 @@ allow_control = true
 
     #[test]
     fn persist_room_fields_out_of_range_room_leaves_file_unchanged() {
-        let dir = env::temp_dir().join(format!(
-            "crowded-room-range-{}",
-            std::process::id()
-        ));
+        let dir = env::temp_dir().join(format!("crowded-room-range-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("crowded.toml");
         let initial = r#"[[rooms]]

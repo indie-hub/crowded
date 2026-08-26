@@ -342,7 +342,11 @@ fn hook_detail_events(payload: &HookPayload) -> Vec<DetailEvent> {
                     .status
                     .clone()
                     .unwrap_or_else(|| "pending".to_owned());
-                events.push(DetailEvent::TodoUpsert { id, content, status });
+                events.push(DetailEvent::TodoUpsert {
+                    id,
+                    content,
+                    status,
+                });
             }
         }
         Some("TodoWrite") => {
@@ -353,7 +357,11 @@ fn hook_detail_events(payload: &HookPayload) -> Vec<DetailEvent> {
                     .clone()
                     .unwrap_or_else(|| "pending".to_owned());
                 let id = payload.task_id.clone().unwrap_or_else(|| content.clone());
-                events.push(DetailEvent::TodoUpsert { id, content, status });
+                events.push(DetailEvent::TodoUpsert {
+                    id,
+                    content,
+                    status,
+                });
             }
         }
         _ => {}
@@ -479,7 +487,9 @@ mod tests {
     #[test]
     fn hook_payload_detail_ignores_unrelated_and_malformed_payloads() {
         assert_eq!(
-            hook_payload_detail(br#"{"hook_event_name":"PreToolUse","model":"o4-mini"}"#.as_slice()),
+            hook_payload_detail(
+                br#"{"hook_event_name":"PreToolUse","model":"o4-mini"}"#.as_slice()
+            ),
             Vec::<DetailEvent>::new()
         );
         assert_eq!(hook_payload_detail(br#"{}"#.as_slice()), Vec::new());
@@ -497,7 +507,10 @@ mod tests {
     #[test]
     fn hook_payload_model_and_detail_read_the_same_payload() {
         let payload = br#"{"hook_event_name":"SubagentStart","agent_id":"a1","model":"o4-mini"}"#;
-        assert_eq!(hook_payload_model(payload.as_slice()), Some("o4-mini".to_owned()));
+        assert_eq!(
+            hook_payload_model(payload.as_slice()),
+            Some("o4-mini".to_owned())
+        );
         assert_eq!(hook_payload_detail(payload.as_slice()).len(), 1);
     }
 

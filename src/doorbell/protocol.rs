@@ -491,15 +491,20 @@ fn validate_detail_event(event: &DetailEvent) -> Result<(), String> {
             fields.push(kind);
         }
         DetailEvent::SubAgentStopped { id } => fields.push(id),
-        DetailEvent::TodoUpsert { id, content, status } => {
+        DetailEvent::TodoUpsert {
+            id,
+            content,
+            status,
+        } => {
             fields.push(id);
             fields.push(content);
             fields.push(status);
         }
     }
-    if fields.iter().any(|field| {
-        field.len() > MAX_DETAIL_BYTES || field.chars().any(char::is_control)
-    }) {
+    if fields
+        .iter()
+        .any(|field| field.len() > MAX_DETAIL_BYTES || field.chars().any(char::is_control))
+    {
         return Err(format!(
             "detail fields must contain 0..={MAX_DETAIL_BYTES} bytes without control characters"
         ));
