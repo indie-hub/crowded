@@ -829,6 +829,11 @@ fn merge_hooks(original: Option<&str>, path: &Path, windows_command: bool) -> io
         ("PreToolUse", "working"),
         ("Stop", "ready"),
         ("SessionEnd", "offline"),
+        ("SubagentStart", "working"),
+        ("SubagentStop", "thinking"),
+        ("TaskCreate", "working"),
+        ("TaskUpdate", "thinking"),
+        ("TodoWrite", "thinking"),
     ] {
         // `--hook-stdin` lets the pulse read the active model straight off the
         // hook JSON payload when the vendor runtime supplies one (Codex always

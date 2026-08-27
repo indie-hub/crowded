@@ -1459,12 +1459,31 @@ fn run_with(
                     continue;
                 }
                 DoorbellEvent::Pulse(pulse) => {
-                    // Timestamp the sample at Doorbell receipt so the freshness
-                    // resolver can tell a live transient state from a stale one.
-                    room_pulses[pulse.from] = Some(PulseSample::now(pulse.state, pulse.model));
-                    if let Some(events) = pulse.detail {
+                    // Detail-only hooks carry sub-agent/todo state but must not
+                    // overwrite the room's real pulse state. Only update the
+                    // pulse sample when there is no non-empty detail payload.
+                    let has_detail = pulse
+                        .detail
+                        .as_ref()
+                        .is_some_and(|events| !events.is_empty());
+                    let state = pulse.state;
+                    let model = pulse.model;
+                    let detail = pulse.detail;
+                    if !has_detail {
+                        room_pulses[pulse.from] = Some(PulseSample::now(state, model.clone()));
+                    }
+                    if let Some(events) = detail {
                         for event in events {
                             apply_detail_event(&mut room_details[pulse.from], event);
+                        }
+                    }
+                    // Keep model up to date even for detail-only pulses
+                    if has_detail && let Some(m) = model {
+                        if let Some(sample) = &mut room_pulses[pulse.from] {
+                            sample.model = Some(m);
+                            sample.received_at = Instant::now();
+                        } else {
+                            room_pulses[pulse.from] = Some(PulseSample::now(state, Some(m)));
                         }
                     }
                     continue;
