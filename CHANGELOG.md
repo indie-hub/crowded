@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-08-27
+
+### Added
+
+- `crowded.toml` room entries' scheduling fields (`model_tier`, `cost_tier`, `capabilities`) are now editable directly in the F1 config overlay, alongside the existing `fuse_size` field.
+- Room Pulse now shows each room's cross-vendor sub-agent and todo detail inline beneath its pulse state, replacing the old modal Detail overlay and its `d` binding, which could steal terminal input mid-session. Detail collection (Claude hook accumulation, OpenCode/Codex artifact collectors) runs on background threads with a bounded 2s refresh cache and never blocks the draw loop; completed todos are filtered out and entries render concisely within the panel.
+
 ## [0.42.0] - 2026-08-26
 
 ### Added
