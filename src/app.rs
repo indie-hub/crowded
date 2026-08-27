@@ -37,7 +37,7 @@ use crate::{
     },
     mailroom::Mailroom,
     pane::{self, Pane},
-    room_detail::{RoomDetail, apply_detail_event, collect_detail},
+    room_detail::{DetailEvent, RoomDetail, apply_detail_event, collect_detail},
 };
 
 enum InputMode {
@@ -621,6 +621,36 @@ impl PulseSample {
 
     fn is_stale(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.received_at) > PULSE_FRESHNESS_WINDOW
+    }
+}
+
+/// Apply one pulse to a room's sample and detail accumulators. A pulse whose
+/// detail payload is non-empty is detail-only: it must not overwrite the
+/// sample's state or `received_at`, must not synthesize a sample when none
+/// exists, and only refreshes the sample's model in place. A pulse without
+/// detail is a normal heartbeat and replaces the sample.
+fn apply_pulse_to_room(
+    room_pulses: &mut [Option<PulseSample>],
+    room_details: &mut [RoomDetail],
+    index: usize,
+    state: PulseState,
+    model: Option<String>,
+    detail: Option<Vec<DetailEvent>>,
+) {
+    let has_detail = detail.as_ref().is_some_and(|events| !events.is_empty());
+    if !has_detail {
+        room_pulses[index] = Some(PulseSample::now(state, model.clone()));
+    }
+    if let Some(events) = detail {
+        for event in events {
+            apply_detail_event(&mut room_details[index], event);
+        }
+    }
+    if has_detail
+        && let Some(model) = model
+        && let Some(sample) = &mut room_pulses[index]
+    {
+        sample.model = Some(model);
     }
 }
 
@@ -1459,33 +1489,14 @@ fn run_with(
                     continue;
                 }
                 DoorbellEvent::Pulse(pulse) => {
-                    // Detail-only hooks carry sub-agent/todo state but must not
-                    // overwrite the room's real pulse state. Only update the
-                    // pulse sample when there is no non-empty detail payload.
-                    let has_detail = pulse
-                        .detail
-                        .as_ref()
-                        .is_some_and(|events| !events.is_empty());
-                    let state = pulse.state;
-                    let model = pulse.model;
-                    let detail = pulse.detail;
-                    if !has_detail {
-                        room_pulses[pulse.from] = Some(PulseSample::now(state, model.clone()));
-                    }
-                    if let Some(events) = detail {
-                        for event in events {
-                            apply_detail_event(&mut room_details[pulse.from], event);
-                        }
-                    }
-                    // Keep model up to date even for detail-only pulses
-                    if has_detail && let Some(m) = model {
-                        if let Some(sample) = &mut room_pulses[pulse.from] {
-                            sample.model = Some(m);
-                            sample.received_at = Instant::now();
-                        } else {
-                            room_pulses[pulse.from] = Some(PulseSample::now(state, Some(m)));
-                        }
-                    }
+                    apply_pulse_to_room(
+                        &mut room_pulses,
+                        &mut room_details,
+                        pulse.from,
+                        pulse.state,
+                        pulse.model,
+                        pulse.detail,
+                    );
                     continue;
                 }
                 DoorbellEvent::Control(control) => {
@@ -2592,6 +2603,53 @@ mod tests {
         let now = Instant::now();
         assert!(!sample(PulseState::Thinking).is_stale(now));
         assert!(stale_sample(PulseState::Thinking).is_stale(now));
+    }
+
+    #[test]
+    fn detail_only_pulse_does_not_refresh_stale_sample_or_create_state() {
+        let now = Instant::now();
+        let stale = stale_sample(PulseState::Thinking);
+        let stale_at = stale.received_at;
+        let mut room_pulses = vec![Some(stale)];
+        let mut room_details = vec![RoomDetail::default()];
+        apply_pulse_to_room(
+            &mut room_pulses,
+            &mut room_details,
+            0,
+            PulseState::Working,
+            Some("new-model".to_owned()),
+            Some(vec![DetailEvent::SubAgentStarted {
+                id: "a1".to_owned(),
+                kind: "Task".to_owned(),
+            }]),
+        );
+        let sample = room_pulses[0].as_ref().unwrap();
+        assert_eq!(sample.state, PulseState::Thinking);
+        assert_eq!(sample.received_at, stale_at);
+        assert!(sample.is_stale(now));
+        assert_eq!(sample.model, Some("new-model".to_owned()));
+        assert_eq!(room_details[0].sub_agents.len(), 1);
+
+        // No-prior-sample case must not synthesize a visible state.
+        let mut empty_pulses: Vec<Option<PulseSample>> = vec![None];
+        let mut empty_details = vec![RoomDetail::default()];
+        apply_pulse_to_room(
+            &mut empty_pulses,
+            &mut empty_details,
+            0,
+            PulseState::Working,
+            Some("m2".to_owned()),
+            Some(vec![DetailEvent::TodoUpsert {
+                id: "t1".to_owned(),
+                content: "x".to_owned(),
+                status: "pending".to_owned(),
+            }]),
+        );
+        assert!(
+            empty_pulses[0].is_none(),
+            "detail-only pulse must not create a sample when none existed"
+        );
+        assert_eq!(empty_details[0].todos.len(), 1);
     }
 
     #[test]
