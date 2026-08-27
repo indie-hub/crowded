@@ -7,6 +7,17 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.43.1] - 2026-08-27
+
+### Added
+
+- `crowded toolbox resync` refreshes managed native-toolbox files after configuration changes without a manual `toolbox remove` followed by `toolbox sync`.
+
+### Fixed
+
+- Claude task and todo detail signals are installed as `PreToolUse` tool matchers instead of unavailable top-level hook events.
+- Room Pulse routes detail-only handling through a single safe helper when no supported adapter detail is available.
+
 ## [0.43.0] - 2026-08-27
 
 ### Added

@@ -56,11 +56,11 @@ enum Removal {
 
 pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
     let action = env::args().nth(2).ok_or_else(|| {
-        invalid_input("usage: crowded toolbox preview|sync|remove (no additional arguments)")
+        invalid_input("usage: crowded toolbox preview|sync|resync|remove (no additional arguments)")
     })?;
     if env::args().nth(3).is_some() {
         return Err(invalid_input(
-            "usage: crowded toolbox preview|sync|remove (no additional arguments)",
+            "usage: crowded toolbox preview|sync|resync|remove (no additional arguments)",
         )
         .into());
     }
@@ -74,13 +74,19 @@ pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
                 println!("synced {}", path.display());
             }
         }
+        "resync" => {
+            let files = resync(&root)?;
+            for path in &files {
+                println!("synced {}", path.display());
+            }
+        }
         "remove" => {
             let restored = remove(&root)?;
             println!("removed the native toolbox from {restored} file(s)");
         }
         _ => {
             return Err(invalid_input(
-                "usage: crowded toolbox preview|sync|remove (no additional arguments)",
+                "usage: crowded toolbox preview|sync|resync|remove (no additional arguments)",
             )
             .into());
         }
@@ -831,6 +837,10 @@ fn merge_hooks(original: Option<&str>, path: &Path, windows_command: bool) -> io
         ("SessionEnd", "offline"),
         ("SubagentStart", "working"),
         ("SubagentStop", "thinking"),
+        // TaskCreate/TaskUpdate/TodoWrite are tool names, not Claude Code
+        // hook lifecycle events, so they can't be installed as top-level
+        // `hooks.<name>` keys (Claude Code silently ignores those with a
+        // startup warning). Route them through PreToolUse matchers below.
         ("TaskCreate", "working"),
         ("TaskUpdate", "thinking"),
         ("TodoWrite", "thinking"),
@@ -848,14 +858,21 @@ fn merge_hooks(original: Option<&str>, path: &Path, windows_command: bool) -> io
             hook["commandWindows"] =
                 Value::String(format!("& \"$env:CROWDED_BIN\" pulse {state} --hook-stdin"));
         }
-        let entry = serde_json::json!({ "hooks": [hook] });
+        let mut entry = serde_json::json!({ "hooks": [hook] });
+        let target_event = match event {
+            "TaskCreate" | "TaskUpdate" | "TodoWrite" => {
+                entry["matcher"] = Value::String(event.to_owned());
+                "PreToolUse"
+            }
+            _ => event,
+        };
         let handlers = hooks
-            .entry(event)
+            .entry(target_event)
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut()
             .ok_or_else(|| {
                 invalid_data(format!(
-                    "{} `hooks.{event}` must contain an array",
+                    "{} `hooks.{target_event}` must contain an array",
                     path.display()
                 ))
             })?;
@@ -1435,6 +1452,56 @@ mod tests {
     }
 
     #[test]
+    fn tool_name_events_route_through_pretooluse_matchers() {
+        // TaskCreate/TaskUpdate/TodoWrite are tool names, not hook lifecycle
+        // events; Claude Code silently ignores unknown top-level `hooks.<name>`
+        // keys, so these must be installed as PreToolUse matchers instead.
+        let root = test_directory();
+        fs::write(
+            root.join("crowded.toml"),
+            r#"
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+            "#,
+        )
+        .unwrap();
+
+        sync(&root).unwrap();
+        let settings: Value = serde_json::from_str(
+            &fs::read_to_string(root.join(".claude/settings.local.json")).unwrap(),
+        )
+        .unwrap();
+        let hooks = settings["hooks"].as_object().unwrap();
+
+        for event in ["TaskCreate", "TaskUpdate", "TodoWrite"] {
+            assert!(
+                !hooks.contains_key(event),
+                "`{event}` must not be installed as a top-level hook event"
+            );
+        }
+
+        let matchers: Vec<&str> = hooks["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["matcher"].as_str())
+            .collect();
+        for event in ["TaskCreate", "TaskUpdate", "TodoWrite"] {
+            assert!(
+                matchers.contains(&event),
+                "expected a PreToolUse matcher for `{event}`"
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn removal_refuses_to_overwrite_a_changed_generated_file() {
         let root = test_directory();
         fs::write(
@@ -1635,6 +1702,93 @@ mod tests {
         assert!(native_files_are_active_at(&root).unwrap());
 
         remove(&root).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resync_refreshes_managed_files_without_removing() {
+        let root = test_directory();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::write(root.join(".mcp.json"), "{\n  \"keep\": true\n}\n").unwrap();
+        fs::write(
+            root.join("crowded.toml"),
+            r#"
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+
+                [[mcp]]
+                name = "first"
+                command = "npx"
+            "#,
+        )
+        .unwrap();
+
+        let first = sync(&root).unwrap();
+        assert_eq!(first.len(), 4);
+        let before: Value =
+            serde_json::from_str(&fs::read_to_string(root.join(".mcp.json")).unwrap()).unwrap();
+        assert!(before["mcpServers"].get("first").is_some());
+        assert!(before["mcpServers"].get("second").is_none());
+
+        // Same file set, so the state is not stale; plain sync refuses.
+        fs::write(
+            root.join("crowded.toml"),
+            r#"
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+
+                [[mcp]]
+                name = "first"
+                command = "npx"
+
+                [[mcp]]
+                name = "second"
+                command = "npx"
+            "#,
+        )
+        .unwrap();
+        assert!(sync(&root).is_err());
+
+        // resync refreshes the managed files in place, without a remove.
+        let files = resync(&root).unwrap();
+        assert_eq!(files.len(), 4);
+        assert!(native_files_are_active_at(&root).unwrap());
+        let after: Value =
+            serde_json::from_str(&fs::read_to_string(root.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(after["keep"], true);
+        assert!(after["mcpServers"].get("first").is_some());
+        assert!(after["mcpServers"].get("second").is_some());
+
+        // The original snapshot survives the refresh; remove still restores it.
+        let state: ToolboxState =
+            serde_json::from_str(&fs::read_to_string(root.join(STATE_FILE)).unwrap()).unwrap();
+        let mcp_file = state
+            .files
+            .iter()
+            .find(|file| file.path.ends_with(".mcp.json"))
+            .unwrap();
+        assert_eq!(
+            mcp_file.original.as_deref(),
+            Some("{\n  \"keep\": true\n}\n")
+        );
+        remove(&root).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(".mcp.json")).unwrap(),
+            "{\n  \"keep\": true\n}\n"
+        );
+        assert!(!root.join(STATE_FILE).exists());
+
         fs::remove_dir_all(root).unwrap();
     }
 
