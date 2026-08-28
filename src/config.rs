@@ -399,7 +399,12 @@ fn load_token_pricing_file(path: &Path) -> io::Result<Vec<TokenPricing>> {
 }
 
 pub(crate) fn validate_room_file(file: &RoomFile) -> io::Result<()> {
-    room_specs_from_file(file.clone(), false, Vec::new()).map(drop)
+    // Validate the full launch-time room resolution, including shared-toolbox
+    // injection for raw rooms. `crowded check` must reject the same unsupported
+    // raw guest plus shared-MCP configuration that a normal launch rejects,
+    // so `inject_shared_mcps` is true here (matching the pre-sync launch path);
+    // validation is read-only and never writes files.
+    room_specs_from_file(file.clone(), true, Vec::new()).map(drop)
 }
 
 fn add_shared_toolbox(

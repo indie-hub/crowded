@@ -98,4 +98,58 @@ mod tests {
         assert!(error.to_string().contains("at least two rooms"));
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn check_rejects_unsupported_raw_guest_with_shared_mcp_like_launch() {
+        // `crowded check` must reject the same unsupported raw guest plus
+        // shared-MCP configuration that a normal launch rejects. The check
+        // must be read-only: only the config file exists in the directory.
+        let root = test_directory();
+        fs::write(
+            root.join(CONFIG_FILE),
+            r#"[[rooms]]
+command = "gemini"
+transport = "raw"
+
+[[rooms]]
+command = "claude"
+transport = "raw"
+
+[[mcp]]
+name = "tools"
+command = "some-mcp-tool"
+"#,
+        )
+        .unwrap();
+        let error = check_at(&root).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("cannot receive shared MCPs"));
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            1,
+            "check must not write files"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn check_still_accepts_unsupported_raw_guest_without_shared_mcp() {
+        // A raw guest with no shared MCPs launches fine, so check must too;
+        // parity is about rejection, not over-rejection.
+        let root = test_directory();
+        fs::write(
+            root.join(CONFIG_FILE),
+            r#"[[rooms]]
+command = "gemini"
+transport = "raw"
+
+[[rooms]]
+command = "claude"
+transport = "raw"
+"#,
+        )
+        .unwrap();
+        assert!(check_at(&root).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

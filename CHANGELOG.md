@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.43.2] - 2026-08-28
+
+### Fixed
+
+- Unix Doorbell requests now accumulate partial writes under a bounded deadline, so valid room-to-room envelopes are not dropped at the former one-second read boundary.
+- `crowded check` now rejects raw guests that shared MCP injection would make launch reject, before a room is started.
+
 ## [0.43.1] - 2026-08-27
 
 ### Added

@@ -3,7 +3,7 @@
 use std::{
     collections::{HashSet, VecDeque},
     env, fs,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixListener, net::UnixStream},
     path::{Path, PathBuf},
     process,
@@ -15,6 +15,16 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+/// Per-read timeout while assembling one request line. Bounds a single `read`
+/// call so the overall [`REQUEST_READ_DEADLINE`] is re-checked between pieces.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(250);
+/// Upper bound for reading one request line from a connected client. Longer
+/// than the old one-second read boundary, so a valid request delivered across
+/// multiple writes (an agent flushing a prompt in pieces) still parses, while
+/// still bounding a stalled connection instead of blocking the accept loop
+/// indefinitely.
+const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(5);
 
 use super::protocol::*;
 use crate::pane::GuestEnvironment;
@@ -112,8 +122,8 @@ fn listener_loop(
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-                let request = read_request(&stream);
+                let _ = stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT));
+                let request = read_request(&mut stream);
                 let response = match request {
                     Ok(WireRequest::Message(request)) => {
                         if seen.contains(&request.id) {
@@ -239,18 +249,54 @@ fn listener_loop(
     }
 }
 
-fn read_request(stream: &UnixStream) -> io::Result<WireRequest> {
-    let mut line = String::new();
-    BufReader::new(stream)
-        .take((MAX_WIRE_BYTES + 1) as u64)
-        .read_line(&mut line)?;
-    if line.len() > MAX_WIRE_BYTES {
+fn read_request(stream: &mut UnixStream) -> io::Result<WireRequest> {
+    // A single `read_line` with a hard per-call timeout fails a valid request
+    // whose bytes arrive across multiple writes with a gap larger than that
+    // timeout (e.g. an agent flushing a prompt in pieces). Accumulate bytes
+    // across reads until the newline, bounded by an overall deadline so a
+    // stalled connection cannot block the accept loop forever.
+    let deadline = Instant::now() + REQUEST_READ_DEADLINE;
+    let mut bytes = Vec::with_capacity(4096);
+    let mut chunk = [0_u8; 4096];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "request read deadline exceeded",
+            ));
+        }
+        let read = match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() > MAX_WIRE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "envelope exceeds wire limit",
+            ));
+        }
+        if bytes.ends_with(b"\n") {
+            break;
+        }
+    }
+    if bytes.len() > MAX_WIRE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "envelope exceeds wire limit",
         ));
     }
-    serde_json::from_str(&line).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn remember_id(id: String, seen: &mut HashSet<String>, order: &mut VecDeque<String>) {
@@ -273,6 +319,7 @@ fn write_response(stream: &mut UnixStream, response: &WireResponse) -> io::Resul
 mod tests {
     use super::*;
     use crate::doorbell::commands::{parse_control_args, parse_send_args};
+    use std::io::BufReader;
 
     #[test]
     fn request_validation_binds_identity_and_limits_hops() {
@@ -450,6 +497,75 @@ mod tests {
         let path = doorbell.path().to_owned();
         drop(doorbell);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn partial_write_request_survives_the_read_boundary() {
+        // A valid request whose bytes arrive in two pieces more than one
+        // second apart must still be accepted; the old fixed one-second read
+        // boundary rejected it mid-line and closed, causing Broken pipe on
+        // the client's second write.
+        let doorbell = Doorbell::start(2).unwrap();
+        let path = doorbell.path().to_owned();
+        let token = doorbell.tokens[0].clone();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(path).unwrap();
+            let mut wire = serde_json::to_vec(&WireRequest::Message(MessageRequest {
+                token,
+                id: "partial-message".to_owned(),
+                to: 2,
+                body: "hello across the boundary".to_owned(),
+                task: None,
+                role: None,
+                hop: 0,
+            }))
+            .unwrap();
+            wire.push(b'\n');
+            let split = wire.len() / 2;
+            stream.write_all(&wire[..split]).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(1300));
+            stream.write_all(&wire[split..]).unwrap();
+            stream.flush().unwrap();
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match doorbell.try_recv() {
+                Ok(DoorbellEvent::Message(envelope)) => {
+                    assert_eq!(envelope.from, 0);
+                    assert_eq!(envelope.to, 1);
+                    assert_eq!(envelope.body, "hello across the boundary");
+                    envelope.reply_injected(9);
+                    break;
+                }
+                Ok(_) => panic!("unexpected Doorbell event"),
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("partial message did not arrive: {error}"),
+            }
+        }
+        let response = client.join().unwrap();
+        assert!(response.ok);
+        assert_eq!(response.status, "injected");
+    }
+
+    #[test]
+    fn request_read_deadline_rejects_a_stalled_connection() {
+        let doorbell = Doorbell::start(2).unwrap();
+        let path = doorbell.path().to_owned();
+        let client = thread::spawn(move || {
+            let stream = UnixStream::connect(path).unwrap();
+            // Never write a request; the server must give up within its
+            // bounded deadline rather than accept forever.
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+
+        let response = client.join().unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.status, "rejected");
     }
 
     #[test]
