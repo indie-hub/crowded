@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.43.3] - 2026-09-03
+
+### Fixed
+
+- A room whose child process is alive but unresponsive can now be force-restarted with F5; `Ctrl+R` alone could never recover it because it only revives an already-exited child.
+- A Doorbell whisper that lands unsubmitted in a guest room's composer is now automatically resubmitted instead of being silently dropped; a related bug that resent a stray Enter after a normally consumed whisper was also fixed.
+
 ## [0.43.2] - 2026-08-28
 
 ### Fixed
