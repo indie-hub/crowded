@@ -1022,6 +1022,49 @@ fn inject_ready_pending(
     (injected, failed)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmitDisposition {
+    /// Keep carrying the record; no action this pass.
+    Wait,
+    /// The whisper was consumed; retire the record without resending.
+    Retire,
+    /// The whisper is stalled in the composer; send one submit and retire.
+    Resend,
+}
+
+fn resend_whisper_submit_due(
+    resendable: bool,
+    saw_busy: bool,
+    input_ready: bool,
+    waited: Duration,
+) -> SubmitDisposition {
+    if !resendable {
+        // Shell rooms submit inside the command itself, so idle means done;
+        // cap the tracking window so a long-running command cannot carry an
+        // entry forever.
+        return if input_ready || waited >= INTRO_READINESS_CEILING {
+            SubmitDisposition::Retire
+        } else {
+            SubmitDisposition::Wait
+        };
+    }
+    if saw_busy && input_ready {
+        // The pane was busy (consuming the whisper) and is idle again.
+        return SubmitDisposition::Retire;
+    }
+    if waited >= INTRO_READINESS_CEILING {
+        // A pane that was never busy reads as ready even while a paste sits
+        // unsubmitted in its composer, so past the ceiling the only honest
+        // conclusion is a stalled paste; resubmit it exactly once.
+        return if saw_busy {
+            SubmitDisposition::Retire
+        } else {
+            SubmitDisposition::Resend
+        };
+    }
+    SubmitDisposition::Wait
+}
+
 fn resend_whisper_submits(
     pending: &mut VecDeque<(Instant, usize, bool)>,
     panes: &mut [Pane],
@@ -1032,24 +1075,24 @@ fn resend_whisper_submits(
         let Some((injected_at, target, saw_busy)) = pending.pop_front() else {
             break;
         };
-        if !saw_busy && input_ready[target] {
-            continue;
-        }
-        if resend_whisper_submit_due(
+        let ready = input_ready[target];
+        let resendable = panes[target].transport() == "raw";
+        match resend_whisper_submit_due(
+            resendable,
             saw_busy,
-            input_ready[target],
+            ready,
             now.duration_since(injected_at),
         ) {
-            panes[target].resend_whisper_submit()?;
-            continue;
+            SubmitDisposition::Wait => {
+                pending.push_back((injected_at, target, saw_busy || !ready));
+            }
+            SubmitDisposition::Retire => {}
+            SubmitDisposition::Resend => {
+                panes[target].resend_whisper_submit()?;
+            }
         }
-        pending.push_back((injected_at, target, true));
     }
     Ok(())
-}
-
-fn resend_whisper_submit_due(saw_busy: bool, input_ready: bool, waited: Duration) -> bool {
-    saw_busy && (input_ready || waited >= INTRO_READINESS_CEILING)
 }
 
 fn pane_size(outer: Rect) -> PtySize {
@@ -3015,19 +3058,48 @@ mod tests {
     }
 
     #[test]
-    fn whisper_submit_resend_waits_for_busy_then_ready_or_ceiling() {
-        assert!(!resend_whisper_submit_due(false, true, Duration::ZERO));
-        assert!(!resend_whisper_submit_due(
-            true,
-            false,
-            Duration::from_secs(14)
-        ));
-        assert!(resend_whisper_submit_due(true, true, Duration::ZERO));
-        assert!(resend_whisper_submit_due(
-            true,
-            false,
-            INTRO_READINESS_CEILING,
-        ));
+    fn whisper_submit_resend_confirms_by_busy_then_idle_and_resends_stalled() {
+        // Idle-after-processing: the pane went busy consuming the whisper and
+        // is idle again, so the record retires without any resend.
+        assert_eq!(
+            resend_whisper_submit_due(true, true, true, Duration::ZERO),
+            SubmitDisposition::Retire
+        );
+        // Ready-looking with staged text: never busy, ready the whole time,
+        // past the ceiling -- must resubmit the stalled paste.
+        assert_eq!(
+            resend_whisper_submit_due(true, false, true, INTRO_READINESS_CEILING),
+            SubmitDisposition::Resend
+        );
+        // Inside the window a ready-looking pane is still uncertain: wait.
+        assert_eq!(
+            resend_whisper_submit_due(true, false, true, Duration::from_secs(1)),
+            SubmitDisposition::Wait
+        );
+        // Busy (consuming) inside the window: wait.
+        assert_eq!(
+            resend_whisper_submit_due(true, false, false, Duration::from_secs(1)),
+            SubmitDisposition::Wait
+        );
+        // Still busy past the ceiling: consumed, retire without a resend.
+        assert_eq!(
+            resend_whisper_submit_due(true, true, false, INTRO_READINESS_CEILING),
+            SubmitDisposition::Retire
+        );
+        // Shell rooms carry the submit inside the command: idle means done,
+        // and a long-running command retires at the ceiling.
+        assert_eq!(
+            resend_whisper_submit_due(false, false, true, Duration::ZERO),
+            SubmitDisposition::Retire
+        );
+        assert_eq!(
+            resend_whisper_submit_due(false, false, false, Duration::from_secs(1)),
+            SubmitDisposition::Wait
+        );
+        assert_eq!(
+            resend_whisper_submit_due(false, false, false, INTRO_READINESS_CEILING),
+            SubmitDisposition::Retire
+        );
     }
 
     #[test]
