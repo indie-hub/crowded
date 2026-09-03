@@ -1242,6 +1242,29 @@ mod tests {
         (pane, captured)
     }
 
+    #[test]
+    fn restart_replaces_the_pane_while_the_previous_child_is_still_alive() {
+        let (mut pane, _) = pane_with_capture(4, 20);
+        // FakeChild reports itself still running, so this pane is online and
+        // plain Ctrl+R would never revive it -- the case F5 must cover.
+        assert!(pane.is_online());
+        // The fixture program name is a placeholder; use an always-present
+        // binary so the replacement genuinely spawns on every platform.
+        pane.spec.program = if cfg!(windows) {
+            OsString::from("cmd.exe")
+        } else {
+            OsString::from("/bin/sh")
+        };
+        pane.restart(PtySize {
+            rows: 4,
+            cols: 20,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+        assert!(pane.is_online(), "the replacement pane must be online");
+    }
+
     fn enter_alternate_screen(pane: &mut Pane) {
         pane.parser.process(b"\x1b[?1049h");
         assert!(pane.is_alternate_screen(), "must be in alternate screen");

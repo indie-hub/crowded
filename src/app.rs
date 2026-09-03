@@ -466,6 +466,24 @@ fn gate_after_control(needs_intro: bool, resumed: bool) -> DeliveryGate {
     DeliveryGate::new(needs_intro && !resumed)
 }
 
+/// Whether this key event requests a restart of the focused pane. F5 forces
+/// a restart even while the child is online; Ctrl+R keeps its long-standing
+/// meaning and restarts only an offline pane, because on a live child the
+/// same chord must keep forwarding a literal 0x12 byte (e.g. shell reverse
+/// search). Extracted from the event-loop arm so the online/offline x
+/// key-chord matrix is unit-testable without a terminal.
+fn force_restart_requested(key: KeyEvent, online: bool) -> bool {
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
+    if key.code == KeyCode::F(5) {
+        return true;
+    }
+    key.code == KeyCode::Char('r')
+        && key.modifiers == KeyModifiers::CONTROL
+        && !online
+}
+
 impl DeliveryFuse {
     /// Create a new delivery fuse. A limit of 0 means unlimited (never trips).
     fn new(limit: usize) -> Self {
@@ -2045,10 +2063,7 @@ fn run_with(
                     }
                 }
                 Event::Key(key)
-                    if key.code == KeyCode::Char('r')
-                        && key.modifiers == KeyModifiers::CONTROL
-                        && key.kind == KeyEventKind::Press
-                        && !panes[focused].is_online() =>
+                    if force_restart_requested(key, panes[focused].is_online()) =>
                 {
                     terminal.autoresize()?;
                     let (rooms, _, _) = content_areas(terminal.size()?.into());
@@ -3131,6 +3146,23 @@ mod tests {
         // Terminal panes take no intro either way, including across a resume.
         assert_eq!(gate_after_control(false, true), DeliveryGate::Ready);
         assert_eq!(gate_after_control(false, false), DeliveryGate::Ready);
+    }
+
+    #[test]
+    fn force_restart_key_is_f5_or_an_offline_ctrl_r() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let f5 = KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE);
+        assert!(force_restart_requested(f5, true), "F5 must restart an online pane");
+        assert!(force_restart_requested(f5, false), "F5 must restart an offline pane");
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(
+            !force_restart_requested(ctrl_r, true),
+            "Ctrl+R on an online pane must still forward a literal 0x12 byte"
+        );
+        assert!(
+            force_restart_requested(ctrl_r, false),
+            "Ctrl+R on an offline pane must keep reviving it"
+        );
     }
 
     /// A resume that could not be honoured leaves the room starting fresh with
