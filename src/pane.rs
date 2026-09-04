@@ -160,6 +160,25 @@ fn headroom_launch(
     }
 }
 
+/// Whether a room's launch is wrapped through `headroom`, decided from the
+/// spec alone (the same PATH/PATHEXT resolution and binary check that
+/// `Pane::spawn` performs). The startup lane needs this decision before a
+/// pane exists, so it can serialize Headroom bootstrap on Windows without
+/// first spawning the wrapper to find out.
+pub(crate) fn spec_uses_headroom(spec: &RoomSpec) -> bool {
+    let path = environment_value(&spec.variables, "PATH");
+    let path_ext = environment_value(&spec.variables, "PATHEXT");
+    headroom_launch(
+        &spec.program,
+        &spec.args,
+        spec.use_headroom,
+        &spec.headroom_args,
+        &path,
+        &path_ext,
+    )
+    .2
+}
+
 /// Apply each guest's "resume most recent conversation" flag ahead of
 /// spawn, for the `crowded resume` CLI entry point. Guests without a
 /// Conductor adapter (shell rooms, unrecognized programs) are left
@@ -1079,6 +1098,24 @@ mod tests {
         );
         assert!(!active);
         fs::remove_dir_all(empty).unwrap();
+    }
+
+    #[test]
+    fn spec_uses_headroom_mirrors_the_launch_wrap_decision() {
+        let (directory, path, ext) = headroom_path();
+        let mut spec = room_spec("claude", &["--continue"]);
+        spec.variables
+            .push((OsString::from("PATH"), path.clone().unwrap()));
+        if let Some(ext) = ext {
+            spec.variables.push((OsString::from("PATHEXT"), ext));
+        }
+        // Flag set and binary present: wrapped, exactly as the launch is.
+        spec.use_headroom = true;
+        assert!(spec_uses_headroom(&spec));
+        // Flag cleared: never wrapped even with the binary present.
+        spec.use_headroom = false;
+        assert!(!spec_uses_headroom(&spec));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

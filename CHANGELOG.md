@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.43.4] - 2026-09-04
+
+### Fixed
+
+- A Headroom-wrapped room no longer receives its house-rules intro while the wrapper is still bootstrapping: its intro now waits for genuine guest readiness instead of being forced by the generic fixed readiness ceiling, so no fixed timeout pastes into a wrapper that is still launching its guest. Non-Headroom rooms keep the existing ceiling fallback for stuck guests.
+- On Windows, Headroom rooms now bootstrap through one serial lane: a second Headroom room does not begin bootstrap until the prior Headroom room reaches the same ready boundary used for intro delivery, so two wrappers never start their proxies at once. Non-Headroom rooms and every room on non-Windows start concurrently, exactly as before.
+
 ## [0.43.3] - 2026-09-03
 
 ### Fixed

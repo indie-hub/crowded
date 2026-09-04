@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "crowded"
-version = "0.43.3"
+version = "0.43.4"
 dependencies = [
  "crossterm",
  "portable-pty",

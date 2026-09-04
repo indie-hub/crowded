@@ -479,9 +479,7 @@ fn force_restart_requested(key: KeyEvent, online: bool) -> bool {
     if key.code == KeyCode::F(5) {
         return true;
     }
-    key.code == KeyCode::Char('r')
-        && key.modifiers == KeyModifiers::CONTROL
-        && !online
+    key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL && !online
 }
 
 impl DeliveryFuse {
@@ -530,6 +528,49 @@ fn quiet_threshold(headroom_active: bool) -> Duration {
         HOUSE_RULES_QUIET + HEADROOM_STARTUP_GRACE
     } else {
         HOUSE_RULES_QUIET
+    }
+}
+
+/// The readiness fallback that unblocks a stuck room's intro. Headroom
+/// rooms get no fixed ceiling: the wrapper's own bootstrap pause is real
+/// startup, not a stuck heuristic, so a fixed timeout must never paste the
+/// intro into a wrapper that is still launching its guest. Their intro
+/// waits for genuine readiness only (see `HEADROOM_STARTUP_GRACE`). Every
+/// other room keeps the shared ceiling for guests whose heuristic can get
+/// stuck.
+fn intro_ceiling(headroom_active: bool) -> Duration {
+    if headroom_active {
+        Duration::MAX
+    } else {
+        INTRO_READINESS_CEILING
+    }
+}
+
+/// Whether a Headroom room's spawn must hold for the prior Headroom room's
+/// ready boundary. Only Windows serializes Headroom bootstrap so two
+/// wrappers never start their proxies at once; a non-Headroom room and
+/// every room on non-Windows spawns immediately.
+fn headroom_lane_holds(windows: bool, spec_uses_headroom: bool, prior_headroom: bool) -> bool {
+    windows && spec_uses_headroom && prior_headroom
+}
+
+/// Drain a just-spawned Headroom pane until its own readiness heuristic
+/// reports ready. Used to serialize Headroom bootstrap on Windows: the
+/// second wrapper must not start its proxy while the first is still
+/// bootstrapping. Mirrors the main loop's `input_ready` computation so the
+/// lane shares the same ready boundary as intro delivery.
+fn wait_for_headroom_ready(pane: &mut Pane, last_output: &mut Option<Instant>) -> io::Result<()> {
+    loop {
+        if pane.drain_output()? {
+            *last_output = Some(Instant::now());
+        }
+        let output_is_quiet = last_output.is_some_and(|last| {
+            Instant::now().duration_since(last) >= quiet_threshold(pane.headroom_active())
+        });
+        if pane.automation_input_ready(output_is_quiet) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -1384,20 +1425,34 @@ fn run_with(
     // a shared one, so a slow room later in this loop isn't penalized for
     // rooms spawned before it.
     let mut spawned_at = Vec::with_capacity(room_count);
+    let mut last_output = vec![None::<Instant>; room_count];
+    // Windows serializes Headroom bootstrap: the next Headroom room's spawn
+    // waits for the prior one to reach its ready boundary, so two wrappers
+    // never start their proxies at once. Non-Headroom rooms and every room
+    // on non-Windows spawn immediately, exactly as before.
+    let mut prior_headroom: Option<usize> = None;
     for (index, (spec, area)) in specs.into_iter().zip(areas).enumerate() {
+        let headroom = pane::spec_uses_headroom(&spec);
+        if headroom_lane_holds(cfg!(windows), headroom, prior_headroom.is_some()) {
+            if let Some(prior) = prior_headroom {
+                wait_for_headroom_ready(&mut panes[prior], &mut last_output[prior])?;
+            }
+        }
         panes.push(Pane::spawn(
             spec,
             pane_size(area),
             doorbell.guest_environment(index)?,
         )?);
         spawned_at.push(Instant::now());
+        if headroom {
+            prior_headroom = Some(index);
+        }
     }
     let mut delivery_gates = panes
         .iter()
         .enumerate()
         .map(|(index, pane)| DeliveryGate::new(pane.needs_intro() && !resumed[index]))
         .collect::<Vec<_>>();
-    let mut last_output = vec![None::<Instant>; room_count];
     let mut focused = 0;
     let mut input_mode = InputMode::Normal;
     let mut notice: Option<String> = None;
@@ -1449,7 +1504,7 @@ fn run_with(
             if delivery_gates[index].can_send_intro(
                 input_ready[index],
                 waited,
-                INTRO_READINESS_CEILING,
+                intro_ceiling(panes[index].headroom_active()),
             ) {
                 let roster = welcome_roster(&panes, &room_pulses, now);
                 match panes[index].send_whisper(
@@ -2105,9 +2160,7 @@ fn run_with(
                         }
                     }
                 }
-                Event::Key(key)
-                    if force_restart_requested(key, panes[focused].is_online()) =>
-                {
+                Event::Key(key) if force_restart_requested(key, panes[focused].is_online()) => {
                     terminal.autoresize()?;
                     let (rooms, _, _) = content_areas(terminal.size()?.into());
                     let area = pane_areas(rooms, room_count)[focused];
@@ -2856,6 +2909,39 @@ mod tests {
     }
 
     #[test]
+    fn headroom_intro_waits_for_genuine_readiness_past_the_shared_ceiling() {
+        // A Headroom-wrapped room still bootstrapping must not have its
+        // intro forced by the generic fixed ceiling: the wrapper's own
+        // startup pause is real work, so no timeout may paste early.
+        let gate = DeliveryGate::new(true);
+        assert!(!gate.can_send_intro(
+            false,
+            INTRO_READINESS_CEILING + Duration::from_secs(1),
+            intro_ceiling(true),
+        ));
+        // Genuine readiness still sends the Headroom intro immediately.
+        assert!(gate.can_send_intro(true, Duration::ZERO, intro_ceiling(true)));
+        // Non-Headroom rooms keep the shared fixed ceiling fallback.
+        assert!(gate.can_send_intro(false, INTRO_READINESS_CEILING, intro_ceiling(false)));
+        assert_eq!(intro_ceiling(false), INTRO_READINESS_CEILING);
+        assert!(intro_ceiling(true) > intro_ceiling(false));
+    }
+
+    #[test]
+    fn headroom_startup_lane_serializes_only_windows_headroom_spawns() {
+        // Windows: a second Headroom room holds for the prior one's ready
+        // boundary.
+        assert!(headroom_lane_holds(true, true, true));
+        // The first Headroom room has no prior to wait on.
+        assert!(!headroom_lane_holds(true, true, false));
+        // A non-Headroom room never holds, even on Windows.
+        assert!(!headroom_lane_holds(true, false, true));
+        // Non-Windows platforms keep startup fully concurrent.
+        assert!(!headroom_lane_holds(false, true, true));
+        assert!(!headroom_lane_holds(false, false, true));
+    }
+
+    #[test]
     fn pane_areas_tile_any_number_of_rooms() {
         let areas = pane_areas(Rect::new(0, 0, 120, 40), 3);
         assert_eq!(
@@ -3224,8 +3310,14 @@ mod tests {
     fn force_restart_key_is_f5_or_an_offline_ctrl_r() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let f5 = KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE);
-        assert!(force_restart_requested(f5, true), "F5 must restart an online pane");
-        assert!(force_restart_requested(f5, false), "F5 must restart an offline pane");
+        assert!(
+            force_restart_requested(f5, true),
+            "F5 must restart an online pane"
+        );
+        assert!(
+            force_restart_requested(f5, false),
+            "F5 must restart an offline pane"
+        );
         let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
         assert!(
             !force_restart_requested(ctrl_r, true),
