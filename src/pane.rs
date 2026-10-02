@@ -450,8 +450,6 @@ fn opencode_model_switch_body(model: &str) -> io::Result<String> {
     if [provider, id]
         .iter()
         .any(|part| part.trim().is_empty() || part.chars().any(char::is_whitespace))
-        || provider.contains('/')
-        || id.contains('/')
         || variant
             .is_some_and(|part| part.trim().is_empty() || part.chars().any(char::is_whitespace))
     {
@@ -468,6 +466,63 @@ fn opencode_model_switch_body(model: &str) -> io::Result<String> {
     };
     serde_json::to_string(&serde_json::json!({ "model": model }))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+#[cfg(test)]
+mod opencode_model_switch_body_tests {
+    use super::opencode_model_switch_body;
+
+    #[test]
+    fn accepts_slash_containing_model_ids_and_variant() {
+        for (reference, id, provider, variant) in [
+            (
+                "lmstudio/mistralai/devstral-small-2-2512",
+                "mistralai/devstral-small-2-2512",
+                "lmstudio",
+                None,
+            ),
+            (
+                "lmstudio/prism-ml/bonsai-27b",
+                "prism-ml/bonsai-27b",
+                "lmstudio",
+                None,
+            ),
+            ("opencode-go/mimo-v2.5", "mimo-v2.5", "opencode-go", None),
+            (
+                "openrouter/anthropic/claude-sonnet-4.5#high",
+                "anthropic/claude-sonnet-4.5",
+                "openrouter",
+                Some("high"),
+            ),
+        ] {
+            let body: serde_json::Value =
+                serde_json::from_str(&opencode_model_switch_body(reference).unwrap()).unwrap();
+            let expected = match variant {
+                Some(variant) => serde_json::json!({
+                    "id": id,
+                    "providerID": provider,
+                    "variant": variant,
+                }),
+                None => serde_json::json!({ "id": id, "providerID": provider }),
+            };
+            assert_eq!(body["model"], expected, "{reference}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_model_references() {
+        for model in [
+            "model",
+            "/model",
+            "provider/",
+            "provider/model##high",
+            "provider /model",
+            "provider/model name",
+            "provider/model#high low",
+        ] {
+            assert!(opencode_model_switch_body(model).is_err(), "{model}");
+        }
+    }
 }
 
 fn opencode_model_switch_args(session_id: &str, body: &str) -> Vec<OsString> {
