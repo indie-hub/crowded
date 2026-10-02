@@ -396,6 +396,33 @@ impl GuestEnvironment {
     }
 }
 
+fn opencode_launch(spec: &RoomSpec) -> io::Result<RoomSpec> {
+    let mut launch = spec.clone();
+    let guest = Path::new(spec.program.as_os_str())
+        .file_name()
+        .unwrap_or(spec.program.as_os_str());
+    if !guest.to_string_lossy().eq_ignore_ascii_case("opencode") {
+        return Ok(launch);
+    }
+    if let Some(model) = controls::scan_option(&spec.args, &["--model", "-m"]) {
+        let existing = environment_value(&spec.variables, "OPENCODE_CONFIG_CONTENT")
+            .map(|value| value.to_string_lossy().into_owned());
+        let config =
+            crate::config::opencode_mcp_config(existing.as_deref(), &[], &[], Some(&model))?;
+        launch
+            .variables
+            .retain(|(key, _)| key != "OPENCODE_CONFIG_CONTENT");
+        launch
+            .variables
+            .push(("OPENCODE_CONFIG_CONTENT".into(), config.into()));
+    }
+    controls::strip_options(&mut launch.args, &["--model", "-m"]);
+    if !launch.args.iter().any(|arg| arg == "--standalone") {
+        launch.args.insert(0, "--standalone".into());
+    }
+    Ok(launch)
+}
+
 impl Pane {
     pub(crate) fn spawn(
         spec: RoomSpec,
@@ -407,11 +434,12 @@ impl Pane {
         // portable-pty defaults an omitted cwd to HOME rather than inheriting
         // Crowded's directory, so the project directory must be explicit.
         let cwd = working_directory(spec.cwd.as_deref())?;
-        let path = environment_value(&spec.variables, "PATH");
-        let path_ext = environment_value(&spec.variables, "PATHEXT");
+        let guest = opencode_launch(&spec)?;
+        let path = environment_value(&guest.variables, "PATH");
+        let path_ext = environment_value(&guest.variables, "PATHEXT");
         let (program, args, headroom_active) = headroom_launch(
             &spec.program,
-            &spec.args,
+            &guest.args,
             spec.use_headroom,
             &spec.headroom_args,
             &path,
@@ -423,7 +451,7 @@ impl Pane {
         let (mut command, tree) = launch.into_parts();
         command.cwd(&cwd);
         command.env("PWD", &cwd);
-        for (key, value) in &spec.variables {
+        for (key, value) in &guest.variables {
             command.env(key, value);
         }
         for (key, value) in &environment.variables {
@@ -829,6 +857,140 @@ mod tests {
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn opencode_launch_moves_model_to_config_without_changing_spec() {
+        for model_args in [
+            vec!["--model", "opencode-go/mimo-v2.5#high"],
+            vec!["-m", "opencode-go/mimo-v2.5#high"],
+            vec!["--model=opencode-go/mimo-v2.5#high"],
+            vec!["-m=opencode-go/mimo-v2.5#high"],
+        ] {
+            let mut args = model_args;
+            args.extend(["--yolo", "--session", "ses_test", "--continue"]);
+            let spec = room_spec("opencode", &args);
+            let launch = opencode_launch(&spec).unwrap();
+            assert_eq!(arguments(&spec), args);
+            assert_eq!(
+                arguments(&launch),
+                [
+                    "--standalone",
+                    "--yolo",
+                    "--session",
+                    "ses_test",
+                    "--continue"
+                ]
+            );
+            let config: serde_json::Value = serde_json::from_str(
+                &environment_value(&launch.variables, "OPENCODE_CONFIG_CONTENT")
+                    .unwrap()
+                    .to_string_lossy(),
+            )
+            .unwrap();
+            assert_eq!(config["model"], "opencode-go/mimo-v2.5#high");
+        }
+    }
+
+    #[test]
+    fn opencode_launch_preserves_config_and_strips_duplicate_model_options() {
+        let mut spec = room_spec(
+            "opencode",
+            &[
+                "--standalone",
+                "--model",
+                "provider/selected",
+                "-m",
+                "provider/other",
+                "--model=provider/third",
+                "--yolo",
+            ],
+        );
+        spec.variables.push(("OPENCODE_CONFIG_CONTENT".into(), r#"{"model":"old/model","permissions":[{"action":"shell","resource":"*","effect":"ask"}],"mcp":{"shared":{"type":"local","command":["fake"]}},"plugin":["fake-plugin"]}"#.into()));
+        let launch = opencode_launch(&spec).unwrap();
+        assert_eq!(arguments(&launch), ["--standalone", "--yolo"]);
+        let before: serde_json::Value =
+            serde_json::from_str(&spec.variables[0].1.to_string_lossy()).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&launch.variables[0].1.to_string_lossy()).unwrap();
+        assert_eq!(after["model"], "provider/selected");
+        for key in ["permissions", "mcp", "plugin"] {
+            assert_eq!(after[key], before[key]);
+        }
+    }
+
+    #[test]
+    fn opencode_launch_without_model_only_adds_standalone() {
+        let spec = room_spec("opencode", &["--yolo", "--continue"]);
+        let launch = opencode_launch(&spec).unwrap();
+        assert_eq!(arguments(&launch), ["--standalone", "--yolo", "--continue"]);
+        assert_eq!(launch.variables, spec.variables);
+    }
+
+    #[test]
+    fn opencode_launch_sample() {
+        let mut spec = room_spec("opencode", &["--model", "opencode-go/mimo-v2.5", "--yolo"]);
+        spec.variables.push((
+            "OPENCODE_CONFIG_CONTENT".into(),
+            r#"{"providers":{"opencode-go":{"settings":{"apiKey":"scratch-no-call"}}}}"#.into(),
+        ));
+        let launch = opencode_launch(&spec).unwrap();
+        assert_eq!(arguments(&launch), ["--standalone", "--yolo"]);
+        println!(
+            "child argv: {:?}; OPENCODE_CONFIG_CONTENT={}",
+            arguments(&launch),
+            launch.variables[0].1.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn opencode_launch_leaves_other_guests_unchanged() {
+        for program in ["claude", "codex", "sh"] {
+            let mut spec = room_spec(program, &["--model", "unchanged", "--continue"]);
+            spec.variables.push(("EXAMPLE".into(), "unchanged".into()));
+            let launch = opencode_launch(&spec).unwrap();
+            assert_eq!(launch.program, spec.program);
+            assert_eq!(launch.args, spec.args);
+            assert_eq!(launch.variables, spec.variables);
+        }
+    }
+
+    #[test]
+    fn opencode_launch_adapts_before_headroom_wrapping() {
+        let (directory, path, ext) = headroom_path();
+        let mut spec = room_spec("opencode", &["--model", "opencode-go/mimo-v2.5", "--yolo"]);
+        spec.use_headroom = true;
+        spec.headroom_args = vec!["--budget".into(), "5000".into()];
+        let launch = opencode_launch(&spec).unwrap();
+        let (program, args, active) = headroom_launch(
+            &launch.program,
+            &launch.args,
+            launch.use_headroom,
+            &launch.headroom_args,
+            &path,
+            &ext,
+        );
+        assert!(active);
+        assert_eq!(program, OsString::from("headroom"));
+        assert_eq!(
+            args,
+            [
+                "wrap",
+                "opencode",
+                "--budget",
+                "5000",
+                "--standalone",
+                "--yolo"
+            ]
+            .map(OsString::from)
+        );
+        assert!(
+            environment_value(&launch.variables, "OPENCODE_CONFIG_CONTENT")
+                .unwrap()
+                .to_string_lossy()
+                .contains("opencode-go/mimo-v2.5")
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     fn temporary_bin_directory() -> PathBuf {

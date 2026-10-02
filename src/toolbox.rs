@@ -796,7 +796,7 @@ fn generate(
         NativeTarget::Mcp(Vendor::Codex) => merge_codex(original, servers, path),
         NativeTarget::Mcp(Vendor::OpenCode) => merge_opencode(
             original,
-            &opencode_mcp_config(None, servers, opencode_plugins)?,
+            &opencode_mcp_config(None, servers, opencode_plugins, None)?,
             path,
         ),
         NativeTarget::Hooks(Vendor::Claude) => merge_hooks(original, path, false),

@@ -843,7 +843,7 @@ fn strip_flags(args: &mut Vec<OsString>, flags: &[&str]) {
     });
 }
 
-fn strip_options(args: &mut Vec<OsString>, options: &[&str]) {
+pub(super) fn strip_options(args: &mut Vec<OsString>, options: &[&str]) {
     let mut kept = Vec::with_capacity(args.len());
     let mut index = 0;
     while index < args.len() {
@@ -871,7 +871,7 @@ fn strip_options(args: &mut Vec<OsString>, options: &[&str]) {
     *args = kept;
 }
 
-fn scan_option(args: &[OsString], aliases: &[&str]) -> Option<String> {
+pub(super) fn scan_option(args: &[OsString], aliases: &[&str]) -> Option<String> {
     let mut index = 0;
     while index < args.len() {
         let argument = args[index].to_string_lossy();

@@ -269,6 +269,7 @@ pub(crate) fn opencode_mcp_config(
     existing: Option<&str>,
     servers: &[McpConfig],
     plugins: &[OpenCodePluginConfig],
+    model: Option<&str>,
 ) -> io::Result<String> {
     let mut config = match existing {
         Some(existing) => serde_json::from_str(existing)
@@ -281,6 +282,9 @@ pub(crate) fn opencode_mcp_config(
             "OPENCODE_CONFIG_CONTENT must contain a JSON object",
         )
     })?;
+    if let Some(model) = model {
+        root.insert("model".into(), serde_json::Value::String(model.into()));
+    }
     let open_code_servers: Vec<_> = servers
         .iter()
         .filter(|server| server.supports(McpClient::Opencode))

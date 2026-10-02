@@ -241,6 +241,7 @@ impl RoomSpec {
                     env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(),
                     servers,
                     opencode_plugins,
+                    None,
                 )?
                 .into(),
             )),
