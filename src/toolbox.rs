@@ -128,6 +128,9 @@ pub(crate) fn native_files_are_active_at(root: &Path) -> io::Result<bool> {
     for file in &state.files {
         let current = read_optional(&file.path)?;
         let exact = current.as_deref() == Some(&file.generated);
+        if exact && is_legacy_opencode_plugin(&file.path, &file.generated) {
+            return Ok(false);
+        }
         let managed_json_is_intact = match current.as_deref() {
             Some(current) if is_opencode_config(&file.path) => {
                 managed_opencode_matches(file, current)?
@@ -146,6 +149,12 @@ pub(crate) fn native_files_are_active_at(root: &Path) -> io::Result<bool> {
         }
     }
     Ok(true)
+}
+
+fn is_legacy_opencode_plugin(path: &Path, contents: &str) -> bool {
+    path.ends_with(Path::new(".opencode/plugins/crowded-pulse.js"))
+        && contents.contains("export const CrowdedPulse")
+        && contents.contains("\"chat.message\"")
 }
 
 fn preview(root: &Path) -> io::Result<()> {
@@ -583,11 +592,23 @@ fn build_plan(root: &Path, force: bool) -> io::Result<ToolboxState> {
                 &config.mcp_servers,
                 &config.opencode_plugins,
             )?;
-            Ok(state.files.len() != expected.len()
+            if state.files.len() != expected.len()
                 || !state
                     .files
                     .iter()
-                    .all(|file| expected.contains_key(&file.path)))
+                    .all(|file| expected.contains_key(&file.path))
+            {
+                return Ok(true);
+            }
+            for file in &state.files {
+                if expected.contains_key(&file.path)
+                    && is_legacy_opencode_plugin(&file.path, &file.generated)
+                    && read_optional(&file.path)?.as_deref() == Some(&file.generated)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         })()
         .unwrap_or(false);
         if !is_stale && !force {
@@ -890,34 +911,54 @@ fn merge_hooks(original: Option<&str>, path: &Path, windows_command: bool) -> io
     Ok(output)
 }
 
-const OPENCODE_PULSE_PLUGIN: &str = r#"const pulse = async (state, model) => {
-  const crowded = process.env.CROWDED_BIN
-  if (!crowded) return
-  const args = [crowded, "pulse", state]
-  if (model) args.push("--model", model)
-  await Bun.spawn(args, {
-    stdout: "ignore",
-    stderr: "ignore",
-  }).exited
-}
-
-let currentModel = null
-
-export const CrowdedPulse = async () => {
-  await pulse("starting")
-  return {
-    "chat.message": async (input) => {
-      const model = input.model
-      currentModel = model ? `${model.providerID}/${model.modelID}` : null
-      await pulse("thinking", currentModel)
-    },
-    "tool.execute.before": async () => pulse("working", currentModel),
-    event: async ({ event }) => {
-      if (event.type === "session.idle") await pulse("ready", currentModel)
-      if (event.type === "session.error") await pulse("error", currentModel)
-      if (event.type === "session.deleted") await pulse("offline", currentModel)
-    },
-  }
+const OPENCODE_PULSE_PLUGIN: &str = r#"export default {
+  id: "crowded.pulse",
+  async setup(ctx) {
+    let sessionID
+    let model
+    const pulse = async (state, selected = model) => {
+      if (selected) model = selected
+      const command = process.env.CROWDED_BIN
+      if (!command) return
+      const args = [command, "pulse", state]
+      if (model) args.push("--model", `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}`)
+      await Bun.spawn(args, { stdout: "ignore", stderr: "ignore" }).exited
+    }
+    await pulse("starting")
+    await ctx.session.hook("prompt", async (event) => {
+      sessionID = event.sessionID
+      await pulse("thinking")
+    })
+    await ctx.session.hook("context", async (event) => {
+      sessionID = event.sessionID
+      await pulse("thinking", event.model)
+    })
+    await ctx.tool.hook("execute.before", (event) => {
+      if (event.sessionID === sessionID) return pulse("working")
+    })
+    const controller = new AbortController()
+    const events = (async () => {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        if (event.data?.sessionID && !sessionID) {
+          sessionID = event.data.sessionID
+          model = event.data.model
+        }
+        if (event.data?.sessionID !== sessionID) continue
+        if (event.type === "session.model.selected") await pulse("ready", event.data.model)
+        if (event.type === "session.status" && event.data.status.type === "idle") await pulse("ready")
+        if (event.type === "session.execution.succeeded") await pulse("ready")
+        if (event.type === "session.execution.interrupted") await pulse(event.data.reason === "shutdown" ? "offline" : "ready")
+        if (event.type === "session.execution.failed") await pulse("error")
+        if (event.type === "session.deleted") await pulse("offline")
+      }
+    })()
+    events.catch(() => { if (!controller.signal.aborted) return pulse("error") })
+    return async () => {
+      controller.abort()
+      await events.catch(() => {})
+      await pulse("offline")
+    }
+  },
 }
 "#;
 
@@ -1225,6 +1266,37 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    const LEGACY_OPENCODE_PULSE_PLUGIN: &str = r###"const pulse = async (state, model) => {
+  const crowded = process.env.CROWDED_BIN
+  if (!crowded) return
+  const args = [crowded, "pulse", state]
+  if (model) args.push("--model", model)
+  await Bun.spawn(args, {
+    stdout: "ignore",
+    stderr: "ignore",
+  }).exited
+}
+
+let currentModel = null
+
+export const CrowdedPulse = async () => {
+  await pulse("starting")
+  return {
+    "chat.message": async (input) => {
+      const model = input.model
+      currentModel = model ? `${model.providerID}/${model.modelID}` : null
+      await pulse("thinking", currentModel)
+    },
+    "tool.execute.before": async () => pulse("working", currentModel),
+    event: async ({ event }) => {
+      if (event.type === "session.idle") await pulse("ready", currentModel)
+      if (event.type === "session.error") await pulse("error", currentModel)
+      if (event.type === "session.deleted") await pulse("offline", currentModel)
+    },
+  }
+}
+"###;
+
     use std::{
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
@@ -1372,16 +1444,11 @@ mod tests {
             codex_hooks["hooks"]["PreToolUse"][0]["hooks"][0]["commandWindows"],
             "& \"$env:CROWDED_BIN\" pulse working --hook-stdin"
         );
-        assert!(
-            fs::read_to_string(root.join(".opencode/plugins/crowded-pulse.js"))
-                .unwrap()
-                .contains("session.idle")
-        );
-        assert!(
-            fs::read_to_string(root.join(".opencode/plugins/crowded-pulse.js"))
-                .unwrap()
-                .contains("providerID")
-        );
+        let pulse_plugin =
+            fs::read_to_string(root.join(".opencode/plugins/crowded-pulse.js")).unwrap();
+        assert!(pulse_plugin.contains("ctx.session.hook(\"prompt\""));
+        assert!(pulse_plugin.contains("session.execution.succeeded"));
+        assert!(pulse_plugin.contains("model.variant"));
         let mut rewritten: Value =
             serde_json::from_str(&fs::read_to_string(root.join("opencode.json")).unwrap()).unwrap();
         rewritten["$schema"] = Value::String("https://opencode.ai/config.json".into());
@@ -1448,6 +1515,44 @@ mod tests {
         remove(&root).unwrap();
         assert!(!root.join(".claude/settings.local.json").exists());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn toolbox_sync_upgrades_the_legacy_opencode_pulse_plugin_in_place() {
+        let root = test_directory();
+        fs::write(
+            root.join("crowded.toml"),
+            "[[rooms]]\ncommand = \"opencode\"\ntransport = \"raw\"\n\n[[rooms]]\ncommand = \"/bin/zsh\"\ntransport = \"shell\"\n",
+        )
+        .unwrap();
+        let mut state = build_plan(&root, false).unwrap();
+        let plugin_path = root.join(".opencode/plugins/crowded-pulse.js");
+        let plugin_file = state
+            .files
+            .iter_mut()
+            .find(|file| file.path == plugin_path)
+            .unwrap();
+        plugin_file.generated = LEGACY_OPENCODE_PULSE_PLUGIN.to_owned();
+        for file in &state.files {
+            fs::create_dir_all(file.path.parent().unwrap()).unwrap();
+            fs::write(&file.path, &file.generated).unwrap();
+        }
+        save_state(&root, &state).unwrap();
+
+        assert!(!native_files_are_active_at(&root).unwrap());
+        assert!(sync(&root).unwrap().contains(&plugin_path));
+        let installed = fs::read_to_string(&plugin_path).unwrap();
+        assert_eq!(installed, OPENCODE_PULSE_PLUGIN);
+        assert!(installed.starts_with("export default {\n  id: \"crowded.pulse\""));
+        assert!(!installed.contains("chat.message"));
+
+        fs::write(&plugin_path, "hand-edited plugin\n").unwrap();
+        assert!(sync(&root).is_err());
+        assert_eq!(
+            fs::read_to_string(&plugin_path).unwrap(),
+            "hand-edited plugin\n"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
