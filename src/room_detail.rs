@@ -121,7 +121,7 @@ fn opencode_detail(_cwd: &Path, session_id: &str) -> Option<RoomDetail> {
         .arg("-json")
         .arg(&database)
         .arg(format!(
-            "SELECT data FROM session_message WHERE session_id = '{escaped}' AND json_extract(data, '$.role') = 'assistant' ORDER BY time_created ASC;"
+            "SELECT data FROM session_message WHERE session_id = '{escaped}' AND type = 'assistant' ORDER BY time_created ASC;"
         ))
         .output()
         .ok()?;
@@ -132,7 +132,12 @@ fn opencode_detail(_cwd: &Path, session_id: &str) -> Option<RoomDetail> {
     let mut detail = RoomDetail::default();
     // Process messages and tool entries oldest-first; the last completed todowrite snapshot wins.
     // Incomplete and errored todowrite entries are ignored.
-    for row in parse_rows(&output.stdout)? {
+    let rows = if output.stdout.iter().all(|byte| byte.is_ascii_whitespace()) {
+        Vec::new()
+    } else {
+        parse_rows(&output.stdout)?
+    };
+    for row in rows {
         let Some(data) = row
             .get("data")
             .and_then(|value| value.as_str())
@@ -534,10 +539,55 @@ mod tests {
         fs::create_dir_all(database.parent().unwrap()).unwrap();
         let setup = Command::new("sqlite3")
             .arg(&database)
-            .arg(sql)
+            .arg(format!(
+                r#"
+                    PRAGMA foreign_keys=OFF;
+                    CREATE TABLE IF NOT EXISTS session_v2 (id text PRIMARY KEY);
+                    CREATE TABLE IF NOT EXISTS "session_message" (
+                        `id` text PRIMARY KEY,
+                        `session_id` text NOT NULL,
+                        `type` text NOT NULL,
+                        `seq` integer NOT NULL,
+                        `time_created` integer NOT NULL,
+                        `time_updated` integer NOT NULL,
+                        `data` text NOT NULL,
+                        CONSTRAINT `fk_session_message_session_id_session_v2_id_fk`
+                            FOREIGN KEY (`session_id`) REFERENCES `session_v2`(`id`) ON DELETE CASCADE
+                    );
+                    CREATE UNIQUE INDEX `session_message_session_seq_idx`
+                        ON `session_message` (`session_id`, `seq`);
+                    CREATE INDEX `session_message_session_type_seq_idx`
+                        ON `session_message` (`session_id`, `type`, `seq`);
+                    CREATE INDEX `session_message_session_time_created_id_idx`
+                        ON `session_message` (`session_id`, `time_created`, `id`);
+                    CREATE INDEX `session_message_time_created_idx`
+                        ON `session_message` (`time_created`);
+                    {sql}
+                "#
+            ))
             .output()
             .unwrap();
         assert!(setup.status.success());
+    }
+
+    #[test]
+    fn opencode_detail_reads_real_v2_session_message_shape() {
+        if Command::new("sqlite3").arg("--version").output().is_err() {
+            return;
+        }
+        let guard = HomeDirGuard::isolated();
+        create_opencode_message_db(
+            guard.path(),
+            r#"
+                INSERT INTO session_message VALUES
+                ('m1', 'parent-1', 'assistant', 1, 1, 1, '{"content":[{"type":"tool","name":"task","state":{"status":"completed","metadata":{"parentSessionId":"parent-1","sessionId":"child-1"}}}]}');
+            "#,
+        );
+
+        let detail = opencode_detail(Path::new("/work"), "parent-1").unwrap();
+        assert_eq!(detail.sub_agents.len(), 1);
+        assert_eq!(detail.sub_agents[0].id, "child-1");
+        assert_eq!(detail.sub_agents[0].status, "completed");
     }
 
     #[test]
@@ -549,13 +599,12 @@ mod tests {
         create_opencode_message_db(
             guard.path(),
             r#"
-                CREATE TABLE session_message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
                 INSERT INTO session_message VALUES
-                ('m1', 'parent-1', 1, '{"role":"assistant","content":[{"type":"tool","name":"task","state":{"metadata":{"parentSessionId":"parent-1","sessionId":"child-1"}}},{"type":"tool","name":"task","state":{"status":"error","metadata":{"parentSessionId":"parent-1","sessionId":"child-2"}}},{"type":"tool","name":"todowrite","state":{"status":"completed","input":{"todos":[{"content":"Old snapshot","status":"pending","priority":"high"}]}}}]}'),
-                ('m2', 'parent-1', 2, '{"role":"assistant","content":[{"type":"tool","name":"todowrite","state":{"status":"completed","input":{"todos":[{"content":"Design","status":"completed","priority":"high"},{"content":"Build","status":"pending","priority":"normal"}]}}}]}'),
-                ('m3', 'parent-1', 3, '{"role":"assistant","content":[{"type":"tool","name":"todowrite","state":{"status":"running","input":{"todos":[{"content":"Incomplete","status":"pending"}]}}}]}'),
-                ('m4', 'parent-1', 4, '{"role":"assistant","content":[{"type":"tool","name":"todowrite","state":{"status":"error","input":{"todos":[{"content":"Failed","status":"pending"}]}}}]}'),
-                ('m5', 'other-session', 5, '{"role":"assistant","content":[{"type":"tool","name":"task","state":{"status":"completed","metadata":{"parentSessionId":"parent-1","sessionId":"ignored-child"}}},{"type":"tool","name":"todowrite","state":{"status":"completed","input":{"todos":[{"content":"Wrong session","status":"pending"}]}}}]}');
+                ('m1', 'parent-1', 'assistant', 1, 1, 1, '{"content":[{"type":"tool","name":"task","state":{"metadata":{"parentSessionId":"parent-1","sessionId":"child-1"}}},{"type":"tool","name":"task","state":{"status":"error","metadata":{"parentSessionId":"parent-1","sessionId":"child-2"}}},{"type":"tool","name":"todowrite","state":{"status":"completed","input":{"todos":[{"content":"Old snapshot","status":"pending","priority":"high"}]}}}]}'),
+                ('m2', 'parent-1', 'assistant', 2, 2, 2, '{"content":[{"type":"tool","name":"todowrite","state":{"status":"completed","input":{"todos":[{"content":"Design","status":"completed","priority":"high"},{"content":"Build","status":"pending","priority":"normal"}]}}}]}'),
+                ('m3', 'parent-1', 'assistant', 3, 3, 3, '{"content":[{"type":"tool","name":"todowrite","state":{"status":"running","input":{"todos":[{"content":"Incomplete","status":"pending"}]}}}]}'),
+                ('m4', 'parent-1', 'assistant', 4, 4, 4, '{"content":[{"type":"tool","name":"todowrite","state":{"status":"error","input":{"todos":[{"content":"Failed","status":"pending"}]}}}]}'),
+                ('m5', 'other-session', 'assistant', 5, 5, 5, '{"content":[{"type":"tool","name":"task","state":{"status":"completed","metadata":{"parentSessionId":"parent-1","sessionId":"ignored-child"}}},{"type":"tool","name":"todowrite","state":{"status":"completed","input":{"todos":[{"content":"Wrong session","status":"pending"}]}}}]}');
             "#,
         );
 
@@ -573,6 +622,25 @@ mod tests {
     }
 
     #[test]
+    fn opencode_detail_ignores_task_and_todowrite_in_user_messages() {
+        if Command::new("sqlite3").arg("--version").output().is_err() {
+            return;
+        }
+        let guard = HomeDirGuard::isolated();
+        create_opencode_message_db(
+            guard.path(),
+            r#"
+                INSERT INTO session_message VALUES
+                ('m1', 'parent-1', 'user', 1, 1, 1, '{"content":[{"type":"tool","name":"task","state":{"status":"completed","metadata":{"parentSessionId":"parent-1","sessionId":"ignored-child"}}},{"type":"tool","name":"todowrite","state":{"status":"completed","input":{"todos":[{"content":"Ignored","status":"pending"}]}}}]}');
+            "#,
+        );
+
+        let detail = opencode_detail(Path::new("/work"), "parent-1").unwrap();
+        assert!(detail.sub_agents.is_empty());
+        assert!(detail.todos.is_empty());
+    }
+
+    #[test]
     fn opencode_detail_without_todowrite_returns_empty_todos() {
         if Command::new("sqlite3").arg("--version").output().is_err() {
             return;
@@ -581,9 +649,8 @@ mod tests {
         create_opencode_message_db(
             guard.path(),
             r#"
-                CREATE TABLE session_message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
                 INSERT INTO session_message VALUES
-                ('m1', 'parent-1', 1, '{"role":"assistant","content":[]}');
+                ('m1', 'parent-1', 'assistant', 1, 1, 1, '{"content":[]}');
             "#,
         );
 
