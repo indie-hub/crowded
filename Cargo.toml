@@ -1,6 +1,6 @@
 [package]
 name = "crowded"
-version = "0.43.4"
+version = "0.44.0"
 edition = "2024"
 
 [dependencies]
