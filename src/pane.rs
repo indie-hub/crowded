@@ -5,9 +5,10 @@ use std::{
     ffi::{OsStr, OsString},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{Arc, mpsc},
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -432,6 +433,141 @@ fn opencode_launch(spec: &RoomSpec) -> io::Result<RoomSpec> {
     Ok(launch)
 }
 
+fn opencode_model_switch_body(model: &str) -> io::Result<String> {
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "OpenCode model must have the form provider/model[#variant]",
+        )
+    };
+    let mut parts = model.split('#');
+    let reference = parts.next().ok_or_else(invalid)?;
+    let variant = parts.next();
+    if parts.next().is_some() {
+        return Err(invalid());
+    }
+    let (provider, id) = reference.split_once('/').ok_or_else(invalid)?;
+    if [provider, id]
+        .iter()
+        .any(|part| part.trim().is_empty() || part.chars().any(char::is_whitespace))
+        || provider.contains('/')
+        || id.contains('/')
+        || variant
+            .is_some_and(|part| part.trim().is_empty() || part.chars().any(char::is_whitespace))
+    {
+        return Err(invalid());
+    }
+
+    let model = match variant {
+        Some(variant) => serde_json::json!({
+            "id": id,
+            "providerID": provider,
+            "variant": variant,
+        }),
+        None => serde_json::json!({ "id": id, "providerID": provider }),
+    };
+    serde_json::to_string(&serde_json::json!({ "model": model }))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+fn opencode_model_switch_args(session_id: &str, body: &str) -> Vec<OsString> {
+    [
+        "api".into(),
+        "--standalone".into(),
+        "--data".into(),
+        body.into(),
+        "POST".into(),
+        format!("/api/session/{session_id}/model").into(),
+    ]
+    .into()
+}
+
+fn opencode_resume_session_id(spec: &RoomSpec, cwd: &Path) -> io::Result<Option<String>> {
+    if controls::cli_vendor(spec)? != controls::CliVendor::OpenCode {
+        return Ok(None);
+    }
+    let is_resuming = spec.args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        matches!(arg.as_ref(), "--session" | "-s" | "--continue" | "-c")
+            || arg.starts_with("--session=")
+            || arg.starts_with("-s=")
+    });
+    if !is_resuming {
+        return Ok(None);
+    }
+    if let Some(id) =
+        controls::scan_option(&spec.args, &["--session", "-s"]).filter(|id| !id.is_empty())
+    {
+        return Ok(Some(id));
+    }
+    if let Some(id) = session_state::lookup("opencode", cwd, &spec.title)
+        .filter(|id| id != session_state::FRESH_STATE_MARKER)
+    {
+        return Ok(Some(id));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "cannot switch the model of a continued OpenCode session without a recorded session id; use clear first",
+    ))
+}
+
+fn switch_opencode_session_model(
+    spec: &RoomSpec,
+    environment: &GuestEnvironment,
+    cwd: &Path,
+    session_id: &str,
+    body: &str,
+) -> io::Result<()> {
+    let mut command = Command::new(&spec.program);
+    command
+        .args(opencode_model_switch_args(session_id, body))
+        .current_dir(cwd)
+        .env("PWD", cwd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (key, value) in &spec.variables {
+        command.env(key, value);
+    }
+    for (key, value) in &environment.variables {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to run OpenCode model switch: {error}"),
+        )
+    })?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "OpenCode model switch failed with exit status {status}"
+                    )))
+                };
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            Ok(None) => {}
+        }
+        if started.elapsed() >= Duration::from_secs(15) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "OpenCode model switch timed out after 15 seconds",
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 impl Pane {
     pub(crate) fn spawn(
         spec: RoomSpec,
@@ -772,15 +908,30 @@ impl Pane {
         effort: Option<&str>,
         size: PtySize,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.reconfigure(size, |spec| {
-            if let Some(model) = model {
-                controls::set_model(spec, model)?;
+        let mut spec = self.spec.clone();
+        let vendor = controls::cli_vendor(&spec)?;
+        if let Some(model) = model {
+            controls::set_model(&mut spec, model)?;
+        }
+        if let Some(effort) = effort {
+            controls::set_effort(&mut spec, effort)?;
+        }
+        if let (controls::CliVendor::OpenCode, Some(model)) = (vendor, model) {
+            let body = opencode_model_switch_body(model)?;
+            if let Some(session_id) = opencode_resume_session_id(&self.spec, &self.cwd)? {
+                switch_opencode_session_model(
+                    &self.spec,
+                    &self.environment,
+                    &self.cwd,
+                    &session_id,
+                    &body,
+                )?;
             }
-            if let Some(effort) = effort {
-                controls::set_effort(spec, effort)?;
-            }
-            Ok(())
-        })
+        }
+        let replacement = Self::spawn(spec, size, self.environment.clone())?;
+        self.cleanup();
+        *self = replacement;
+        Ok(())
     }
 
     pub(crate) fn current_model(&self) -> Option<String> {
@@ -866,6 +1017,244 @@ mod tests {
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn opencode_model_switch_builds_session_request_with_variant() {
+        let body = opencode_model_switch_body("provider/model#high").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({
+                "model": {"id": "model", "providerID": "provider", "variant": "high"}
+            })
+        );
+        assert_eq!(
+            opencode_model_switch_args("ses-exact", &body),
+            [
+                "api",
+                "--standalone",
+                "--data",
+                body.as_str(),
+                "POST",
+                "/api/session/ses-exact/model"
+            ]
+            .map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn opencode_model_switch_omits_missing_variant() {
+        let body = opencode_model_switch_body("provider/model").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"model": {"id": "model", "providerID": "provider"}})
+        );
+    }
+
+    #[test]
+    fn opencode_model_switch_rejects_malformed_model() {
+        for model in ["model", "/model", "provider/", "provider/model#", "p/m#v#x"] {
+            assert!(opencode_model_switch_body(model).is_err(), "{model}");
+        }
+    }
+
+    #[test]
+    fn opencode_model_switch_resolves_only_resumed_sessions() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = temporary_bin_directory();
+        let fresh = room_spec("opencode", &["--model", "provider/model"]);
+        assert_eq!(opencode_resume_session_id(&fresh, &cwd).unwrap(), None);
+
+        let other = room_spec("claude", &["--continue"]);
+        assert_eq!(opencode_resume_session_id(&other, &cwd).unwrap(), None);
+
+        let continued = room_spec("opencode", &["--continue"]);
+        assert!(
+            opencode_resume_session_id(&continued, &cwd)
+                .unwrap_err()
+                .to_string()
+                .contains("use clear first")
+        );
+
+        let mut mapped = continued.clone();
+        mapped.title = "mapped room".into();
+        session_state::upsert("opencode", &cwd, &mapped.title, "ses-mapped");
+        assert_eq!(
+            opencode_resume_session_id(&mapped, &cwd)
+                .unwrap()
+                .as_deref(),
+            Some("ses-mapped")
+        );
+
+        let exact = room_spec("opencode", &["--session", "ses-exact", "--continue"]);
+        assert_eq!(
+            opencode_resume_session_id(&exact, &cwd).unwrap().as_deref(),
+            Some("ses-exact")
+        );
+        fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn fake_opencode(root: &Path, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let executable = bin.join("opencode");
+        fs::write(&executable, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_model_switch_failure_keeps_the_running_room() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = temporary_bin_directory();
+        let bin = fake_opencode(
+            &root,
+            "if [ \"$1\" = api ]; then printf '%s\\n' \"$@\" > \"$SWITCH_LOG\"; exit 23; fi; exec /bin/sleep 60",
+        );
+        let log = root.join("api-args.txt");
+        let mut spec = room_spec(
+            "opencode",
+            &["--session", "ses-exact", "--model", "provider/old"],
+        );
+        spec.cwd = Some(root.clone());
+        spec.variables
+            .push(("PATH".into(), bin.as_os_str().to_os_string()));
+        spec.variables
+            .push(("SWITCH_LOG".into(), log.as_os_str().to_os_string()));
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let mut pane = Pane::spawn(spec, size, GuestEnvironment::new([])).unwrap();
+        let original_pid = pane.child.child.as_ref().unwrap().process_id();
+        let malformed = pane
+            .configure(Some("bad-model"), None, size)
+            .unwrap_err()
+            .to_string();
+        assert!(malformed.contains("provider/model[#variant]"));
+        assert_eq!(
+            pane.child.child.as_ref().unwrap().process_id(),
+            original_pid
+        );
+        assert!(!log.exists());
+        let error = pane
+            .configure(Some("provider/new#high"), None, size)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exit status: 23"), "{error}");
+        assert_eq!(
+            pane.child.child.as_ref().unwrap().process_id(),
+            original_pid
+        );
+        assert_eq!(
+            fs::read_to_string(log).unwrap(),
+            "api\n--standalone\n--data\n{\"model\":{\"id\":\"new\",\"providerID\":\"provider\",\"variant\":\"high\"}}\nPOST\n/api/session/ses-exact/model\n"
+        );
+        pane.cleanup();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolved_continue_keeps_the_running_opencode_room() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = temporary_bin_directory();
+        let bin = fake_opencode(
+            &root,
+            "if [ \"$1\" = api ]; then printf called > \"$SWITCH_LOG\"; exit 0; fi; exec /bin/sleep 60",
+        );
+        let log = root.join("api-called");
+        let mut spec = room_spec("opencode", &["--continue", "--model", "provider/old"]);
+        spec.cwd = Some(root.clone());
+        spec.variables
+            .push(("PATH".into(), bin.as_os_str().to_os_string()));
+        spec.variables
+            .push(("SWITCH_LOG".into(), log.as_os_str().to_os_string()));
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let mut pane = Pane::spawn(spec, size, GuestEnvironment::new([])).unwrap();
+        let original_pid = pane.child.child.as_ref().unwrap().process_id();
+        let error = pane
+            .configure(Some("provider/new"), None, size)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("continued OpenCode session"));
+        assert!(error.contains("use clear first"));
+        assert_eq!(
+            pane.child.child.as_ref().unwrap().process_id(),
+            original_pid
+        );
+        assert!(!log.exists());
+        pane.cleanup();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_opencode_model_change_skips_the_api_call() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = temporary_bin_directory();
+        let bin = fake_opencode(
+            &root,
+            "if [ \"$1\" = api ]; then printf called > \"$SWITCH_LOG\"; exit 0; fi; exec /bin/sleep 60",
+        );
+        let log = root.join("api-called");
+        let mut spec = room_spec("opencode", &["--model", "provider/old"]);
+        spec.cwd = Some(root.clone());
+        spec.variables
+            .push(("PATH".into(), bin.as_os_str().to_os_string()));
+        spec.variables
+            .push(("SWITCH_LOG".into(), log.as_os_str().to_os_string()));
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let mut pane = Pane::spawn(spec, size, GuestEnvironment::new([])).unwrap();
+        pane.configure(Some("provider/new"), None, size).unwrap();
+        assert!(!log.exists());
+        pane.cleanup();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_opencode_model_change_does_not_call_the_opencode_api() {
+        let root = temporary_bin_directory();
+        let bin = fake_opencode(
+            &root,
+            "if [ \"$1\" = api ]; then printf called > \"$SWITCH_LOG\"; exit 0; fi; exec /bin/sleep 60",
+        );
+        std::os::unix::fs::symlink(bin.join("opencode"), bin.join("claude")).unwrap();
+        let log = root.join("api-called");
+        let mut spec = room_spec("claude", &["--model", "old"]);
+        spec.cwd = Some(root.clone());
+        spec.variables
+            .push(("PATH".into(), bin.as_os_str().to_os_string()));
+        spec.variables
+            .push(("SWITCH_LOG".into(), log.as_os_str().to_os_string()));
+        let size = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let mut pane = Pane::spawn(spec, size, GuestEnvironment::new([])).unwrap();
+        pane.configure(Some("new"), None, size).unwrap();
+        assert!(!log.exists());
+        pane.cleanup();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
