@@ -69,10 +69,7 @@ args = ["mcp", "--project", __BASIC_MEMORY_PROJECT__]
 name = "context-mode"
 command = "npx"
 args = ["-y", "context-mode@1.0.169"]
-clients = ["claude", "codex"]
-
-[[opencode_plugin]]
-package = "context-mode@1.0.169"
+clients = ["claude", "codex", "opencode"]
 
 # Setup commands run once, in order. CCC asks you to choose its embedding model
 # the first time and its local model dependencies can download several GB.

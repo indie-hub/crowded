@@ -1096,17 +1096,14 @@ transport = "raw"
     }
 
     #[test]
-    fn context_mode_uses_mcp_for_claude_and_codex_but_a_plugin_for_opencode() {
+    fn context_mode_uses_mcp_for_supported_cli_rooms() {
         let rooms = room_specs_from_toml(
             r#"
                 [[mcp]]
                 name = "context-mode"
                 command = "npx"
                 args = ["-y", "context-mode@1.0.169"]
-                clients = ["claude", "codex"]
-
-                [[opencode_plugin]]
-                package = "context-mode@1.0.169"
+                clients = ["claude", "codex", "opencode"]
 
                 [[rooms]]
                 command = "claude"
@@ -1145,8 +1142,12 @@ transport = "raw"
                 .unwrap(),
         )
         .unwrap();
-        assert!(opencode.get("mcp").is_none());
-        assert_eq!(opencode["plugin"][0], "context-mode@1.0.169");
+        assert_eq!(opencode["mcp"]["context-mode"]["type"], "local");
+        assert_eq!(
+            opencode["mcp"]["context-mode"]["command"],
+            serde_json::json!(["npx", "-y", "context-mode@1.0.169"])
+        );
+        assert!(opencode.get("plugin").is_none());
     }
 
     #[test]
