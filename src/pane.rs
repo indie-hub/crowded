@@ -204,8 +204,8 @@ fn opencode_input_ready(screen: &str) -> bool {
     // Checking the entire screen for "esc interrupt" is too strict: history
     // may contain that phrase from a previous thinking turn or from code
     // in the transcript, even though the current prompt is idle. Only
-    // the prompt area (tail of the screen) matters, and only the busy
-    // indicators near the last prompt matter.
+    // the prompt area (tail of the screen) matters, and only busy indicators
+    // after the last prompt matter.
     let tail = screen
         .get(screen.len().saturating_sub(1200)..)
         .unwrap_or(screen);
@@ -214,26 +214,35 @@ fn opencode_input_ready(screen: &str) -> bool {
     // (e.g. "...ctrl+p" / "commands..."), so a single line's contents can't
     // be trusted alone. Join each line with the next one (space-separated,
     // collapsing the wrap) before searching for the marker.
-    let prompt_idx = (0..lines.len()).rposition(|i| {
+    let ask_idx = (0..lines.len()).rposition(|i| {
         let joined = lines[i..(i + 3).min(lines.len())].join(" ");
         joined.contains("Ask anything")
-            || (joined.contains("ctrl+p") && joined.contains("commands"))
     });
+    let footer_idx = (0..lines.len()).rposition(|i| {
+        let joined = lines[i..(i + 3).min(lines.len())].join(" ");
+        joined.contains("ctrl+p") && joined.contains("commands")
+    });
+    // The v2 home prompt is centered, so pair it with the nearby status footer
+    // instead of treating the final build-version row as the prompt position.
+    let prompt_idx = match (ask_idx, footer_idx) {
+        (Some(ask), Some(footer)) if footer >= ask && footer - ask <= 8 => Some(ask),
+        (Some(ask), _) if lines.len() - ask <= 6 => Some(ask),
+        (_, Some(footer)) => Some(footer),
+        (Some(ask), None) => Some(ask),
+        (None, None) => None,
+    };
     let Some(idx) = prompt_idx else {
         return false;
     };
-    // Prompt must be near the bottom of the visible tail. A prompt
-    // far above (e.g. old history with Ask anything at the top) must
-    // not count; the current idle prompt lives at the bottom.
-    if lines.len() - idx > 6 {
+    let paired_home_prompt = ask_idx
+        .is_some_and(|ask| footer_idx.is_some_and(|footer| footer >= ask && footer - ask <= 8));
+    if !paired_home_prompt && lines.len() - idx > 6 {
         return false;
     }
-    // Only the prompt line and the next couple of lines can contain the
-    // busy indicators when the UI is actually busy. History's "esc
-    // interrupt" far above the prompt must not block readiness.
-    let window = &lines[idx..(idx + 3).min(lines.len())];
-    let prompt_area = window.join("\n");
-    !prompt_area.contains("esc interrupt") && !prompt_area.contains("exit shell mode")
+    let prompt_area = lines[idx..].join("\n");
+    !prompt_area.contains("esc interrupt")
+        && !prompt_area.contains("again to interrupt")
+        && !prompt_area.contains("exit shell mode")
 }
 
 #[cfg(not(windows))]
@@ -1090,6 +1099,43 @@ mod tests {
         assert!(!opencode_input_ready("ctrl+p commands  esc interrupt"));
         assert!(!opencode_input_ready(
             "Run a command... ctrl+p commands  esc exit shell mode"
+        ));
+    }
+
+    #[test]
+    fn opencode_v2_captured_idle_home_screens_report_ready() {
+        const CONTENT_ENABLED: &str = concat!(
+            "┃  Ask anything… \"What is the tech stack of this project?\"\n",
+            "┃\n",
+            "┃  Build · MiMo V2.5 OpenCode Go\n",
+            "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
+            "/…/opencode-v2-room2-re…/content-enabled  shift+tab agents  ctrl+p commands\n",
+            "\n\n\n\n\n\n\n\n\n\n\n\n\n"
+        );
+        const VAL_LAUNCH: &str = concat!(
+            "┃  Ask anything… \"What is the tech stack of this project?\"\n",
+            "┃\n",
+            "┃  Build auto · MiMo V2.5 OpenCode Go\n",
+            "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n",
+            "/…/opencode-v2-room2-research/val-launch  shift+tab agents  ctrl+p commands\n",
+            "\n\n\n\n\n\n\n\n\n\n\n\n\n"
+        );
+        assert!(opencode_input_ready(CONTENT_ENABLED));
+        assert!(opencode_input_ready(VAL_LAUNCH));
+    }
+
+    #[test]
+    fn opencode_v2_busy_screen_status_blocks_input() {
+        const LOOPBACK_BUSY: &str = concat!(
+            "┃  readiness probe\n",
+            "\n",
+            "──────────────────────────────── ⠼ Compaction ────────────────────────────────\n",
+            "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+            "⬝⬝⬝■■■■■ esc interrupt  shift+tab agents  ctrl+p commands\n"
+        );
+        assert!(!opencode_input_ready(LOOPBACK_BUSY));
+        assert!(!opencode_input_ready(
+            "Ask anything\nctrl+p commands\nesc again to interrupt"
         ));
     }
 
