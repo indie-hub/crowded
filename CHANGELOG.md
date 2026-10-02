@@ -19,16 +19,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Changing the model of a resumed OpenCode room updates its saved session through OpenCode's API before relaunch. Slash-containing model IDs and `#variant` values are supported.
 - OpenCode session capture, resume repair, model checks and cost reporting now read the v2 session store, including model variants.
 - OpenCode Room Pulse details now come from v2 session messages. The generated pulse plugin uses the v2 plugin API, and `crowded toolbox sync` upgrades the managed legacy plugin in place.
-- OpenCode rooms receive context-mode as an MCP server because its currently published plugin uses the v1 API; context-mode's plugin hooks require an upstream v2-compatible plugin.
+- The starter configuration now delivers context-mode to OpenCode rooms as an MCP server. Its currently published plugin uses the v1 API, and its plugin hooks require an upstream v2-compatible plugin.
 
 ### Fixed
 
-- OpenCode's v2 idle home screen is recognized as ready for automated input, and Room Pulse detail reads assistant messages using the v2 message type column.
+- OpenCode's v2 idle home screen is recognized as ready for automated input.
 - `crowded toolbox preview` no longer changes files when saved toolbox state is stale.
 
 ### Upgrade notes
 
-- Run `crowded toolbox sync` once after installing 0.44.0 to upgrade the managed OpenCode pulse plugin.
+- In an existing `crowded.toml`, add `opencode` to the context-mode MCP `clients` list and remove its `[[opencode_plugin]]` entry, then run `crowded toolbox sync` once after installing 0.44.0 to upgrade the managed OpenCode pulse plugin.
 - Existing OpenCode sessions keep their current model until it is changed with the model control.
 
 ## [0.43.4] - 2026-09-04
