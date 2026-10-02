@@ -116,68 +116,93 @@ fn opencode_detail(_cwd: &Path, session_id: &str) -> Option<RoomDetail> {
     if !database.is_file() {
         return None;
     }
-    // Sub-agents: `part` rows whose tool is `task` and whose state metadata
-    // links the part back to this session as its parent.
-    let output = Command::new("sqlite3")
-        .arg("-json")
-        .arg(&database)
-        .arg("SELECT data FROM part WHERE json_extract(data, '$.tool') = 'task';")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let mut sub_agents = Vec::new();
-    for row in parse_rows(&output.stdout)? {
-        let data = parse_json(row.get("data")?.as_str()?)?;
-        let state = data.get("state")?;
-        let metadata = state.get("metadata")?;
-        if metadata.get("parentSessionId")?.as_str()? != session_id {
-            continue;
-        }
-        sub_agents.push(SubAgent {
-            id: metadata.get("sessionId")?.as_str()?.to_owned(),
-            kind: "task".to_owned(),
-            status: state
-                .get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("completed")
-                .to_owned(),
-        });
-    }
-    // Todos: the dedicated `todo` table, ordered by its `(session_id,
-    // position)` key.
     let escaped = session_id.replace('\'', "''");
     let output = Command::new("sqlite3")
         .arg("-json")
         .arg(&database)
         .arg(format!(
-            "SELECT content, status FROM todo WHERE session_id = '{escaped}' ORDER BY position;"
+            "SELECT data FROM session_message WHERE session_id = '{escaped}' AND json_extract(data, '$.role') = 'assistant' ORDER BY time_created ASC;"
         ))
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let mut todos = Vec::new();
-    for (index, row) in parse_rows(&output.stdout)?.into_iter().enumerate() {
-        todos.push(TodoItem {
-            id: index.to_string(),
-            content: row
-                .get("content")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_owned(),
-            status: row
-                .get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("pending")
-                .to_owned(),
-        });
-    }
-    Some(RoomDetail { sub_agents, todos })
-}
 
+    let mut detail = RoomDetail::default();
+    // Process messages and tool entries oldest-first; the last completed todowrite snapshot wins.
+    // Incomplete and errored todowrite entries are ignored.
+    for row in parse_rows(&output.stdout)? {
+        let Some(data) = row
+            .get("data")
+            .and_then(|value| value.as_str())
+            .and_then(parse_json)
+        else {
+            continue;
+        };
+        for tool in data
+            .get("content")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.get("type").and_then(|value| value.as_str()) == Some("tool"))
+        {
+            let Some(state) = tool.get("state") else {
+                continue;
+            };
+            match tool.get("name").and_then(|value| value.as_str()) {
+                Some("task") => {
+                    let Some(metadata) = state.get("metadata") else {
+                        continue;
+                    };
+                    if metadata
+                        .get("parentSessionId")
+                        .and_then(|value| value.as_str())
+                        != Some(session_id)
+                    {
+                        continue;
+                    }
+                    let Some(id) = metadata.get("sessionId").and_then(|value| value.as_str())
+                    else {
+                        continue;
+                    };
+                    detail.sub_agents.push(SubAgent {
+                        id: id.to_owned(),
+                        kind: "task".to_owned(),
+                        status: state
+                            .get("status")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("completed")
+                            .to_owned(),
+                    });
+                }
+                Some("todowrite")
+                    if state.get("status").and_then(|value| value.as_str())
+                        == Some("completed") =>
+                {
+                    detail.todos.clear();
+                    if let Some(items) = state
+                        .get("input")
+                        .and_then(|value| value.get("todos"))
+                        .and_then(|value| value.as_array())
+                    {
+                        detail.todos.extend(items.iter().enumerate().filter_map(
+                            |(index, item)| {
+                                Some(TodoItem {
+                                    id: index.to_string(),
+                                    content: item.get("content")?.as_str()?.to_owned(),
+                                    status: item.get("status")?.as_str()?.to_owned(),
+                                })
+                            },
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(detail)
+}
 fn codex_detail(_cwd: &Path, session_id: &str) -> Option<RoomDetail> {
     let sessions = home_dir()?.join(".codex").join("sessions");
     // Sub-agents: every rollout whose `session_meta` opens a sub-agent thread
@@ -504,39 +529,66 @@ mod tests {
         assert_eq!(detail.todos[1].status, "completed");
     }
 
+    fn create_opencode_message_db(home: &Path, sql: &str) {
+        let database = home.join(".local/share/opencode/opencode.db");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let setup = Command::new("sqlite3")
+            .arg(&database)
+            .arg(sql)
+            .output()
+            .unwrap();
+        assert!(setup.status.success());
+    }
+
     #[test]
-    fn opencode_detail_reads_task_parts_and_todo_rows() {
+    fn opencode_detail_reads_v2_task_and_latest_completed_todowrite() {
         if Command::new("sqlite3").arg("--version").output().is_err() {
             return;
         }
         let guard = HomeDirGuard::isolated();
-        let database = guard.path().join(".local/share/opencode/opencode.db");
-        fs::create_dir_all(database.parent().unwrap()).unwrap();
-        let setup = Command::new("sqlite3")
-            .arg(&database)
-            .arg(
-                "CREATE TABLE session (id TEXT, directory TEXT, time_created INTEGER);\
-                 CREATE TABLE todo (session_id TEXT, position INTEGER, content TEXT, status TEXT, priority INTEGER);\
-                 CREATE TABLE part (id TEXT, session_id TEXT, data TEXT);\
-                 INSERT INTO session VALUES ('parent-1', '/work', 1);\
-                 INSERT INTO todo VALUES ('parent-1', 0, 'Design', 'completed', 1);\
-                 INSERT INTO todo VALUES ('parent-1', 1, 'Build', 'pending', 2);\
-                 INSERT INTO part VALUES ('p1', 'parent-1', '{\"tool\":\"task\",\"state\":{\"status\":\"completed\",\"metadata\":{\"parentSessionId\":\"parent-1\",\"sessionId\":\"child-1\"}}}');\
-                 INSERT INTO part VALUES ('p2', 'parent-1', '{\"tool\":\"task\",\"state\":{\"status\":\"error\",\"metadata\":{\"parentSessionId\":\"parent-1\",\"sessionId\":\"child-2\"}}}');\
-                 INSERT INTO part VALUES ('p3', 'parent-1', '{\"tool\":\"file\",\"state\":{}}');",
-            )
-            .output()
-            .unwrap();
-        assert!(setup.status.success());
+        create_opencode_message_db(
+            guard.path(),
+            r#"
+                CREATE TABLE session_message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+                INSERT INTO session_message VALUES
+                ('m1', 'parent-1', 1, '{"role":"assistant","content":[{"type":"tool","name":"task","state":{"metadata":{"parentSessionId":"parent-1","sessionId":"child-1"}}},{"type":"tool","name":"task","state":{"status":"error","metadata":{"parentSessionId":"parent-1","sessionId":"child-2"}}},{"type":"tool","name":"todowrite","state":{"status":"completed","input":{"todos":[{"content":"Old snapshot","status":"pending","priority":"high"}]}}}]}'),
+                ('m2', 'parent-1', 2, '{"role":"assistant","content":[{"type":"tool","name":"todowrite","state":{"status":"completed","input":{"todos":[{"content":"Design","status":"completed","priority":"high"},{"content":"Build","status":"pending","priority":"normal"}]}}}]}'),
+                ('m3', 'parent-1', 3, '{"role":"assistant","content":[{"type":"tool","name":"todowrite","state":{"status":"running","input":{"todos":[{"content":"Incomplete","status":"pending"}]}}}]}'),
+                ('m4', 'parent-1', 4, '{"role":"assistant","content":[{"type":"tool","name":"todowrite","state":{"status":"error","input":{"todos":[{"content":"Failed","status":"pending"}]}}}]}'),
+                ('m5', 'other-session', 5, '{"role":"assistant","content":[{"type":"tool","name":"task","state":{"status":"completed","metadata":{"parentSessionId":"parent-1","sessionId":"ignored-child"}}},{"type":"tool","name":"todowrite","state":{"status":"completed","input":{"todos":[{"content":"Wrong session","status":"pending"}]}}}]}');
+            "#,
+        );
 
         let detail = opencode_detail(Path::new("/work"), "parent-1").unwrap();
         assert_eq!(detail.sub_agents.len(), 2);
         assert_eq!(detail.sub_agents[0].id, "child-1");
         assert_eq!(detail.sub_agents[0].status, "completed");
+        assert_eq!(detail.sub_agents[1].id, "child-2");
         assert_eq!(detail.sub_agents[1].status, "error");
         assert_eq!(detail.todos.len(), 2);
         assert_eq!(detail.todos[0].content, "Design");
+        assert_eq!(detail.todos[0].status, "completed");
         assert_eq!(detail.todos[1].content, "Build");
         assert_eq!(detail.todos[1].status, "pending");
+    }
+
+    #[test]
+    fn opencode_detail_without_todowrite_returns_empty_todos() {
+        if Command::new("sqlite3").arg("--version").output().is_err() {
+            return;
+        }
+        let guard = HomeDirGuard::isolated();
+        create_opencode_message_db(
+            guard.path(),
+            r#"
+                CREATE TABLE session_message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+                INSERT INTO session_message VALUES
+                ('m1', 'parent-1', 1, '{"role":"assistant","content":[]}');
+            "#,
+        );
+
+        let detail = opencode_detail(Path::new("/work"), "parent-1").unwrap();
+        assert!(detail.sub_agents.is_empty());
+        assert!(detail.todos.is_empty());
     }
 }
