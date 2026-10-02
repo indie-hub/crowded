@@ -158,6 +158,18 @@ fn is_legacy_opencode_plugin(path: &Path, contents: &str) -> bool {
 }
 
 fn preview(root: &Path) -> io::Result<()> {
+    if let Some((updates, removals)) = stale_preview_targets(root)? {
+        println!(
+            "saved toolbox state is out of date; `crowded toolbox sync` would reconcile these target files:"
+        );
+        for path in updates {
+            println!("update {}", path.display());
+        }
+        for path in removals {
+            println!("restore/remove {}", path.display());
+        }
+        return Ok(());
+    }
     let state = build_plan(root, false)?;
     for file in state.files {
         let action = if file.original.is_some() {
@@ -169,6 +181,49 @@ fn preview(root: &Path) -> io::Result<()> {
         print!("{}", file.generated);
     }
     Ok(())
+}
+
+fn stale_preview_targets(root: &Path) -> io::Result<Option<(Vec<PathBuf>, Vec<PathBuf>)>> {
+    let state_path = root.join(STATE_FILE);
+    if !state_path.try_exists()? {
+        return Ok(None);
+    }
+    let state = load_state(&state_path)?;
+    let config = load_room_file(&root.join("crowded.toml"))?;
+    let expected = native_targets(
+        root,
+        &config.rooms,
+        &config.mcp_servers,
+        &config.opencode_plugins,
+    )?;
+    let mut stale = state.files.len() != expected.len()
+        || !state
+            .files
+            .iter()
+            .all(|file| expected.contains_key(&file.path));
+    if !stale {
+        for file in &state.files {
+            if expected.contains_key(&file.path)
+                && is_legacy_opencode_plugin(&file.path, &file.generated)
+                && read_optional(&file.path)?.as_deref() == Some(&file.generated)
+            {
+                stale = true;
+                break;
+            }
+        }
+    }
+    if !stale {
+        return Ok(None);
+    }
+
+    let updates = expected.keys().cloned().collect();
+    let removals = state
+        .files
+        .iter()
+        .filter(|file| !expected.contains_key(&file.path))
+        .map(|file| file.path.clone())
+        .collect();
+    Ok(Some((updates, removals)))
 }
 
 pub(crate) fn sync(root: &Path) -> io::Result<Vec<PathBuf>> {
@@ -1298,6 +1353,8 @@ export const CrowdedPulse = async () => {
 "###;
 
     use std::{
+        collections::BTreeMap,
+        hash::{Hash, Hasher},
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -1894,6 +1951,94 @@ export const CrowdedPulse = async () => {
         );
         assert!(!root.join(STATE_FILE).exists());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn tree_hash(root: &Path) -> u64 {
+        fn visit(root: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            let mut entries = fs::read_dir(path)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let relative = path.strip_prefix(root).unwrap().to_path_buf();
+                if entry.file_type().unwrap().is_dir() {
+                    files.insert(relative, None);
+                    visit(root, &path, files);
+                } else {
+                    files.insert(relative, Some(fs::read(path).unwrap()));
+                }
+            }
+        }
+
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for (path, contents) in files {
+            path.hash(&mut hash);
+            contents.hash(&mut hash);
+        }
+        hash.finish()
+    }
+
+    fn write_preview_fixture(root: &Path) {
+        fs::write(
+            root.join("crowded.toml"),
+            "[[rooms]]\ncommand = \"opencode\"\ntransport = \"raw\"\n\n[[rooms]]\ncommand = \"/bin/zsh\"\ntransport = \"shell\"\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn toolbox_preview_is_read_only_without_state() {
+        let root = test_directory();
+        write_preview_fixture(&root);
+        let before = tree_hash(&root);
+        preview(&root).unwrap();
+        assert_eq!(tree_hash(&root), before);
+        assert!(!root.join(STATE_FILE).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn toolbox_preview_is_read_only_with_current_state() {
+        let root = test_directory();
+        write_preview_fixture(&root);
+        sync(&root).unwrap();
+        let before = tree_hash(&root);
+        let error = preview(&root).unwrap_err();
+        assert!(error.to_string().contains("already synced"));
+        assert_eq!(tree_hash(&root), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn toolbox_preview_is_read_only_with_stale_legacy_plugin_state() {
+        let root = test_directory();
+        write_preview_fixture(&root);
+        let mut state = build_plan(&root, false).unwrap();
+        let plugin_path = root.join(".opencode/plugins/crowded-pulse.js");
+        state
+            .files
+            .iter_mut()
+            .find(|file| file.path == plugin_path)
+            .unwrap()
+            .generated = LEGACY_OPENCODE_PULSE_PLUGIN.to_owned();
+        for file in &state.files {
+            fs::create_dir_all(file.path.parent().unwrap()).unwrap();
+            fs::write(&file.path, &file.generated).unwrap();
+        }
+        save_state(&root, &state).unwrap();
+        let (updates, removals) = stale_preview_targets(&root).unwrap().unwrap();
+        assert!(updates.contains(&plugin_path));
+        assert!(removals.is_empty());
+
+        let before = tree_hash(&root);
+        preview(&root).unwrap();
+        assert_eq!(tree_hash(&root), before);
+        assert!(root.join(STATE_FILE).exists());
         fs::remove_dir_all(root).unwrap();
     }
 
