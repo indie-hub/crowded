@@ -588,7 +588,7 @@ fn opencode_session_model(database: &Path, session_id: &str) -> Option<String> {
         return None;
     }
     let esc_id = session_id.replace('\'', "''");
-    let query = format!("SELECT model FROM session WHERE id = '{esc_id}';");
+    let query = format!("SELECT model FROM session_v2 WHERE id = '{esc_id}';");
     let output = Command::new("sqlite3")
         .arg(database)
         .arg(query)
@@ -605,12 +605,15 @@ fn opencode_model_matches(stored: &str, configured: &str) -> bool {
     let Ok(stored_json) = serde_json::from_str::<serde_json::Value>(stored) else {
         return false;
     };
-    let (cfg_provider, cfg_id) = normalize_opencode_model(configured);
+    let (cfg_provider, cfg_id, cfg_variant) = normalize_opencode_model(configured);
     let stored_provider = stored_json
         .get("providerID")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let stored_id = stored_json.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if stored_provider.is_empty() || stored_id.is_empty() {
+        return false;
+    }
     if let Some(p) = cfg_provider
         && stored_provider != p
     {
@@ -618,6 +621,11 @@ fn opencode_model_matches(stored: &str, configured: &str) -> bool {
     }
     if let Some(i) = cfg_id
         && stored_id != i
+    {
+        return false;
+    }
+    if let Some(variant) = cfg_variant
+        && stored_json.get("variant").and_then(|v| v.as_str()) != Some(variant.as_str())
     {
         return false;
     }
@@ -629,20 +637,31 @@ fn opencode_model_matches(stored: &str, configured: &str) -> bool {
 /// here. `since_millis` is a locally-computed integer, safe to interpolate
 /// directly. Passed as a single argv element to `Command`, never through a
 /// shell.
-fn normalize_opencode_model(model: &str) -> (Option<String>, Option<String>) {
+fn normalize_opencode_model(model: &str) -> (Option<String>, Option<String>, Option<String>) {
     let trimmed = model.trim();
     if trimmed.is_empty() {
-        return (None, None);
+        return (None, None, None);
     }
     if let Some((provider, id)) = trimmed.split_once('/') {
         let provider = provider.trim();
+        let (id, variant) = id
+            .trim()
+            .split_once('#')
+            .map_or((id.trim(), None), |(id, variant)| (id, Some(variant)));
         let id = id.trim();
         if provider.is_empty() || id.is_empty() {
-            return (None, None);
+            return (None, None, None);
         }
-        (Some(provider.to_owned()), Some(id.to_owned()))
+        (
+            Some(provider.to_owned()),
+            Some(id.to_owned()),
+            variant.map(str::to_owned),
+        )
     } else {
-        (None, Some(trimmed.to_owned()))
+        let (id, variant) = trimmed
+            .split_once('#')
+            .map_or((trimmed, None), |(id, variant)| (id, Some(variant)));
+        (None, Some(id.to_owned()), variant.map(str::to_owned))
     }
 }
 
@@ -654,10 +673,10 @@ fn opencode_session_query(
 ) -> String {
     let escaped_cwd = cwd.to_string_lossy().replace('\'', "''");
     let mut query = format!(
-        "SELECT id FROM session WHERE directory = '{escaped_cwd}' AND time_created > {since_millis}"
+        "SELECT id FROM session_v2 WHERE directory = '{escaped_cwd}' AND time_created > {since_millis}"
     );
     if let Some(m) = model {
-        let (provider, id) = normalize_opencode_model(m);
+        let (provider, id, variant) = normalize_opencode_model(m);
         if let Some(p) = provider {
             let esc_p = p.replace('\'', "''");
             query.push_str(&format!(
@@ -667,6 +686,12 @@ fn opencode_session_query(
         if let Some(i) = id {
             let esc_i = i.replace('\'', "''");
             query.push_str(&format!(" AND json_extract(model, '$.id') = '{esc_i}'"));
+        }
+        if let Some(v) = variant {
+            let esc_v = v.replace('\'', "''");
+            query.push_str(&format!(
+                " AND json_extract(model, '$.variant') = '{esc_v}'"
+            ));
         }
     }
     if !exclude.is_empty() {
@@ -1320,23 +1345,46 @@ mod tests {
     fn normalize_opencode_model_splits_provider_and_id() {
         assert_eq!(
             normalize_opencode_model("meta/muse-spark-1.2"),
-            (Some("meta".to_owned()), Some("muse-spark-1.2".to_owned()))
+            (
+                Some("meta".to_owned()),
+                Some("muse-spark-1.2".to_owned()),
+                None
+            )
         );
         assert_eq!(
             normalize_opencode_model("deepseek/deepseek-v4-flash"),
             (
                 Some("deepseek".to_owned()),
-                Some("deepseek-v4-flash".to_owned())
+                Some("deepseek-v4-flash".to_owned()),
+                None
             )
         );
         assert_eq!(
             normalize_opencode_model("muse-spark-1.2"),
-            (None, Some("muse-spark-1.2".to_owned()))
+            (None, Some("muse-spark-1.2".to_owned()), None)
         );
-        assert_eq!(normalize_opencode_model(""), (None, None));
-        assert_eq!(normalize_opencode_model("  "), (None, None));
-        assert_eq!(normalize_opencode_model("a/"), (None, None));
-        assert_eq!(normalize_opencode_model("/b"), (None, None));
+        assert_eq!(
+            normalize_opencode_model("meta/muse#high"),
+            (
+                Some("meta".to_owned()),
+                Some("muse".to_owned()),
+                Some("high".to_owned())
+            )
+        );
+        assert_eq!(normalize_opencode_model(""), (None, None, None));
+        assert_eq!(normalize_opencode_model("  "), (None, None, None));
+        assert_eq!(normalize_opencode_model("a/"), (None, None, None));
+        assert_eq!(normalize_opencode_model("/b"), (None, None, None));
+    }
+
+    #[test]
+    fn opencode_model_matching_checks_requested_variant_and_requires_metadata() {
+        let stored = r#"{"providerID":"provider","id":"model","variant":"high"}"#;
+        assert!(opencode_model_matches(stored, "provider/model#high"));
+        assert!(!opencode_model_matches(stored, "provider/model#low"));
+        assert!(opencode_model_matches(stored, "provider/model"));
+        assert!(!opencode_model_matches("", "provider/model"));
+        assert!(!opencode_model_matches("{}", "provider/model"));
     }
 
     #[test]
@@ -1349,9 +1397,9 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_file(&database);
-        let create = r#"CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_created INTEGER NOT NULL, model TEXT);
-              INSERT INTO session VALUES ('ses-spark','/repo',1000, '{"providerID":"meta","id":"muse-spark-1.2"}');
-              INSERT INTO session VALUES ('ses-deepseek','/repo',1074, '{"providerID":"deepseek","id":"deepseek-v4-flash"}');"#;
+        let create = r#"CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_created INTEGER NOT NULL, model TEXT, cost REAL NOT NULL DEFAULT 0);
+              INSERT INTO session_v2 VALUES ('ses-spark', '/repo', 1000, '{"providerID":"meta","id":"muse-spark-1.2"}', 0);
+              INSERT INTO session_v2 VALUES ('ses-deepseek', '/repo', 1074, '{"providerID":"deepseek","id":"deepseek-v4-flash"}', 0);"#;
         let setup = Command::new("sqlite3")
             .arg(&database)
             .arg(create)
@@ -1401,9 +1449,9 @@ mod tests {
         let _ = std::fs::remove_file(&db);
         let cwd_str = cwd.to_string_lossy().to_string();
         let create = format!(
-            r#"CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_created INTEGER NOT NULL, model TEXT);
-              INSERT INTO session VALUES ('ses-spark','{cwd_str}',1000, '{{"providerID":"meta","id":"muse-spark-1.2"}}');
-              INSERT INTO session VALUES ('ses-deepseek','{cwd_str}',1074, '{{"providerID":"deepseek","id":"deepseek-v4-flash"}}');"#,
+            r#"CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_created INTEGER NOT NULL, model TEXT, cost REAL NOT NULL DEFAULT 0);
+              INSERT INTO session_v2 VALUES ('ses-spark', '{cwd_str}', 1000, '{{"providerID":"meta","id":"muse-spark-1.2"}}', 0);
+              INSERT INTO session_v2 VALUES ('ses-deepseek', '{cwd_str}', 1074, '{{"providerID":"deepseek","id":"deepseek-v4-flash"}}', 0);"#,
         );
         let setup = Command::new("sqlite3")
             .arg(&db)
@@ -1503,10 +1551,10 @@ mod tests {
         let cwd_str = cwd.to_string_lossy().to_string();
         let model = r#"{"providerID":"deepseek","id":"deepseek-v4-flash"}"#;
         let create = format!(
-            r#"CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_created INTEGER NOT NULL, model TEXT);
-              INSERT INTO session VALUES ('ses-older','{cwd_str}',1000, '{model}');
-              INSERT INTO session VALUES ('ses-newer','{cwd_str}',2000, '{model}');
-              INSERT INTO session VALUES ('ses-stale','{cwd_str}',500, '{{"providerID":"meta","id":"muse-spark-1.2"}}');"#,
+            r#"CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_created INTEGER NOT NULL, model TEXT, cost REAL NOT NULL DEFAULT 0);
+              INSERT INTO session_v2 VALUES ('ses-older', '{cwd_str}', 1000, '{model}', 0);
+              INSERT INTO session_v2 VALUES ('ses-newer', '{cwd_str}', 2000, '{model}', 0);
+              INSERT INTO session_v2 VALUES ('ses-stale', '{cwd_str}', 500, '{{"providerID":"meta","id":"muse-spark-1.2"}}', 0);"#,
         );
         assert!(
             Command::new("sqlite3")
@@ -1570,10 +1618,10 @@ mod tests {
         let cwd_str = cwd.to_string_lossy().to_string();
         let model = r#"{"providerID":"deepseek","id":"deepseek-v4-flash"}"#;
         let create = format!(
-            r#"CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_created INTEGER NOT NULL, model TEXT);
-              INSERT INTO session VALUES ('ses-older','{cwd_str}',1000, '{model}');
-              INSERT INTO session VALUES ('ses-newer','{cwd_str}',2000, '{model}');
-              INSERT INTO session VALUES ('ses-stale','{cwd_str}',500, '{{"providerID":"meta","id":"muse-spark-1.2"}}');"#,
+            r#"CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_created INTEGER NOT NULL, model TEXT, cost REAL NOT NULL DEFAULT 0);
+              INSERT INTO session_v2 VALUES ('ses-older', '{cwd_str}', 1000, '{model}', 0);
+              INSERT INTO session_v2 VALUES ('ses-newer', '{cwd_str}', 2000, '{model}', 0);
+              INSERT INTO session_v2 VALUES ('ses-stale', '{cwd_str}', 500, '{{"providerID":"meta","id":"muse-spark-1.2"}}', 0);"#,
         );
         assert!(
             Command::new("sqlite3")
@@ -1741,7 +1789,7 @@ mod tests {
             Command::new("sqlite3")
                 .arg(&db)
                 .arg(format!(
-                    "INSERT INTO session VALUES ('ses-nometa','{cwd_str}',3000, NULL);"
+                    "INSERT INTO session_v2 VALUES ('ses-nometa', '{cwd_str}', 3000, NULL, 0);"
                 ))
                 .output()
                 .unwrap()
@@ -1806,7 +1854,7 @@ mod tests {
             Command::new("sqlite3")
                 .arg(&db)
                 .arg(format!(
-                    "INSERT INTO session VALUES ('ses-nometa','{cwd_str}',3000, NULL);"
+                    "INSERT INTO session_v2 VALUES ('ses-nometa', '{cwd_str}', 3000, NULL, 0);"
                 ))
                 .output()
                 .unwrap()
@@ -1858,12 +1906,12 @@ mod tests {
         // time_created values are Unix-epoch milliseconds. `ses-pre-spawn`
         // predates `since` (a stale row from an earlier spawn in the same
         // directory) and must never be returned regardless of exclude state.
-        let create = "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, \
-             time_created INTEGER NOT NULL); \
-             INSERT INTO session VALUES ('ses-new','/repo',2000); \
-             INSERT INTO session VALUES ('ses-old','/repo',1500); \
-             INSERT INTO session VALUES ('ses-pre-spawn','/repo',500); \
-             INSERT INTO session VALUES ('ses-other','/elsewhere',2500);";
+        let create = "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, \
+             time_created INTEGER NOT NULL, model TEXT, cost REAL NOT NULL DEFAULT 0); \
+             INSERT INTO session_v2 VALUES ('ses-new', '/repo', 2000, NULL, 0); \
+             INSERT INTO session_v2 VALUES ('ses-old', '/repo', 1500, NULL, 0); \
+             INSERT INTO session_v2 VALUES ('ses-pre-spawn', '/repo', 500, NULL, 0); \
+             INSERT INTO session_v2 VALUES ('ses-other', '/elsewhere', 2500, NULL, 0);";
         let setup = Command::new("sqlite3")
             .arg(&database)
             .arg(create)
@@ -1923,6 +1971,45 @@ mod tests {
         );
 
         fs::remove_file(&database).ok();
+    }
+
+    #[test]
+    fn discover_opencode_session_id_reads_v2_runtime_model_shape() {
+        if Command::new("sqlite3").arg("--version").output().is_err() {
+            return;
+        }
+        let _state = super::super::session_state::StateRootGuard::isolated();
+        let home = HomeDirGuard::isolated();
+        let cwd = std::env::current_dir().unwrap();
+        let database = home.path().join(OPENCODE_DATABASE_PATH);
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let millis = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let cwd_sql = cwd.to_string_lossy().replace('\'', "''");
+        let create = format!(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, time_created INTEGER NOT NULL, model TEXT, cost REAL NOT NULL DEFAULT 0); INSERT INTO session_v2 VALUES ('ses_f03596104ffeLLZU8YNLqaKBb2', '{cwd_sql}', {millis}, '{{\"id\":\"busy-model\",\"providerID\":\"loopback\"}}', 0);"
+        );
+        assert!(
+            Command::new("sqlite3")
+                .arg(&database)
+                .arg(create)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let id = discover_session_id(
+            CliVendor::OpenCode,
+            &cwd,
+            SystemTime::now() - std::time::Duration::from_secs(1),
+            &[],
+            Some("loopback/busy-model"),
+        );
+        assert_eq!(id.as_deref(), Some("ses_f03596104ffeLLZU8YNLqaKBb2"));
+        let model = opencode_session_model(&database, id.as_deref().unwrap()).unwrap();
+        assert!(opencode_model_matches(&model, "loopback/busy-model"));
     }
 
     fn set_modified(path: &Path, time: SystemTime) {

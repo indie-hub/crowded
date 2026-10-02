@@ -334,7 +334,7 @@ fn opencode_cost(home: &Path, session_id: &str) -> Option<f64> {
     let id = session_id.replace('\'', "''");
     let output = Command::new("sqlite3")
         .arg(database)
-        .arg(format!("SELECT cost FROM session WHERE id = '{id}';"))
+        .arg(format!("SELECT cost FROM session_v2 WHERE id = '{id}';"))
         .output()
         .ok()?;
     output.status.success().then_some(())?;
@@ -742,7 +742,7 @@ mod tests {
         fs::create_dir_all(database.parent().unwrap()).unwrap();
         let setup = Command::new("sqlite3")
             .arg(&database)
-            .arg("CREATE TABLE session (id TEXT PRIMARY KEY, cost REAL); INSERT INTO session VALUES ('session', 1.25);")
+            .arg("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, cost REAL NOT NULL); INSERT INTO session_v2 (id, cost) VALUES ('session', 1.25);")
             .output()
             .unwrap();
         assert!(setup.status.success());
@@ -1091,9 +1091,9 @@ mod tests {
         let setup = std::process::Command::new("sqlite3")
             .arg(&database)
             .arg(
-                "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, \
-                 time_created INTEGER NOT NULL); \
-                 INSERT INTO session VALUES ('stale-pre-clear-id','/repo',1000);",
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, \
+                 time_created INTEGER NOT NULL, model TEXT, cost REAL NOT NULL DEFAULT 0); \
+                 INSERT INTO session_v2 VALUES ('stale-pre-clear-id', '/repo', 1000, NULL, 0);",
             )
             .output()
             .unwrap();
@@ -1119,7 +1119,7 @@ mod tests {
         // captures it and supersedes the stale entry in place.
         let advance = std::process::Command::new("sqlite3")
             .arg(&database)
-            .arg("INSERT INTO session VALUES ('fresh-post-clear-id','/repo',2000);")
+            .arg("INSERT INTO session_v2 VALUES ('fresh-post-clear-id', '/repo', 2000, NULL, 0);")
             .output()
             .unwrap();
         assert!(advance.status.success());
@@ -1171,9 +1171,9 @@ mod tests {
         let setup = std::process::Command::new("sqlite3")
             .arg(&database)
             .arg(
-                "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL, \
-                 time_created INTEGER NOT NULL); \
-                 INSERT INTO session VALUES ('sibling-claimed-id','/repo',1000);",
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL, \
+                 time_created INTEGER NOT NULL, model TEXT, cost REAL NOT NULL DEFAULT 0); \
+                 INSERT INTO session_v2 VALUES ('sibling-claimed-id', '/repo', 1000, NULL, 0);",
             )
             .output()
             .unwrap();
@@ -1194,7 +1194,7 @@ mod tests {
         // sibling's entry untouched.
         let advance = std::process::Command::new("sqlite3")
             .arg(&database)
-            .arg("INSERT INTO session VALUES ('room-3-own-id','/repo',2000);")
+            .arg("INSERT INTO session_v2 VALUES ('room-3-own-id', '/repo', 2000, NULL, 0);")
             .output()
             .unwrap();
         assert!(advance.status.success());
@@ -1245,7 +1245,7 @@ mod tests {
         let setup = std::process::Command::new("sqlite3")
             .arg(&database)
             .arg(
-                "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL,                  time_created INTEGER NOT NULL);                  INSERT INTO session VALUES ('race-candidate-id','/repo',2000);",
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL,                  time_created INTEGER NOT NULL, model TEXT, cost REAL NOT NULL DEFAULT 0);                  INSERT INTO session_v2 VALUES ('race-candidate-id', '/repo', 2000, NULL, 0);",
             )
             .output()
             .unwrap();
