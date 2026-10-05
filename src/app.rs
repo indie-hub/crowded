@@ -416,6 +416,14 @@ impl DeliveryGate {
         }
     }
 
+    fn observe_pulse(&mut self, state: PulseState, input_ready: bool) {
+        match state {
+            PulseState::Thinking | PulseState::Working => self.observe(false),
+            PulseState::Ready => self.observe(input_ready),
+            _ => {}
+        }
+    }
+
     fn observe(&mut self, input_ready: bool) {
         *self = match (*self, input_ready) {
             (Self::IntroSent, false) => Self::IntroRunning,
@@ -1605,6 +1613,10 @@ fn run_with(
                     continue;
                 }
                 DoorbellEvent::Pulse(pulse) => {
+                    if pulse.detail.as_ref().is_none_or(|events| events.is_empty()) {
+                        delivery_gates[pulse.from]
+                            .observe_pulse(pulse.state, input_ready[pulse.from]);
+                    }
                     apply_pulse_to_room(
                         &mut room_pulses,
                         &mut room_details,
@@ -3119,6 +3131,24 @@ mod tests {
         }
         assert!(!fuse.is_tripped());
         assert_eq!(fuse.remaining(), 0);
+    }
+
+    #[test]
+    fn delivery_gate_observes_fast_hook_busy_cycles_without_unlocking_a_busy_screen() {
+        let mut gate = DeliveryGate::new(true);
+        gate.intro_sent();
+        gate.observe_pulse(PulseState::Ready, true);
+        assert_eq!(gate, DeliveryGate::IntroSent);
+        gate.observe_pulse(PulseState::Thinking, true);
+        assert_eq!(gate, DeliveryGate::IntroRunning);
+        gate.observe_pulse(PulseState::Ready, false);
+        assert!(!gate.can_deliver(false));
+        gate.observe_pulse(PulseState::Ready, true);
+        assert!(gate.can_deliver(true));
+        gate.message_sent();
+        gate.observe_pulse(PulseState::Working, true);
+        gate.observe_pulse(PulseState::Ready, true);
+        assert!(gate.can_deliver(true));
     }
 
     #[test]

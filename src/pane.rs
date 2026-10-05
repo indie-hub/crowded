@@ -207,10 +207,16 @@ fn opencode_input_ready(screen: &str) -> bool {
     // in the transcript, even though the current prompt is idle. Only
     // the prompt area (tail of the screen) matters, and only busy indicators
     // after the last prompt matter.
-    let tail = screen
-        .get(screen.len().saturating_sub(1200)..)
-        .unwrap_or(screen);
-    let lines: Vec<&str> = tail.lines().collect();
+    // Ignore terminal padding, including blank rows above the version footer.
+    // ponytail: last 40 meaningful rows; track prompt bounds if layouts need more.
+    let mut lines: Vec<&str> = screen
+        .trim_end()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .rev()
+        .take(40)
+        .collect();
+    lines.reverse();
     // Narrow panes wrap the marker phrase itself across a line boundary
     // (e.g. "...ctrl+p" / "commands..."), so a single line's contents can't
     // be trusted alone. Join each line with the next one (space-separated,
@@ -391,6 +397,7 @@ pub(crate) struct Pane {
     /// screen (readiness, whisper delivery) never sees the scrolled view.
     scroll_offset: usize,
     headroom_active: bool,
+    _opencode_config: Option<tempfile::NamedTempFile>,
 }
 
 #[derive(Clone)]
@@ -431,6 +438,97 @@ fn opencode_launch(spec: &RoomSpec) -> io::Result<RoomSpec> {
         launch.args.insert(0, "--standalone".into());
     }
     Ok(launch)
+}
+
+fn opencode_wrapped_config(
+    guest: &mut RoomSpec,
+    headroom_active: bool,
+) -> io::Result<Option<tempfile::NamedTempFile>> {
+    if !headroom_active
+        || !Path::new(&guest.program)
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("opencode"))
+    {
+        return Ok(None);
+    }
+    let Some(content) = environment_value(&guest.variables, "OPENCODE_CONFIG_CONTENT") else {
+        return Ok(None);
+    };
+    let mut room: serde_json::Value = serde_json::from_str(&content.to_string_lossy())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let values = room.as_object_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "OPENCODE_CONFIG_CONTENT must contain a JSON object",
+        )
+    })?;
+    values.retain(|key, _| matches!(key.as_str(), "model" | "mcp"));
+    let mut config_directory = None;
+    let content = match environment_value(&guest.variables, "OPENCODE_CONFIG") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                working_directory(guest.cwd.as_deref())?.join(path)
+            };
+            let original = std::fs::read_to_string(&path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot read OpenCode config {}: {error}", path.display()),
+                )
+            })?;
+            config_directory = path.parent().map(Path::to_path_buf);
+            let mut base: serde_json::Value = serde_json::from_str(&original).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "OpenCode config {} must be plain JSON (JSONC is unsupported): {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            if !base.is_object() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "OpenCode config {} must contain a JSON object",
+                        path.display()
+                    ),
+                ));
+            }
+            merge_opencode_room_config(&mut base, room);
+            serde_json::to_string(&base)?
+        }
+        None => serde_json::to_string(&room)?,
+    };
+    // Headroom replaces inline config; a private config document survives wrapping.
+    let mut file = match config_directory {
+        Some(directory) => tempfile::NamedTempFile::new_in(directory)?,
+        None => tempfile::NamedTempFile::new()?,
+    };
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    guest.variables.retain(|(key, _)| key != "OPENCODE_CONFIG");
+    guest
+        .variables
+        .push(("OPENCODE_CONFIG".into(), file.path().as_os_str().into()));
+    Ok(Some(file))
+}
+
+fn merge_opencode_room_config(base: &mut serde_json::Value, room: serde_json::Value) {
+    match (base, room) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(room)) => {
+            for (key, value) in room {
+                if let Some(original) = base.get_mut(&key) {
+                    merge_opencode_room_config(original, value);
+                } else {
+                    base.insert(key, value);
+                }
+            }
+        }
+        (base, room) => *base = room,
+    }
 }
 
 fn opencode_model_switch_body(model: &str) -> io::Result<String> {
@@ -634,7 +732,7 @@ impl Pane {
         // portable-pty defaults an omitted cwd to HOME rather than inheriting
         // Crowded's directory, so the project directory must be explicit.
         let cwd = working_directory(spec.cwd.as_deref())?;
-        let guest = opencode_launch(&spec)?;
+        let mut guest = opencode_launch(&spec)?;
         let path = environment_value(&guest.variables, "PATH");
         let path_ext = environment_value(&guest.variables, "PATHEXT");
         let (program, args, headroom_active) = headroom_launch(
@@ -645,6 +743,7 @@ impl Pane {
             &path,
             &path_ext,
         );
+        let opencode_config = opencode_wrapped_config(&mut guest, headroom_active)?;
         let launch =
             ResolvedCommand::resolve_with_environment(&program, &args, &cwd, path, path_ext)?
                 .portable()?;
@@ -705,6 +804,7 @@ impl Pane {
             parser: Parser::new(size.rows.max(2), size.cols.max(2), SCROLLBACK_LINES),
             scroll_offset: 0,
             headroom_active,
+            _opencode_config: opencode_config,
         })
     }
 
@@ -1547,6 +1647,161 @@ mod tests {
     }
 
     #[test]
+    fn opencode_v2_space_padded_home_screen_reports_ready() {
+        let rows = ["Ask anything…", "", "Build auto", "", "ctrl+p commands"];
+        for padding in [13, 80] {
+            let screen = rows
+                .into_iter()
+                .chain(std::iter::repeat_n("", padding))
+                .chain(["2.0.20", ""])
+                .map(|line| format!("{line:120}\n"))
+                .collect::<String>();
+            assert!(opencode_input_ready(&screen));
+            assert!(!opencode_input_ready(&format!("{screen}esc interrupt")));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_wrapped_rooms_keep_distinct_models_after_inline_config_is_replaced() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let bin = fake_opencode(root.path(), "exit 0");
+        let headroom = bin.join("headroom");
+        fs::copy(bin.join("opencode"), &headroom).unwrap();
+        fs::write(&headroom, "#!/bin/sh\nexport OPENCODE_CONFIG_CONTENT='{\"model\":\"shared/default\"}'\nif [ -n \"$OPENCODE_CONFIG\" ]; then cat \"$OPENCODE_CONFIG\"; else printf '%s' \"$OPENCODE_CONFIG_CONTENT\"; fi\nsleep 2\n").unwrap();
+        let search_path = env::join_paths(
+            std::iter::once(bin).chain(env::split_paths(&env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let mut panes = Vec::new();
+        for model in ["opencode-go/mimo-v2.5", "opencode-go/deepseek-v4-flash"] {
+            let mut spec = room_spec("opencode", &["--model", model]);
+            spec.cwd = Some(root.path().to_path_buf());
+            spec.use_headroom = true;
+            spec.variables.push(("PATH".into(), search_path.clone()));
+            let mut pane = Pane::spawn(
+                spec,
+                PtySize {
+                    rows: 8,
+                    cols: 160,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                GuestEnvironment::new([]),
+            )
+            .unwrap();
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(1) {
+                pane.drain_output().unwrap();
+                if pane.parser.screen().contents().contains(model) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(pane.parser.screen().contents().contains(model));
+            panes.push(pane);
+        }
+        let paths: Vec<_> = panes
+            .iter()
+            .map(|pane| pane._opencode_config.as_ref().unwrap().path().to_path_buf())
+            .collect();
+        assert_ne!(paths[0], paths[1]);
+        let size = PtySize {
+            rows: 8,
+            cols: 160,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        panes[0].restart(size).unwrap();
+        panes[1].resume_context(size).unwrap();
+        let replacement_paths: Vec<_> = panes
+            .iter()
+            .map(|pane| pane._opencode_config.as_ref().unwrap().path().to_path_buf())
+            .collect();
+        assert_ne!(paths, replacement_paths);
+        assert!(paths.iter().all(|path| !path.exists()));
+        assert!(replacement_paths.iter().all(|path| path.exists()));
+        drop(panes);
+        assert!(replacement_paths.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn opencode_wrapped_config_merges_plain_json_base_with_room_values_winning() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("custom.json");
+        fs::write(&path, r#"{"model":"base/model","mcp":{"shared":{"command":["base"]},"room":{"command":["old"]}},"plugin":["base-plugin"],"settings":{"preserved":true,"selected":"base"}}"#).unwrap();
+        let mut spec = room_spec("opencode", &["--model", "room/model"]);
+        spec.cwd = Some(root.path().to_path_buf());
+        spec.variables
+            .push(("OPENCODE_CONFIG".into(), "custom.json".into()));
+        spec.variables.push((
+            "OPENCODE_CONFIG_CONTENT".into(),
+            r#"{"mcp":{"room":{"command":["new"]}},"settings":{"selected":"room"}}"#.into(),
+        ));
+        let mut launch = opencode_launch(&spec).unwrap();
+        let file = opencode_wrapped_config(&mut launch, true).unwrap().unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(file.path()).unwrap()).unwrap();
+        assert_eq!(file.path().parent(), path.parent());
+        assert_eq!(config["model"], "room/model");
+        assert_eq!(
+            config["mcp"]["shared"]["command"],
+            serde_json::json!(["base"])
+        );
+        assert_eq!(config["mcp"]["room"]["command"], serde_json::json!(["new"]));
+        assert_eq!(config["plugin"], serde_json::json!(["base-plugin"]));
+        assert_eq!(config["settings"]["preserved"], true);
+        assert_eq!(config["settings"]["selected"], "base");
+        assert!(fs::read_to_string(&path).unwrap().contains("base/model"));
+    }
+
+    #[test]
+    fn opencode_wrapped_config_excludes_ambient_plugins_and_providers() {
+        let mut spec = room_spec("opencode", &["--model", "room/model"]);
+        spec.variables.push((
+            "OPENCODE_CONFIG_CONTENT".into(),
+            r#"{"plugin":["ambient-plugin"],"providers":{"headroom":{}},"mcp":{"crowded":{"enabled":false}}}"#.into(),
+        ));
+        let mut launch = opencode_launch(&spec).unwrap();
+        let file = opencode_wrapped_config(&mut launch, true).unwrap().unwrap();
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(file.path()).unwrap()).unwrap();
+        assert_eq!(config.as_object().unwrap().len(), 2);
+        assert_eq!(config["model"], "room/model");
+        assert_eq!(config["mcp"]["crowded"]["enabled"], false);
+    }
+
+    #[test]
+    fn opencode_wrapped_config_rejects_unreadable_file_with_path() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("missing.json");
+        let mut spec = room_spec("opencode", &["--model", "room/model"]);
+        spec.variables
+            .push(("OPENCODE_CONFIG".into(), path.as_os_str().into()));
+        let mut launch = opencode_launch(&spec).unwrap();
+        let error = opencode_wrapped_config(&mut launch, true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn opencode_wrapped_config_rejects_jsonc_with_path_and_parse_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("custom.jsonc");
+        fs::write(&path, "{ // JSONC comment\n\"model\":\"base/model\"\n}").unwrap();
+        let mut spec = room_spec("opencode", &["--model", "room/model"]);
+        spec.variables
+            .push(("OPENCODE_CONFIG".into(), path.as_os_str().into()));
+        let mut launch = opencode_launch(&spec).unwrap();
+        let error = opencode_wrapped_config(&mut launch, true).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()));
+        assert!(message.contains("plain JSON (JSONC is unsupported)"));
+        assert!(message.contains("line 1"));
+    }
+    #[test]
     fn opencode_v2_captured_idle_home_screens_report_ready() {
         const CONTENT_ENABLED: &str = concat!(
             "┃  Ask anything… \"What is the tech stack of this project?\"\n",
@@ -1821,6 +2076,7 @@ mod tests {
             parser: Parser::new(rows, cols, SCROLLBACK_LINES),
             scroll_offset: 0,
             headroom_active: false,
+            _opencode_config: None,
         }
     }
 
