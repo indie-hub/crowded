@@ -1,25 +1,35 @@
-# Crowded
+# Crowded Room
 
-See [WISHLIST.md](WISHLIST.md) for the living roadmap and durable design
-decisions.
+Crowded Room runs terminal agents together in one Ratatui interface. It keeps room
+configuration, shared tools, and room-to-room messages in the workspace rather
+than in each agent's global configuration.
 
-The Crowded Room runs multiple terminal agents under one Ratatui roof.
+Crowded Room is intentionally opinionated about multi-agent work. Its starter
+configuration recommends a small working stack:
 
-Crowded is opinionated by design. The starter configuration wires in a small
-set of plugins — including
-[code4me-ntg](https://github.com/indie-hub/code4me-ntg), which governs how
-rooms plan, delegate, and validate work across each other — plus
-[ponytail](https://github.com/DietrichGebert/ponytail) and
-[context-mode](https://github.com/mksglu/context-mode) for lean
-implementation and large-output handling. Every plugin is optional and can be
-dropped from `crowded.toml`, but they exist because unmanaged multi-room
-orchestration tends to drift into duplicated work and unvalidated changes; we
-strongly recommend keeping them enabled.
+- [**Code4Me**](https://github.com/indie-hub/code4me-ntg) turns a request into
+  a scoped task with independent validation.
+- [**Ponytail**](https://github.com/DietrichGebert/ponytail) keeps the
+  implementation to the smallest solution that works.
+- [**Context Mode**](https://github.com/mksglu/context-mode) keeps large
+  inspection output out of an agent's active context.
+- [**Headroom**](https://github.com/headroomlabs-ai/headroom) is recommended
+  for supported agent rooms; it optionally wraps a CLI to compress agent
+  context and tool output.
+- [**CocoIndex Code**](https://github.com/cocoindex-io/cocoindex-code) indexes
+  the codebase for structural and semantic discovery.
+- [**Basic Memory**](https://github.com/basicmachines-co/basic-memory) keeps
+  durable workspace knowledge shared across rooms.
 
-## Installation
+These plugins are configurable, but together they are the recommended way to
+plan, build, and validate work in a Crowded room. Planned work lives on the
+project Trello board.
 
-Crowded is not yet published to crates.io. Build it from source with a Rust
-toolchain and install it onto `PATH`:
+See [CHANGELOG.md](CHANGELOG.md) for released changes.
+
+## Install
+
+Crowded is built from source. Install a current Rust toolchain, then:
 
 ```console
 git clone https://github.com/indie-hub/crowded.git
@@ -27,76 +37,44 @@ cd crowded
 cargo install --path .
 ```
 
-The `crowded` commands below assume that installed binary. Working directly
-from an uninstalled checkout instead? Use `cargo run --` in place of
-`crowded`, e.g. `cargo run -- init`.
+The rest of this guide uses the installed `crowded` command. From an uninstalled
+checkout, prefix a command with `cargo run --`; for example,
+`cargo run -- init`.
 
-## Workspace bootstrap
+## Start a workspace
 
-Run this in a clean project directory:
+In the project directory where the rooms should run:
 
 ```console
 crowded init
 ```
 
-The first run creates a starter `crowded.toml`, adds `/.crowded/` to
-`.gitignore`, and stops so the configuration can be reviewed. Later runs
-validate the whole file, install missing declared plugins, synchronize the
-native toolbox, and run pending setup actions.
+The first run writes `crowded.toml`, adds `/.crowded/` to `.gitignore`, and
+stops for review. Run `crowded init` again after review to install declared
+plugins, synchronize the shared toolbox, and complete pending setup actions.
 
-Validate a reviewed configuration without changing the workspace:
+Check the reviewed configuration without changing the workspace:
 
 ```console
 crowded check
 ```
 
-Declare shared plugins and direct, one-time setup commands alongside rooms and
-MCPs:
+The starter configuration includes Claude and Codex rooms plus optional
+Code4Me, Ponytail, Context Mode, CocoIndex Code, CodeGraph, and Basic Memory
+integration. The first setup of CocoIndex Code can download several GB and
+asks you to select an embedding model.
 
-```toml
-[[plugin]]
-name = "code4me-ntg"
-source = "https://github.com/indie-hub/code4me-ntg.git"
-adapters = true
-# ref = "v0.4.0"
+## Configure rooms
 
-[[plugin]]
-name = "context-mode"
-source = "https://github.com/mksglu/context-mode.git"
-ref = "v1.0.169"
-adapters = true
+Crowded has native raw-room support for Claude Code (`claude`), Codex (`codex`),
+and OpenCode (`opencode`). OpenCode rooms require OpenCode v2; OpenCode 1.x is
+no longer supported. Any terminal command can instead run as a
+`transport = "shell"` room. Set `use_headroom = true` to wrap a supported room
+with Headroom when its `headroom` executable is on `PATH`. Pass Headroom flags
+with `headroom_args`, for example `headroom_args = ["--no-serena"]`.
 
-[[setup]]
-name = "ccc-index"
-command = "ccc"
-args = ["index"]
-```
-
-Crowded invokes setup programs directly, so `command` may be an existing
-executable, `uv`, `uvx`, or `npx`; package installation remains an explicit
-setup action in the reviewed configuration.
-Each successful action creates `.crowded/init/NAME.done`. Failed actions are
-not marked and run again on the next `crowded init`. Existing plugins are left
-at their installed revision; use `crowded plugin update` explicitly.
-An install action may declare `provides = "tool-name"`; when that executable is
-already on `PATH`, Crowded marks the action satisfied without replacing it.
-
-The starter configuration shares pinned tools for CocoIndex Code, CodeGraph,
-Basic Memory, and Context Mode. It also creates one workspace-named Basic
-Memory project, initializes CodeGraph, and initializes and indexes CCC. Review
-the file before the second `crowded init`: CCC's local embedding dependencies
-can download several GB on Linux and its first initialization asks which model
-to use. The recipe installs Basic Memory and CCC once with `uv tool install`;
-their MCP and setup actions then call the persistent executables directly.
-CCC's environment currently constrains `mcp<2` because CCC still uses the
-Python MCP SDK's 1.x FastMCP import path.
-`uv` and `npx` must be on `PATH`. Crowded checks each executable immediately
-before its action, allowing an earlier setup action to install a tool used by
-the next one.
-
-## Local rooms
-
-Create `crowded.toml` in the directory where you launch Crowded:
+`crowded.toml` lives in the directory where you launch Crowded. A minimal
+configuration is:
 
 ```toml
 [[rooms]]
@@ -105,9 +83,7 @@ command = "claude"
 vendor = "anthropic"
 transport = "raw"
 allow_control = true
-model_tier = "balanced" # fast | balanced | deep
-cost_tier = "medium" # low | medium | high
-capabilities = ["implement", "validate"] # produce | implement | validate | qa | audit
+capabilities = ["implement", "validate"]
 
 [[rooms]]
 name = "Codex"
@@ -115,31 +91,10 @@ command = "codex"
 vendor = "openai"
 transport = "raw"
 allow_control = true
-
-[[rooms]]
-name = "OpenCode"
-command = "opencode"
-vendor = "deepseek"
-transport = "raw"
-allow_control = true
-use_headroom = true
 ```
 
-Then run:
-
-```console
-cargo run
-```
-
-Rooms inherit the launch directory (`$PWD`). Optional `args` and `cwd` fields
-override command arguments and a particular room's working directory:
-
-```toml
-args = ["--continue"]
-cwd = "../another-project"
-```
-
-For a plain terminal room:
+Use `transport = "raw"` for supported agent terminal interfaces. A normal
+terminal can use `transport = "shell"`:
 
 ```toml
 [[rooms]]
@@ -149,250 +104,101 @@ args = ["-l"]
 transport = "shell"
 ```
 
-`shell` rooms print whispers safely and are skipped by Shared Toolbox. `raw`
-rooms are treated as agent TUIs and require a supported native adapter.
+Optional room fields include `args`, `cwd`, `model_tier` (`fast`, `balanced`,
+or `deep`), `cost_tier` (`low`, `medium`, or `high`), and `use_headroom = true`
+when the `headroom` executable is on `PATH`.
 
-Optional `use_headroom` wraps a room's launch through the `headroom` wrapper
-binary when one is installed on `PATH`. It defaults to `false`; a missing
-`headroom` binary is a silent fallback, not an error:
+## Run rooms
 
-```toml
-use_headroom = true
-```
-
-When active, Crowded launches `headroom wrap <original-command> <original-args...>`.
-The Room Pulse sidebar appends `[headroom]` to that
-room's title, and the live roster reports `headroom: true` for rooms actually
-running under the wrapper.
-
-`headroom_args` are flags for `headroom`'s `wrap` subcommand itself, not the
-wrapped guest. `headroom wrap` takes the tool name as its own subcommand
-(`headroom wrap claude`, `headroom wrap codex`, ...), so `headroom_args` land
-after that tool name and before the guest's own arguments:
-
-```toml
-use_headroom = true
-headroom_args = ["--budget", "5000"]
-```
-
-This launches `headroom wrap <original-command> --budget 5000 <original-args...>`.
-
-Command-line guests still work and override the configured room list while
-retaining the Shared Toolbox:
+Start the configured room set:
 
 ```console
-cargo run -- raw:claude raw:codex
+crowded
 ```
 
-## Live Roster
-
-Every room can discover the current topology through the authenticated
-Doorbell:
+Or start explicit guests without using the configured room list:
 
 ```console
-"$CROWDED_BIN" roster
+crowded raw:claude raw:codex
 ```
 
-The JSON response lists each numeric room, name, guest program, model vendor,
-transport, live state, whether peer control is enabled, the room's current
-model and effort (read live from launch arguments), and whether the room is
-running under the `headroom` wrapper (`headroom: true` only when the config
-flag is set *and* the wrapper was found on `PATH`). `claude` and `codex`
-default to `anthropic` and `openai`; other guests default to `unknown`, so set
-`vendor` explicitly for OpenCode and other model drivers. This lets orchestration
-choose from the rooms that actually exist without guessing vendor or room number.
-
-## The Conductor
-
-A room can control another opted-in agent through Crowded's authenticated
-Doorbell:
-
-```console
-"$CROWDED_BIN" control 2 clear
-"$CROWDED_BIN" control 2 resume
-"$CROWDED_BIN" control 2 model gpt-5
-"$CROWDED_BIN" control 2 effort high
-"$CROWDED_BIN" control 2 model gpt-5 effort high
-```
-
-`allow_control` defaults to `false`. Controls are structured events, so
-ordinary whispers and terminal output cannot trigger them. All three native
-CLIs support `clear`, `resume`, and `model`; Claude and Codex support
-`effort`. OpenCode effort is rejected until it exposes a stable launch
-option. Model and effort can be set together in one restart instead of two,
-and the roster now reports each room's current model and effort.
-
-This first Conductor slice restarts the target CLI. `clear` removes known
-resume arguments so the replacement starts a fresh context; `resume` restarts
-with each CLI's "continue the most recent conversation" flag (Claude and
-OpenCode: `--continue`; Codex: `resume --last`) instead of picking a specific
-session; model and effort retain the room's configured continuation
-arguments.
-
-Run `crowded resume` from the terminal to launch the whole room layout with
-every supported guest resumed from the start, without needing a peer room to
-send a control message first:
+Resume supported agent sessions from the same configuration:
 
 ```console
 crowded resume
 ```
 
-It reads the same `crowded.toml` as plain `crowded`, applying each room's
-continue flag before the first launch. Rooms without a known continue flag
-(shell rooms, unsupported guests) start normally.
+Run `crowded --help` for the full command list.
 
-## Shared Plugins
+## Work across rooms
 
-The first local plugin slice shares instruction-only skills with every agent
-room. A compatible Git repository needs a top-level `skills/` directory and
-one of:
-
-- `crowded-plugin.toml`
-- `.codex-plugin/plugin.json`
-- `.claude-plugin/plugin.json`
-
-Native Codex and Claude manifests make existing plugins installable without
-repackaging. Skills are shared immediately; executable vendor components stay
-disabled until you preview and enable them.
-
-A minimal Crowded-native repository has this layout:
-
-```text
-crowded-plugin.toml
-skills/
-└── room-greeter/
-    └── SKILL.md
-```
-
-`crowded-plugin.toml` contains:
-
-```toml
-name = "greetings"
-version = "1.0.0"
-```
-
-Install from a local Git repository, Git URL, or GitHub `owner/repo` shorthand:
+From inside a room, Crowded exposes `CROWDED_BIN` and `CROWDED_ROOM`. Use the
+live roster instead of guessing room numbers:
 
 ```console
-cargo run -- plugin add indie-hub/greetings --ref v1.0.0
-cargo run -- plugin update greetings
-cargo run -- plugin list
-cargo run -- plugin preview greetings
-cargo run -- plugin enable greetings
-cargo run -- plugin disable greetings
-cargo run -- plugin remove greetings
+"$CROWDED_BIN" roster --json
 ```
 
-Crowded records the exact Git revision under `.crowded/plugins/`, then links
-each skill into `.agents/skills/` for Codex, `.claude/skills/` for Claude, and
-`.opencode/skills/` for OpenCode. Existing skill paths are never replaced.
-Restart the rooms after installation or update so every CLI refreshes its skill
-list.
+Send a message to a room:
 
-`plugin update` fetches the installed plugin's recorded source and ref, validates
-the replacement before swapping it in, and preserves its enabled state and
-plugin data. Pass `--ref REF` to move a pinned plugin to another Git ref.
+```console
+"$CROWDED_BIN" send 2 -- 'Please review this change.'
+```
 
-`plugin preview` shows the exact hook commands and files an adapter would add.
-`plugin enable` shares the skills, merges native hooks into
-`.claude/settings.local.json` and `.codex/hooks.json`, and links supported
-OpenCode plugins and commands into `.opencode/`. `plugin disable` removes all
-of those owned changes from every CLI; `remove` disables them automatically.
-Set `adapters = true` on a `[[plugin]]` declaration to have later `crowded init`
-runs enable those adapters after the first-run configuration review. Crowded
-does not translate one vendor's plugin code into another vendor's format.
+Rooms that set `allow_control = true` can be restarted with a fresh or resumed
+context, model, or effort:
 
-## Shared Toolbox
+```console
+"$CROWDED_BIN" control 2 clear
+"$CROWDED_BIN" control 2 resume
+"$CROWDED_BIN" control 2 model gpt-5 effort high
+```
 
-Declare a local stdio MCP once to make it available in every configured agent
-room:
+`crowded pulse` is the hook-facing command that updates the room status display.
+
+## Share plugins and tools
+
+Declare plugins in `crowded.toml`; plugins are optional and remain pinned to
+their configured Git reference until you update them:
 
 ```toml
+[[plugin]]
+name = "code4me-ntg"
+source = "https://github.com/indie-hub/code4me-ntg.git"
+adapters = true
+
 [[mcp]]
 name = "basic-memory"
 command = "basic-memory"
 args = ["mcp"]
 ```
 
-Remote Streamable HTTP servers use a URL instead of a command:
-
-```toml
-[[mcp]]
-name = "remote-tools"
-url = "https://example.com/mcp"
-transport = "http"
-```
-
-Legacy SSE is available to Claude and OpenCode, but must explicitly exclude
-Codex because Codex only documents Streamable HTTP:
-
-```toml
-[[mcp]]
-name = "legacy-tools"
-url = "https://example.com/sse"
-transport = "sse"
-clients = ["claude", "opencode"]
-```
-
-Limit an MCP to particular clients when a vendor has a better native adapter:
-
-```toml
-[[mcp]]
-name = "context-mode"
-command = "npx"
-args = ["-y", "context-mode@1.0.169"]
-clients = ["claude", "codex"]
-
-[[opencode_plugin]]
-package = "context-mode@1.0.169"
-```
-
-That is how the starter config installs Context Mode: Claude and Codex use its
-shared MCP plus native hooks, while OpenCode uses the npm plugin only. Avoiding
-both integrations in OpenCode prevents Context Mode's duplicate-tool conflict.
-
-Shared MCPs currently support native `claude`, `codex`, and `opencode`
-commands. Crowded keeps them project-local and does not modify the guests'
-global configuration.
-
-### Native project files
-
-Preview the project-local MCP and pulse-hook files Crowded would create or
-merge:
+Manage installed plugins with:
 
 ```console
-cargo run -- toolbox preview
+crowded plugin list
+crowded plugin add OWNER/REPOSITORY --ref TAG
+crowded plugin preview NAME
+crowded plugin enable NAME
+crowded plugin disable NAME
+crowded plugin update NAME
+crowded plugin remove NAME
 ```
 
-Then synchronize the native files in each configured room's working directory:
+Declare a local stdio or remote HTTP Model Context Protocol (MCP) server once
+and Crowded can expose it to the configured native clients. Manage entries with
+`crowded mcp list`, `crowded mcp add`, and `crowded mcp remove`.
+
+Preview or synchronize the project-local native files that carry shared MCPs
+and room-status hooks:
 
 ```console
-cargo run -- toolbox sync
+crowded toolbox preview
+crowded toolbox sync
+crowded toolbox resync
+crowded toolbox remove
 ```
 
-While synchronized, Crowded lets the guests load those project files instead
-of injecting MCP command-line arguments. The Room Pulse sidebar reports only
-`starting`, `thinking`, `working`, `ready`, `error`, or `offline`; prompts,
-commands, and tool output never enter the pulse channel.
-
-The generated hook files are:
-
-- `.claude/settings.local.json`
-- `.codex/hooks.json`
-- `.opencode/plugins/crowded-pulse.js`
-
-Codex requires a one-time review of project hooks through `/hooks`. OpenCode
-loads its local plugin automatically. The toolbox can synchronize hooks even
-when `crowded.toml` has no `[[mcp]]` declarations.
-
-Remove Crowded's managed entries with:
-
-```console
-cargo run -- toolbox remove
-```
-
-Crowded keeps ownership state in the ignored, private
-`.crowded/toolbox-state.json`. JSON files may be reformatted or extended by
-their native CLI; Crowded checks and removes only its own MCP entries. Codex
-TOML and hook files use exact snapshots, and OpenCode JSONC files are left
-untouched.
+Crowded only manages project-local files such as `.claude/settings.local.json`,
+`.codex/hooks.json`, and `.opencode/plugins/crowded-pulse.js`. Review Codex
+project hooks with `/hooks` after synchronization.
