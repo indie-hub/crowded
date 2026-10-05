@@ -7,6 +7,15 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- `tempfile` moved from a dev-dependency to a runtime dependency.
+
+### Fixed
+
+- OpenCode rooms launched through Headroom keep their own configured model. Headroom replaces `OPENCODE_CONFIG_CONTENT`, so each wrapped room now gets a private `OPENCODE_CONFIG` file carrying its model and MCP servers instead of falling back to the shared recent-model list. A plain-JSON `OPENCODE_CONFIG` already set for the room is merged as the base; a JSONC or unreadable one fails the launch with an error naming the path.
+- OpenCode v2 rooms are introduced automatically. The readiness check now ignores blank screen rows, and Room Pulse hook events for Thinking and Working count as the busy cycle that the delivery gate waits for.
+
 ## [0.44.0] - 2026-10-02
 
 ### Breaking
