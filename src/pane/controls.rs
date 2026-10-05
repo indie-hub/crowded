@@ -352,10 +352,16 @@ fn test_home() -> Option<PathBuf> {
     lock.read().ok().and_then(|guard| guard.clone())
 }
 
+/// Serializes tests that swap `TEST_HOME`, so parallel tests cannot overwrite
+/// or clear each other's temp home.
+#[cfg(test)]
+static HOME_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Points `discover_session_id`'s home at a fresh temp tree while held, and
 /// restores the real home on drop.
 #[cfg(test)]
 pub(super) struct HomeDirGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
     home: PathBuf,
 }
 
@@ -363,6 +369,9 @@ pub(super) struct HomeDirGuard {
 impl HomeDirGuard {
     pub(super) fn isolated() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let hold = HOME_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let home = std::env::temp_dir().join(format!(
             "crowded-fake-home-{}-{}",
             std::process::id(),
@@ -372,7 +381,7 @@ impl HomeDirGuard {
         if let Ok(mut guard) = lock.write() {
             *guard = Some(home.clone());
         }
-        Self { home }
+        Self { _lock: hold, home }
     }
 
     pub(super) fn path(&self) -> &Path {

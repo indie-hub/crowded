@@ -46,12 +46,16 @@ mod tests {
     };
 
     fn test_directory() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            env::temp_dir().join(format!("crowded-check-test-{}-{nonce}", std::process::id()));
+        let root = env::temp_dir().join(format!(
+            "crowded-check-test-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         fs::create_dir(&root).unwrap();
         root
     }
