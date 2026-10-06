@@ -1114,12 +1114,12 @@ fn resend_whisper_submit_due(
     SubmitDisposition::Wait
 }
 
-fn resend_whisper_submits(
+pub(crate) fn resend_whisper_submits(
     pending: &mut VecDeque<(Instant, usize, bool)>,
     panes: &mut [Pane],
     input_ready: &[bool],
     now: Instant,
-) -> io::Result<()> {
+) {
     for _ in 0..pending.len() {
         let Some((injected_at, target, saw_busy)) = pending.pop_front() else {
             break;
@@ -1137,11 +1137,26 @@ fn resend_whisper_submits(
             }
             SubmitDisposition::Retire => {}
             SubmitDisposition::Resend => {
-                panes[target].resend_whisper_submit()?;
+                // A full queue is transient, so keep the record and retry next
+                // frame; any other failure means the writer is gone, drop it.
+                match panes[target].resend_whisper_submit() {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        pending.push_back((injected_at, target, saw_busy));
+                    }
+                    Err(_) => {}
+                }
             }
         }
     }
-    Ok(())
+}
+
+/// Sends one key to a pane, turning an enqueue failure into a user notice so a
+/// transiently full or stopped write queue cannot end the event loop.
+pub(crate) fn forward_key(pane: &mut Pane, key: KeyEvent) -> Option<String> {
+    pane.write_key(key)
+        .err()
+        .map(|error| format!("{} rejected input: {error}", pane.title()))
 }
 
 fn pane_size(outer: Rect) -> PtySize {
@@ -1505,7 +1520,7 @@ fn run_with(
                 pane.automation_input_ready(output_is_quiet)
             })
             .collect();
-        resend_whisper_submits(&mut submit_pending, &mut panes, &input_ready, now)?;
+        resend_whisper_submits(&mut submit_pending, &mut panes, &input_ready, now);
         for index in 0..room_count {
             delivery_gates[index].observe(input_ready[index]);
             let waited = now.duration_since(spawned_at[index]);
@@ -2288,7 +2303,9 @@ fn run_with(
                                 panes[focused].scroll_down(rows);
                             }
                         } else if panes[focused].is_online() {
-                            panes[focused].write_key(key)?;
+                            if let Some(message) = forward_key(&mut panes[focused], key) {
+                                notice = Some(message);
+                            }
                         } else {
                             notice = Some(format!(
                                 "{} is offline; press Ctrl+R to revive it",

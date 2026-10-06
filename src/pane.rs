@@ -6,7 +6,11 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -366,6 +370,100 @@ impl Drop for ChildGuard {
     }
 }
 
+// A pane's PTY writes go through one writer thread so a guest that stops
+// reading its input cannot block the UI thread. The queue is bounded so a
+// runaway producer fails fast instead of growing without limit.
+// ponytail: 256 jobs is the ceiling; raise it only if a real workload needs
+// deeper buffering, since each job also holds its bytes.
+const WRITER_QUEUE_JOBS: usize = 256;
+
+/// One unit of PTY input. `followup` carries an optional pause and trailing
+/// bytes so a whisper's body, submit delay, and submit bytes are written as a
+/// unit that no other queued write can interleave with.
+struct WriteJob {
+    bytes: Vec<u8>,
+    followup: Option<(Duration, Vec<u8>)>,
+}
+
+/// Owns the sending end of a pane's write queue. Dropping it closes the queue,
+/// then the writer thread ends after any in-flight write completes.
+struct PaneWriter {
+    jobs: mpsc::SyncSender<WriteJob>,
+    failed: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+}
+
+impl PaneWriter {
+    fn spawn(mut inner: Box<dyn Write + Send>) -> Self {
+        let (jobs, rx) = mpsc::sync_channel(WRITER_QUEUE_JOBS);
+        let failed = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let failed_flag = Arc::clone(&failed);
+        let finished_flag = Arc::clone(&finished);
+        thread::spawn(move || {
+            while let Ok(job) = rx.recv() {
+                if write_job(&mut *inner, job).is_err() {
+                    failed_flag.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+            finished_flag.store(true, Ordering::SeqCst);
+        });
+        Self {
+            jobs,
+            failed,
+            finished,
+        }
+    }
+
+    fn enqueue(&self, job: WriteJob) -> io::Result<()> {
+        if self.failed.load(Ordering::SeqCst) || self.finished.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "room writer has stopped",
+            ));
+        }
+        match self.jobs.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "room is not reading its input",
+            )),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "room writer has stopped",
+            )),
+        }
+    }
+}
+
+fn write_job(inner: &mut dyn Write, job: WriteJob) -> io::Result<()> {
+    inner.write_all(&job.bytes)?;
+    inner.flush()?;
+    if let Some((pause, bytes)) = job.followup {
+        thread::sleep(pause);
+        inner.write_all(&bytes)?;
+        inner.flush()?;
+    }
+    Ok(())
+}
+
+// Lets `respond_to_terminal_queries` keep taking `&mut dyn Write`: a reply is
+// enqueued like any other write instead of running on the caller's thread.
+impl Write for PaneWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.enqueue(WriteJob {
+            bytes: buf.to_vec(),
+            followup: None,
+        })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 // One Pane owns everything required to drive one child terminal.
 pub(crate) struct Pane {
     spec: RoomSpec,
@@ -387,7 +485,7 @@ pub(crate) struct Pane {
     environment: GuestEnvironment,
     child: ChildGuard,
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: PaneWriter,
     output_rx: mpsc::Receiver<Vec<u8>>,
     response_tail: Vec<u8>,
     parser: Parser,
@@ -767,7 +865,7 @@ impl Pane {
 
         // Input and output use separate master handles so reading can block
         // on another thread while the UI remains responsive.
-        let writer = pty.master.take_writer()?;
+        let writer = PaneWriter::spawn(pty.master.take_writer()?);
         let mut reader = pty.master.try_clone_reader()?;
         let (output_tx, output_rx) = mpsc::channel();
         // `move` transfers the reader and sender into the new thread.
@@ -851,7 +949,9 @@ impl Pane {
         let mut received = false;
         while let Ok(bytes) = self.output_rx.try_recv() {
             received = true;
-            respond_to_terminal_queries(&mut *self.writer, &mut self.response_tail, &bytes)?;
+            // A cursor-position reply is best effort: a full or stopped write
+            // queue must not fail output draining and end the app.
+            let _ = respond_to_terminal_queries(&mut self.writer, &mut self.response_tail, &bytes);
             self.parser.process(&bytes);
         }
         Ok(received)
@@ -865,14 +965,20 @@ impl Pane {
     }
 
     pub(crate) fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.push_write(WriteJob {
+            bytes: bytes.to_vec(),
+            followup: None,
+        })
+    }
+
+    fn push_write(&self, job: WriteJob) -> io::Result<()> {
         if !self.is_online() {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "room is offline",
             ));
         }
-        self.writer.write_all(bytes)?;
-        self.writer.flush()
+        self.writer.enqueue(job)
     }
 
     pub(crate) fn is_online(&self) -> bool {
@@ -1011,15 +1117,12 @@ impl Pane {
     pub(crate) fn send_whisper(&mut self, source: &str, message: &str) -> io::Result<()> {
         let bracketed_paste = controls::uses_bracketed_paste(&self.spec);
         let (body, submit) = whisper_parts(self.spec.transport, bracketed_paste, source, message);
-        self.write_bytes(&body)?;
-        if let Some(submit) = submit {
-            // Raw TUIs can keep Enter in paste/newline mode briefly after input.
-            // ponytail: this briefly blocks the UI; schedule it asynchronously
-            // only if a measured 150 ms pause becomes noticeable.
-            thread::sleep(RAW_SUBMIT_DELAY);
-            self.write_bytes(&submit)?;
-        }
-        Ok(())
+        // The pause and submit bytes ride in the same job as the body so no
+        // other queued write can land between a paste and its Enter.
+        self.push_write(WriteJob {
+            bytes: body,
+            followup: submit.map(|bytes| (RAW_SUBMIT_DELAY, bytes)),
+        })
     }
 
     pub(crate) fn resend_whisper_submit(&mut self) -> io::Result<()> {
@@ -1593,8 +1696,11 @@ mod tests {
         // submit was reported.
         pane.spec.program = "codex".into();
         pane.send_whisper("Room 1", "hello").unwrap();
-        let bytes = captured.lock().unwrap().clone();
         let expected_body = b"\x1b[200~[whisper from Room 1] hello\x1b[201~";
+        let mut expected = expected_body.to_vec();
+        expected.extend_from_slice(RAW_SUBMIT_BYTES);
+        wait_for_captured(&captured, &expected);
+        let bytes = captured.lock().unwrap().clone();
         assert!(
             bytes.starts_with(expected_body),
             "the paste body must be written first, got {:?}",
@@ -2056,7 +2162,7 @@ mod tests {
                 pixel_height: 0,
             })
             .unwrap();
-        let writer = pty.master.take_writer().unwrap();
+        let writer = PaneWriter::spawn(pty.master.take_writer().unwrap());
         let (_, output_rx) = mpsc::channel();
         Pane {
             spec,
@@ -2178,13 +2284,31 @@ mod tests {
     fn pane_with_capture(rows: u16, cols: u16) -> (Pane, Arc<Mutex<Vec<u8>>>) {
         let mut pane = scroll_fixture(rows, cols);
         let captured = Arc::new(Mutex::new(Vec::new()));
-        pane.writer = Box::new(SharedWriter(captured.clone()));
+        pane.writer = PaneWriter::spawn(Box::new(SharedWriter(captured.clone())));
         pane.child = ChildGuard {
             child: Some(Box::new(FakeChild) as Box<dyn portable_pty::Child + Send + Sync>),
             #[cfg(windows)]
             tree: None,
         };
         (pane, captured)
+    }
+
+    /// Waits, up to a bounded time, for the writer thread to deliver exactly
+    /// `expected`, so tests that read a capturing writer do not race the thread.
+    fn wait_for_captured(captured: &Arc<Mutex<Vec<u8>>>, expected: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if captured.lock().unwrap().as_slice() == expected {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "expected captured bytes {expected:?}, got {:?} after 2s",
+                    captured.lock().unwrap()
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
@@ -2256,9 +2380,11 @@ mod tests {
         let scroll_before = pane.scroll_offset;
         pane.forward_page_up().unwrap();
         assert_eq!(pane.scroll_offset, scroll_before);
+        wait_for_captured(&captured, b"\x1b[5~");
         assert_eq!(captured.lock().unwrap().as_slice(), b"\x1b[5~");
         captured.lock().unwrap().clear();
         pane.forward_page_down().unwrap();
+        wait_for_captured(&captured, b"\x1b[6~");
         assert_eq!(captured.lock().unwrap().as_slice(), b"\x1b[6~");
     }
 
@@ -2267,6 +2393,7 @@ mod tests {
         let (mut pane, captured) = pane_with_capture(4, 20);
         enter_alternate_screen(&mut pane);
         pane.forward_wheel(true).unwrap();
+        wait_for_captured(&captured, b"\x1b[5~");
         assert_eq!(captured.lock().unwrap().as_slice(), b"\x1b[5~");
         // Must not contain raw SGR mouse encoding
         assert!(
@@ -2275,6 +2402,7 @@ mod tests {
         );
         captured.lock().unwrap().clear();
         pane.forward_wheel(false).unwrap();
+        wait_for_captured(&captured, b"\x1b[6~");
         assert_eq!(captured.lock().unwrap().as_slice(), b"\x1b[6~");
         captured.lock().unwrap().clear();
         // Re-entering primary should not forward wheel as CSI
@@ -2297,5 +2425,344 @@ mod tests {
         // Wheel in primary must also scroll, not forward, so we test scroll_up directly
         pane.scroll_up(3);
         assert_eq!(pane.scroll_offset, 3);
+    }
+
+    /// Kills a spawned guest by process id from outside its owning thread, so a
+    /// test can unblock a stuck PTY write without joining that thread.
+    #[cfg(unix)]
+    fn kill_child_process(pid: Option<u32>) {
+        if let Some(pid) = pid {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(pid.to_string())
+                .output();
+        }
+    }
+
+    #[cfg(unix)]
+    fn whisper_test_size() -> PtySize {
+        PtySize {
+            rows: 8,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+
+    // A full-screen TUI such as OpenCode sets its tty to raw mode, where the
+    // kernel input queue is about a kibibyte. Enqueuing a 64 KiB whisper must
+    // still return promptly, because a pane writer thread does the blocking
+    // write instead of the UI thread.
+    #[cfg(unix)]
+    #[test]
+    fn send_whisper_returns_promptly_when_the_child_never_reads_stdin() {
+        let _state = session_state::StateRootGuard::isolated();
+        let spec = room_spec("sh", &["-c", "stty raw -echo; exec /bin/sleep 600"]);
+        let mut pane = Pane::spawn(spec, whisper_test_size(), GuestEnvironment::new([])).unwrap();
+        let pid = pane.child.child.as_ref().unwrap().process_id();
+        // Let the child enter raw mode before the write is attempted.
+        thread::sleep(Duration::from_millis(300));
+        let message = "x".repeat(64 * 1024);
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(
+                pane.send_whisper("room-9", &message)
+                    .map_err(|e| e.to_string()),
+            );
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(3));
+        kill_child_process(pid);
+        match outcome {
+            Ok(Ok(())) => {}
+            other => panic!(
+                "send_whisper must return Ok within 3s even when the raw-mode child never \
+                 reads its input: {other:?}"
+            ),
+        }
+    }
+
+    // Control: the same raw-mode 64 KiB write with a child that drains stdin.
+    #[cfg(unix)]
+    #[test]
+    fn send_whisper_returns_when_the_child_drains_stdin() {
+        let _state = session_state::StateRootGuard::isolated();
+        let spec = room_spec("sh", &["-c", "stty raw -echo; cat > /dev/null"]);
+        let mut pane = Pane::spawn(spec, whisper_test_size(), GuestEnvironment::new([])).unwrap();
+        let pid = pane.child.child.as_ref().unwrap().process_id();
+        thread::sleep(Duration::from_millis(300));
+        let message = "x".repeat(64 * 1024);
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(
+                pane.send_whisper("room-9", &message)
+                    .map_err(|e| e.to_string()),
+            );
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(3));
+        kill_child_process(pid);
+        match outcome {
+            Ok(Ok(())) => {}
+            other => {
+                panic!("send_whisper must return within 3s when the child drains stdin: {other:?}")
+            }
+        }
+    }
+
+    // The writer thread owns the blocking write, so a full queue is the only way
+    // a caller learns the guest is behind. It must fail fast, not grow.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_write_queue_returns_would_block_promptly() {
+        let _state = session_state::StateRootGuard::isolated();
+        let spec = room_spec("sh", &["-c", "stty raw -echo; exec /bin/sleep 600"]);
+        let mut pane = Pane::spawn(spec, whisper_test_size(), GuestEnvironment::new([])).unwrap();
+        let pid = pane.child.child.as_ref().unwrap().process_id();
+        thread::sleep(Duration::from_millis(300));
+        let job = vec![b'x'; 16 * 1024];
+        let start = Instant::now();
+        let mut accepted = 0usize;
+        let error = loop {
+            match pane.write_bytes(&job) {
+                Ok(()) => accepted += 1,
+                Err(error) => break error,
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "queue never filled after {accepted} jobs"
+            );
+        };
+        let elapsed = start.elapsed();
+        kill_child_process(pid);
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::WouldBlock,
+            "expected WouldBlock, got {error:?}"
+        );
+        assert!(
+            accepted <= WRITER_QUEUE_JOBS + 4,
+            "queue grew past its {WRITER_QUEUE_JOBS}-job bound: {accepted} jobs"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "WouldBlock took {elapsed:?}"
+        );
+    }
+
+    // Each whisper is one queued job, so two consecutive whispers must land as
+    // body, submit, body, submit and never interleave.
+    #[test]
+    fn consecutive_whispers_reach_the_writer_in_order() {
+        let (mut pane, captured) = pane_with_capture(4, 20);
+        let bracketed = controls::uses_bracketed_paste(&pane.spec);
+        let (body_a, submit_a) = whisper_parts(pane.spec.transport, bracketed, "Room A", "first");
+        let (body_b, submit_b) = whisper_parts(pane.spec.transport, bracketed, "Room B", "second");
+        pane.send_whisper("Room A", "first").unwrap();
+        pane.send_whisper("Room B", "second").unwrap();
+        let mut expected = body_a;
+        expected.extend_from_slice(&submit_a.unwrap());
+        expected.extend_from_slice(&body_b);
+        expected.extend_from_slice(&submit_b.unwrap());
+        wait_for_captured(&captured, &expected);
+    }
+
+    // Once the writer thread fails it exits; later callers must not enqueue into
+    // a dead queue and must see BrokenPipe.
+    #[test]
+    fn a_failed_writer_makes_later_writes_fail_with_broken_pipe() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(io::Error::other("writer failed"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut pane = scroll_fixture(4, 20);
+        pane.writer = PaneWriter::spawn(Box::new(FailingWriter));
+        pane.child = ChildGuard {
+            child: Some(Box::new(FakeChild) as Box<dyn portable_pty::Child + Send + Sync>),
+            #[cfg(windows)]
+            tree: None,
+        };
+        // The first job is accepted; the thread then hits the failing write.
+        pane.write_bytes(b"x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pane.writer.failed.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "writer never reported failure");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let error = pane.write_bytes(b"x").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe,
+            "expected BrokenPipe, got {error:?}"
+        );
+    }
+
+    // A cursor-position reply that cannot be queued must not fail draining: the
+    // output still has to reach the parser.
+    #[test]
+    fn drain_output_stays_ok_when_the_writer_has_stopped() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(io::Error::other("writer failed"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut pane = scroll_fixture(4, 20);
+        pane.writer = PaneWriter::spawn(Box::new(FailingWriter));
+        pane.child = ChildGuard {
+            child: Some(Box::new(FakeChild) as Box<dyn portable_pty::Child + Send + Sync>),
+            #[cfg(windows)]
+            tree: None,
+        };
+        // Stop the writer thread so any reply enqueue fails with BrokenPipe.
+        pane.write_bytes(b"x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pane.writer.finished.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "writer never stopped");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let (output_tx, output_rx) = mpsc::channel();
+        output_tx.send(CURSOR_POSITION_QUERY.to_vec()).unwrap();
+        pane.output_rx = output_rx;
+        assert!(
+            pane.drain_output().unwrap(),
+            "output must still drain when the reply cannot be written"
+        );
+    }
+
+    // Dropping a pane whose writer thread is blocked on a non-reading guest must
+    // return promptly and let the thread end once the child is killed.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_pane_with_a_blocked_writer_completes() {
+        let _state = session_state::StateRootGuard::isolated();
+        let spec = room_spec("sh", &["-c", "stty raw -echo; exec /bin/sleep 600"]);
+        let mut pane = Pane::spawn(spec, whisper_test_size(), GuestEnvironment::new([])).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let job = vec![b'x'; 16 * 1024];
+        for _ in 0..(WRITER_QUEUE_JOBS + 8) {
+            if pane.write_bytes(&job).is_err() {
+                break;
+            }
+        }
+        let finished = Arc::clone(&pane.writer.finished);
+        let start = Instant::now();
+        drop(pane);
+        let drop_elapsed = start.elapsed();
+        assert!(
+            drop_elapsed < Duration::from_secs(3),
+            "drop took {drop_elapsed:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !finished.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "writer thread did not finish after the pane was dropped"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // A raw-mode pane whose guest never reads, with its write queue already full.
+    #[cfg(unix)]
+    fn saturated_raw_pane() -> Pane {
+        let spec = room_spec("sh", &["-c", "stty raw -echo; exec /bin/sleep 600"]);
+        let mut pane = Pane::spawn(spec, whisper_test_size(), GuestEnvironment::new([])).unwrap();
+        // Let the child enter raw mode before the writes are attempted.
+        thread::sleep(Duration::from_millis(300));
+        let job = vec![b'x'; 16 * 1024];
+        while pane.write_bytes(&job).is_ok() {}
+        pane
+    }
+
+    // A pane whose writer thread has already failed, so every later enqueue is
+    // a BrokenPipe.
+    fn pane_with_stopped_writer(rows: u16, cols: u16) -> Pane {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(io::Error::other("writer failed"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (mut pane, _captured) = pane_with_capture(rows, cols);
+        pane.writer = PaneWriter::spawn(Box::new(FailingWriter));
+        let _ = pane.write_bytes(b"x");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pane.writer.finished.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "stopped writer never finished");
+            thread::sleep(Duration::from_millis(5));
+        }
+        pane
+    }
+
+    // Queue saturation must not end the event loop: a key that cannot be
+    // enqueued surfaces as a notice instead of a propagated error.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_that_cannot_be_queued_becomes_a_notice() {
+        let mut pane = saturated_raw_pane();
+        let notice = crate::app::forward_key(
+            &mut pane,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        assert!(
+            notice.is_some(),
+            "a failed key enqueue must surface as a notice"
+        );
+    }
+
+    // A stopped writer means the resubmit record is dropped, never propagated.
+    #[test]
+    fn resubmit_drops_the_record_when_the_writer_has_stopped() {
+        let mut pane = pane_with_stopped_writer(4, 20);
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(30);
+        let mut pending = std::collections::VecDeque::from([(stale, 0usize, false)]);
+        crate::app::resend_whisper_submits(
+            &mut pending,
+            std::slice::from_mut(&mut pane),
+            &[true],
+            now,
+        );
+        assert!(
+            pending.is_empty(),
+            "a stopped writer must drop the resubmit record"
+        );
+    }
+
+    // A full queue is transient: the resubmit record is kept for the next frame.
+    #[cfg(unix)]
+    #[test]
+    fn resubmit_keeps_the_record_when_the_queue_is_full() {
+        let mut pane = saturated_raw_pane();
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(30);
+        let mut pending = std::collections::VecDeque::from([(stale, 0usize, false)]);
+        crate::app::resend_whisper_submits(
+            &mut pending,
+            std::slice::from_mut(&mut pane),
+            &[true],
+            now,
+        );
+        assert_eq!(
+            pending.len(),
+            1,
+            "a full queue must keep the resubmit record for retry"
+        );
     }
 }
