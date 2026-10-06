@@ -41,6 +41,14 @@ impl Mailroom {
     ) -> (u64, io::Result<()>) {
         let id = self.queue(from, target.title().to_owned(), body, "awaiting injection");
         let result = self.inject(id, target);
+        match &result {
+            // A direct send is not queued for retry, so a full input queue is a
+            // final failure here rather than the transient state `inject` records.
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                self.set_status(id, DeliveryStatus::Failed(error.to_string()));
+            }
+            _ => {}
+        }
         (id, result)
     }
 
@@ -76,6 +84,11 @@ impl Mailroom {
         let result = target.send_whisper(&from, &body);
         let status = match &result {
             Ok(()) => DeliveryStatus::Injected,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                // A full queue is transient, so the envelope is still queued,
+                // not failed.
+                DeliveryStatus::Queued("room busy: its input queue is full".to_owned())
+            }
             Err(error) => DeliveryStatus::Failed(error.to_string()),
         };
         self.set_status(id, status);

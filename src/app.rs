@@ -392,13 +392,13 @@ impl TornMouseReport {
 // stopped reporting must not pin the roster to a stale self-report forever.
 const PULSE_FRESHNESS_WINDOW: Duration = Duration::from_secs(30);
 
-struct DeliveryFuse {
+pub(crate) struct DeliveryFuse {
     used: usize,
     limit: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DeliveryGate {
+pub(crate) enum DeliveryGate {
     AwaitingIntro,
     IntroSent,
     IntroRunning,
@@ -408,7 +408,7 @@ enum DeliveryGate {
 }
 
 impl DeliveryGate {
-    fn new(needs_intro: bool) -> Self {
+    pub(crate) fn new(needs_intro: bool) -> Self {
         if needs_intro {
             Self::AwaitingIntro
         } else {
@@ -492,7 +492,7 @@ fn force_restart_requested(key: KeyEvent, online: bool) -> bool {
 
 impl DeliveryFuse {
     /// Create a new delivery fuse. A limit of 0 means unlimited (never trips).
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self { used: 0, limit }
     }
 
@@ -1030,12 +1030,12 @@ fn render_pulse_lines(
     lines
 }
 
-struct PendingSubmit<'a> {
-    queue: &'a mut VecDeque<(Instant, usize, bool)>,
-    now: Instant,
+pub(crate) struct PendingSubmit<'a> {
+    pub(crate) queue: &'a mut VecDeque<(Instant, usize, bool)>,
+    pub(crate) now: Instant,
 }
 
-fn inject_ready_pending(
+pub(crate) fn inject_ready_pending(
     pending: &mut VecDeque<(u64, usize)>,
     submit: PendingSubmit<'_>,
     mailroom: &mut Mailroom,
@@ -1046,6 +1046,9 @@ fn inject_ready_pending(
 ) -> (usize, usize) {
     let mut injected = 0;
     let mut failed = 0;
+    // Once a target's queue is full in this pass, later envelopes for it must
+    // wait too, so a later message can never overtake an earlier one.
+    let mut blocked: Vec<usize> = Vec::new();
     let candidates = pending.len();
     for _ in 0..candidates {
         if fuse.is_tripped() {
@@ -1054,6 +1057,10 @@ fn inject_ready_pending(
         let Some((id, target)) = pending.pop_front() else {
             break;
         };
+        if blocked.contains(&target) {
+            pending.push_back((id, target));
+            continue;
+        }
         if !gates[target].can_deliver(input_ready[target]) {
             pending.push_back((id, target));
             continue;
@@ -1064,6 +1071,12 @@ fn inject_ready_pending(
                 submit.queue.push_back((submit.now, target, false));
                 fuse.record();
                 injected += 1;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                // Transient: keep the envelope and stop trying this room until a
+                // later pass, in original order.
+                pending.push_back((id, target));
+                blocked.push(target);
             }
             Err(_) => failed += 1,
         }

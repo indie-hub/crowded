@@ -1246,6 +1246,10 @@ impl Pane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        app::{DeliveryFuse, DeliveryGate, PendingSubmit, inject_ready_pending},
+        mailroom::Mailroom,
+    };
     use std::{
         ffi::OsStr,
         fs,
@@ -2764,5 +2768,241 @@ mod tests {
             1,
             "a full queue must keep the resubmit record for retry"
         );
+    }
+
+    // A writer that blocks its first write until released, then drains
+    // instantly: it lets a test fill a pane's write queue and later drain it.
+    struct GatedWriter {
+        reading: Arc<AtomicBool>,
+    }
+
+    impl std::io::Write for GatedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            while !self.reading.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn pane_with_gated_writer(rows: u16, cols: u16, reading: bool) -> (Pane, Arc<AtomicBool>) {
+        let (mut pane, _captured) = pane_with_capture(rows, cols);
+        let gate = Arc::new(AtomicBool::new(reading));
+        pane.writer = PaneWriter::spawn(Box::new(GatedWriter {
+            reading: Arc::clone(&gate),
+        }));
+        (pane, gate)
+    }
+
+    fn fill_pane_queue(pane: &mut Pane) {
+        let job = vec![b'x'; 16 * 1024];
+        loop {
+            if pane.write_bytes(&job).is_err() {
+                break;
+            }
+        }
+    }
+
+    fn run_inject_pass(
+        pending: &mut std::collections::VecDeque<(u64, usize)>,
+        mailroom: &mut Mailroom,
+        panes: &mut [Pane],
+        gates: &mut [DeliveryGate],
+        input_ready: &[bool],
+        submit: &mut std::collections::VecDeque<(Instant, usize, bool)>,
+    ) -> (usize, usize) {
+        inject_ready_pending(
+            pending,
+            PendingSubmit {
+                queue: submit,
+                now: Instant::now(),
+            },
+            mailroom,
+            panes,
+            gates,
+            input_ready,
+            &mut DeliveryFuse::new(0),
+        )
+    }
+
+    // A WouldBlock delivery is transient: the envelope stays pending and its
+    // Mailroom status stays queued, not failed.
+    #[test]
+    fn a_would_block_delivery_stays_pending_and_queued() {
+        let (mut pane, gate) = pane_with_gated_writer(4, 20, false);
+        fill_pane_queue(&mut pane);
+        let mut mailroom = Mailroom::new(100);
+        let id = mailroom.queue(
+            "Room A".into(),
+            pane.title().to_owned(),
+            "hello".into(),
+            "awaiting injection",
+        );
+        let mut pending = std::collections::VecDeque::from([(id, 0usize)]);
+        let mut gates = vec![DeliveryGate::new(false)];
+        let mut submit = std::collections::VecDeque::new();
+        let counts = run_inject_pass(
+            &mut pending,
+            &mut mailroom,
+            std::slice::from_mut(&mut pane),
+            &mut gates,
+            &[true],
+            &mut submit,
+        );
+        assert_eq!(counts, (0, 0));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0], (id, 0));
+        let summary = mailroom.summary();
+        assert!(summary.contains("QUEUED"), "expected QUEUED, got {summary}");
+        assert!(!summary.contains("FAILED"), "unexpected FAILED: {summary}");
+        gate.store(true, Ordering::SeqCst);
+    }
+
+    // After the guest starts reading, the kept envelope is delivered exactly
+    // once on a later pass.
+    #[test]
+    fn a_requeued_delivery_is_later_injected_exactly_once() {
+        let (mut pane, gate) = pane_with_gated_writer(4, 20, false);
+        fill_pane_queue(&mut pane);
+        let mut mailroom = Mailroom::new(100);
+        let id = mailroom.queue(
+            "Room A".into(),
+            pane.title().to_owned(),
+            "hello".into(),
+            "awaiting injection",
+        );
+        let mut pending = std::collections::VecDeque::from([(id, 0usize)]);
+        let mut gates = vec![DeliveryGate::new(false)];
+        let mut submit = std::collections::VecDeque::new();
+        let first = run_inject_pass(
+            &mut pending,
+            &mut mailroom,
+            std::slice::from_mut(&mut pane),
+            &mut gates,
+            &[true],
+            &mut submit,
+        );
+        assert_eq!(first, (0, 0));
+        assert_eq!(pending.len(), 1);
+        // Let the guest start reading: the queue drains, freeing a slot.
+        gate.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pane.write_bytes(b"x").is_err() {
+            assert!(Instant::now() < deadline, "queue never drained");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let second = run_inject_pass(
+            &mut pending,
+            &mut mailroom,
+            std::slice::from_mut(&mut pane),
+            &mut gates,
+            &[true],
+            &mut submit,
+        );
+        assert_eq!(second, (1, 0));
+        assert!(pending.is_empty());
+        assert_eq!(mailroom.summary().matches("INJECTED").count(), 1);
+    }
+
+    // A blocked room keeps its envelopes in order while another room's envelope
+    // in the same pass is still delivered.
+    #[test]
+    fn a_blocked_room_keeps_order_while_another_room_still_delivers() {
+        let (mut busy, busy_gate) = pane_with_gated_writer(4, 20, false);
+        fill_pane_queue(&mut busy);
+        let (free, _free_gate) = pane_with_gated_writer(4, 20, true);
+        let mut mailroom = Mailroom::new(100);
+        let first = mailroom.queue(
+            "Room A".into(),
+            busy.title().to_owned(),
+            "first".into(),
+            "awaiting injection",
+        );
+        let other = mailroom.queue(
+            "Room A".into(),
+            free.title().to_owned(),
+            "other".into(),
+            "awaiting injection",
+        );
+        let second = mailroom.queue(
+            "Room A".into(),
+            busy.title().to_owned(),
+            "second".into(),
+            "awaiting injection",
+        );
+        // The other room's envelope sits between the two blocked-room ones.
+        let mut pending =
+            std::collections::VecDeque::from([(first, 0usize), (other, 1), (second, 0)]);
+        let mut gates = vec![DeliveryGate::new(false), DeliveryGate::new(false)];
+        let mut submit = std::collections::VecDeque::new();
+        let counts = run_inject_pass(
+            &mut pending,
+            &mut mailroom,
+            &mut [busy, free],
+            &mut gates,
+            &[true, true],
+            &mut submit,
+        );
+        assert_eq!(counts, (1, 0));
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0], (first, 0));
+        assert_eq!(pending[1], (second, 0));
+        assert_eq!(mailroom.summary().matches("INJECTED").count(), 1);
+        busy_gate.store(true, Ordering::SeqCst);
+    }
+
+    // A non-WouldBlock error is still a hard failure: dropped, counted failed,
+    // and marked failed.
+    #[test]
+    fn a_non_would_block_error_is_dropped_and_marked_failed() {
+        // A pane with no child is offline, so its whisper fails NotConnected.
+        let mut pane = scroll_fixture(4, 20);
+        assert!(!pane.is_online());
+        let mut mailroom = Mailroom::new(100);
+        let id = mailroom.queue(
+            "Room A".into(),
+            pane.title().to_owned(),
+            "hello".into(),
+            "awaiting injection",
+        );
+        let mut pending = std::collections::VecDeque::from([(id, 0usize)]);
+        let mut gates = vec![DeliveryGate::new(false)];
+        let mut submit = std::collections::VecDeque::new();
+        let counts = run_inject_pass(
+            &mut pending,
+            &mut mailroom,
+            std::slice::from_mut(&mut pane),
+            &mut gates,
+            &[true],
+            &mut submit,
+        );
+        assert_eq!(counts, (0, 1));
+        assert!(pending.is_empty());
+        let summary = mailroom.summary();
+        assert!(summary.contains("FAILED"), "expected FAILED, got {summary}");
+        assert!(!summary.contains("QUEUED"), "unexpected QUEUED: {summary}");
+    }
+
+    // A direct send is not retried, so a full queue is recorded as FAILED even
+    // though the pending path records the same error as QUEUED.
+    #[test]
+    fn a_direct_delivery_marks_would_block_as_failed() {
+        let (mut pane, gate) = pane_with_gated_writer(4, 20, false);
+        fill_pane_queue(&mut pane);
+        let mut mailroom = Mailroom::new(100);
+        let (_, result) = mailroom.deliver("Room A".to_owned(), &mut pane, "hello".to_owned());
+        assert_eq!(
+            result.unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "a full queue must report WouldBlock to the direct sender"
+        );
+        let summary = mailroom.summary();
+        assert!(summary.contains("FAILED"), "expected FAILED, got {summary}");
+        assert!(!summary.contains("QUEUED"), "unexpected QUEUED: {summary}");
+        gate.store(true, Ordering::SeqCst);
     }
 }
