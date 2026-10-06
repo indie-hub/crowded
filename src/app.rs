@@ -1137,6 +1137,13 @@ pub(crate) fn resend_whisper_submits(
         let Some((injected_at, target, saw_busy)) = pending.pop_front() else {
             break;
         };
+        // Do not age the record while its whisper is still queued or in flight:
+        // restart the clock so the resubmit ceiling counts from the moment the
+        // writer has actually written it.
+        if panes[target].has_unwritten_input() {
+            pending.push_back((now, target, saw_busy));
+            continue;
+        }
         let ready = input_ready[target];
         let resendable = panes[target].transport() == "raw";
         match resend_whisper_submit_due(

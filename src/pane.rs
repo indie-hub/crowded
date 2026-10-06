@@ -8,7 +8,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -391,6 +391,9 @@ struct PaneWriter {
     jobs: mpsc::SyncSender<WriteJob>,
     failed: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
+    /// Jobs accepted but not yet fully written. Callers use it to avoid ageing
+    /// a submit-tracking record while its whisper is still queued.
+    unwritten: Arc<AtomicUsize>,
 }
 
 impl PaneWriter {
@@ -398,11 +401,16 @@ impl PaneWriter {
         let (jobs, rx) = mpsc::sync_channel(WRITER_QUEUE_JOBS);
         let failed = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
+        let unwritten = Arc::new(AtomicUsize::new(0));
         let failed_flag = Arc::clone(&failed);
         let finished_flag = Arc::clone(&finished);
+        let unwritten_flag = Arc::clone(&unwritten);
         thread::spawn(move || {
             while let Ok(job) = rx.recv() {
-                if write_job(&mut *inner, job).is_err() {
+                let result = write_job(&mut *inner, job);
+                // The job is no longer waiting, whatever the write result was.
+                unwritten_flag.fetch_sub(1, Ordering::SeqCst);
+                if result.is_err() {
                     failed_flag.store(true, Ordering::SeqCst);
                     break;
                 }
@@ -413,6 +421,7 @@ impl PaneWriter {
             jobs,
             failed,
             finished,
+            unwritten,
         }
     }
 
@@ -423,17 +432,32 @@ impl PaneWriter {
                 "room writer has stopped",
             ));
         }
+        // Count before the handoff so the writer thread can never decrement a
+        // job the caller has not counted yet.
+        self.unwritten.fetch_add(1, Ordering::SeqCst);
         match self.jobs.try_send(job) {
             Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(_)) => Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "room is not reading its input",
-            )),
-            Err(mpsc::TrySendError::Disconnected(_)) => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "room writer has stopped",
-            )),
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.unwritten.fetch_sub(1, Ordering::SeqCst);
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "room is not reading its input",
+                ))
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.unwritten.fetch_sub(1, Ordering::SeqCst);
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "room writer has stopped",
+                ))
+            }
         }
+    }
+
+    fn write_in_flight(&self) -> bool {
+        self.unwritten.load(Ordering::SeqCst) > 0
+            && !self.failed.load(Ordering::SeqCst)
+            && !self.finished.load(Ordering::SeqCst)
     }
 }
 
@@ -983,6 +1007,13 @@ impl Pane {
 
     pub(crate) fn is_online(&self) -> bool {
         self.child.child.is_some()
+    }
+
+    /// Whether any accepted pane input is still waiting to be written. A stopped
+    /// writer reports false: it will never write the job, so callers must not
+    /// wait on it.
+    pub(crate) fn has_unwritten_input(&self) -> bool {
+        self.writer.write_in_flight()
     }
 
     pub(crate) fn title(&self) -> &str {
@@ -3004,5 +3035,181 @@ mod tests {
         assert!(summary.contains("FAILED"), "expected FAILED, got {summary}");
         assert!(!summary.contains("QUEUED"), "unexpected QUEUED: {summary}");
         gate.store(true, Ordering::SeqCst);
+    }
+
+    // A gated writer that also records everything it writes, so a test can see
+    // exactly which bytes (and how many Enters) reached the pane.
+    struct GatedCaptureWriter {
+        reading: Arc<AtomicBool>,
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for GatedCaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            while !self.reading.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            self.captured.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn pane_with_gated_capture(
+        rows: u16,
+        cols: u16,
+        reading: bool,
+    ) -> (Pane, Arc<AtomicBool>, Arc<Mutex<Vec<u8>>>) {
+        let (mut pane, _captured) = pane_with_capture(rows, cols);
+        let gate = Arc::new(AtomicBool::new(reading));
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        pane.writer = PaneWriter::spawn(Box::new(GatedCaptureWriter {
+            reading: Arc::clone(&gate),
+            captured: Arc::clone(&captured),
+        }));
+        (pane, gate, captured)
+    }
+
+    fn wait_for_no_unwritten_input(pane: &Pane) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pane.has_unwritten_input() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    // A queued or in-flight whisper is reported as unwritten until the writer
+    // finishes it.
+    #[test]
+    fn unwritten_input_is_reported_until_the_writer_drains() {
+        let (mut pane, gate) = pane_with_gated_writer(4, 20, false);
+        pane.send_whisper("Room A", "hello").unwrap();
+        assert!(pane.has_unwritten_input(), "a queued whisper is unwritten");
+        gate.store(true, Ordering::SeqCst);
+        assert!(wait_for_no_unwritten_input(&pane), "writer never drained");
+        assert!(!pane.has_unwritten_input());
+    }
+
+    // The regression: an old record whose whisper is still unwritten is kept and
+    // its clock restarts, so only the original Enter reaches the pane.
+    #[test]
+    fn an_old_record_with_unwritten_input_is_not_resent() {
+        let (mut pane, gate, captured) = pane_with_gated_capture(4, 20, false);
+        pane.send_whisper("Room A", "hello").unwrap();
+        let injected_at = Instant::now();
+        let future = injected_at + Duration::from_secs(30);
+        let mut pending = std::collections::VecDeque::from([(injected_at, 0usize, false)]);
+        crate::app::resend_whisper_submits(
+            &mut pending,
+            std::slice::from_mut(&mut pane),
+            &[true],
+            future,
+        );
+        assert_eq!(
+            pending.len(),
+            1,
+            "an unwritten whisper must keep its record"
+        );
+        assert_eq!(
+            pending[0],
+            (future, 0, false),
+            "the record's clock must restart while the whisper is unwritten"
+        );
+        // The gate opens; only the original body and its Enter are written.
+        gate.store(true, Ordering::SeqCst);
+        assert!(wait_for_no_unwritten_input(&pane), "writer never drained");
+        let bytes = captured.lock().unwrap().clone();
+        assert_eq!(
+            bytes.iter().filter(|byte| **byte == b'\r').count(),
+            1,
+            "exactly one Enter must reach the pane, got {bytes:?}"
+        );
+    }
+
+    // Once the writer has drained, an old record that was never seen busy is
+    // still resent exactly once.
+    #[test]
+    fn an_old_record_is_resent_once_after_the_writer_drains() {
+        let (mut pane, _gate, captured) = pane_with_gated_capture(4, 20, true);
+        pane.send_whisper("Room A", "hello").unwrap();
+        assert!(wait_for_no_unwritten_input(&pane), "writer never drained");
+        let injected_at = Instant::now();
+        let future = injected_at + Duration::from_secs(30);
+        let mut pending = std::collections::VecDeque::from([(injected_at, 0usize, false)]);
+        crate::app::resend_whisper_submits(
+            &mut pending,
+            std::slice::from_mut(&mut pane),
+            &[true],
+            future,
+        );
+        assert!(pending.is_empty(), "a resend retires the record");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|byte| **byte == b'\r')
+            .count()
+            < 2
+        {
+            assert!(Instant::now() < deadline, "resend Enter never written");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let bytes = captured.lock().unwrap().clone();
+        assert_eq!(
+            bytes.iter().filter(|byte| **byte == b'\r').count(),
+            2,
+            "the resend must add exactly one Enter, got {bytes:?}"
+        );
+    }
+
+    // A stopped writer is not awaited: its record is resolved at once.
+    #[test]
+    fn a_stopped_writer_resolves_the_record_without_waiting() {
+        let mut pane = pane_with_stopped_writer(4, 20);
+        assert!(
+            !pane.has_unwritten_input(),
+            "a stopped writer has no in-flight input"
+        );
+        let injected_at = Instant::now();
+        let future = injected_at + Duration::from_secs(30);
+        let mut pending = std::collections::VecDeque::from([(injected_at, 0usize, false)]);
+        crate::app::resend_whisper_submits(
+            &mut pending,
+            std::slice::from_mut(&mut pane),
+            &[true],
+            future,
+        );
+        assert!(
+            pending.is_empty(),
+            "a stopped writer must resolve the record instead of keeping it"
+        );
+    }
+
+    // The unwritten counter must return to zero after a drain and after a
+    // WouldBlock rejection, never underflowing.
+    #[test]
+    fn the_unwritten_counter_returns_to_zero() {
+        let (mut pane, _gate) = pane_with_gated_writer(4, 20, true);
+        for _ in 0..100 {
+            let _ = pane.write_bytes(b"x");
+        }
+        assert!(
+            wait_for_no_unwritten_input(&pane),
+            "counter never returned to zero after enqueues"
+        );
+        let (mut pane, gate) = pane_with_gated_writer(4, 20, false);
+        fill_pane_queue(&mut pane);
+        gate.store(true, Ordering::SeqCst);
+        assert!(
+            wait_for_no_unwritten_input(&pane),
+            "counter stuck after a WouldBlock rejection and drain"
+        );
     }
 }
