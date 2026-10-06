@@ -33,7 +33,13 @@ impl CliVendor {
 }
 
 pub(super) fn uses_bracketed_paste(spec: &RoomSpec) -> bool {
-    matches!(cli_vendor(spec), Ok(CliVendor::Claude | CliVendor::Codex))
+    // A bracketed paste arrives as one paste event. OpenCode assembles a long
+    // paste in milliseconds, but the same text typed byte-by-byte pegs it at
+    // 100% CPU and can take minutes.
+    matches!(
+        cli_vendor(spec),
+        Ok(CliVendor::Claude | CliVendor::Codex | CliVendor::OpenCode)
+    )
 }
 
 pub(super) fn clear_resume_args(spec: &mut RoomSpec) -> io::Result<()> {
@@ -968,10 +974,12 @@ mod tests {
     }
 
     #[test]
-    fn claude_and_codex_use_bracketed_paste() {
+    fn agent_rooms_use_bracketed_paste() {
         assert!(uses_bracketed_paste(&raw_room("claude")));
         assert!(uses_bracketed_paste(&raw_room("codex")));
-        assert!(!uses_bracketed_paste(&raw_room("opencode")));
+        assert!(uses_bracketed_paste(&raw_room("opencode")));
+        // An unknown raw program keeps the typed-bytes encoding.
+        assert!(!uses_bracketed_paste(&raw_room("bash")));
     }
 
     #[test]

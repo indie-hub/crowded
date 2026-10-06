@@ -1725,9 +1725,19 @@ mod tests {
     }
 
     #[test]
+    fn opencode_room_whispers_as_a_bracketed_paste() {
+        let spec = room_spec("opencode", &[]);
+        let bracketed = controls::uses_bracketed_paste(&spec);
+        assert!(bracketed, "an OpenCode room must use a bracketed paste");
+        let (body, submit) = whisper_parts(spec.transport, bracketed, "Room 4", "hello");
+        assert_eq!(body, b"\x1b[200~[whisper from Room 4] hello\x1b[201~");
+        assert_eq!(submit, Some(RAW_SUBMIT_BYTES.to_vec()));
+    }
+
+    #[test]
     fn whisper_submit_is_a_distinct_write_after_the_paste_end_marker() {
         let (mut pane, captured) = pane_with_capture(4, 20);
-        // Codex opts into bracketed paste, the path where the dropped
+        // Agent rooms take a bracketed paste, the path where the dropped
         // submit was reported.
         pane.spec.program = "codex".into();
         pane.send_whisper("Room 1", "hello").unwrap();
