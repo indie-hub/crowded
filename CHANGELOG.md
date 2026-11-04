@@ -7,12 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.44.1] - 2026-11-04
+
 ### Changed
 
 - `tempfile` moved from a dev-dependency to a runtime dependency.
 
 ### Fixed
 
+- OpenCode rooms receive whispers as a bracketed paste.
+- Plugins whose `plugin.json` lists `hooks` as an array of files (ponytail 5.3.x) now install and update. A string, an array, or no `hooks` value is accepted, and the entries of every listed file are merged into one hooks target per tool. A file with no hook entries adds nothing.
 - Crowded no longer freezes while delivering a message to a room that is slow to read its input. Every write to a room's terminal now goes through a bounded per-room writer thread, so a large message to a busy OpenCode room can no longer block drawing, the Doorbell, or other rooms. A delivery acknowledgement now means the message was accepted into the room's write queue. A full queue rejects the write instead of blocking, the app reports a rejected keystroke as a notice, and a queued Doorbell envelope that meets a full queue stays queued and is retried in order instead of being dropped.
 - OpenCode rooms launched through Headroom keep their own configured model. Headroom replaces `OPENCODE_CONFIG_CONTENT`, so each wrapped room now gets a private `OPENCODE_CONFIG` file carrying its model and MCP servers instead of falling back to the shared recent-model list. A plain-JSON `OPENCODE_CONFIG` already set for the room is merged as the base; a JSONC or unreadable one fails the launch with an error naming the path.
 - OpenCode v2 rooms are introduced automatically. The readiness check now ignores blank screen rows, and Room Pulse hook events for Thinking and Working count as the busy cycle that the delivery gate waits for.
