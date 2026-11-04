@@ -20,8 +20,8 @@ use serde_json::Value;
 use crate::toolbox::remove_empty_directory;
 
 use super::{
-    INSTALLS_DIRECTORY, NativePluginManifest, invalid_data, invalid_input, load_record,
-    validate_name,
+    INSTALLS_DIRECTORY, NativeHooks, NativePluginManifest, invalid_data, invalid_input,
+    load_record, validate_name,
 };
 
 pub(super) const ADAPTER_FILE: &str = ".crowded-adapters.json";
@@ -285,15 +285,35 @@ pub(super) fn adapter_plan(root: &Path, name: &str) -> io::Result<AdapterState> 
                 manifest.name
             )));
         }
-        let hook_path = manifest.hooks.as_deref().or(conventional_hooks);
-        if let Some(hook_path) = hook_path
-            && installed.join(hook_path).try_exists()?
-        {
+        let hook_paths: Vec<&str> = match &manifest.hooks {
+            Some(NativeHooks::Single(path)) => vec![path],
+            Some(NativeHooks::Multiple(paths)) => paths.iter().map(String::as_str).collect(),
+            None => conventional_hooks.into_iter().collect(),
+        };
+        let mut entries = BTreeMap::new();
+        let mut found = false;
+        for hook_path in hook_paths {
+            if !installed.join(hook_path).try_exists()? {
+                continue;
+            }
             let hook_path = safe_plugin_file(&installed, hook_path)?;
-            let windows_command = target == Path::new(".codex/hooks.json");
+            found = true;
+            for (event, handlers) in adapted_hooks(
+                root,
+                name,
+                &hook_path,
+                target == Path::new(".codex/hooks.json"),
+            )? {
+                entries
+                    .entry(event)
+                    .or_insert_with(Vec::new)
+                    .extend(handlers);
+            }
+        }
+        if found {
             hooks.push(AdapterHooks {
                 path: target,
-                entries: adapted_hooks(root, name, &hook_path, windows_command)?,
+                entries,
                 created: false,
             });
         }

@@ -36,7 +36,14 @@ struct NativePluginManifest {
     name: String,
     version: String,
     #[serde(default)]
-    hooks: Option<String>,
+    hooks: Option<NativeHooks>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum NativeHooks {
+    Single(String),
+    Multiple(Vec<String>),
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1148,8 +1155,9 @@ mod tests {
         fs::write(
             source.join(".claude-plugin/plugin.json"),
             r#"{
-                "name": "greetings",
-                "version": "1.0.0"
+    "name": "greetings",
+    "version": "1.0.0",
+    "hooks": ["./hooks/hooks.json", "./hooks/band.json", "./hooks/extra.json"]
             }"#,
         )
         .unwrap();
@@ -1168,6 +1176,16 @@ mod tests {
         )
         .unwrap();
         fs::write(source.join("hooks/activate.js"), "console.log('hello')\n").unwrap();
+        fs::write(
+            source.join("hooks/band.json"),
+            r#"{"hooks":{},"modules":["./band/register.tsx"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("hooks/extra.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"extra"}]}]}}"#,
+        )
+        .unwrap();
         fs::write(
             source.join(".opencode/plugins/greetings.mjs"),
             "export const Greetings = async () => ({})\n",
@@ -1232,7 +1250,13 @@ mod tests {
             &fs::read_to_string(project.join(".claude/settings.local.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(claude["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+        assert_eq!(claude["hooks"]["SessionStart"].as_array().unwrap().len(), 3);
+        assert!(
+            claude["hooks"]["SessionStart"][2]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with(" extra")
+        );
         assert!(
             claude["hooks"]["SessionStart"][1]["hooks"][0]["command"]
                 .as_str()
