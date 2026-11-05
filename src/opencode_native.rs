@@ -203,7 +203,7 @@ impl Client {
                 };
                 if item["id"].as_str() != Some(message_id)
                     || item["sessionID"].as_str() != Some(session)
-                    || Sha256::digest(returned.as_bytes()) != Sha256::digest(text.as_bytes())
+                    || !returned.starts_with(text)
                 {
                     Delivery::Conflict
                 } else {
@@ -262,7 +262,7 @@ impl Client {
             return Delivery::Uncertain;
         };
         if item["sessionID"].as_str() != Some(session)
-            || Sha256::digest(returned.as_bytes()) != Sha256::digest(text.as_bytes())
+            || !returned.starts_with(text)
         {
             Delivery::Conflict
         } else {
@@ -810,6 +810,56 @@ mod tests {
             Delivery::Conflict
         );
         assert!(busy.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stored_appendix_accepted_only_as_suffix() {
+        let client = fake(1, |_, _, _| {
+            Some(response(
+                200,
+                &json!({"data": item("msg_a", "hello\n\nextra")}),
+            ))
+        });
+        assert_eq!(client.queue("ses_a", "msg_a", "hello"), Delivery::Accepted);
+        let client = fake(1, |_, _, _| {
+            Some(response(
+                200,
+                &json!({"data": [item("msg_a", "hello\n\nextra")]}),
+            ))
+        });
+        assert_eq!(
+            client.reconcile("ses_a", "msg_a", "hello"),
+            Delivery::Accepted
+        );
+        let client = fake(1, |_, _, _| {
+            Some(response(200, &json!({"data": item("msg_a", "hxllo\n\nextra")})))
+        });
+        assert_eq!(client.queue("ses_a", "msg_a", "hello"), Delivery::Conflict);
+        let client = fake(1, |_, _, _| {
+            Some(response(
+                200,
+                &json!({"data": [item("msg_a", "hxllo\n\nextra")]}),
+            ))
+        });
+        assert_eq!(
+            client.reconcile("ses_a", "msg_a", "hello"),
+            Delivery::Conflict
+        );
+        let client = fake(1, |_, _, _| {
+            Some(response(200, &json!({"data": item("msg_a", "hell")})))
+        });
+        assert_eq!(client.queue("ses_a", "msg_a", "hello"), Delivery::Conflict);
+        let client = fake(1, |_, _, _| {
+            Some(response(200, &json!({"data": [item("msg_a", "hell")]})))
+        });
+        assert_eq!(
+            client.reconcile("ses_a", "msg_a", "hello"),
+            Delivery::Conflict
+        );
+        let client = fake(1, |_, _, _| {
+            Some(response(200, &json!({"data": item("msg_a", "extra hello")})))
+        });
+        assert_eq!(client.queue("ses_a", "msg_a", "hello"), Delivery::Conflict);
     }
 
     #[test]
