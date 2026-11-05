@@ -7,6 +7,25 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-11-05
+
+### Added
+
+- Native delivery for OpenCode rooms, opt-in per room with `native_delivery = true`. The room runs its own Crowded-owned `opencode serve` on loopback with a random per-room password, and its terminal attaches to it. The intro, Doorbell mail, Ctrl+W messages and F4 reintroductions are saved first in `.crowded/native-outbox.json`, then handed to OpenCode's prompt queue, one at a time per room and in order, instead of being pasted into the terminal. See the README for the statuses shown in the mail log (F2) and the Doorbell answers (`accepted`, `queued`, `held`, `uncertain`).
+- A lost reply is looked up in OpenCode's inbox with a read-only request and settled without resending. Mail saved for an earlier launch stays visible as held and is never delivered to a new session.
+- Native rooms may use Headroom.
+
+### Changed
+
+- The Room Pulse shows a native room's real state, as for any other room.
+- The welcome message ends by telling a room to check the roster and stand by.
+- Crowded leaves the same way on SIGHUP, SIGINT and SIGTERM as after Ctrl+Q, and the owned servers go with it. SIGKILL still leaves them running.
+
+### Fixed
+
+- Delivered native mail was shown as failed when a room hook appended text to the prompt; the stored text now only has to start with the sent text.
+- Accepted native mail no longer counts toward the outbox capacity, and a message whose save was not confirmed is held instead of being sent later.
+
 ## [0.44.1] - 2026-11-04
 
 ### Changed
