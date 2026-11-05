@@ -328,6 +328,35 @@ pub(crate) enum DoorbellEvent {
     Roster(DoorbellRoster),
 }
 
+/// Reads back what a test envelope was answered with.
+#[cfg(test)]
+pub(crate) struct TestAnswers(std::sync::mpsc::Receiver<WireResponse>);
+
+#[cfg(test)]
+impl TestAnswers {
+    /// (ok, status, envelope id, error) of the one answer that was sent.
+    pub(crate) fn read(&self) -> (bool, String, Option<u64>, Option<String>) {
+        let answer = self.0.try_recv().expect("an answer was sent");
+        (answer.ok, answer.status, answer.envelope_id, answer.error)
+    }
+}
+
+#[cfg(test)]
+impl DoorbellEnvelope {
+    pub(crate) fn for_test() -> (Self, TestAnswers) {
+        let (reply, answers) = std::sync::mpsc::sync_channel(1);
+        let envelope = Self {
+            from: 0,
+            to: 1,
+            body: "body".to_owned(),
+            task: None,
+            role: None,
+            reply,
+        };
+        (envelope, TestAnswers(answers))
+    }
+}
+
 impl DoorbellEnvelope {
     pub(crate) fn reply_injected(&self, envelope_id: u64) {
         let _ = self
@@ -339,6 +368,16 @@ impl DoorbellEnvelope {
         let _ = self
             .reply
             .send(WireResponse::accepted("queued", Some(envelope_id)));
+    }
+
+        /// A message routed through the native outbox. `status` says how far it got:
+    /// "accepted" (OpenCode accepted it into its queue), "queued" (saved here,
+    /// not yet sent), "held" (saved but not sent, needs attention) or
+    /// "uncertain" (it may have been accepted; it is never resent).
+    pub(crate) fn reply_native(&self, status: &str, envelope_id: u64) {
+        let _ = self
+            .reply
+            .send(WireResponse::accepted(status, Some(envelope_id)));
     }
 
     pub(crate) fn reply_failed(&self, error: impl Into<String>) {

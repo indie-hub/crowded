@@ -36,6 +36,7 @@ use crate::{
         SupportedControl,
     },
     mailroom::Mailroom,
+    native_route::{self, NativeRouter},
     pane::{self, Pane},
     room_detail::{DetailEvent, RoomDetail, apply_detail_event, collect_detail},
 };
@@ -844,6 +845,8 @@ fn pulse_label(
 ) -> String {
     if !pane.is_online() {
         "offline".to_owned()
+        } else if pane.is_native() {
+        "native".to_owned()
     } else if !pane.needs_intro() {
         "terminal".to_owned()
     } else {
@@ -1426,11 +1429,12 @@ impl Drop for TerminalGuard {
 pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let resolved = room_specs()?;
     let resumed = vec![false; resolved.specs.len()];
-    run_with(
+        run_with(
         resolved.specs,
         resumed,
         resolved.fuse_size,
         resolved.token_pricing,
+        None,
     )
 }
 
@@ -1438,28 +1442,121 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// launch, but every supported guest starts with its resume-most-recent
 /// flag already applied.
 pub(crate) fn run_resumed() -> Result<(), Box<dyn std::error::Error>> {
-    let mut resolved = room_specs_resumed()?;
+        resume_with(room_specs_resumed()?, run_with)
+}
+
+/// The part of `crowded resume` that decides what each room does and what the
+/// user is told, separated from the terminal so it can be exercised.
+pub(crate) fn resume_with(
+    mut resolved: crate::config::ResolvedConfig,
+    run: impl FnOnce(
+        Vec<RoomSpec>,
+        Vec<bool>,
+        usize,
+        Vec<TokenPricing>,
+        Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let resumed = pane::resume_supported_specs(&mut resolved.specs);
-    run_with(
+    let notice = pane::native_resume_notice(&resolved.specs);
+    run(
         resolved.specs,
         resumed,
         resolved.fuse_size,
         resolved.token_pricing,
+        notice,
     )
 }
 
+/// Runs the launch first and only then takes over the terminal, so a slow
+/// launch happens while the terminal is still usable.
+pub(crate) fn launch_then_enter<N, G>(
+    launch: impl FnOnce() -> io::Result<N>,
+    enter: impl FnOnce() -> io::Result<G>,
+) -> io::Result<(N, G)> {
+    let launched = launch()?;
+    Ok((launched, enter()?))
+}
+
+/// Rooms whose detail panel reads a legacy session entry. A native room has
+/// none, so it is never scheduled.
+pub(crate) fn rooms_needing_detail(panes: &[Pane]) -> Vec<usize> {
+    (0..panes.len())
+        .filter(|&index| !panes[index].is_native())
+        .collect()
+}
+
+/// The room the Ctrl+W composer would write to, or the notice that explains
+/// why it cannot be written to.
+pub(crate) fn compose_target(panes: &[Pane], focused: usize) -> Result<usize, String> {
+        let target = (focused + 1) % panes.len();
+    if panes[target].is_online() {
+        Ok(target)
+    } else {
+        Err(format!("{} is offline", panes[target].title()))
+    }
+}
+
+/// Turns a native outcome into the doorbell's answer, exactly as far as it got:
+/// "accepted" (OpenCode took it), "queued" (saved, still waiting), "held"
+/// (saved, not sent, needs attention), "uncertain" (never resent), or a failure.
+pub(crate) fn doorbell_reply(envelope: crate::doorbell::DoorbellEnvelope) -> native_route::Reply {
+    Box::new(move |id, outcome| match outcome {
+        native_route::NativeReply::Accepted => envelope.reply_native("accepted", id),
+        native_route::NativeReply::Queued => envelope.reply_native("queued", id),
+        native_route::NativeReply::Held(_) => envelope.reply_native("held", id),
+        native_route::NativeReply::Uncertain => envelope.reply_native("uncertain", id),
+        native_route::NativeReply::Failed(reason) => envelope.reply_failed(reason),
+    })
+}
+
+/// Owned OpenCode servers are killed on reaper threads, so Crowded waits for
+/// them on every way out instead of leaving a server behind.
 fn run_with(
     specs: Vec<RoomSpec>,
     resumed: Vec<bool>,
-    mut fuse_size: usize,
+        fuse_size: usize,
     token_pricing: Vec<TokenPricing>,
+    startup_notice: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+        // A hang-up or a kill from outside ends the loop below like Ctrl+Q does.
+    crate::shutdown::install();
+    let result = run_rooms(specs, resumed, fuse_size, token_pricing, startup_notice);
+    crate::native_launch::wait_for_reaps();
+    result
+}
+
+fn run_rooms(
+    specs: Vec<RoomSpec>,
+    resumed: Vec<bool>,
+        mut fuse_size: usize,
+    token_pricing: Vec<TokenPricing>,
+    startup_notice: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let room_count = specs.len();
     debug_assert_eq!(resumed.len(), room_count);
     // Each room receives only its own capability token.
     let doorbell = Doorbell::start(room_count)?;
-    // `?` returns early on an error. The guards below still run their Drop code.
-    let _terminal_guard = TerminalGuard::enter()?;
+    // Owned OpenCode servers start before the terminal is taken over, in
+    // parallel, so a slow start never freezes the event loop; a room that
+    // cannot start fails the launch instead of falling back to paste.
+    let environments = (0..room_count)
+        .map(|index| doorbell.guest_environment(index))
+        .collect::<Result<Vec<_>, _>>()?;
+    if specs.iter().any(|spec| spec.native_delivery) {
+        eprintln!("Starting native OpenCode servers...");
+    }
+        // `?` returns early on an error. The guards below still run their Drop code.
+        let ((natives, router), _terminal_guard) = launch_then_enter(
+        || {
+            let natives = pane::launch_native_rooms(&specs, &environments)?;
+            let router = pane::start_native_router(&specs, &natives)?;
+            Ok((natives, router))
+        },
+        TerminalGuard::enter,
+    )?;
+    let mut natives = natives.into_iter();
+    let mut router: Option<NativeRouter> = router;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let (rooms, _, _) = content_areas(terminal.size()?.into());
     let areas = pane_areas(rooms, room_count);
@@ -1481,10 +1578,14 @@ fn run_with(
                 wait_for_headroom_ready(&mut panes[prior], &mut last_output[prior])?;
             }
         }
-        panes.push(Pane::spawn(
+                // The owned server starts here, before the event loop, because the
+        // loop cannot wait for it; a room that cannot start its server fails
+        // startup instead of falling back to paste or a private server.
+                        panes.push(Pane::spawn_with_native(
             spec,
             pane_size(area),
             doorbell.guest_environment(index)?,
+            natives.next().flatten(),
         )?);
         spawned_at.push(Instant::now());
         if headroom {
@@ -1498,7 +1599,7 @@ fn run_with(
         .collect::<Vec<_>>();
     let mut focused = 0;
     let mut input_mode = InputMode::Normal;
-    let mut notice: Option<String> = None;
+        let mut notice: Option<String> = startup_notice;
     let mut mailroom = Mailroom::new(100);
     let mut fuse = DeliveryFuse::new(fuse_size);
     let mut delivery_paused = false;
@@ -1521,10 +1622,43 @@ fn run_with(
     // Holds the event that ended a wheel burst, so draining never discards it,
     // and any key run handed back by the torn-report filter.
     let mut stashed_events: VecDeque<Event> = VecDeque::new();
-    let mut torn_report = TornMouseReport::default();
+        let mut torn_report = TornMouseReport::default();
 
-    loop {
+    // A native room is introduced through its outbox, like all of its mail.
+    if let Some(router) = router.as_mut() {
         let now = Instant::now();
+        for index in 0..room_count {
+            if router.is_native(index) {
+                let roster = welcome_roster(&panes, &room_pulses, now);
+                if let Err(error) = router.send(
+                    &mut mailroom,
+                    "The Crowded Room",
+                    index,
+                    &house_rules(index + 1, &roster, fuse_size),
+                    None,
+                ) {
+                    notice = Some(format!(
+                        "Could not teach {} the house rules: {error}",
+                        panes[index].title()
+                    ));
+                }
+            }
+        }
+    }
+
+        loop {
+        if crate::shutdown::requested() {
+            break;
+        }
+        let now = Instant::now();
+        if let Some(router) = router.as_mut() {
+            if let Some(text) = router
+                .tick(now, &mut mailroom, delivery_paused, fuse.is_tripped())
+                .pop()
+            {
+                notice = Some(text);
+            }
+        }
         for (index, pane) in panes.iter_mut().enumerate() {
             if pane.drain_output()? {
                 last_output[index] = Some(now);
@@ -1716,13 +1850,44 @@ fn run_with(
                 }
                 DoorbellEvent::Message(envelope) => envelope,
             };
-            let source = panes[envelope.from].title().to_owned();
+                        let source = panes[envelope.from].title().to_owned();
             let target = panes[envelope.to].title().to_owned();
-            let body = message_with_hat(
+                        let body = message_with_hat(
                 envelope.task.as_deref(),
                 envelope.role.as_deref(),
                 &envelope.body,
             );
+            // A native room never receives terminal paste: its mail is saved to
+            // the outbox first, and the sender is told how far it got.
+            if panes[envelope.to].is_native() {
+                let to = envelope.to;
+                let result = match router.as_mut() {
+                    Some(router) => router.send(
+                        &mut mailroom,
+                        &source,
+                        to,
+                        &body,
+                        Some(doorbell_reply(envelope)),
+                    ),
+                    None => {
+                        envelope.reply_failed("native delivery is unavailable");
+                        Err("native delivery is unavailable".to_owned())
+                    }
+                };
+                notice = Some(match result {
+                    Ok(()) => {
+                        fuse.record();
+                        if fuse.is_tripped() {
+                            delivery_paused = true;
+                            format!("{source} → {target} saved; delivery fuse tripped at {}", fuse.limit)
+                        } else {
+                            format!("{source} → {target} saved for native delivery")
+                        }
+                    }
+                    Err(error) => format!("{source} → {target} not saved: {error}"),
+                });
+                continue;
+            }
             if delivery_paused || !delivery_gates[envelope.to].can_deliver(input_ready[envelope.to])
             {
                 if pending.len() >= 100 {
@@ -1822,7 +1987,7 @@ fn run_with(
             );
         }
         {
-            for index in 0..room_count {
+                                    for index in rooms_needing_detail(&panes) {
                 let guest = panes[index].guest().to_owned();
                 let cwd = panes[index].cwd().to_path_buf();
                 let title = panes[index].title().to_owned();
@@ -2186,7 +2351,30 @@ fn run_with(
                         && key.kind == KeyEventKind::Press
                         && matches!(&input_mode, InputMode::Normal) =>
                 {
-                    let roster = welcome_roster(&panes, &room_pulses, now);
+                                        let roster = welcome_roster(&panes, &room_pulses, now);
+                    if let Some(router) = router
+                        .as_mut()
+                        .filter(|router| router.is_native(focused))
+                    {
+                        notice = Some(
+                            match router.send(
+                                &mut mailroom,
+                                "The Crowded Room",
+                                focused,
+                                &house_rules(focused + 1, &roster, fuse_size),
+                                None,
+                            ) {
+                                Ok(()) => format!(
+                                    "{} reintroduced to the room",
+                                    panes[focused].title()
+                                ),
+                                Err(error) => format!(
+                                    "Could not reintroduce {}: {error}",
+                                    panes[focused].title()
+                                ),
+                            },
+                        );
+                    } else {
                     match panes[focused].send_whisper(
                         "The Crowded Room",
                         &house_rules(focused + 1, &roster, fuse_size),
@@ -2200,11 +2388,12 @@ fn run_with(
                             ));
                         }
                         Err(error) => {
-                            notice = Some(format!(
+                                                        notice = Some(format!(
                                 "Could not reintroduce {}: {error}",
                                 panes[focused].title()
                             ));
                         }
+                    }
                     }
                 }
                 Event::Key(key) if force_restart_requested(key, panes[focused].is_online()) => {
@@ -2238,12 +2427,28 @@ fn run_with(
                                     input_mode = InputMode::Normal;
                                 }
                                 KeyCode::Enter if key.kind == KeyEventKind::Press => {
-                                    let target = (focused + 1) % panes.len();
+                                                                        let target = (focused + 1) % panes.len();
                                     if panes[target].is_online() {
                                         let message = std::mem::take(message);
                                         let source = panes[focused].title().to_owned();
                                         input_mode = InputMode::Normal;
-                                        if delivery_paused
+                                        if let Some(router) = router
+                                            .as_mut()
+                                            .filter(|router| router.is_native(target))
+                                        {
+                                            notice = Some(
+                                                match router.send(
+                                                    &mut mailroom,
+                                                    &source,
+                                                    target,
+                                                    &message,
+                                                    None,
+                                                ) {
+                                                    Ok(()) => "Saved for native delivery".to_owned(),
+                                                    Err(error) => format!("Not saved: {error}"),
+                                                },
+                                            );
+                                        } else if delivery_paused
                                             || !delivery_gates[target]
                                                 .can_deliver(input_ready[target])
                                         {
@@ -2295,12 +2500,12 @@ fn run_with(
                             && key.modifiers == KeyModifiers::CONTROL
                             && key.kind == KeyEventKind::Press
                         {
-                            let target = (focused + 1) % panes.len();
-                            if panes[target].is_online() {
-                                input_mode = InputMode::Composing(String::new());
-                                notice = None;
-                            } else {
-                                notice = Some(format!("{} is offline", panes[target].title()));
+                                                                                    match compose_target(&panes, focused) {
+                                Ok(_) => {
+                                    input_mode = InputMode::Composing(String::new());
+                                    notice = None;
+                                }
+                                Err(reason) => notice = Some(reason),
                             }
                         } else if key.code == KeyCode::Tab
                             && key.modifiers == KeyModifiers::NONE
@@ -2441,6 +2646,128 @@ fn run_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doorbell_answers_say_exactly_how_far_a_native_message_got() {
+        use crate::doorbell::DoorbellEnvelope;
+        use native_route::NativeReply::*;
+        let answer = |outcome| {
+            let (envelope, answers) = DoorbellEnvelope::for_test();
+            doorbell_reply(envelope)(7, outcome);
+            answers.read()
+        };
+        assert_eq!(answer(Accepted), (true, "accepted".to_owned(), Some(7), None));
+        assert_eq!(answer(Queued), (true, "queued".to_owned(), Some(7), None));
+        assert_eq!(answer(Held("why".to_owned())), (true, "held".to_owned(), Some(7), None));
+        assert_eq!(answer(Uncertain), (true, "uncertain".to_owned(), Some(7), None));
+        assert_eq!(
+            answer(Failed("HTTP 401".to_owned())),
+            (false, "rejected".to_owned(), None, Some("HTTP 401".to_owned()))
+        );
+    }
+
+    /// Intro, doorbell mail, the Ctrl+W composer and F4 reintroduction are the
+    /// four ways agent text reaches a room; each must offer a native room to the
+    /// router before it can fall through to a terminal write.
+    #[test]
+    fn all_four_agent_text_entry_points_route_native_rooms_to_the_router() {
+        let source = include_str!("app.rs");
+        let production = &source[..source.find("#[cfg(test)]").unwrap()];
+        assert_eq!(production.matches("router.send(").count(), 4);
+        // The terminal writers that remain are the two for ordinary rooms.
+        assert_eq!(production.matches(".send_whisper(").count(), 2);
+    }
+
+    #[test]
+    fn a_signal_reaches_the_loop_and_the_reap_path() {
+        let source = include_str!("app.rs");
+        let production = &source[..source.find("#[cfg(test)]").unwrap()];
+        // The signals are routed to the flag before anything is launched and the
+        // reap wait follows the run on every way out, as for Ctrl+Q.
+        let run_with = &production[production.find("fn run_with(").unwrap()..];
+        let run_with = &run_with[..run_with.find("\n}\n").unwrap()];
+        let install = run_with.find("shutdown::install()").expect("handlers are installed");
+        let run = run_with.find("run_rooms(").expect("rooms run");
+        let wait = run_with.find("wait_for_reaps()").expect("reaping is awaited");
+        assert!(install < run && run < wait);
+        // The loop leaves as soon as it is asked to, before doing anything else.
+        let body = &production[production.find("fn run_rooms(").unwrap()..];
+        let loop_start = body.find("    loop {\n").expect("event loop");
+        let after = &body[loop_start + "    loop {\n".len()..];
+        assert!(
+            after.trim_start().starts_with("if crate::shutdown::requested() {\n            break;"),
+            "the first thing the loop does is check for a shutdown request"
+        );
+    }
+
+    #[test]
+    fn terminal_is_taken_only_after_the_launch() {
+        let order = std::cell::RefCell::new(Vec::new());
+        let (launched, entered) = launch_then_enter(
+            || {
+                order.borrow_mut().push("launch");
+                Ok(1)
+            },
+            || {
+                order.borrow_mut().push("enter");
+                Ok(2)
+            },
+        )
+        .unwrap();
+        assert_eq!((launched, entered), (1, 2));
+        assert_eq!(*order.borrow(), ["launch", "enter"]);
+
+        // A failed launch never takes the terminal.
+        let order = std::cell::RefCell::new(Vec::new());
+        let result = launch_then_enter(
+            || -> io::Result<()> { Err(io::Error::other("no server")) },
+            || {
+                order.borrow_mut().push("enter");
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(order.borrow().is_empty());
+    }
+
+    #[test]
+    fn run_rooms_reaches_the_terminal_only_through_launch_then_enter() {
+        let source = include_str!("app.rs");
+        let body = &source[source.find("fn run_rooms(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let launch = body.find("launch_then_enter(").expect("launch_then_enter is used");
+        let enter = body.find("TerminalGuard::enter").expect("terminal is entered");
+        assert!(launch < enter);
+        assert_eq!(body.matches("TerminalGuard::enter").count(), 1);
+        assert!(!body.contains("TerminalGuard::enter()"));
+        assert!(body.contains("launch_native_rooms"));
+    }
+
+    /// The only direct writes to a pane's terminal that the app may contain.
+    /// Anything else is a new automated writer that has not been reviewed
+    /// against native rooms: classify it, guard it in the pane, then list it.
+    #[test]
+    fn app_has_no_unreviewed_direct_terminal_writer() {
+        let source = include_str!("app.rs");
+        let production = &source[..source.find("#[cfg(test)]").unwrap()];
+        let writers = [
+            ("write_bytes", 0),
+            ("push_write", 0),
+            ("enqueue", 0),
+            // The person's own keystrokes and scroll keys.
+            ("write_key", 1),
+            ("forward_page_up", 1),
+            ("forward_page_down", 1),
+            // Automated writers; the pane refuses them for native rooms.
+            ("send_whisper", 2),
+            ("resend_whisper_submit", 1),
+        ];
+        for (method, expected) in writers {
+            let calls = production.matches(&format!(".{method}(")).count();
+            assert_eq!(calls, expected, "direct calls of .{method}( in app.rs");
+        }
+    }
+
 
     fn released(keys: &str) -> String {
         // Feeds one key at a time, as the event loop does, and collects what the

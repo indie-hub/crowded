@@ -7,10 +7,17 @@ mod config;
 mod doorbell;
 mod initializer;
 mod mailroom;
+mod native_binding;
+mod native_launch;
+mod native_outbox;
+mod native_route;
+mod opencode_native;
+mod opencode_outbox;
 mod mcp_cli;
 mod pane;
 mod plugins;
 mod room_detail;
+mod shutdown;
 mod toolbox;
 
 const USAGE: &str = "\

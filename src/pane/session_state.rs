@@ -547,13 +547,18 @@ fn state_root() -> PathBuf {
     env::current_dir().unwrap_or_default()
 }
 
+/// Directory holding Crowded's private runtime state.
+pub(crate) fn state_directory() -> PathBuf {
+    state_root().join(SESSION_STATE_DIRECTORY)
+}
+
 fn state_path() -> PathBuf {
     state_root()
         .join(SESSION_STATE_DIRECTORY)
         .join(SESSION_STATE_FILE)
 }
 
-fn refuse_symlink(path: &Path) -> io::Result<()> {
+pub(crate) fn refuse_symlink(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -566,7 +571,7 @@ fn refuse_symlink(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn create_private_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_directory(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -577,13 +582,13 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_directory(path: &Path) -> io::Result<()> {
     refuse_symlink(path)?;
     fs::create_dir_all(path)
 }
 
 #[cfg(unix)]
-fn private_file(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn private_file(path: &Path) -> io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     fs::OpenOptions::new()
@@ -594,7 +599,7 @@ fn private_file(path: &Path) -> io::Result<fs::File> {
 }
 
 #[cfg(not(unix))]
-fn private_file(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn private_file(path: &Path) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)

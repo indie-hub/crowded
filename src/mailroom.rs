@@ -8,6 +8,9 @@ enum DeliveryStatus {
     Queued(String),
     Injected,
     Failed(String),
+    /// A message routed through the native outbox; the text is its full,
+    /// already-worded status ("QUEUED", "ACCEPTED ...", "HELD: ...").
+    Native(String),
 }
 
 struct Envelope {
@@ -50,6 +53,24 @@ impl Mailroom {
             _ => {}
         }
         (id, result)
+    }
+
+        /// Lists a native-outbox message in the same history, so its status shows
+    /// beside terminal deliveries. The status is updated as the outbox reports.
+    pub(crate) fn record_native(
+        &mut self,
+        from: String,
+        to: String,
+        body: String,
+        status: impl Into<String>,
+    ) -> u64 {
+        let id = self.queue(from, to, body, "");
+        self.set_native_status(id, status);
+        id
+    }
+
+    pub(crate) fn set_native_status(&mut self, id: u64, status: impl Into<String>) {
+        self.set_status(id, DeliveryStatus::Native(status.into()));
     }
 
     pub(crate) fn queue(
@@ -110,6 +131,7 @@ impl Mailroom {
                 DeliveryStatus::Queued(reason) => format!("QUEUED: {reason}"),
                 DeliveryStatus::Injected => "INJECTED".to_owned(),
                 DeliveryStatus::Failed(error) => format!("FAILED: {error}"),
+                DeliveryStatus::Native(text) => text.clone(),
             };
             let _ = writeln!(
                 summary,

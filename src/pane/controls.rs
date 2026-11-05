@@ -970,6 +970,7 @@ mod tests {
             use_headroom: false,
             scheduling: None,
             headroom_args: Vec::new(),
+            native_delivery: false,
         }
     }
 
@@ -1498,6 +1499,7 @@ mod tests {
             use_headroom: false,
             scheduling: None,
             headroom_args: Vec::new(),
+            native_delivery: false,
         };
         let room4 = RoomSpec {
             name: "OpenCode".to_owned(),
@@ -1512,6 +1514,7 @@ mod tests {
             use_headroom: false,
             scheduling: None,
             headroom_args: Vec::new(),
+            native_delivery: false,
         };
 
         // Repair is a slate-level decision, so drive the same entry point
@@ -1601,6 +1604,7 @@ mod tests {
             use_headroom: false,
             scheduling: None,
             headroom_args: Vec::new(),
+            native_delivery: false,
         };
         let mut specs = [spec("OpenCode \u{00b7} 3"), spec("OpenCode \u{00b7} 4")];
         crate::pane::resume_supported_specs(&mut specs);
@@ -1669,6 +1673,7 @@ mod tests {
             use_headroom: false,
             scheduling: None,
             headroom_args: Vec::new(),
+            native_delivery: false,
         }
     }
 

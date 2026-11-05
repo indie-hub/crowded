@@ -108,6 +108,70 @@ Optional room fields include `args`, `cwd`, `model_tier` (`fast`, `balanced`,
 or `deep`), `cost_tier` (`low`, `medium`, or `high`), and `use_headroom = true`
 when the `headroom` executable is on `PATH`.
 
+### Native OpenCode rooms (opt-in)
+
+An OpenCode room with `native_delivery = true` runs its own Crowded-owned
+`opencode serve` on `127.0.0.1` (OpenCode 2.2.5 or newer) and attaches its
+terminal to it with `--server` and `--session`, instead of OpenCode's private
+`--standalone` server. The server password is random per launch and reaches
+OpenCode only through the `OPENCODE_PASSWORD` environment variable of the server
+and the terminal; it is never put on a command line or saved. Both processes
+keep your normal environment so your OpenCode login still works. OpenCode has no
+option to hide the variable from the tools it runs, so a tool the agent runs can
+read it and call the owned server directly; treat a native room's agent as
+trusted with its own server.
+
+The setting needs `transport = "raw"` and cannot be combined with
+`use_headroom`, `--standalone`, `--server`, `--session`, `--continue`, `--fork`
+or `--port`. The server gets the same OpenCode environment as the terminal (the
+room's configuration, model override and Crowded's hook variables), because the
+server is what runs the agent. Servers start in parallel before Crowded takes
+over the screen, so a slow start shows a one-line message instead of a frozen
+terminal. A native room that cannot start its server stops Crowded at startup
+with an error; it never falls back to another launch path.
+
+Mail to a native room never goes to its terminal. The intro, doorbell mail,
+Ctrl+W messages and F4 reintroductions are saved first in
+`.crowded/native-outbox.json` (private, restored on restart), then handed to
+OpenCode's own prompt queue, one at a time per room and in order. A message that
+arrives while the agent is working waits its turn; an idle agent starts a turn.
+Typing in the room works as usual. The mail log (F2) shows each message's
+status:
+
+| Status | Meaning |
+| --- | --- |
+| `QUEUED` | Saved here, not sent yet (waiting its turn, or delivery is paused or the fuse has tripped). |
+| `SENDING` | A request is in flight. |
+| `ACCEPTED by OpenCode` | OpenCode admitted it into its queue. This is not proof the agent read it. |
+| `UNCERTAIN` | The reply was lost, so it may have been accepted. It is never resent. Crowded looks for it in OpenCode's inbox with a read-only request and settles it if it is found; until then later mail to that room waits behind it. |
+| `HELD` | Saved but not sent (the request could not be made, or the mail belongs to an earlier launch of the room). It is kept and is never moved to another session. |
+| `FAILED` | Rejected, for example by a wrong login (HTTP 401) or because OpenCode holds different content under the message ID. |
+
+The doorbell answers a send with how far the message got within about a second
+and a half: `accepted`, `queued` (saved, still waiting), `held`, `uncertain`, or a
+rejection with the reason when it could not be saved. `queued` means saved
+locally, not delivered.
+
+A restart of Crowded gives each native room a new server and session. Mail
+saved for an earlier launch stays in the log as `HELD` or `UNCERTAIN`; it is not
+delivered to the new session and does not block it. A native room still cannot be
+restarted, cleared, resumed or reconfigured in place, and `crowded resume` starts
+a new session and says so. There is not yet a way to release or discard held mail
+from inside Crowded.
+
+When Crowded is hung up on, interrupted or terminated (SIGHUP, SIGINT,
+SIGTERM) it leaves the same way as after Ctrl+Q, and its owned servers go with
+it. SIGKILL cannot be caught, so `kill -9` on Crowded (or a crash) leaves its
+OpenCode servers running. They are the `opencode serve --hostname 127.0.0.1
+--port 0` processes and can be stopped by hand; the next start never reuses them.
+
+```toml
+[[rooms]]
+command = "opencode"
+transport = "raw"
+native_delivery = true
+```
+
 ## Run rooms
 
 Start the configured room set:

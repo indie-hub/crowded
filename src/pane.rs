@@ -16,13 +16,14 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use portable_pty::{Child, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tui_term::vt100::{Parser, Screen};
 
 use crate::{
     command::{ResolvedCommand, headroom_on_path},
     config::{RoomScheduling, RoomSpec, Transport},
     doorbell::RoomCapabilities,
+    native_launch::{self, GenerationAllocator, NativeRoom},
 };
 
 mod controls;
@@ -30,6 +31,10 @@ mod controls;
 pub(crate) mod session_state;
 
 pub(crate) use session_state::usage_cost;
+
+/// Shown for every automated send to a native room.
+pub(crate) const NATIVE_PASTE_REFUSED: &str =
+    "native delivery room: terminal paste is disabled; its mail goes through the native outbox";
 
 const CURSOR_POSITION_QUERY: &[u8] = b"\x1b[6n";
 // ponytail: ConPTY only needs a valid DSR here; report the parser's exact
@@ -197,10 +202,19 @@ pub(crate) fn spec_uses_headroom(spec: &RoomSpec) -> bool {
 pub(crate) fn resume_supported_specs(specs: &mut [RoomSpec]) -> Vec<bool> {
     // Runs across the whole slate first: which OpenCode session belongs to
     // which room cannot be decided from one room's view alone.
-    let refused = controls::repair_opencode_session_mappings(specs);
+        // Native-delivery rooms always start a fresh explicit session, so they
+    // neither take part in the repair nor receive resume arguments.
+    let slate: Vec<RoomSpec> = specs
+        .iter()
+        .filter(|spec| !spec.native_delivery)
+        .cloned()
+        .collect();
+    let refused = controls::repair_opencode_session_mappings(&slate);
     specs
         .iter_mut()
-        .map(|spec| controls::add_resume_args(spec, &refused).unwrap_or(false))
+        .map(|spec| {
+            !spec.native_delivery && controls::add_resume_args(spec, &refused).unwrap_or(false)
+        })
         .collect()
 }
 
@@ -274,13 +288,18 @@ const RAW_SUBMIT_BYTES: &[u8] = b"\r\n";
 #[cfg(not(windows))]
 const RAW_SUBMIT_BYTES: &[u8] = b"\r";
 
+/// The text of a whisper as the guest sees it, whatever carries it.
+pub(crate) fn whisper_note(source: &str, message: &str) -> String {
+    format!("[whisper from {source}] {message}")
+}
+
 fn whisper_parts(
     transport: Transport,
     bracketed_paste: bool,
     source: &str,
     message: &str,
 ) -> (Vec<u8>, Option<Vec<u8>>) {
-    let note = format!("[whisper from {source}] {message}");
+    let note = whisper_note(source, message);
     // ponytail: `Shell` currently means POSIX shell; add cmd/PowerShell
     // encoders only when Windows becomes a real target.
     match transport {
@@ -520,6 +539,9 @@ pub(crate) struct Pane {
     scroll_offset: usize,
     headroom_active: bool,
     _opencode_config: Option<tempfile::NamedTempFile>,
+    /// The owned OpenCode server behind a native-delivery room. Dropping the
+    /// pane hands the server to a reaper thread instead of killing it inline.
+    native: Option<NativeRoom>,
 }
 
 #[derive(Clone)]
@@ -560,6 +582,147 @@ fn opencode_launch(spec: &RoomSpec) -> io::Result<RoomSpec> {
         launch.args.insert(0, "--standalone".into());
     }
     Ok(launch)
+}
+
+/// Points a launch that `opencode_launch` prepared at a Crowded-owned server
+/// instead of OpenCode's private standalone one.
+fn attach_to_native_server(launch: &mut RoomSpec, native: &NativeRoom) -> io::Result<()> {
+    let Some(position) = launch.args.iter().position(|arg| arg == "--standalone") else {
+        return Err(io::Error::other("native delivery needs an OpenCode launch"));
+    };
+    launch.args.splice(position..=position, native.tui_arguments());
+    Ok(())
+}
+
+/// The server password reaches the TUI only through its environment, set on
+/// the command itself so it is never stored in a room spec.
+fn native_environment(command: &mut CommandBuilder, native: &NativeRoom) {
+    command.env("OPENCODE_PASSWORD", native.tui_password());
+}
+
+/// The environment a native room's terminal runs with: the launch variables
+/// (room configuration, model override) and the doorbell variables. The owned
+/// server runs the agent, so it must see exactly this, not only the parent's
+/// environment. The password is added separately and cannot be overridden.
+fn native_variables(
+    spec: &RoomSpec,
+    environment: &GuestEnvironment,
+) -> io::Result<native_launch::Variables> {
+    let mut variables = opencode_launch(spec)?.variables;
+    for (key, value) in &environment.variables {
+        variables.retain(|(existing, _)| existing != OsStr::new(key));
+        variables.push((OsString::from(*key), value.clone()));
+    }
+    variables.retain(|(key, _)| key != OsStr::new("OPENCODE_PASSWORD"));
+    Ok(variables)
+}
+
+/// Where the native outbox keeps its saved mail: the private runtime state
+/// directory, so mail survives a restart of Crowded.
+pub(crate) fn native_outbox_path() -> PathBuf {
+    session_state::state_directory().join("native-outbox.json")
+}
+
+/// Opens the outbox and binds every native room to it. Rooms without the
+/// setting make this a no-op, so their delivery is exactly what it was.
+pub(crate) fn start_native_router(
+    specs: &[RoomSpec],
+    natives: &[Option<NativeRoom>],
+) -> io::Result<Option<crate::native_route::NativeRouter>> {
+    let rooms: Vec<crate::native_route::RoomEntry> = specs
+        .iter()
+        .zip(natives)
+        .enumerate()
+        .filter_map(|(index, (spec, room))| {
+            room.as_ref().map(|room| crate::native_route::RoomEntry {
+                index,
+                title: spec.title.clone(),
+                binding: room.binding().clone(),
+                server: room.server(),
+            })
+        })
+        .collect();
+    if rooms.is_empty() {
+        return Ok(None);
+    }
+    crate::native_route::NativeRouter::start(native_outbox_path(), rooms).map(Some)
+}
+
+/// `crowded resume` cannot reattach a native room's earlier session yet, so the
+/// room starts a new one; the user is told instead of it happening silently.
+pub(crate) fn native_resume_notice(specs: &[RoomSpec]) -> Option<String> {
+    // Room numbers, not titles, so a long list still fits a narrow status line.
+    let rooms: Vec<String> = specs
+        .iter()
+        .enumerate()
+        .filter(|(_, spec)| spec.native_delivery)
+        .map(|(index, _)| (index + 1).to_string())
+        .collect();
+    if rooms.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Resume: native room {} started a new session",
+        rooms.join(",")
+    ))
+}
+
+/// Starts the Crowded-owned OpenCode server of every native-delivery room, in
+/// parallel on tracked workers, and waits for them. This runs before the
+/// terminal is taken over, so a slow start never freezes the event loop; a
+/// room that cannot start fails the launch and cancels the others, with no
+/// fallback to paste or a private server.
+pub(crate) fn launch_native_rooms(
+    specs: &[RoomSpec],
+    environments: &[GuestEnvironment],
+) -> io::Result<Vec<Option<NativeRoom>>> {
+    debug_assert_eq!(specs.len(), environments.len());
+    let named = |spec: &RoomSpec, error: io::Error| {
+        io::Error::other(format!(
+            "{}: native delivery could not start: {error}",
+            spec.title
+        ))
+    };
+    let mut launches = Vec::with_capacity(specs.len());
+    let mut allocator = None;
+    for (index, (spec, environment)) in specs.iter().zip(environments).enumerate() {
+        if !spec.native_delivery {
+            launches.push(None);
+            continue;
+        }
+        let allocator = allocator
+            .get_or_insert_with(|| GenerationAllocator::new(session_state::state_directory()));
+        let launch = (|| {
+            let cwd = working_directory(spec.cwd.as_deref())?;
+            let variables = native_variables(spec, environment)?;
+            let generation = allocator.next()?;
+            Ok(native_launch::begin(
+                spec.program.clone(),
+                                cwd,
+                // The generation is part of the lane, so mail for an earlier
+                // launch of this room can never block or reach the new one.
+                format!("{}.{generation}", index + 1),
+                generation,
+                variables,
+            ))
+        })()
+        .map_err(|error| named(spec, error))?;
+        launches.push(Some(launch));
+    }
+    let deadline = Instant::now() + native_launch::LAUNCH_TIMEOUT;
+    let mut rooms = Vec::with_capacity(specs.len());
+    for (spec, launch) in specs.iter().zip(launches) {
+        rooms.push(match launch {
+            None => None,
+            Some(launch) => {
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(1));
+                Some(launch.wait(remaining).map_err(|error| named(spec, error))?)
+            }
+        });
+    }
+    Ok(rooms)
 }
 
 fn opencode_wrapped_config(
@@ -849,12 +1012,37 @@ impl Pane {
         size: PtySize,
         environment: GuestEnvironment,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_with_native(spec, size, environment, None)
+    }
+
+    /// A native-delivery room must be launched with its owned server, and no
+    /// other room may be: nothing falls back to paste or a private server.
+    pub(crate) fn spawn_with_native(
+        spec: RoomSpec,
+        size: PtySize,
+        environment: GuestEnvironment,
+        native: Option<NativeRoom>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if spec.native_delivery != native.is_some() {
+            return Err(io::Error::other(if spec.native_delivery {
+                "native delivery room has no owned server"
+            } else {
+                "owned server given to a room without native delivery"
+            })
+            .into());
+        }
+        if native.is_some() && spec.use_headroom {
+            return Err(io::Error::other("native delivery cannot use headroom").into());
+        }
         // A PTY has two ends: the child receives the slave; we keep the master.
         let pty = native_pty_system().openpty(size)?;
         // portable-pty defaults an omitted cwd to HOME rather than inheriting
         // Crowded's directory, so the project directory must be explicit.
         let cwd = working_directory(spec.cwd.as_deref())?;
         let mut guest = opencode_launch(&spec)?;
+        if let Some(native) = &native {
+            attach_to_native_server(&mut guest, native)?;
+        }
         let path = environment_value(&guest.variables, "PATH");
         let path_ext = environment_value(&guest.variables, "PATHEXT");
         let (program, args, headroom_active) = headroom_launch(
@@ -877,6 +1065,9 @@ impl Pane {
         }
         for (key, value) in &environment.variables {
             command.env(key, value);
+        }
+        if let Some(native) = &native {
+            native_environment(&mut command, native);
         }
         // Anchor session-id discovery to the instant the guest process spawns.
         // Codex writes its session artifact at spawn, before any intro is
@@ -906,9 +1097,12 @@ impl Pane {
         // already persisted opens with that id seeded, so the Room Pulse cost
         // gate is true immediately instead of only after an intro-triggered
         // capture -- which a resume deliberately skips.
-        let captured_session = match controls::cli_vendor(&spec) {
-            Ok(vendor) => session_state::initial_capture_cell(vendor.key(), &cwd, &spec.title),
-            Err(_) => session_state::fresh_capture_cell(),
+                let captured_session = match controls::cli_vendor(&spec) {
+            // A native room never trusts a legacy persisted id.
+            Ok(vendor) if native.is_none() => {
+                session_state::initial_capture_cell(vendor.key(), &cwd, &spec.title)
+            }
+            _ => session_state::fresh_capture_cell(),
         };
 
         Ok(Self {
@@ -927,6 +1121,7 @@ impl Pane {
             scroll_offset: 0,
             headroom_active,
             _opencode_config: opencode_config,
+            native,
         })
     }
 
@@ -937,9 +1132,14 @@ impl Pane {
     /// `session_state::SESSION_CAPTURE_GRACE` (OpenCode uses its own, longer
     /// bound), so it never blocks the UI loop.
     /// Resumed panes skip the intro and therefore never call this.
-    pub(crate) fn begin_session_capture(&self) {
+            pub(crate) fn begin_session_capture(&self) -> bool {
+        // A native room's session is the one its owned server created; legacy
+        // discovery would pick a session by directory and time instead.
+        if self.native.is_some() {
+            return false;
+        }
         let Ok(vendor) = controls::cli_vendor(&self.spec) else {
-            return;
+            return false;
         };
         // The room identity (spec.title) keys the persisted entry so this room
         // only ever resumes its own captured id, even when a sibling room
@@ -957,9 +1157,10 @@ impl Pane {
             self.cwd.clone(),
             self.spec.title.clone(),
             self.spawned_at,
-            Arc::clone(&self.captured_session),
+                        Arc::clone(&self.captured_session),
             opencode_model,
         );
+        true
     }
 
     /// Whether this pane's exact session id has been captured yet. A plain
@@ -988,7 +1189,7 @@ impl Pane {
         Ok(())
     }
 
-    pub(crate) fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+    fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.push_write(WriteJob {
             bytes: bytes.to_vec(),
             followup: None,
@@ -1067,8 +1268,9 @@ impl Pane {
         self.headroom_active
     }
 
-    pub(crate) fn needs_intro(&self) -> bool {
-        self.spec.transport == Transport::Raw
+        pub(crate) fn needs_intro(&self) -> bool {
+        // The intro is a terminal paste, which a native room never receives.
+        self.spec.transport == Transport::Raw && self.native.is_none()
     }
 
     pub(crate) fn screen(&self) -> &Screen {
@@ -1145,7 +1347,25 @@ impl Pane {
         output_is_quiet
     }
 
+        /// Whether this room's mail is meant to travel through the native outbox.
+    pub(crate) fn is_native(&self) -> bool {
+        self.native.is_some()
+    }
+
+    /// Until native routing exists, no automated terminal input may reach a
+    /// native room; the human's own typing is a different path and unaffected.
+    fn refuse_native_paste(&self) -> io::Result<()> {
+        if self.native.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                NATIVE_PASTE_REFUSED,
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn send_whisper(&mut self, source: &str, message: &str) -> io::Result<()> {
+        self.refuse_native_paste()?;
         let bracketed_paste = controls::uses_bracketed_paste(&self.spec);
         let (body, submit) = whisper_parts(self.spec.transport, bracketed_paste, source, message);
         // The pause and submit bytes ride in the same job as the body so no
@@ -1156,7 +1376,8 @@ impl Pane {
         })
     }
 
-    pub(crate) fn resend_whisper_submit(&mut self) -> io::Result<()> {
+        pub(crate) fn resend_whisper_submit(&mut self) -> io::Result<()> {
+        self.refuse_native_paste()?;
         self.write_bytes(RAW_SUBMIT_BYTES)
     }
 
@@ -1167,7 +1388,9 @@ impl Pane {
     pub(crate) fn clear_context(
         &mut self,
         size: PtySize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        ) -> Result<(), Box<dyn std::error::Error>> {
+        // Refuse before the durable fresh-state marker below is written.
+        self.refuse_native_relaunch()?;
         // Record durable fresh-state intent before reconfiguration so a later
         // resume from the pre-clear spawn never restores the stale session.
         if let Ok(vendor) = controls::cli_vendor(&self.spec) {
@@ -1184,7 +1407,8 @@ impl Pane {
     pub(crate) fn resume_context(
         &mut self,
         size: PtySize,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+        ) -> Result<bool, Box<dyn std::error::Error>> {
+        self.refuse_native_relaunch()?;
         // One room resuming on its own request has no slate to be judged
         // against, so there is no refusal to honour. The objective checks
         // inside `add_resume_args` still apply.
@@ -1196,7 +1420,9 @@ impl Pane {
         model: Option<&str>,
         effort: Option<&str>,
         size: PtySize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        ) -> Result<(), Box<dyn std::error::Error>> {
+        // Refuse before any model-switch subprocess runs.
+        self.refuse_native_relaunch()?;
         let mut spec = self.spec.clone();
         let vendor = controls::cli_vendor(&spec)?;
         if let Some(model) = model {
@@ -1244,6 +1470,7 @@ impl Pane {
         size: PtySize,
         configure: impl FnOnce(&mut RoomSpec) -> io::Result<T>,
     ) -> Result<T, Box<dyn std::error::Error>> {
+        self.refuse_native_relaunch()?;
         let mut spec = self.spec.clone();
         let outcome = configure(&mut spec)?;
         let replacement = Self::spawn(spec, size, self.environment.clone())?;
@@ -1252,7 +1479,20 @@ impl Pane {
         Ok(outcome)
     }
 
+    /// A native room's server and session are created once per launch. Relaunching
+    /// in place would need a second, asynchronous launch, so it is refused
+    /// visibly rather than falling back to a private server.
+    fn refuse_native_relaunch(&self) -> io::Result<()> {
+        if self.native.is_some() {
+            return Err(io::Error::other(
+                "native delivery rooms cannot be restarted, cleared, resumed or reconfigured yet",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn restart(&mut self, size: PtySize) -> Result<(), Box<dyn std::error::Error>> {
+        self.refuse_native_relaunch()?;
         let replacement = Self::spawn(self.spec.clone(), size, self.environment.clone())?;
         self.cleanup();
         *self = replacement;
@@ -1302,7 +1542,524 @@ mod tests {
             use_headroom: false,
             scheduling: None,
             headroom_args: Vec::new(),
+            native_delivery: false,
         }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_file(path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(text) = fs::read_to_string(path) {
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            assert!(Instant::now() < deadline, "{} never appeared", path.display());
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn native_test_size() -> PtySize {
+        PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+
+    #[cfg(unix)]
+    fn native_spec(program: &Path, cwd: &Path, args: &[&str]) -> RoomSpec {
+        let mut spec = room_spec(program.to_str().unwrap(), args);
+        spec.native_delivery = true;
+        spec.cwd = Some(cwd.to_path_buf());
+        spec
+    }
+
+    /// Launches one native room through the real launch path and spawns its pane.
+    #[cfg(unix)]
+    fn spawn_native_pane(
+        root: &Path,
+        cwd: &Path,
+        name: &str,
+        args: &[&str],
+        token: &str,
+    ) -> (Pane, native_launch::tests::FakeRoom) {
+        let fake = native_launch::tests::fake_room(root, name, "v2.2.5");
+        let spec = native_spec(&fake.program, cwd, args);
+        let environment = GuestEnvironment::new([("CROWDED_TEST_TOKEN", token.into())]);
+        let room = launch_native_rooms(
+            std::slice::from_ref(&spec),
+            std::slice::from_ref(&environment),
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .unwrap();
+        let pane =
+            Pane::spawn_with_native(spec, native_test_size(), environment, Some(room)).unwrap();
+        (pane, fake)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_terminal_and_server_share_the_room_environment_and_only_the_terminal_gets_arguments()
+    {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut one, fake_one) = spawn_native_pane(
+            root.path(),
+            cwd.path(),
+            "one",
+            &["--model", "provider/alpha"],
+            "token-one",
+        );
+        let (two, fake_two) = spawn_native_pane(
+            root.path(),
+            cwd.path(),
+            "two",
+            &["--model", "provider/beta"],
+            "token-two",
+        );
+
+        for (fake, model, other, token) in [
+            (&fake_one, "provider/alpha", "provider/beta", "token-one"),
+            (&fake_two, "provider/beta", "provider/alpha", "token-two"),
+        ] {
+            let server_config = wait_for_file(&fake.dir.join("config"));
+            let tui_config = wait_for_file(&fake.dir.join("tui_config"));
+            // The agent runs in the server, so the server sees the room's
+            // configuration and model, and exactly what the terminal sees.
+            assert_eq!(server_config, tui_config);
+            assert!(server_config.contains(model), "{server_config}");
+            assert!(!server_config.contains(other), "{server_config}");
+            assert_eq!(wait_for_file(&fake.dir.join("token")), token);
+            assert_eq!(wait_for_file(&fake.dir.join("tui_token")), token);
+            // The password is the server's own and reaches the terminal by environment.
+            let password = wait_for_file(&fake.dir.join("password"));
+            assert_eq!(wait_for_file(&fake.dir.join("tui_password")), password);
+            let argv = wait_for_file(&fake.dir.join("tui_argv"));
+            assert!(argv.starts_with("--server http://127.0.0.1:"));
+            assert!(argv.contains("--session ses_"));
+            assert!(!argv.contains("--standalone"));
+            assert!(!argv.contains("--model"));
+            assert!(!argv.contains(&password));
+            assert_eq!(
+                wait_for_file(&fake.dir.join("argv")),
+                "serve --hostname 127.0.0.1 --port 0"
+            );
+        }
+        // Same directory, different servers and sessions.
+        assert_ne!(
+            wait_for_file(&fake_one.dir.join("pid")),
+            wait_for_file(&fake_two.dir.join("pid"))
+        );
+
+        // The server and its session are created once per launch, so an
+        // in-place relaunch is refused visibly and leaves the room running.
+        let refused = |error: Box<dyn std::error::Error>| {
+            assert!(error.to_string().contains("native delivery rooms cannot"));
+        };
+        refused(one.restart(native_test_size()).err().unwrap());
+        refused(one.clear_context(native_test_size()).err().unwrap());
+        // The refusal happens before the durable fresh-state marker is written.
+        assert!(session_state::lookup("opencode", &one.cwd, &one.spec.title).is_none());
+        refused(one.resume_context(native_test_size()).err().unwrap());
+        refused(
+            one.configure(Some("provider/model"), None, native_test_size())
+                .err()
+                .unwrap(),
+        );
+        assert!(one.is_native());
+        let server_pid = wait_for_file(&fake_one.dir.join("pid"));
+        one.cleanup();
+        drop(one);
+        drop(two);
+        native_launch::wait_for_reaps();
+        assert!(!native_launch::tests::process_alive(&server_pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_native_room_takes_no_automated_terminal_input_but_keeps_human_typing() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut pane, _fake) = spawn_native_pane(root.path(), cwd.path(), "one", &[], "t");
+
+        // Intro, queued delivery, doorbell sends and the manual whisper all end
+        // here, and the Enter resubmit too.
+        assert!(!pane.needs_intro());
+        for error in [
+            pane.send_whisper("Room 2", "hello").unwrap_err(),
+            pane.resend_whisper_submit().unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert_eq!(error.to_string(), NATIVE_PASTE_REFUSED);
+        }
+        let mut mailroom = Mailroom::new(10);
+        let (id, result) = mailroom.deliver("Room 2".to_owned(), &mut pane, "hello".to_owned());
+        assert!(result.is_err());
+        assert!(mailroom.summary().contains("FAILED"), "{id}");
+        assert!(!mailroom.summary().contains("INJECTED"));
+                // The reintroduction key cannot start a guessed session capture.
+        assert!(!pane.begin_session_capture());
+        assert!(!pane.has_captured_session());
+        // A queued envelope for the room is never injected: it fails visibly.
+        let mut mailroom = Mailroom::new(10);
+        let id = mailroom.queue("Room 2".to_owned(), pane.title().to_owned(), "hi".into(), "q");
+        let mut pending = std::collections::VecDeque::from([(id, 0usize)]);
+        let mut gates = vec![DeliveryGate::new(false)];
+        let mut submit = std::collections::VecDeque::new();
+        let pass = run_inject_pass(
+            &mut pending,
+            &mut mailroom,
+            std::slice::from_mut(&mut pane),
+            &mut gates,
+            &[true],
+            &mut submit,
+        );
+        assert_eq!(pass, (0, 1));
+        assert!(submit.is_empty());
+        assert!(!mailroom.summary().contains("INJECTED"));
+        // The person at the keyboard is not affected.
+        pane.write_bytes(b"x").unwrap();
+    }
+
+    /// Every automated entry point against a real PTY child: nothing reaches
+    /// the terminal, and the person's own typing still does.
+    #[cfg(unix)]
+    #[test]
+    fn nothing_automated_reaches_a_native_terminal_but_human_typing_does() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (pane, fake) = spawn_native_pane(root.path(), cwd.path(), "one", &[], "t");
+        wait_for_file(&fake.dir.join("tui_argv"));
+        let mut panes = vec![pane];
+
+        // Intro and F4 reintroduce, manual whisper, Ctrl+W composer and doorbell
+        // delivery all end in send_whisper (through Mailroom::deliver or directly).
+        assert!(panes[0].send_whisper("Room 2", "intro").is_err());
+        let mut mailroom = Mailroom::new(10);
+        let (_, delivered) = mailroom.deliver("Room 2".to_owned(), &mut panes[0], "mail".into());
+        assert!(delivered.is_err());
+        // Queued delivery.
+        let id = mailroom.queue("Room 2".to_owned(), "t".to_owned(), "queued".into(), "q");
+        let mut pending = std::collections::VecDeque::from([(id, 0usize)]);
+        let mut gates = vec![DeliveryGate::new(false)];
+        let mut submit = std::collections::VecDeque::new();
+        run_inject_pass(&mut pending, &mut mailroom, &mut panes, &mut gates, &[true], &mut submit);
+        // A stale Enter resubmit record that is due.
+        let now = Instant::now();
+        let mut stale = std::collections::VecDeque::from([(
+            now - Duration::from_secs(120),
+            0usize,
+            false,
+        )]);
+        crate::app::resend_whisper_submits(&mut stale, &mut panes, &[true], now);
+        assert!(stale.is_empty());
+
+        // None of it reached the terminal; the person's typing does.
+        thread::sleep(Duration::from_millis(500));
+        assert!(!fake.dir.join("tui_stdin").exists());
+        panes[0].write_bytes(b"ok\r").unwrap();
+        assert_eq!(wait_for_file(&fake.dir.join("tui_stdin")), "ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_native_room_ignores_legacy_session_entries() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let fake = native_launch::tests::fake_room(root.path(), "one", "v2.2.5");
+        let spec = native_spec(&fake.program, cwd.path(), &[]);
+        let working = working_directory(spec.cwd.as_deref()).unwrap();
+        // A same-title entry from an earlier, non-native run of this room.
+        session_state::upsert("opencode", &working, &spec.title, "foreign-session");
+        let environment = GuestEnvironment::new([]);
+        let room = launch_native_rooms(
+            std::slice::from_ref(&spec),
+            std::slice::from_ref(&environment),
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        let session = room.binding().session.clone();
+        let pane =
+            Pane::spawn_with_native(spec, native_test_size(), environment, Some(room)).unwrap();
+                assert!(!pane.has_captured_session());
+        assert!(!pane.begin_session_capture());
+        assert!(!pane.has_captured_session());
+        // The legacy entry is untouched and the owned session is not recorded under it.
+        assert_eq!(
+            session_state::lookup("opencode", &pane.cwd, &pane.spec.title).as_deref(),
+            Some("foreign-session")
+        );
+        assert_ne!(session, "foreign-session");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_room_cannot_use_headroom() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let fake = native_launch::tests::fake_room(root.path(), "one", "v2.2.5");
+        let mut spec = native_spec(&fake.program, cwd.path(), &[]);
+        let environment = GuestEnvironment::new([]);
+        let room = launch_native_rooms(
+            std::slice::from_ref(&spec),
+            std::slice::from_ref(&environment),
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        spec.use_headroom = true;
+        let error = Pane::spawn_with_native(spec, native_test_size(), environment, Some(room))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("headroom"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_native_rooms_start_servers_each_launch_is_a_new_generation_and_a_failure_cancels_all() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+
+        // A room without the setting starts nothing and writes no state.
+        let ordinary = room_spec("opencode", &[]);
+        let rooms = launch_native_rooms(
+            std::slice::from_ref(&ordinary),
+            &[GuestEnvironment::new([])],
+        )
+        .unwrap();
+        assert!(rooms[0].is_none());
+        assert!(!session_state::state_directory().exists());
+
+        let good = native_launch::tests::fake_room(root.path(), "good", "v2.2.5");
+        let spec = native_spec(&good.program, cwd.path(), &[]);
+        let environments = [GuestEnvironment::new([]), GuestEnvironment::new([])];
+        let first = launch_native_rooms(&[spec.clone(), ordinary.clone()], &environments)
+            .unwrap();
+        assert_eq!(first[0].as_ref().unwrap().binding().room, "1.1");
+        assert_eq!(first[0].as_ref().unwrap().binding().generation, 1);
+        assert!(first[1].is_none());
+        drop(first);
+        let second = launch_native_rooms(&[ordinary, spec.clone()], &environments).unwrap();
+        assert_eq!(second[1].as_ref().unwrap().binding().room, "2.2");
+        assert_eq!(second[1].as_ref().unwrap().binding().generation, 2);
+        drop(second);
+        native_launch::wait_for_reaps();
+
+        // One room that cannot start is a visible error naming it, and the
+        // servers already started for the others are cleaned up.
+        let old = native_launch::tests::fake_room(root.path(), "old", "v2.1.0");
+        let stale = native_spec(&old.program, cwd.path(), &[]);
+        let error = launch_native_rooms(&[spec, stale], &environments)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("native delivery could not start"));
+        assert!(error.to_string().contains("OpenCode 2.2.5 or newer"));
+        let pid = wait_for_file(&good.dir.join("pid"));
+        native_launch::wait_for_reaps();
+        assert!(!native_launch::tests::process_alive(&pid));
+    }
+
+    /// Runs the real OpenCode TUI against a real owned server in an isolated
+    /// environment; no model call is made.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn isolated_real_tui_attaches_to_the_owned_server() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut spec = native_spec(Path::new("opencode"), cwd.path(), &[]);
+        spec.variables = native_launch::tests::isolated_variables(root.path());
+        let environment = GuestEnvironment::new([]);
+        let room = launch_native_rooms(
+            std::slice::from_ref(&spec),
+            std::slice::from_ref(&environment),
+        )
+        .unwrap()
+        .remove(0)
+        .unwrap();
+        let port = room.tui_arguments()[1]
+            .to_string_lossy()
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .to_owned();
+        let mut pane =
+            Pane::spawn_with_native(spec, native_test_size(), environment, Some(room)).unwrap();
+        // The TUI keeps a connection to the owned server's port.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let connected = loop {
+            let _ = pane.drain_output();
+            let lsof = std::process::Command::new("lsof")
+                .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:ESTABLISHED"])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&lsof.stdout).lines().count() > 1 {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(200));
+        };
+        pane.cleanup();
+        drop(pane);
+        native_launch::wait_for_reaps();
+        assert!(connected, "the TUI never connected to the owned server");
+    }
+
+    #[test]
+    fn resume_runs_native_rooms_fresh_and_hands_the_notice_to_the_run() {
+        let _state = session_state::StateRootGuard::isolated();
+        let mut native = room_spec("opencode", &[]);
+        native.native_delivery = true;
+        let native_title = native.title.clone();
+        let resolved = crate::config::ResolvedConfig {
+            specs: vec![native, room_spec("claude", &[])],
+            fuse_size: 7,
+            token_pricing: Vec::new(),
+        };
+        let mut seen = None;
+        crate::app::resume_with(resolved, |specs, resumed, fuse, _pricing, notice| {
+            seen = Some((specs, resumed, fuse, notice));
+            Ok(())
+        })
+        .unwrap();
+        let (specs, resumed, fuse, notice) = seen.expect("the run was started");
+        assert_eq!(fuse, 7);
+        // The native room is not resumed and keeps its arguments; another is.
+        assert_eq!(resumed, [false, true]);
+        assert!(specs[0].args.is_empty());
+        assert!(!specs[1].args.is_empty());
+        // The user is told, and only about the native room.
+        let notice = notice.expect("the notice reaches the run");
+        let _ = &native_title;
+        assert!(notice.contains("native room 1 "), "{notice}");
+        assert!(!notice.contains('2'), "{notice}");
+        // Without a native room there is nothing to say.
+        let plain = crate::config::ResolvedConfig {
+            specs: vec![room_spec("claude", &[])],
+            fuse_size: 7,
+            token_pricing: Vec::new(),
+        };
+        let mut plain_notice = Some("unset".to_owned());
+        crate::app::resume_with(plain, |_, _, _, _, notice| {
+            plain_notice = notice;
+            Ok(())
+        })
+        .unwrap();
+        assert!(plain_notice.is_none());
+    }
+
+    #[test]
+    fn a_room_supplied_password_is_stripped_before_the_server_sees_the_environment() {
+        let mut spec = room_spec("opencode", &[]);
+        spec.variables = vec![
+            ("OPENCODE_PASSWORD".into(), "from-the-room".into()),
+            ("KEEP_ME".into(), "1".into()),
+        ];
+        let environment = GuestEnvironment::new([
+            ("OPENCODE_PASSWORD", "from-the-doorbell".into()),
+            ("CROWDED_TEST_TOKEN", "t".into()),
+        ]);
+        let variables = native_variables(&spec, &environment).unwrap();
+        assert!(variables.iter().all(|(key, _)| key != "OPENCODE_PASSWORD"));
+        assert!(variables.iter().any(|(key, value)| key == "KEEP_ME" && value == "1"));
+        assert!(
+            variables
+                .iter()
+                .any(|(key, value)| key == "CROWDED_TEST_TOKEN" && value == "t")
+        );
+    }
+
+    #[cfg(unix)]
+    fn spawn_ordinary_pane() -> Pane {
+        Pane::spawn(
+            room_spec("/bin/sh", &["-c", "sleep 20"]),
+            native_test_size(),
+            GuestEnvironment::new([]),
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_decisions_about_native_rooms() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (native, _fake) = spawn_native_pane(root.path(), cwd.path(), "one", &[], "t");
+        let ordinary = spawn_ordinary_pane();
+        let mut offline = scroll_fixture(4, 20);
+        offline.child.child = None;
+        let title = native.title().to_owned();
+        let panes = vec![native, ordinary];
+
+
+
+        // The detail panel reads legacy session entries a native room lacks.
+        assert_eq!(crate::app::rooms_needing_detail(&panes), [1]);
+
+                // Ctrl+W reaches a native room too: it goes through the outbox, not
+        // the terminal, so the composer is allowed.
+        assert_eq!(crate::app::compose_target(&panes, 1), Ok(0));
+        let _ = &title;
+        // From the native room the next room is an online ordinary one.
+        assert_eq!(crate::app::compose_target(&panes, 0), Ok(1));
+        // An offline ordinary room is reported as offline, not as native.
+        let panes = vec![panes.into_iter().next().unwrap(), offline];
+        let error = crate::app::compose_target(&panes, 0).unwrap_err();
+                assert!(error.contains("offline"), "{error}");
+    }
+
+    #[test]
+    fn native_flag_and_owned_server_must_agree() {
+        let mut native = room_spec("opencode", &[]);
+        native.native_delivery = true;
+        let error = Pane::spawn_with_native(
+            native,
+            native_test_size(),
+            GuestEnvironment::new([]),
+            None,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("has no owned server"));
+    }
+
+    #[test]
+    fn native_rooms_are_skipped_by_resume_and_the_user_is_told() {
+        let mut native = room_spec("opencode", &[]);
+        native.native_delivery = true;
+        let ordinary = room_spec("claude", &[]);
+        let mut specs = vec![native, ordinary];
+        let resumed = resume_supported_specs(&mut specs);
+        assert!(!resumed[0]);
+        assert!(specs[0].args.is_empty());
+        let notice = native_resume_notice(&specs).unwrap();
+        assert_eq!(notice, "Resume: native room 1 started a new session");
+        // Every native room is named, by number, in a short line.
+        let mut many: Vec<RoomSpec> = (0..8).map(|_| room_spec("claude", &[])).collect();
+        for index in [1, 4, 7] {
+            many[index].native_delivery = true;
+        }
+        let notice = native_resume_notice(&many).unwrap();
+        assert_eq!(notice, "Resume: native room 2,5,8 started a new session");
+        assert!(notice.len() < 60);
+        assert!(native_resume_notice(&specs[1..]).is_none());
     }
 
     fn arguments(spec: &RoomSpec) -> Vec<String> {
@@ -2228,6 +2985,7 @@ mod tests {
             scroll_offset: 0,
             headroom_active: false,
             _opencode_config: None,
+            native: None,
         }
     }
 

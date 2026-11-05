@@ -209,11 +209,14 @@ dependencies = [
 name = "crowded"
 version = "0.44.1"
 dependencies = [
+ "base64",
  "crossterm",
+ "getrandom 0.4.3",
  "portable-pty",
  "ratatui",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml",
  "toml_edit",

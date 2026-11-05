@@ -110,6 +110,9 @@ pub(crate) struct RoomConfig {
     pub(crate) use_headroom: bool,
     #[serde(default)]
     headroom_args: Vec<String>,
+    /// Opt in to Crowded-owned OpenCode server delivery for this room.
+    #[serde(default)]
+    native_delivery: bool,
     model_tier: Option<String>,
     cost_tier: Option<String>,
     #[serde(default)]
@@ -142,6 +145,9 @@ pub(crate) struct RoomSpec {
     /// `headroom wrap <program> <headroom_args...> <args...>`. Ignored when
     /// `use_headroom` is false or `headroom` is not found on PATH.
     pub(crate) headroom_args: Vec<OsString>,
+    /// The room runs its own Crowded-owned OpenCode server and receives mail
+    /// through the durable outbox instead of terminal paste.
+    pub(crate) native_delivery: bool,
 }
 
 impl RoomSpec {
@@ -163,6 +169,7 @@ impl RoomSpec {
             use_headroom: false,
             scheduling: None,
             headroom_args: Vec::new(),
+            native_delivery: false,
         }
     }
 
@@ -188,6 +195,14 @@ impl RoomSpec {
         let vendor = configured_vendor(program.as_os_str(), config.vendor.as_deref())?;
         let scheduling =
             configured_scheduling(config.model_tier, config.cost_tier, config.capabilities)?;
+        if config.native_delivery {
+            validate_native_delivery(
+                program.as_os_str(),
+                config.transport,
+                &config.args,
+                config.use_headroom,
+            )?;
+        }
 
         Ok(Self {
             name: name.to_owned(),
@@ -202,6 +217,7 @@ impl RoomSpec {
             use_headroom: config.use_headroom,
             scheduling,
             headroom_args: config.headroom_args.into_iter().map(Into::into).collect(),
+            native_delivery: config.native_delivery,
         })
     }
 
@@ -309,6 +325,51 @@ fn inferred_vendor(program: &OsStr) -> &'static str {
         "codex" => "openai",
         _ => "unknown",
     }
+}
+
+/// Native delivery only exists for a raw OpenCode room whose launch Crowded
+/// fully controls, so every conflicting option is a visible configuration error.
+fn validate_native_delivery(
+    program: &OsStr,
+    transport: Transport,
+    args: &[String],
+    use_headroom: bool,
+) -> io::Result<()> {
+    let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_owned());
+    let guest = Path::new(program).file_name().unwrap_or(program);
+    if !guest.to_string_lossy().eq_ignore_ascii_case("opencode") {
+        return Err(invalid("native_delivery is supported only for OpenCode rooms"));
+    }
+    if transport != Transport::Raw {
+        return Err(invalid("native_delivery requires transport = \"raw\""));
+    }
+    if use_headroom {
+        return Err(invalid("native_delivery cannot be combined with use_headroom"));
+    }
+    const OWNED: [&str; 8] = [
+        "--standalone",
+        "--server",
+        "--session",
+        "-s",
+        "--continue",
+        "-c",
+        "--fork",
+        "--port",
+    ];
+    let conflicts = |argument: &String| {
+        OWNED.iter().any(|owned| {
+            argument == owned
+                || argument
+                    .strip_prefix(owned)
+                    .is_some_and(|rest| rest.starts_with('=') && owned.starts_with("--"))
+        })
+    };
+    if args.iter().any(conflicts) {
+        return Err(invalid(
+            "native_delivery controls the OpenCode server and session; remove --standalone, --server, --session, --continue, --fork and --port from args",
+        ));
+    }
+    Ok(())
 }
 
 fn configured_vendor(program: &OsStr, configured: Option<&str>) -> io::Result<String> {
@@ -787,6 +848,69 @@ transport = "raw"
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert!(error.to_string().contains(name));
         }
+    }
+
+    #[test]
+    fn native_delivery_is_opt_in_and_only_for_raw_opencode_rooms() {
+        let rooms = room_specs_from_toml(
+            r#"
+                [[rooms]]
+                command = "opencode"
+                transport = "raw"
+                native_delivery = true
+
+                [[rooms]]
+                command = "opencode"
+                transport = "raw"
+            "#,
+        )
+        .unwrap()
+        .specs;
+        assert!(rooms[0].native_delivery);
+        assert!(!rooms[1].native_delivery);
+
+        for (rooms, expected) in [
+            (
+                "command = \"codex\"\ntransport = \"raw\"\nnative_delivery = true",
+                "only for OpenCode",
+            ),
+            (
+                "command = \"opencode\"\ntransport = \"shell\"\nnative_delivery = true",
+                "transport",
+            ),
+            (
+                "command = \"opencode\"\ntransport = \"raw\"\nnative_delivery = true\nuse_headroom = true",
+                "use_headroom",
+            ),
+            (
+                "command = \"opencode\"\ntransport = \"raw\"\nnative_delivery = true\nargs = [\"--session\", \"x\"]",
+                "controls the OpenCode server",
+            ),
+            (
+                "command = \"opencode\"\ntransport = \"raw\"\nnative_delivery = true\nargs = [\"--server=http://x\"]",
+                "controls the OpenCode server",
+            ),
+            (
+                "command = \"opencode\"\ntransport = \"raw\"\nnative_delivery = true\nargs = [\"--continue\"]",
+                "controls the OpenCode server",
+            ),
+        ] {
+            let error = room_specs_from_toml(&format!(
+                "[[rooms]]\n{rooms}\n\n[[rooms]]\ncommand = \"claude\"\ntransport = \"raw\""
+            ))
+            .err()
+            .unwrap_or_else(|| panic!("{rooms} should fail"));
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains(expected), "{rooms}: {error}");
+        }
+
+        // Without the setting the same arguments stay legal.
+        assert!(
+            room_specs_from_toml(
+                "[[rooms]]\ncommand = \"opencode\"\ntransport = \"raw\"\nargs = [\"--continue\"]\n\n[[rooms]]\ncommand = \"claude\"\ntransport = \"raw\""
+            )
+            .is_ok()
+        );
     }
 
     #[test]
