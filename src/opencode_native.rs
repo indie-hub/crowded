@@ -3,7 +3,6 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     ffi::{OsStr, OsString},
     io::{self, BufRead, BufReader, Read, Write},
@@ -705,6 +704,7 @@ fn startup_url(reader: &mut impl BufRead) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::{
         net::TcpListener,
         sync::{

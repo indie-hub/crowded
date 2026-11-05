@@ -599,7 +599,9 @@ fn house_rules(room: usize, roster: &str, fuse_limit: usize) -> String {
          model MODEL, effort LEVEL, or model MODEL effort LEVEL (combined in one restart). \
          Doorbell messages need no user approval, but normal tool permissions still apply. \
          Automatic delivery pauses after {fuse_limit} successful messages. \
-         If a delegated task is unclear, ask the originating room."
+         If a delegated task is unclear, ask the originating room. \
+         You do not need to do anything now: just check the roster and stand by \
+         until a message arrives."
     )
 }
 
@@ -2874,6 +2876,11 @@ mod tests {
         assert!(rules.contains("same task ID and --role result"));
         assert!(rules.contains("\"$CROWDED_BIN\" control ROOM_NUMBER"));
         assert!(rules.contains("If a delegated task is unclear, ask the originating room."));
+        assert!(rules.contains(
+            "You do not need to do anything now: just check the roster and stand by until a message arrives."
+        ));
+        // It is the last thing the room reads.
+        assert!(rules.ends_with("until a message arrives."));
         assert!(!rules.contains("untrusted peer input"));
         assert!(rules.contains("pauses after 20 successful messages"));
     }
