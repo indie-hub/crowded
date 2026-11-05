@@ -845,9 +845,7 @@ fn pulse_label(
 ) -> String {
     if !pane.is_online() {
         "offline".to_owned()
-        } else if pane.is_native() {
-        "native".to_owned()
-    } else if !pane.needs_intro() {
+    } else if !pane.needs_intro() && !pane.is_native() {
         "terminal".to_owned()
     } else {
         let resolved = roster_state(true, gate, input_ready, pulse.clone(), now);
@@ -3137,6 +3135,18 @@ mod tests {
             "detail-only pulse must not create a sample when none existed"
         );
         assert_eq!(empty_details[0].todos.len(), 1);
+    }
+
+    #[test]
+    fn native_pulse_label_follows_state_not_a_fixed_string() {
+        let source = include_str!("app.rs");
+        let production = &source[..source.find("#[cfg(test)]").unwrap()];
+        // No special case that pins native rooms to a constant label.
+        assert!(!production.contains("\"native\".to_owned()"));
+        // Native rooms reach the shared roster_state path like any other.
+        let fn_body = &production[production.find("fn pulse_label(").unwrap()..];
+        let fn_body = &fn_body[..fn_body.find("\n}\n").unwrap()];
+        assert!(fn_body.contains("roster_state("));
     }
 
     #[test]
