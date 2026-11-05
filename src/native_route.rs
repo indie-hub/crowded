@@ -611,13 +611,13 @@ mod tests {
 
     fn launch(root: &Path, cwd: &Path, name: &str, number: usize, generation: u64) -> Launched {
         let fake = fake_room(root, name, "v2.2.5");
-        let room = native_launch::start(
+        let room = native_launch::start(native_launch::NativeLaunch::direct(
             fake.program.as_os_str(),
             cwd,
             format!("{number}.{generation}"),
             generation,
             &[],
-        )
+        ))
         .unwrap();
         Launched { room, fake }
     }

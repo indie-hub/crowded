@@ -22,6 +22,10 @@ use crate::native_outbox::Binding;
 const MAX_RESPONSE: usize = 128 * 1024;
 const MAX_REQUEST: usize = 128 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// Startup is slower behind a Headroom wrapper (its proxy starts first), so
+/// the first announcement of the server's address gets a wider bound than a
+/// single request.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Delivery {
@@ -150,7 +154,7 @@ impl Client {
             .as_u64()
             .and_then(|pid| u32::try_from(pid).ok())
             .ok_or_else(|| io::Error::other("invalid server identity"))?;
-        if response.status != 200 || reported != child_pid {
+        if response.status != 200 || !owned_by(child_pid, reported) {
             return Err(io::Error::other("server identity mismatch"));
         }
         Ok(reported)
@@ -386,6 +390,75 @@ pub(crate) struct Handoff {
     pub password: String,
 }
 
+/// How long a spawned wrapper gets to forward SIGTERM to its child before it
+/// is killed outright.
+const TERMINATE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The server is ours when it is the process Crowded spawned, or a direct
+/// child of it: `headroom wrap` starts OpenCode as its own child.
+fn owned_by(spawned: u32, reported: u32) -> bool {
+    reported == spawned || process_parent(reported) == Some(spawned)
+}
+
+#[cfg(unix)]
+fn process_parent(pid: u32) -> Option<u32> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+#[cfg(not(unix))]
+fn process_parent(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// Stops the spawned process and, on Unix, gives it a chance to stop its own
+/// children first: a wrapper only forwards the signal while it is alive.
+fn terminate(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let deadline = Instant::now() + TERMINATE_TIMEOUT;
+        while Instant::now() < deadline {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Kills a server the wrapper did not reap. It is only ever the pid the
+/// authenticated server reported and Crowded proved it owns.
+fn stop_process(pid: u32) {
+    #[cfg(unix)]
+    {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if alive {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
 /// Own and drop the server on a background thread because reaping may block.
 pub(crate) struct Server {
     child: Option<Child>,
@@ -393,13 +466,19 @@ pub(crate) struct Server {
     session: String,
     url: String,
     binding: Option<LaunchBinding>,
+    /// The authenticated server's own pid; when it differs from the spawned
+    /// child (a wrapper sits in between), it is stopped explicitly on drop.
+    server_pid: Option<u32>,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let spawned = child.id();
+            terminate(&mut child);
+            if let Some(server) = self.server_pid.filter(|server| *server != spawned) {
+                stop_process(server);
+            }
         }
     }
 }
@@ -441,10 +520,13 @@ impl Server {
             return Err(io::Error::other("server has exited"));
         }
         let reported_pid = self.client.verify_pid(child.id())?;
-        let mut binding = LaunchBinding::new(room, generation, child.id())?;
+        self.server_pid = Some(reported_pid);
+        // The binding identifies the verified server process, which is a
+        // wrapper's child when Headroom launches OpenCode for us.
+        let mut binding = LaunchBinding::new(room, generation, reported_pid)?;
         let result = binding
             .bind(OwnershipEvidence {
-                child_pid: child.id(),
+                child_pid: reported_pid,
                 reported_pid,
                 endpoint: self.client.address,
                 session: self.session.clone(),
@@ -522,7 +604,7 @@ impl Server {
     }
 
     pub(crate) fn start(program: &OsStr, cwd: &Path) -> io::Result<Self> {
-        Self::start_with_environment(program, cwd, &[])
+        Self::start_with_environment(program, &[], cwd, &[])
     }
 
     /// `variables` is the room's effective OpenCode environment (configuration,
@@ -530,16 +612,19 @@ impl Server {
     /// so it can never replace it.
     pub(crate) fn start_with_environment(
         program: &OsStr,
+        prefix: &[OsString],
         cwd: &Path,
         variables: &[(OsString, OsString)],
     ) -> io::Result<Self> {
         let mut random = [0u8; 32];
         getrandom::fill(&mut random).map_err(io::Error::other)?;
         let password = STANDARD.encode(random);
-        let args: Vec<OsString> = ["serve", "--hostname", "127.0.0.1", "--port", "0"]
-            .into_iter()
-            .map(Into::into)
-            .collect();
+        let mut args: Vec<OsString> = prefix.to_vec();
+        args.extend(
+            ["serve", "--hostname", "127.0.0.1", "--port", "0"]
+                .into_iter()
+                .map(Into::into),
+        );
         let resolved = ResolvedCommand::resolve(program, &args, cwd)?;
         // Inherit OpenCode login settings; its descendants can also inherit this password.
         let mut command = resolved.standard();
@@ -567,26 +652,32 @@ impl Server {
             let _ = tx.send(startup_url(&mut reader));
             let _ = io::copy(&mut reader, &mut io::sink());
         });
+        let mut verified = None;
         let result = (|| {
             let url = rx
-                .recv_timeout(TIMEOUT)
+                .recv_timeout(STARTUP_TIMEOUT)
                 .map_err(|_| io::Error::other("server startup timed out"))??;
             let client = Arc::new(Client::new(&url, &password)?);
-            client.verify_pid(child.id())?;
+            let server_pid = client.verify_pid(child.id())?;
+            verified = Some(server_pid);
             let session = client.create_session()?;
-            Ok((client, session, url))
+            Ok((client, session, url, server_pid))
         })();
         match result {
-            Ok((client, session, url)) => Ok(Self {
+            Ok((client, session, url, server_pid)) => Ok(Self {
                 child: Some(child),
                 client,
                 session,
                 url,
                 binding: None,
+                server_pid: Some(server_pid),
             }),
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let spawned = child.id();
+                terminate(&mut child);
+                if let Some(server) = verified.filter(|server| *server != spawned) {
+                    stop_process(server);
+                }
                 Err(error)
             }
         }
@@ -1102,6 +1193,7 @@ mod tests {
             session: "ses_a".into(),
             url: "http://127.0.0.1:1234".into(),
             binding: None,
+            server_pid: None,
         };
         let fake_binding = Binding {
             room: "room".into(),
@@ -1186,6 +1278,7 @@ mod tests {
             session: "ses_a".into(),
             url: "http://127.0.0.1:1234".into(),
             binding: None,
+            server_pid: None,
         };
         let binding = server.claim("room-a".into(), 1).unwrap();
         let server = Arc::new(server);
@@ -1261,6 +1354,7 @@ mod tests {
                 session: "ses_a".into(),
                 url: "http://127.0.0.1:1234".into(),
                 binding: None,
+                server_pid: None,
             };
             let binding = server.claim("room-a".into(), 1).unwrap();
             let mut adapter =
@@ -1344,9 +1438,35 @@ mod tests {
             session: "ses_a".into(),
             url: "http://127.0.0.1:1234".into(),
             binding: None,
+            server_pid: None,
         };
         assert!(server.claim("room".into(), 1).is_err());
         assert!(server.binding.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_accepts_the_spawned_process_or_its_direct_child_only() {
+        let mut wrapper = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(wrapper.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let grandchild: u32 = line.trim().parse().unwrap();
+
+        assert!(owned_by(wrapper.id(), grandchild));
+        assert!(!owned_by(std::process::id(), grandchild));
+        assert!(!owned_by(grandchild, wrapper.id()));
+
+        let _ = wrapper.kill();
+        let _ = wrapper.wait();
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &grandchild.to_string()])
+            .status();
     }
 
     #[cfg(unix)]
@@ -1364,6 +1484,7 @@ mod tests {
             session: "ses_a".into(),
             url: "http://127.0.0.1:1234".into(),
             binding: None,
+            server_pid: None,
         };
         drop(server);
         let status = std::process::Command::new("kill")
@@ -1424,7 +1545,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let variables = crate::native_launch::tests::isolated_variables(root.path());
         let mut server =
-            Server::start_with_environment(OsStr::new("opencode"), cwd.path(), &variables).unwrap();
+            Server::start_with_environment(OsStr::new("opencode"), &[], cwd.path(), &variables).unwrap();
         let binding = server.claim("isolated-room".into(), 1).unwrap();
         assert_eq!(
             server

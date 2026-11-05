@@ -211,16 +211,28 @@ fn split_unix_paths(path: &OsStr) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Resolves an executable against a given PATH, the same lookup the launch
+/// itself performs. An absolute or relative path is used as it is.
+pub(crate) fn program_on_path(
+    program: &OsStr,
+    path: Option<&OsStr>,
+    path_ext: Option<&OsStr>,
+) -> io::Result<PathBuf> {
+    let program = Path::new(program);
+    if cfg!(windows) {
+        resolve_windows(program, Path::new("."), path, path_ext)
+    } else if program.components().count() > 1 {
+        Ok(program.to_path_buf())
+    } else {
+        resolve_unix(program, path)
+    }
+}
+
 /// Whether the `headroom` wrapper binary is installed on the given PATH.
 /// Mirrors the launch-time lookup (`resolve_windows` for Windows, the new
 /// `resolve_unix` scan for Unix) without spawning a subprocess.
 pub(crate) fn headroom_on_path(path: Option<&OsStr>, path_ext: Option<&OsStr>) -> bool {
-    let program = Path::new("headroom");
-    if cfg!(windows) {
-        resolve_windows(program, Path::new("."), path, path_ext).is_ok()
-    } else {
-        resolve_unix(program, path).is_ok()
-    }
+    program_on_path(OsStr::new("headroom"), path, path_ext).is_ok()
 }
 
 #[cfg(windows)]

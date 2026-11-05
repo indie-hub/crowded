@@ -170,6 +170,34 @@ fn headroom_launch(
     }
 }
 
+/// The process that runs a native room's owned server: OpenCode itself, or the
+/// Headroom wrapper around it. `headroom wrap` takes the tool name, then its
+/// own flags; the server arguments follow and reach OpenCode unchanged.
+fn native_server_command(spec: &RoomSpec, headroom: bool) -> (OsString, Vec<OsString>) {
+    if !headroom {
+        return (spec.program.clone(), Vec::new());
+    }
+    // Resolve against the room's PATH: the spawned process would otherwise be
+    // found through Crowded's own environment instead of the room's.
+    let path = environment_value(&spec.variables, "PATH");
+    let path_ext = environment_value(&spec.variables, "PATHEXT");
+    let wrapper = crate::command::program_on_path(
+        OsStr::new("headroom"),
+        path.as_deref(),
+        path_ext.as_deref(),
+    )
+    .map(PathBuf::into_os_string)
+    .unwrap_or_else(|_| OsString::from("headroom"));
+    let mut prefix = Vec::with_capacity(spec.headroom_args.len() + 3);
+    prefix.push(OsString::from("wrap"));
+    prefix.push(spec.program.clone());
+    prefix.extend(spec.headroom_args.iter().cloned());
+    // Without the separator Headroom's own click parser would consume the
+    // server's `--port 0` (a colliding option) instead of passing it on.
+    prefix.push(OsString::from("--"));
+    (wrapper, prefix)
+}
+
 /// Whether a room's launch is wrapped through `headroom`, decided from the
 /// spec alone (the same PATH/PATHEXT resolution and binary check that
 /// `Pane::spawn` performs). The startup lane needs this decision before a
@@ -694,17 +722,29 @@ pub(crate) fn launch_native_rooms(
             .get_or_insert_with(|| GenerationAllocator::new(session_state::state_directory()));
         let launch = (|| {
             let cwd = working_directory(spec.cwd.as_deref())?;
-            let variables = native_variables(spec, environment)?;
+            let mut variables = native_variables(spec, environment)?;
             let generation = allocator.next()?;
-            Ok(native_launch::begin(
-                spec.program.clone(),
-                                cwd,
+            let headroom = spec_uses_headroom(spec);
+            let (program, prefix) = native_server_command(spec, headroom);
+            // Headroom replaces the inline configuration of the process it
+            // wraps, so the server reads the room's document from a file.
+            let config = if headroom {
+                write_opencode_config(&mut variables, spec.cwd.as_deref())?
+            } else {
+                None
+            };
+            Ok(native_launch::begin(native_launch::NativeLaunch {
+                guest: spec.program.clone(),
+                program,
+                prefix,
+                cwd,
                 // The generation is part of the lane, so mail for an earlier
                 // launch of this room can never block or reach the new one.
-                format!("{}.{generation}", index + 1),
+                room: format!("{}.{generation}", index + 1),
                 generation,
                 variables,
-            ))
+                config,
+            }))
         })()
         .map_err(|error| named(spec, error))?;
         launches.push(Some(launch));
@@ -736,7 +776,16 @@ fn opencode_wrapped_config(
     {
         return Ok(None);
     }
-    let Some(content) = environment_value(&guest.variables, "OPENCODE_CONFIG_CONTENT") else {
+    write_opencode_config(&mut guest.variables, guest.cwd.as_deref())
+}
+
+/// Headroom replaces `OPENCODE_CONFIG_CONTENT` with its own, so the room's
+/// document is written to a private file that survives the wrapper.
+fn write_opencode_config(
+    variables: &mut Vec<(OsString, OsString)>,
+    cwd: Option<&Path>,
+) -> io::Result<Option<tempfile::NamedTempFile>> {
+    let Some(content) = environment_value(variables, "OPENCODE_CONFIG_CONTENT") else {
         return Ok(None);
     };
     let mut room: serde_json::Value = serde_json::from_str(&content.to_string_lossy())
@@ -749,13 +798,13 @@ fn opencode_wrapped_config(
     })?;
     values.retain(|key, _| matches!(key.as_str(), "model" | "mcp"));
     let mut config_directory = None;
-    let content = match environment_value(&guest.variables, "OPENCODE_CONFIG") {
+    let content = match environment_value(variables, "OPENCODE_CONFIG") {
         Some(path) => {
             let path = PathBuf::from(path);
             let path = if path.is_absolute() {
                 path
             } else {
-                working_directory(guest.cwd.as_deref())?.join(path)
+                working_directory(cwd)?.join(path)
             };
             let original = std::fs::read_to_string(&path).map_err(|error| {
                 io::Error::new(
@@ -794,10 +843,8 @@ fn opencode_wrapped_config(
     };
     file.write_all(content.as_bytes())?;
     file.flush()?;
-    guest.variables.retain(|(key, _)| key != "OPENCODE_CONFIG");
-    guest
-        .variables
-        .push(("OPENCODE_CONFIG".into(), file.path().as_os_str().into()));
+    variables.retain(|(key, _)| key != "OPENCODE_CONFIG");
+    variables.push(("OPENCODE_CONFIG".into(), file.path().as_os_str().into()));
     Ok(Some(file))
 }
 
@@ -1031,9 +1078,9 @@ impl Pane {
             })
             .into());
         }
-        if native.is_some() && spec.use_headroom {
-            return Err(io::Error::other("native delivery cannot use headroom").into());
-        }
+        // A native room's agent runs in its owned server, not in this TUI:
+        // the server is wrapped, and the terminal only attaches to it.
+        let native_room = native.is_some();
         // A PTY has two ends: the child receives the slave; we keep the master.
         let pty = native_pty_system().openpty(size)?;
         // portable-pty defaults an omitted cwd to HOME rather than inheriting
@@ -1045,15 +1092,20 @@ impl Pane {
         }
         let path = environment_value(&guest.variables, "PATH");
         let path_ext = environment_value(&guest.variables, "PATHEXT");
-        let (program, args, headroom_active) = headroom_launch(
+        let (program, args, tui_headroom) = headroom_launch(
             &spec.program,
             &guest.args,
-            spec.use_headroom,
+            spec.use_headroom && !native_room,
             &spec.headroom_args,
             &path,
             &path_ext,
         );
-        let opencode_config = opencode_wrapped_config(&mut guest, headroom_active)?;
+        let headroom_active = if native_room {
+            spec_uses_headroom(&spec)
+        } else {
+            tui_headroom
+        };
+        let opencode_config = opencode_wrapped_config(&mut guest, tui_headroom)?;
         let launch =
             ResolvedCommand::resolve_with_environment(&program, &args, &cwd, path, path_ext)?
                 .portable()?;
@@ -1805,12 +1857,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_room_cannot_use_headroom() {
+    fn native_room_starts_its_owned_server_through_headroom() {
+        use std::os::unix::fs::PermissionsExt;
         let _state = session_state::StateRootGuard::isolated();
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let fake = native_launch::tests::fake_room(root.path(), "one", "v2.2.5");
-        let mut spec = native_spec(&fake.program, cwd.path(), &[]);
+        let bin = temporary_bin_directory();
+        let wrapper = bin.join("headroom");
+        fs::write(
+            &wrapper,
+            "#!/bin/sh\n[ \"$1\" = \"wrap\" ] && shift\nprog=\"$1\"; shift\nwhile [ \"${1#--}\" != \"$1\" ]; do shift; done\nexec \"$prog\" \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut spec = native_spec(&fake.program, cwd.path(), &["--model", "opencode-go/mimo-v2.5"]);
+        spec.use_headroom = true;
+        spec.headroom_args = vec!["--no-serena".into()];
+        spec.variables.push((
+            "PATH".into(),
+            format!("{}:{}", bin.display(), env::var("PATH").unwrap_or_default()).into(),
+        ));
         let environment = GuestEnvironment::new([]);
         let room = launch_native_rooms(
             std::slice::from_ref(&spec),
@@ -1819,11 +1887,35 @@ mod tests {
         .unwrap()
         .remove(0)
         .unwrap();
-        spec.use_headroom = true;
-        let error = Pane::spawn_with_native(spec, native_test_size(), environment, Some(room))
-            .err()
+        // The wrapper passed the server arguments through unchanged.
+        assert_eq!(
+            fs::read_to_string(fake.dir.join("argv")).unwrap(),
+            "serve --hostname 127.0.0.1 --port 0"
+        );
+        // Headroom replaces the inline config, so the room document is a file.
+        let config_path = fs::read_to_string(fake.dir.join("config_path")).unwrap();
+        assert!(!config_path.is_empty());
+        assert!(
+            fs::read_to_string(&config_path).unwrap().contains("opencode-go/mimo-v2.5"),
+            "the wrapped server reads the room config from {config_path}"
+        );
+        let pane = Pane::spawn_with_native(spec, native_test_size(), environment, Some(room))
             .unwrap();
-        assert!(error.to_string().contains("headroom"));
+        assert!(pane.headroom_active());
+        // The TUI only attaches; it is not wrapped a second time.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let tui = loop {
+            if let Ok(text) = fs::read_to_string(fake.dir.join("tui_argv")) {
+                break text;
+            }
+            assert!(Instant::now() < deadline, "the TUI never started");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(tui.starts_with("--server "), "{tui}");
+        assert!(!tui.contains("wrap"), "{tui}");
+        drop(pane);
+        native_launch::wait_for_reaps();
+        fs::remove_dir_all(bin).unwrap();
     }
 
     #[cfg(unix)]
@@ -2439,6 +2531,21 @@ mod tests {
                 .contains("opencode-go/mimo-v2.5")
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_server_command_wraps_the_server_only_when_headroom_is_active() {
+        let mut spec = room_spec("opencode", &[]);
+        spec.headroom_args = vec!["--no-serena".into()];
+        let (program, prefix) = native_server_command(&spec, false);
+        assert_eq!(program, OsString::from("opencode"));
+        assert!(prefix.is_empty());
+        let (program, prefix) = native_server_command(&spec, true);
+        assert_eq!(Path::new(&program).file_name().unwrap(), "headroom");
+        assert_eq!(
+            prefix,
+            ["wrap", "opencode", "--no-serena", "--"].map(OsString::from)
+        );
     }
 
     fn temporary_bin_directory() -> PathBuf {

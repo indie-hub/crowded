@@ -343,8 +343,12 @@ fn validate_native_delivery(
     if transport != Transport::Raw {
         return Err(invalid("native_delivery requires transport = \"raw\""));
     }
-    if use_headroom {
-        return Err(invalid("native_delivery cannot be combined with use_headroom"));
+    // The wrapped server is owned by proving it is the wrapper's direct child;
+    // that check is not implemented on Windows.
+    if use_headroom && cfg!(windows) {
+        return Err(invalid(
+            "native_delivery with use_headroom is not supported on Windows",
+        ));
     }
     const OWNED: [&str; 8] = [
         "--standalone",
@@ -869,6 +873,20 @@ transport = "raw"
         assert!(rooms[0].native_delivery);
         assert!(!rooms[1].native_delivery);
 
+        // Headroom is allowed in a native room wherever the wrapped server's
+        // parent can be checked.
+        let headroom = "[[rooms]]\ncommand = \"opencode\"\ntransport = \"raw\"\nnative_delivery = true\nuse_headroom = true\n\n[[rooms]]\ncommand = \"claude\"\ntransport = \"raw\"";
+        #[cfg(unix)]
+        {
+            let rooms = room_specs_from_toml(headroom).unwrap().specs;
+            assert!(rooms[0].native_delivery && rooms[0].use_headroom);
+        }
+        #[cfg(not(unix))]
+        {
+            let error = room_specs_from_toml(headroom).unwrap_err();
+            assert!(error.to_string().contains("Windows"), "{error}");
+        }
+
         for (rooms, expected) in [
             (
                 "command = \"codex\"\ntransport = \"raw\"\nnative_delivery = true",
@@ -877,10 +895,6 @@ transport = "raw"
             (
                 "command = \"opencode\"\ntransport = \"shell\"\nnative_delivery = true",
                 "transport",
-            ),
-            (
-                "command = \"opencode\"\ntransport = \"raw\"\nnative_delivery = true\nuse_headroom = true",
-                "use_headroom",
             ),
             (
                 "command = \"opencode\"\ntransport = \"raw\"\nnative_delivery = true\nargs = [\"--session\", \"x\"]",

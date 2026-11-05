@@ -122,13 +122,31 @@ read it and call the owned server directly; treat a native room's agent as
 trusted with its own server.
 
 The setting needs `transport = "raw"` and cannot be combined with
-`use_headroom`, `--standalone`, `--server`, `--session`, `--continue`, `--fork`
-or `--port`. The server gets the same OpenCode environment as the terminal (the
-room's configuration, model override and Crowded's hook variables), because the
-server is what runs the agent. Servers start in parallel before Crowded takes
-over the screen, so a slow start shows a one-line message instead of a frozen
-terminal. A native room that cannot start its server stops Crowded at startup
-with an error; it never falls back to another launch path.
+`--standalone`, `--server`, `--session`, `--continue`, `--fork` or `--port`.
+The server gets the same OpenCode environment as the terminal (the room's
+configuration, model override and Crowded's hook variables), because the server
+is what runs the agent. Servers start in parallel before Crowded takes over the
+screen, so a slow start shows a one-line message instead of a frozen terminal. A
+native room that cannot start its server stops Crowded at startup with an error;
+it never falls back to another launch path.
+
+`native_delivery` can also use `use_headroom = true`. Crowded then runs the
+owned server as `headroom wrap opencode <headroom_args> serve --hostname
+127.0.0.1 --port 0`, so the agent's model traffic goes through Headroom; the
+terminal only attaches to that server and is not wrapped a second time. Headroom
+rewrites the OpenCode configuration file it is given (it adds its provider and a
+`.headroom-backup` file), exactly as it already does for other Headroom rooms, so
+the room's own configuration is handed to it as a private file. Crowded still
+verifies the server: the authenticated `/api/info` must report a loopback
+server, and its pid must be the process Crowded spawned or its direct child (the
+wrapper is the parent in that case). This combination is refused on Windows,
+where the parent of the reported pid cannot be checked.
+
+When a Headroom native room stops, Crowded sends SIGTERM to the wrapper (which
+stops OpenCode) and then stops the server pid if it survived; the Headroom proxy
+is deliberately left running because later Headroom rooms reuse it. As with
+SIGKILL on Crowded itself, a hard kill of a wrapper can leave its OpenCode server
+behind.
 
 Mail to a native room never goes to its terminal. The intro, doorbell mail,
 Ctrl+W messages and F4 reintroductions are saved first in

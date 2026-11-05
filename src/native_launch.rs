@@ -212,11 +212,53 @@ pub(crate) fn wait_for_reaps() {
     }
 }
 
+/// One room's launch: what to spawn, what to verify, and the private config
+/// that must outlive the server.
+pub(crate) struct NativeLaunch {
+    /// The OpenCode binary whose version and environment Crowded verifies.
+    pub(crate) guest: OsString,
+    /// The process Crowded spawns: OpenCode itself or its Headroom wrapper.
+    pub(crate) program: OsString,
+    /// Arguments before the fixed `serve --hostname 127.0.0.1 --port 0`.
+    pub(crate) prefix: Vec<OsString>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) room: String,
+    pub(crate) generation: u64,
+    pub(crate) variables: Variables,
+    /// Headroom replaces the inline OpenCode configuration, so the room's own
+    /// document is a file the server keeps referring to.
+    pub(crate) config: Option<tempfile::NamedTempFile>,
+}
+
+impl NativeLaunch {
+    /// The guest itself, with no wrapper; used by tests and direct launches.
+    pub(crate) fn direct(
+        program: &OsStr,
+        cwd: impl Into<PathBuf>,
+        room: String,
+        generation: u64,
+        variables: &[(OsString, OsString)],
+    ) -> Self {
+        Self {
+            guest: program.to_os_string(),
+            program: program.to_os_string(),
+            prefix: Vec::new(),
+            cwd: cwd.into(),
+            room,
+            generation,
+            variables: variables.to_vec(),
+            config: None,
+        }
+    }
+}
+
 /// One room's owned server, its exact binding, and the credentials its TUI needs.
 pub(crate) struct NativeRoom {
     server: Reaped<Arc<Server>>,
     binding: Binding,
     handoff: Handoff,
+    /// Kept alive for as long as the server can read it.
+    _config: Option<tempfile::NamedTempFile>,
 }
 
 impl NativeRoom {
@@ -253,35 +295,30 @@ pub(crate) type Variables = Vec<(OsString, OsString)>;
 /// Starts the owned server, proves it is the child, creates the session and
 /// binds it to this launch generation. Blocks; callers on a thread that must
 /// stay responsive use [`begin`].
-pub(crate) fn start(
-    program: &OsStr,
-    cwd: &Path,
-    room: String,
-    generation: u64,
-    variables: &[(OsString, OsString)],
-) -> io::Result<NativeRoom> {
-    start_cancellable(program, cwd, room, generation, variables, &AtomicBool::new(false))
+pub(crate) fn start(launch: NativeLaunch) -> io::Result<NativeRoom> {
+    start_cancellable(launch, &AtomicBool::new(false))
 }
 
 fn start_cancellable(
-    program: &OsStr,
-    cwd: &Path,
-    room: String,
-    generation: u64,
-    variables: &[(OsString, OsString)],
+    launch: NativeLaunch,
     cancelled: &AtomicBool,
 ) -> io::Result<NativeRoom> {
-        ensure_reaper()?;
-    check_version(program, cwd, variables, VERSION_TIMEOUT)?;
+    ensure_reaper()?;
+    check_version(&launch.guest, &launch.cwd, &launch.variables, VERSION_TIMEOUT)?;
     // The version check can be slow; do not start a server nobody waits for.
     if cancelled.load(Ordering::SeqCst) {
         return Err(io::Error::other("native launch was cancelled"));
     }
-        // A launch abandoned from here on still ends cleanly: its result has no
+    // A launch abandoned from here on still ends cleanly: its result has no
     // receiver, so the server it owns is handed to the reaper.
-    let mut server = Server::start_with_environment(program, cwd, variables)?;
+    let mut server = Server::start_with_environment(
+        &launch.program,
+        &launch.prefix,
+        &launch.cwd,
+        &launch.variables,
+    )?;
     // Binding needs exclusive access, so it happens before the server is shared.
-    let binding = server.claim(room, generation)?;
+    let binding = server.claim(launch.room, launch.generation)?;
     // A delivered message is meant to be acted on, not just stored.
     server.resume_turns()?;
     let handoff = server.handoff()?;
@@ -289,6 +326,7 @@ fn start_cancellable(
         server: Reaped::new(Arc::new(server)),
         binding,
         handoff,
+        _config: launch.config,
     })
 }
 
@@ -316,13 +354,7 @@ impl Drop for Launch {
 }
 
 /// Starts a launch on a tracked worker, so exit can join it.
-pub(crate) fn begin(
-    program: OsString,
-    cwd: PathBuf,
-    room: String,
-    generation: u64,
-    variables: Variables,
-) -> Launch {
+pub(crate) fn begin(launch: NativeLaunch) -> Launch {
     let (sender, receiver) = mpsc::sync_channel(1);
     let cancelled = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&cancelled);
@@ -334,9 +366,7 @@ pub(crate) fn begin(
             // Dropped last, after the result and any server it still owns have
             // been handed on, so waiting for no active launches is enough.
             let _active = active;
-            let _ = sender.send(start_cancellable(
-                &program, &cwd, room, generation, &variables, &flag,
-            ));
+            let _ = sender.send(start_cancellable(launch, &flag));
         });
     if let Err(error) = spawned {
         // The closure, and the registration it owned, are gone with the error.
@@ -701,7 +731,7 @@ pub(crate) mod tests {
         fs::write(
             &program,
             format!(
-                "#!/bin/sh\ncase \"$1\" in\n--version) printf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{dir}/version_config'; printf '%s' \"$PWD\" > '{dir}/version_pwd'; sleep {version_delay}; echo {version}; exit 0;;\nserve) ;;\n*)\nprintf '%s' \"$*\" > '{dir}/tui_argv'\nprintf '%s' \"$OPENCODE_PASSWORD\" > '{dir}/tui_password'\nprintf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{dir}/tui_config'\nprintf '%s' \"$CROWDED_TEST_TOKEN\" > '{dir}/tui_token'\nIFS= read -r line\nprintf '%s' \"$line\" > '{dir}/tui_stdin'\nexec sleep 30;;\nesac\nprintf '%s' \"$$\" > '{dir}/pid'\nprintf '%s' \"$OPENCODE_PASSWORD\" > '{dir}/password'\nprintf '%s' \"$HOME\" > '{dir}/home'\nprintf '%s' \"$PWD\" > '{dir}/pwd'\nprintf '%s' \"$*\" > '{dir}/argv'\nprintf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{dir}/config'\nprintf '%s' \"$CROWDED_TEST_TOKEN\" > '{dir}/token'\nsleep {delay}\nprintf 'server listening on http://{address}\\n'\nexec sleep 30\n",
+                "#!/bin/sh\ncase \"$1\" in\n--version) printf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{dir}/version_config'; printf '%s' \"$PWD\" > '{dir}/version_pwd'; sleep {version_delay}; echo {version}; exit 0;;\nserve) ;;\n*)\nprintf '%s' \"$*\" > '{dir}/tui_argv'\nprintf '%s' \"$OPENCODE_PASSWORD\" > '{dir}/tui_password'\nprintf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{dir}/tui_config'\nprintf '%s' \"$CROWDED_TEST_TOKEN\" > '{dir}/tui_token'\nIFS= read -r line\nprintf '%s' \"$line\" > '{dir}/tui_stdin'\nexec sleep 30;;\nesac\nprintf '%s' \"$$\" > '{dir}/pid'\nprintf '%s' \"$OPENCODE_PASSWORD\" > '{dir}/password'\nprintf '%s' \"$HOME\" > '{dir}/home'\nprintf '%s' \"$PWD\" > '{dir}/pwd'\nprintf '%s' \"$*\" > '{dir}/argv'\nprintf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{dir}/config'\nprintf '%s' \"$OPENCODE_CONFIG\" > '{dir}/config_path'\nprintf '%s' \"$CROWDED_TEST_TOKEN\" > '{dir}/token'\nsleep {delay}\nprintf 'server listening on http://{address}\\n'\nexec sleep 30\n",
                 dir = dir.display()
             ),
         )
@@ -733,8 +763,8 @@ pub(crate) mod tests {
         let shared = tempfile::tempdir().unwrap();
         let a = fake_room(root.path(), "a", "v2.2.5");
         let b = fake_room(root.path(), "b", "v2.2.5");
-        let room_a = start(a.program.as_os_str(), shared.path(), "1".into(), 1, &[]).unwrap();
-        let room_b = start(b.program.as_os_str(), shared.path(), "2".into(), 2, &[]).unwrap();
+        let room_a = start(NativeLaunch::direct(a.program.as_os_str(), shared.path(), "1".into(), 1, &[])).unwrap();
+        let room_b = start(NativeLaunch::direct(b.program.as_os_str(), shared.path(), "2".into(), 2, &[])).unwrap();
 
         assert_ne!(room_a.binding().session, room_b.binding().session);
         assert_ne!(room_a.binding().endpoint, room_b.binding().endpoint);
@@ -786,7 +816,7 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let fake = fake_room(root.path(), "a", "v2.2.5");
-        let room = start(fake.program.as_os_str(), cwd.path(), "1".into(), 1, &[]).unwrap();
+        let room = start(NativeLaunch::direct(fake.program.as_os_str(), cwd.path(), "1".into(), 1, &[])).unwrap();
 
         let password = fs::read_to_string(fake.dir.join("password")).unwrap();
         assert!(!password.is_empty());
@@ -843,7 +873,7 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let variables = isolated_variables(root.path());
-        let room = start(OsStr::new("opencode"), cwd.path(), "1".into(), 1, &variables).unwrap();
+        let room = start(NativeLaunch::direct(OsStr::new("opencode"), cwd.path(), "1".into(), 1, &variables)).unwrap();
         assert_eq!(room.binding().generation, 1);
         assert_eq!(room.tui_arguments().len(), 4);
         let server = room.server();
@@ -884,7 +914,7 @@ pub(crate) mod tests {
             ("banana", "could not read the OpenCode version"),
         ] {
             let fake = fake_room(root.path(), version, version);
-            let error = start(fake.program.as_os_str(), cwd.path(), "1".into(), 1, &[])
+            let error = start(NativeLaunch::direct(fake.program.as_os_str(), cwd.path(), "1".into(), 1, &[]))
                 .err()
                 .expect("must refuse");
             assert!(error.to_string().contains(expected), "{error}");
@@ -907,7 +937,7 @@ pub(crate) mod tests {
             script.replace("printf '%s' \"$$\"", "printf '%s' \"1\""),
         )
         .unwrap();
-        let error = start(fake.program.as_os_str(), cwd.path(), "1".into(), 1, &[])
+        let error = start(NativeLaunch::direct(fake.program.as_os_str(), cwd.path(), "1".into(), 1, &[]))
             .err()
             .expect("must refuse");
         assert!(error.to_string().contains("identity"), "{error}");
@@ -928,8 +958,8 @@ pub(crate) mod tests {
                 ("OPENCODE_PASSWORD".into(), "attacker".into()),
             ]
         };
-        let room_a = start(a.program.as_os_str(), cwd.path(), "1".into(), 1, &variables("one")).unwrap();
-        let room_b = start(b.program.as_os_str(), cwd.path(), "2".into(), 2, &variables("two")).unwrap();
+        let room_a = start(NativeLaunch::direct(a.program.as_os_str(), cwd.path(), "1".into(), 1, &variables("one"))).unwrap();
+        let room_b = start(NativeLaunch::direct(b.program.as_os_str(), cwd.path(), "2".into(), 2, &variables("two"))).unwrap();
         assert_eq!(fs::read_to_string(a.dir.join("config")).unwrap(), "one");
         assert_eq!(fs::read_to_string(b.dir.join("config")).unwrap(), "two");
         assert_eq!(fs::read_to_string(a.dir.join("token")).unwrap(), "token-one");
@@ -948,13 +978,13 @@ pub(crate) mod tests {
         let cwd = tempfile::tempdir().unwrap();
         // The stand-in takes 2 s to announce its server.
         let fake = fake_room_with_delay(root.path(), "slow", "v2.2.5", 2);
-        let launch = begin(
-            fake.program.clone().into_os_string(),
-            cwd.path().to_path_buf(),
+        let launch = begin(NativeLaunch::direct(
+            fake.program.as_os_str(),
+            cwd.path(),
             "1".into(),
             1,
-            Vec::new(),
-        );
+            &[],
+        ));
         // Once the stand-in is running but still silent, the caller gives up.
         let pid = wait_for_pid_file(&fake.dir.join("pid"));
         let error = launch.wait(Duration::from_millis(50)).err().unwrap();
@@ -970,17 +1000,86 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let fake = fake_room_with_delay(root.path(), "slow", "v2.2.5", 1);
-        let launch = begin(
-            fake.program.clone().into_os_string(),
-            cwd.path().to_path_buf(),
+        let launch = begin(NativeLaunch::direct(
+            fake.program.as_os_str(),
+            cwd.path(),
             "1".into(),
             1,
-            Vec::new(),
-        );
+            &[],
+        ));
         let pid = wait_for_pid_file(&fake.dir.join("pid"));
         drop(launch);
         wait_for_reaps();
         assert!(!process_alive(&pid));
+    }
+
+    /// A stand-in `headroom wrap`: runs the wrapped program as its own child,
+    /// like the real wrapper, and either forwards SIGTERM or ignores it.
+    #[cfg(unix)]
+    fn wrapper_binary(root: &Path, name: &str, forward_term: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let program = root.join(name);
+        let signal = if forward_term {
+            "trap 'kill -TERM $child 2>/dev/null; wait $child; exit 0' TERM"
+        } else {
+            "trap '' TERM"
+        };
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = \"wrap\" ] && shift\nprog=\"$1\"; shift\n\"$prog\" \"$@\" &\nchild=$!\n{signal}\nwait $child\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        program
+    }
+
+    #[cfg(unix)]
+    fn wrapped_launch(fake: &FakeRoom, wrapper: &Path, cwd: &Path) -> NativeLaunch {
+        NativeLaunch {
+            guest: fake.program.clone().into_os_string(),
+            program: wrapper.as_os_str().to_os_string(),
+            prefix: vec![OsString::from("wrap"), fake.program.clone().into_os_string()],
+            cwd: cwd.to_path_buf(),
+            room: "1".into(),
+            generation: 1,
+            variables: Vec::new(),
+            config: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapped_server_is_owned_when_it_is_the_wrappers_direct_child() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let fake = fake_room(root.path(), "wrapped", "v2.2.5");
+        let wrapper = wrapper_binary(root.path(), "headroom", true);
+
+        let room = start(wrapped_launch(&fake, &wrapper, cwd.path())).unwrap();
+        assert_eq!(room.binding().session, "ses_wrapped");
+        let server = fs::read_to_string(fake.dir.join("pid")).unwrap();
+
+        drop(room);
+        wait_for_reaps();
+        assert!(!process_alive(&server), "the wrapper's server is reaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapper_that_never_forwards_sigterm_still_has_its_server_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let fake = fake_room(root.path(), "stubborn", "v2.2.5");
+        let wrapper = wrapper_binary(root.path(), "headroom", false);
+
+        let room = start(wrapped_launch(&fake, &wrapper, cwd.path())).unwrap();
+        let server = fs::read_to_string(fake.dir.join("pid")).unwrap();
+
+        drop(room);
+        wait_for_reaps();
+        assert!(!process_alive(&server), "the verified server pid is stopped");
     }
 
     #[cfg(unix)]
@@ -1014,7 +1113,7 @@ pub(crate) mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let fake = fake_room(root.path(), "a", "v2.2.5");
         let variables: Variables = vec![("OPENCODE_CONFIG_CONTENT".into(), "room-config".into())];
-        let _room = start(fake.program.as_os_str(), cwd.path(), "1.1".into(), 1, &variables).unwrap();
+        let _room = start(NativeLaunch::direct(fake.program.as_os_str(), cwd.path(), "1.1".into(), 1, &variables)).unwrap();
         let expected = cwd.path().to_str().unwrap();
         assert_eq!(fs::read_to_string(fake.dir.join("version_config")).unwrap(), "room-config");
         assert_eq!(fs::read_to_string(fake.dir.join("config")).unwrap(), "room-config");
@@ -1028,13 +1127,13 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let fake = fake_room_with_delays(root.path(), "slow-version", "v2.2.5", 1, 0);
-        let launch = begin(
-            fake.program.clone().into_os_string(),
-            cwd.path().to_path_buf(),
+        let launch = begin(NativeLaunch::direct(
+            fake.program.as_os_str(),
+            cwd.path(),
             "1".into(),
             1,
-            Vec::new(),
-        );
+            &[],
+        ));
         drop(launch);
         wait_for_reaps();
         assert!(!fake.dir.join("pid").exists(), "serve must not have run");
