@@ -45,6 +45,9 @@ enum Vendor {
 enum NativeTarget {
     Mcp(Vendor),
     Hooks(Vendor),
+    /// Crowded's own OpenCode TUI plugin directory entry. Tracked per file so
+    /// the existing refuse-to-overwrite, remove and resync handling applies.
+    OpenCodeTui,
 }
 
 enum Removal {
@@ -344,10 +347,14 @@ fn remove(root: &Path) -> io::Result<usize> {
                 } else {
                     fs::remove_file(&file.path)?;
                     remove_empty_codex_directory(&file.path)?;
+                    remove_empty_opencode_plugin_directory(&file.path)?;
                 }
             }
             Removal::RewriteJson(contents) => fs::write(&file.path, contents)?,
-            Removal::Delete => fs::remove_file(&file.path)?,
+            Removal::Delete => {
+                fs::remove_file(&file.path)?;
+                remove_empty_opencode_plugin_directory(&file.path)?;
+            }
         }
     }
 
@@ -634,6 +641,7 @@ fn owned_array_entries(file: &ManagedFile, section: &str) -> io::Result<Vec<Valu
 
 fn build_plan(root: &Path, force: bool) -> io::Result<ToolboxState> {
     let state_path = root.join(STATE_FILE);
+    let mut orphan_removals: Vec<(usize, Removal)> = Vec::new();
     let old_state = if state_path.try_exists()? {
         // Allow re-sync when the state is stale (e.g. rooms added after last sync).
         // Otherwise require explicit `toolbox remove` to avoid clobbering,
@@ -679,9 +687,10 @@ fn build_plan(root: &Path, force: bool) -> io::Result<ToolboxState> {
             &config.mcp_servers,
             &config.opencode_plugins,
         )?;
-        // Restore orphaned targets that fell out of the new expected set before
-        // dropping the state file (same logic as remove()).
-        for file in &old_state.files {
+        // Orphaned targets that fell out of the new expected set are restored
+        // like remove() does, but only after the whole new plan is known to be
+        // acceptable: a refusal must leave every file and the state untouched.
+        for (index, file) in old_state.files.iter().enumerate() {
             if expected.contains_key(&file.path) {
                 continue;
             }
@@ -712,26 +721,8 @@ fn build_plan(root: &Path, force: bool) -> io::Result<ToolboxState> {
                     file.path.display()
                 )));
             };
-            match removal {
-                Removal::AlreadyRestored => {}
-                Removal::RestoreSnapshot => {
-                    if let Some(original) = &file.original {
-                        fs::write(&file.path, original)?;
-                    } else {
-                        fs::remove_file(&file.path)?;
-                        remove_empty_codex_directory(&file.path)?;
-                    }
-                }
-                Removal::RewriteJson(contents) => fs::write(&file.path, contents)?,
-                Removal::Delete => {
-                    fs::remove_file(&file.path)?;
-                    remove_empty_codex_directory(&file.path)?;
-                }
-            }
+            orphan_removals.push((index, removal));
         }
-        // Stale: drop the old state so a fresh plan can be built.
-        fs::remove_file(&state_path)?;
-        let _ = remove_empty_directory(&root.join(STATE_DIRECTORY));
         Some(old_state)
     } else {
         None
@@ -761,27 +752,87 @@ fn build_plan(root: &Path, force: bool) -> io::Result<ToolboxState> {
                 path.with_extension("jsonc").display()
             )));
         }
-        let original = if let Some(old) = &old_state {
-            if let Some(prev) = old.files.iter().find(|f| f.path == path) {
-                prev.original.clone()
-            } else {
-                read_optional(&path)?
-            }
-        } else {
-            read_optional(&path)?
+        let current = read_optional(&path)?;
+        let previous = old_state
+            .as_ref()
+            .and_then(|state| state.files.iter().find(|file| file.path == path));
+        let original = match previous {
+            Some(previous) => previous.original.clone(),
+            None => current.clone(),
         };
-        let generated = generate(
-            target,
-            original.as_deref(),
-            &config.mcp_servers,
-            &config.opencode_plugins,
-            &path,
-        )?;
+        // Replacing a file Crowded already wrote is only safe when it still
+        // holds what Crowded wrote. Hook files are the exception: they keep
+        // merge semantics, so Crowded rewrites only its own entries and the
+        // user's hooks stay.
+        let generated = match (previous, current.as_deref()) {
+            (Some(previous), Some(current)) if current != previous.generated => {
+                if json_section(&path) != Some("hooks") {
+                    return Err(invalid_data(format!(
+                        "{} changed Crowded-managed configuration; refusing to overwrite it",
+                        path.display()
+                    )));
+                }
+                let base = match remove_managed_json(previous, current, "hooks") {
+                    Ok(base) => base,
+                    // The user removed one of Crowded's entries, or the file
+                    // is not the JSON Crowded wrote; merge into what is there
+                    // and let the generator reject anything unusable.
+                    Err(_) => Some(current.to_owned()),
+                };
+                generate(
+                    target,
+                    base.as_deref(),
+                    &config.mcp_servers,
+                    &config.opencode_plugins,
+                    &path,
+                )?
+            }
+            (Some(previous), _) => generate(
+                target,
+                previous.original.as_deref(),
+                &config.mcp_servers,
+                &config.opencode_plugins,
+                &path,
+            )?,
+            (None, _) => generate(
+                target,
+                original.as_deref(),
+                &config.mcp_servers,
+                &config.opencode_plugins,
+                &path,
+            )?,
+        };
         files.push(ManagedFile {
             path,
             original,
             generated,
         });
+    }
+
+    if let Some(old_state) = &old_state {
+        for (index, removal) in orphan_removals {
+            let file = &old_state.files[index];
+            match removal {
+                Removal::AlreadyRestored => {}
+                Removal::RestoreSnapshot => {
+                    if let Some(original) = &file.original {
+                        fs::write(&file.path, original)?;
+                    } else {
+                        fs::remove_file(&file.path)?;
+                        remove_empty_codex_directory(&file.path)?;
+                        remove_empty_opencode_plugin_directory(&file.path)?;
+                    }
+                }
+                Removal::RewriteJson(contents) => fs::write(&file.path, contents)?,
+                Removal::Delete => {
+                    fs::remove_file(&file.path)?;
+                    remove_empty_codex_directory(&file.path)?;
+                    remove_empty_opencode_plugin_directory(&file.path)?;
+                }
+            }
+        }
+        fs::remove_file(&state_path)?;
+        let _ = remove_empty_directory(&root.join(STATE_DIRECTORY));
     }
 
     Ok(ToolboxState {
@@ -854,6 +905,16 @@ fn native_targets(
             targets.insert(mcp_path, NativeTarget::Mcp(vendor));
         }
         targets.insert(hook_path, NativeTarget::Hooks(vendor));
+        if vendor == Vendor::OpenCode {
+            targets.insert(
+                directory
+                    .join(".opencode")
+                    .join("plugins")
+                    .join("crowded-tui")
+                    .join("tui.js"),
+                NativeTarget::OpenCodeTui,
+            );
+        }
     }
     Ok(targets)
 }
@@ -875,8 +936,8 @@ fn generate(
             &opencode_mcp_config(None, servers, opencode_plugins, None)?,
             path,
         ),
-        NativeTarget::Hooks(Vendor::Claude) => merge_hooks(original, path, false),
-        NativeTarget::Hooks(Vendor::Codex) => merge_hooks(original, path, true),
+        NativeTarget::Hooks(Vendor::Claude) => merge_hooks(original, path, Vendor::Claude),
+        NativeTarget::Hooks(Vendor::Codex) => merge_hooks(original, path, Vendor::Codex),
         NativeTarget::Hooks(Vendor::OpenCode) => {
             if original.is_some() {
                 return Err(invalid_input(format!(
@@ -886,10 +947,20 @@ fn generate(
             }
             Ok(OPENCODE_PULSE_PLUGIN.to_owned())
         }
+        NativeTarget::OpenCodeTui => {
+            if original.is_some() {
+                return Err(invalid_input(format!(
+                    "{} already exists; Crowded will not replace a local TUI plugin",
+                    path.display()
+                )));
+            }
+            Ok(OPENCODE_TUI_PLUGIN.to_owned())
+        }
     }
 }
 
-fn merge_hooks(original: Option<&str>, path: &Path, windows_command: bool) -> io::Result<String> {
+fn merge_hooks(original: Option<&str>, path: &Path, vendor: Vendor) -> io::Result<String> {
+    let windows_command = vendor == Vendor::Codex;
     let mut document = parse_json_document(original, path)?;
     let root = document
         .as_object_mut()
@@ -959,6 +1030,39 @@ fn merge_hooks(original: Option<&str>, path: &Path, windows_command: bool) -> io
             )));
         }
         handlers.push(entry);
+        if vendor == Vendor::Codex && event == "SessionStart" {
+            // A second SessionStart hook reports the new thread id to Crowded
+            // (`crowded session-report` reads the session id from stdin). It
+            // is a separate entry from the pulse so each can evolve alone;
+            // like the pulse, it carries no matcher.
+            let mut report = serde_json::json!({
+                "type": "command",
+                "command": "\"$CROWDED_BIN\" session-report",
+                "timeout": 3
+            });
+            if windows_command {
+                report["commandWindows"] =
+                    Value::String("& \"$env:CROWDED_BIN\" session-report".to_owned());
+            }
+            let report = serde_json::json!({ "hooks": [report] });
+            let handlers = hooks
+                .entry("SessionStart")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+                .ok_or_else(|| {
+                    invalid_data(format!(
+                        "{} `hooks.SessionStart` must contain an array",
+                        path.display()
+                    ))
+                })?;
+            if handlers.contains(&report) {
+                return Err(invalid_input(format!(
+                    "{} already configures the Crowded `{event}` session report",
+                    path.display()
+                )));
+            }
+            handlers.push(report);
+        }
     }
 
     let mut output = serde_json::to_string_pretty(&document).map_err(invalid_json(path))?;
@@ -1015,6 +1119,507 @@ const OPENCODE_PULSE_PLUGIN: &str = r#"export default {
     }
   },
 }
+"#;
+
+/// Crowded's OpenCode TUI plugin. Auto-discovered from the
+/// `.opencode/plugins/crowded-tui/` directory: the TUI loads the directory's
+/// `tui.js` entry, no package.json or config key needed. It reports the room's
+/// sessions to Crowded (`crowded session-report`), creating one after /clear
+/// when auto-create is on. Never logs the CROWDED_TOKEN and never passes it
+/// in an argument; every host call is guarded so the plugin cannot throw
+/// into the TUI.
+const OPENCODE_TUI_PLUGIN: &str = r#"export default {
+  id: "crowded-tui",
+  async setup(ctx) {
+    const ui = ctx && ctx.ui;
+    if (!ui || typeof ui.router?.current !== "function") {
+      return;
+    }
+    const AUTOCREATE = process.env.CROWDED_TUI_AUTOCREATE !== "0";
+    const POLL_MS = 300;
+    // A `crowded session-report` child answers as soon as it has its argument.
+    // One that outlives this bound is sent SIGTERM, then SIGKILL after the
+    // grace period; the next report starts only once the child has exited, so
+    // a late report can never overtake a newer one.
+    const REPORT_TIMEOUT_MS = 5000;
+    const KILL_GRACE_MS = 1000;
+    // The id rule `crowded session-report` applies to its own input: a
+    // non-empty string of at most 128 characters drawn from letters, digits,
+    // `-`, `_` and `.`. Anything else is left for the human.
+    const validId = (id) =>
+      typeof id === "string" && id.length > 0 && id.length <= 128 && /^[A-Za-z0-9._-]+$/.test(id);
+    const PENDING = { kind: "pending" };
+    const sessionItem = (id) => ({ kind: "session", id });
+    // `--ack` makes the exit status say whether Crowded accepted the report;
+    // without it the command exits 0 whatever happened.
+    const argsOf = (item) => (item.kind === "pending" ? ["--pending", "--ack"] : ["--session", item.id, "--ack"]);
+    const last = (list) => list[list.length - 1];
+
+    // ---- Reports: one child in flight, the rest coalesced in `need`. ----
+    // `need` is what still has to reach Crowded, in the one order that is
+    // always safe: the pending marker first, then the session. A pending
+    // boundary is information a later session report does not replace, so only
+    // an older session id is superseded by a newer one. A child that timed
+    // out or exited non-zero has delivered nothing: its report is queued
+    // again, after a wait that grows with the failures in a row. A pending
+    // marker is never given up on and nothing that follows it is sent before it
+    // is delivered, so Crowded can never rebind the room without having held
+    // the mail of the interval in between.
+    const RETRY_MS = [0, 0, 5000, 15000, 60000];
+    const FAILED_AFTER = 3;
+    const STUCK_AFTER_KILL_MS = 2000;
+    const NOTHING = { pending: false, session: null };
+    const IDLE_REPORT = { flight: null, need: NOTHING, failures: 0, waiting: false, noted: false, stuck: false };
+
+    const startNext = (report) => {
+      if (report.flight || report.waiting) {
+        return { report, fx: [] };
+      }
+      const { pending, session } = report.need;
+      if (!pending && !session) {
+        return { report, fx: [] };
+      }
+      const item = pending ? PENDING : sessionItem(session);
+      return {
+        report: { ...report, flight: { item, stage: "run" }, need: pending ? { pending: false, session } : NOTHING },
+        fx: [{ t: "spawn", item }, { t: "timer", name: "report", ms: REPORT_TIMEOUT_MS }],
+      };
+    };
+
+    // A report equal to the one running needs no second child, but only while
+    // that child has not timed out.
+    const deliver = (report, item) => {
+      const running = report.flight && report.flight.stage === "run" ? report.flight.item : null;
+      let need;
+      if (item.kind === "pending") {
+        need = running && running.kind === "pending" ? NOTHING : { pending: true, session: null };
+      } else if (!report.need.pending && running && running.kind === "session" && running.id === item.id) {
+        need = NOTHING;
+      } else {
+        need = { pending: report.need.pending, session: item.id };
+      }
+      return startNext({ ...report, need });
+    };
+
+    const requeue = (need, item) => {
+      if (item.kind === "pending") {
+        return { pending: true, session: need.session };
+      }
+      return need.pending || need.session ? need : { pending: false, session: item.id };
+    };
+
+    // ---- The state machine. ----
+    // phase: idle (no session seen yet), bound (session known to Crowded),
+    // pending (between sessions), creating (clear seen, auto-create running),
+    // disposed. Fields besides phase:
+    //   session   the id Crowded was told last
+    //   wantCreate  creating, still waiting for the pending report to finish
+    //   call      true while a session.create call has not resolved (it can
+    //             outlive the attempt)
+    //   nav       creating, navigating to the session the call returned
+    //   unused    a session this plugin created but did not show
+    //   report    { flight, need, failures, waiting, noted, stuck }
+    const INITIAL = {
+      phase: "idle",
+      session: null,
+      wantCreate: null,
+      call: null,
+      nav: null,
+      unused: null,
+      report: IDLE_REPORT,
+    };
+
+    const adopt = (id) => ({ phase: "bound", session: id, wantCreate: null, nav: null, tell: sessionItem(id) });
+
+    const leave = (s, e) => {
+      const create = AUTOCREATE && !s.call;
+      return { phase: create ? "creating" : "pending", wantCreate: create ? { dir: e.dir } : null, tell: PENDING };
+    };
+
+    const adoptRoute = (s, e) => adopt(e.id);
+    const keepOrAdoptRoute = (s, e) => (e.id === s.session ? {} : adopt(e.id));
+
+    // Only a session on screen is the human's choice. One created in the
+    // background (a subagent, another client) waits until the route shows it.
+    const onCreated = (s, e) => {
+      if (!e.displayed || s.call) {
+        return {};
+      }
+      if (e.id === s.unused || e.id === s.nav || (s.phase === "bound" && e.id === s.session)) {
+        return {};
+      }
+      return adopt(e.id);
+    };
+
+    const onResolvedWhileCreating = (s, e) => {
+      if (!s.call) {
+        return {};
+      }
+      if (e.routeId) {
+        // The human reached a session while the create ran: it wins.
+        return { call: null, unused: e.id && e.routeId !== e.id ? e.id : s.unused, ...adopt(e.routeId) };
+      }
+      if (!e.id) {
+        return { call: null, phase: "pending" };
+      }
+      return { call: null, nav: e.id, fx: [{ t: "navigate", id: e.id }] };
+    };
+
+    const onResolvedLate = (s, e) => (s.call ? { call: null, unused: e.id || s.unused } : {});
+
+    const onReportExited = (s, e) => {
+      const r = s.report;
+      if (!r.flight) {
+        return {};
+      }
+      const fx = [{ t: "clear", name: "report" }, { t: "clear", name: "grace" }, { t: "clear", name: "stuck" }];
+      if (s.phase === "disposed") {
+        return { report: IDLE_REPORT, fx };
+      }
+      const item = r.flight.item;
+      const delivered = e.ok && r.flight.stage === "run";
+      let patch = {};
+      let report = { ...r, flight: null, stuck: false };
+      if (delivered) {
+        report.failures = 0;
+        report.noted = false;
+        if (item.kind === "pending" && s.phase === "creating" && s.wantCreate) {
+          patch = { wantCreate: null, call: true };
+          fx.push({ t: "create", dir: s.wantCreate.dir });
+        }
+      } else {
+        report.failures = r.failures + 1;
+        report.need = requeue(r.need, item);
+        if (report.failures >= FAILED_AFTER && !report.noted) {
+          report.noted = true;
+          fx.push({ t: "failed" });
+        }
+        const wait = RETRY_MS[Math.min(report.failures, RETRY_MS.length) - 1];
+        if (wait > 0) {
+          report.waiting = true;
+          fx.push({ t: "timer", name: "retry", ms: wait });
+        }
+      }
+      const next = startNext(report);
+      return { ...patch, report: next.report, fx: [...fx, ...next.fx] };
+    };
+
+    const onRetryDue = (s) => {
+      if (!s.report.waiting) {
+        return {};
+      }
+      return startNext({ ...s.report, waiting: false });
+    };
+
+    const onReportTimeout = (s) => {
+      const flight = s.report.flight;
+      if (!flight || flight.stage !== "run") {
+        return {};
+      }
+      return {
+        report: { ...s.report, flight: { ...flight, stage: "term" } },
+        fx: [{ t: "kill", signal: "SIGTERM" }, { t: "timer", name: "grace", ms: KILL_GRACE_MS }],
+      };
+    };
+
+    const onGraceExpired = (s) => {
+      const flight = s.report.flight;
+      if (!flight || flight.stage !== "term") {
+        return {};
+      }
+      return {
+        report: { ...s.report, flight: { ...flight, stage: "kill" } },
+        fx: [{ t: "kill", signal: "SIGKILL" }, { t: "timer", name: "stuck", ms: STUCK_AFTER_KILL_MS }],
+      };
+    };
+
+    // A child still alive after SIGKILL cannot be abandoned: a later report
+    // started beside it could be overtaken by it. The queue waits and the
+    // condition is said once on stderr.
+    const onStuckCheck = (s) => {
+      const flight = s.report.flight;
+      if (!flight || flight.stage !== "kill" || s.report.stuck) {
+        return {};
+      }
+      return { report: { ...s.report, stuck: true }, fx: [{ t: "stuck" }] };
+    };
+
+    const onDispose = (s) => {
+      if (s.phase === "disposed") {
+        return {};
+      }
+      return {
+        phase: "disposed",
+        wantCreate: null,
+        call: null,
+        nav: null,
+        report: { ...s.report, need: NOTHING, waiting: false },
+        fx: [...(s.report.flight ? [{ t: "kill", signal: "SIGKILL" }] : []), { t: "teardown" }],
+      };
+    };
+
+    // phase -> event -> (state, event) -> { patch fields, tell, fx }
+    const TABLE = {
+      idle: {
+        routeSession: adoptRoute,
+        created: onCreated,
+        createResolved: onResolvedLate,
+      },
+      bound: {
+        routeHome: leave,
+        routeSession: keepOrAdoptRoute,
+        created: onCreated,
+        createResolved: onResolvedLate,
+      },
+      pending: {
+        routeSession: adoptRoute,
+        created: onCreated,
+        createResolved: onResolvedLate,
+      },
+      creating: {
+        routeSession: adoptRoute,
+        created: onCreated,
+        createResolved: onResolvedWhileCreating,
+        navDone: (s, e) => (s.nav === e.id ? adopt(e.id) : {}),
+        navFailed: (s) => (s.nav ? { phase: "pending", unused: s.nav, nav: null } : {}),
+      },
+      disposed: {},
+    };
+    const COMMON = {
+      reportExited: onReportExited,
+      reportTimeout: onReportTimeout,
+      graceExpired: onGraceExpired,
+      stuckCheck: onStuckCheck,
+      retryDue: onRetryDue,
+      dispose: onDispose,
+    };
+
+    const step = (s, event) => {
+      let e = event;
+      if (e.type === "routeSession" || e.type === "created" || e.type === "navDone") {
+        if (!validId(e.id)) {
+          return { s, fx: [] };
+        }
+      } else if (e.type === "createResolved") {
+        e = { ...e, id: validId(e.id) ? e.id : null, routeId: validId(e.routeId) ? e.routeId : null };
+      }
+      const handler = TABLE[s.phase][e.type] || COMMON[e.type];
+      if (!handler) {
+        return { s, fx: [] };
+      }
+      const { tell, fx = [], ...patch } = handler(s, e);
+      let next = { ...s, ...patch };
+      let sent = [];
+      if (tell) {
+        const delivery = deliver(next.report, tell);
+        next = { ...next, report: delivery.report };
+        sent = delivery.fx;
+      }
+      return { s: next, fx: [...sent, ...fx] };
+    };
+
+    // ---- The runner: the only place that touches the host. ----
+    const safe = (fn) => {
+      try {
+        return { ok: true, value: fn() };
+      } catch {
+        return { ok: false };
+      }
+    };
+    const route = () => {
+      const r = safe(() => ui.router.current());
+      return r.ok ? r.value : null;
+    };
+    const sessionIdOf = (r) => (r && r.type === "session" && typeof r.sessionID === "string" ? r.sessionID : null);
+    const homeDirOf = (r) => (r && r.location && typeof r.location.directory === "string" ? r.location.directory : null);
+
+    let state = INITIAL;
+    let child = null;
+    let pollTimer = null;
+    let unsubscribe = null;
+    const timers = new Map();
+    const inbox = [];
+    let draining = false;
+
+    const dispatch = (event) => {
+      inbox.push(event);
+      if (draining) {
+        return;
+      }
+      draining = true;
+      try {
+        while (inbox.length > 0) {
+          const result = safe(() => step(state, inbox.shift()));
+          if (!result.ok) {
+            continue;
+          }
+          state = result.value.s;
+          for (const effect of result.value.fx) {
+            safe(() => perform(effect));
+          }
+        }
+      } finally {
+        draining = false;
+      }
+    };
+
+    const TIMER_EVENTS = { report: "reportTimeout", grace: "graceExpired", stuck: "stuckCheck", retry: "retryDue" };
+    const startTimer = (name, ms) => {
+      clearTimer(name);
+      timers.set(
+        name,
+        setTimeout(() => {
+          timers.delete(name);
+          dispatch({ type: TIMER_EVENTS[name] });
+        }, ms),
+      );
+    };
+    const clearTimer = (name) => {
+      if (timers.has(name)) {
+        clearTimeout(timers.get(name));
+        timers.delete(name);
+      }
+    };
+
+    const spawnReport = (item) => {
+      const bin = process.env.CROWDED_BIN;
+      if (!bin) {
+        // Outside a Crowded room there is nobody to tell.
+        dispatch({ type: "reportExited", ok: true });
+        return;
+      }
+      let mine;
+      try {
+        mine = Bun.spawn([bin, "session-report", ...argsOf(item)], { stdout: "ignore", stderr: "ignore" });
+      } catch {
+        dispatch({ type: "reportExited", ok: false });
+        return;
+      }
+      child = mine;
+      const exited = (code) => {
+        if (child === mine) {
+          child = null;
+          dispatch({ type: "reportExited", ok: code === 0 });
+        }
+      };
+      try {
+        mine.exited.then(exited, () => exited(-1));
+      } catch {
+        exited(-1);
+      }
+    };
+
+    const createSession = (dir) => {
+      const settle = (created) => {
+        const data = created && created.data;
+        const id = (created && (created.id || (data && (data.id || data.sessionID)) || created.sessionID)) || null;
+        dispatch({ type: "createResolved", id, routeId: sessionIdOf(route()) });
+      };
+      let pending;
+      try {
+        pending = Promise.resolve(ctx.client.session.create({ location: { directory: dir } }));
+      } catch {
+        pending = Promise.reject(new Error("create failed"));
+      }
+      pending.then(settle, () => settle(null));
+    };
+
+    const navigateTo = (id) => {
+      let result;
+      try {
+        result = ui.router.navigate({ type: "session", sessionID: id });
+      } catch {
+        dispatch({ type: "navFailed" });
+        return;
+      }
+      if (result && typeof result.then === "function") {
+        result.then(
+          () => dispatch({ type: "navDone", id }),
+          () => dispatch({ type: "navFailed" }),
+        );
+      } else {
+        dispatch({ type: "navDone", id });
+      }
+    };
+
+    const perform = (effect) => {
+      switch (effect.t) {
+        case "spawn":
+          spawnReport(effect.item);
+          break;
+        case "kill":
+          if (child) {
+            safe(() => child.kill(effect.signal));
+          }
+          break;
+        case "timer":
+          startTimer(effect.name, effect.ms);
+          break;
+        case "clear":
+          clearTimer(effect.name);
+          break;
+        case "create":
+          createSession(effect.dir);
+          break;
+        case "navigate":
+          navigateTo(effect.id);
+          break;
+        case "stuck":
+          process.stderr.write("crowded-tui: a session-report child survived SIGKILL; reports wait for it to exit\n");
+          break;
+        case "failed":
+          process.stderr.write("crowded-tui: Crowded has not accepted the session report; retrying, and nothing is created until it does\n");
+          break;
+        case "teardown":
+          if (pollTimer) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+          }
+          for (const name of [...timers.keys()]) {
+            clearTimer(name);
+          }
+          if (unsubscribe) {
+            safe(() => unsubscribe());
+            unsubscribe = null;
+          }
+          break;
+      }
+    };
+
+    let lastRoute = "";
+    pollTimer = setInterval(() => {
+      const r = route();
+      if (!r || typeof r !== "object") {
+        return;
+      }
+      const key = JSON.stringify(r);
+      if (key === lastRoute) {
+        return;
+      }
+      lastRoute = key;
+      if (r.type === "home") {
+        dispatch({ type: "routeHome", dir: homeDirOf(r) || process.cwd() });
+        return;
+      }
+      const id = sessionIdOf(r);
+      if (id) {
+        dispatch({ type: "routeSession", id });
+      }
+    }, POLL_MS);
+    safe(() => {
+      const off = ctx.data.on("session.created", (event) => {
+        safe(() => {
+          const id = event && event.data && event.data.sessionID;
+          dispatch({ type: "created", id, displayed: validId(id) && sessionIdOf(route()) === id });
+        });
+      });
+      if (typeof off === "function") {
+        unsubscribe = off;
+      }
+    });
+    return () => dispatch({ type: "dispose" });
+  },
+};
 "#;
 
 fn merge_json(
@@ -1252,6 +1857,44 @@ fn remove_empty_codex_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// After deleting Crowded's own `tui.js`, drop the `crowded-tui` directory
+/// and then `plugins` itself when both are empty. Anything else inside stops
+/// the cleanup, and `.opencode` itself is never touched.
+fn remove_empty_opencode_plugin_directory(path: &Path) -> io::Result<()> {
+    if path.file_name().and_then(|name| name.to_str()) != Some("tui.js") {
+        return Ok(());
+    }
+    let Some(plugin_dir) = path.parent() else {
+        return Ok(());
+    };
+    if plugin_dir.file_name().and_then(|name| name.to_str()) != Some("crowded-tui") {
+        return Ok(());
+    }
+    let Some(plugins_dir) = plugin_dir.parent() else {
+        return Ok(());
+    };
+    if plugins_dir.file_name().and_then(|name| name.to_str()) != Some("plugins") {
+        return Ok(());
+    }
+    if plugin_dir
+        .read_dir()
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
+    {
+        fs::remove_dir(plugin_dir)?;
+    } else {
+        return Ok(());
+    }
+    if plugins_dir
+        .read_dir()
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
+    {
+        fs::remove_dir(plugins_dir)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn remove_empty_directory(path: &Path) -> io::Result<()> {
     match fs::remove_dir(path) {
         Ok(()) => Ok(()),
@@ -1447,7 +2090,7 @@ export const CrowdedPulse = async () => {
         .unwrap();
 
         let paths = sync(&root).unwrap();
-        assert_eq!(paths.len(), 6);
+        assert_eq!(paths.len(), 7);
         assert!(native_files_are_active_at(&root).unwrap());
         assert!(
             fs::read_to_string(root.join(".mcp.json"))
@@ -1501,11 +2144,48 @@ export const CrowdedPulse = async () => {
             codex_hooks["hooks"]["PreToolUse"][0]["hooks"][0]["commandWindows"],
             "& \"$env:CROWDED_BIN\" pulse working --hook-stdin"
         );
+        let codex_session_starts = codex_hooks["hooks"]["SessionStart"]
+            .as_array()
+            .expect("codex SessionStart hooks");
+        assert_eq!(codex_session_starts.len(), 2);
+        assert!(codex_session_starts.iter().any(|entry| {
+            entry["hooks"][0]["command"] == "\"$CROWDED_BIN\" pulse starting --hook-stdin"
+        }));
+        let report_entry = codex_session_starts
+            .iter()
+            .find(|entry| entry["hooks"][0]["command"] == "\"$CROWDED_BIN\" session-report")
+            .expect("codex SessionStart session-report");
+        assert!(report_entry.get("matcher").is_none());
+        assert_eq!(
+            report_entry["hooks"][0]["commandWindows"],
+            "& \"$env:CROWDED_BIN\" session-report"
+        );
+        assert_eq!(report_entry["hooks"][0]["timeout"], 3);
+        let claude_hooks_again: Value = serde_json::from_str(
+            &fs::read_to_string(root.join(".claude/settings.local.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !serde_json::to_string(&claude_hooks_again["hooks"]).unwrap().contains("session-report"),
+            "Claude hooks must not gain a session report"
+        );
         let pulse_plugin =
             fs::read_to_string(root.join(".opencode/plugins/crowded-pulse.js")).unwrap();
         assert!(pulse_plugin.contains("ctx.session.hook(\"prompt\""));
         assert!(pulse_plugin.contains("session.execution.succeeded"));
         assert!(pulse_plugin.contains("model.variant"));
+        let tui_plugin =
+            fs::read_to_string(root.join(".opencode/plugins/crowded-tui/tui.js")).unwrap();
+        assert!(tui_plugin.contains("id: \"crowded-tui\""));
+        assert!(tui_plugin.contains("ui.router.current"));
+        assert!(tui_plugin.contains("ctx.client.session.create"));
+        assert!(tui_plugin.contains("session-report"));
+        assert!(tui_plugin.contains("\"--pending\""));
+        assert!(tui_plugin.contains("\"--session\""));
+        assert!(tui_plugin.contains("CROWDED_TUI_AUTOCREATE"));
+        assert!(tui_plugin.contains("CROWDED_BIN"));
+        assert!(!tui_plugin.contains("CROWDED_TOKEN"));
+        assert!(!tui_plugin.contains("commandWindows"));
         let mut rewritten: Value =
             serde_json::from_str(&fs::read_to_string(root.join("opencode.json")).unwrap()).unwrap();
         rewritten["$schema"] = Value::String("https://opencode.ai/config.json".into());
@@ -1537,6 +2217,8 @@ export const CrowdedPulse = async () => {
         );
         assert!(!root.join(".codex/hooks.json").exists());
         assert!(!root.join(".opencode/plugins/crowded-pulse.js").exists());
+        assert!(!root.join(".opencode/plugins/crowded-tui/tui.js").exists());
+        assert!(!root.join(".opencode/plugins/crowded-tui").exists());
         let opencode: Value =
             serde_json::from_str(&fs::read_to_string(root.join("opencode.json")).unwrap()).unwrap();
         assert_eq!(opencode["model"], "openai/gpt-5");
@@ -1545,6 +2227,151 @@ export const CrowdedPulse = async () => {
         assert!(opencode.get("plugin").is_none());
         assert!(!root.join(STATE_FILE).exists());
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opencode_tui_plugin_sync_is_idempotent_and_refuses_foreign_files() {
+        let root = test_directory();
+        fs::write(
+            root.join("crowded.toml"),
+            r#"
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+
+                [[rooms]]
+                command = "opencode"
+                transport = "raw"
+            "#,
+        )
+        .unwrap();
+
+        sync(&root).unwrap();
+        let first = fs::read(root.join(".opencode/plugins/crowded-tui/tui.js")).unwrap();
+        resync(&root).unwrap();
+        let second = fs::read(root.join(".opencode/plugins/crowded-tui/tui.js")).unwrap();
+        assert_eq!(first, second, "a second sync must be byte-identical");
+        assert!(native_files_are_active_at(&root).unwrap());
+
+        // A resync keeps exactly one copy of each SessionStart entry.
+        let hooks: Value =
+            serde_json::from_str(&fs::read_to_string(root.join(".codex/hooks.json")).unwrap())
+                .unwrap();
+        let starts = hooks["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(
+            starts
+                .iter()
+                .filter(|entry| entry["hooks"][0]["command"]
+                    == "\"$CROWDED_BIN\" session-report")
+                .count(),
+            1
+        );
+
+        // A user-owned file at the same path is never overwritten.
+        let foreign = test_directory();
+        fs::write(
+            foreign.join("crowded.toml"),
+            r#"
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+
+                [[rooms]]
+                command = "opencode"
+                transport = "raw"
+            "#,
+        )
+        .unwrap();
+        fs::create_dir_all(foreign.join(".opencode/plugins/crowded-tui")).unwrap();
+        fs::write(
+            foreign.join(".opencode/plugins/crowded-tui/tui.js"),
+            "// mine\n",
+        )
+        .unwrap();
+        assert!(sync(&foreign).is_err());
+        assert_eq!(
+            fs::read_to_string(foreign.join(".opencode/plugins/crowded-tui/tui.js")).unwrap(),
+            "// mine\n"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(foreign).unwrap();
+    }
+
+    #[test]
+    fn removing_a_changed_tui_plugin_keeps_everything() {
+        let root = test_directory();
+        fs::write(
+            root.join("crowded.toml"),
+            r#"
+                [[rooms]]
+                command = "codex"
+                transport = "raw"
+
+                [[rooms]]
+                command = "opencode"
+                transport = "raw"
+            "#,
+        )
+        .unwrap();
+
+        sync(&root).unwrap();
+        fs::write(
+            root.join(".opencode/plugins/crowded-tui/tui.js"),
+            "// touched\n",
+        )
+        .unwrap();
+        assert!(remove(&root).is_err());
+        assert!(root.join(".opencode/plugins/crowded-tui/tui.js").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generated_tui_plugin_passes_node_checks_when_node_is_present() {
+        use std::process::Command;
+        if Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let root = test_directory();
+        let plugin = root.join("crowded-tui.mjs");
+        let generated = generate(
+            NativeTarget::OpenCodeTui,
+            None,
+            &[],
+            &[],
+            Path::new("tui.js"),
+        )
+        .unwrap();
+        fs::write(&plugin, generated).unwrap();
+        let check = Command::new("node")
+            .arg("--check")
+            .arg(&plugin)
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "node --check failed: {}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+        let suite = Command::new("node")
+            .arg("--test")
+            .arg("--test-reporter=spec")
+            .arg(format!(
+                "{}/tests/tui_session_report.mjs",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .env("TUI_UNDER_TEST", &plugin)
+            .output()
+            .unwrap();
+        assert!(
+            suite.status.success(),
+            "node --test failed:\n{}\n{}",
+            String::from_utf8_lossy(&suite.stdout),
+            String::from_utf8_lossy(&suite.stderr)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1724,12 +2551,12 @@ export const CrowdedPulse = async () => {
         )
         .unwrap();
 
-        // First sync with 2 rooms -> 4 files
+        // First sync with 2 rooms -> 5 files
         let first = sync(&root).unwrap();
-        assert_eq!(first.len(), 4);
+        assert_eq!(first.len(), 5);
         assert!(native_files_are_active_at(&root).unwrap());
 
-        // Add a new room -> stale state (4 vs 6 files)
+        // Add a new room -> stale state (5 vs 7 files)
         fs::write(
             root.join("crowded.toml"),
             r#"
@@ -1757,7 +2584,7 @@ export const CrowdedPulse = async () => {
         .unwrap();
         // stale sync must succeed and preserve original for surviving paths
         let second = sync(&root).unwrap();
-        assert_eq!(second.len(), 6);
+        assert_eq!(second.len(), 7);
         let state: ToolboxState =
             serde_json::from_str(&fs::read_to_string(root.join(STATE_FILE)).unwrap()).unwrap();
         let mcp_file = state
@@ -1826,7 +2653,7 @@ export const CrowdedPulse = async () => {
         .unwrap();
 
         let first = sync(&root).unwrap();
-        assert_eq!(first.len(), 6);
+        assert_eq!(first.len(), 7);
         assert!(root.join(".codex/config.toml").exists());
         assert!(root.join(".codex/hooks.json").exists());
 
@@ -1853,7 +2680,7 @@ export const CrowdedPulse = async () => {
         .unwrap();
 
         let second = sync(&root).unwrap();
-        assert_eq!(second.len(), 4);
+        assert_eq!(second.len(), 5);
         // orphaned files must have been restored/deleted during stale handling
         assert_eq!(
             fs::read_to_string(root.join(".codex/config.toml")).unwrap(),
