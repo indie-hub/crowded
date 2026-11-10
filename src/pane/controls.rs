@@ -2155,7 +2155,7 @@ mod tests {
         // Pre-seed a stale session id.
         super::super::session_state::upsert("claude", &cwd, room, "stale-pre-clear-id");
         // Clear records the marker.
-        super::super::session_state::clear_room("claude", &cwd, room);
+        super::super::session_state::clear_room("claude", &cwd, room).unwrap();
 
         let mut spec = raw_room("claude");
         spec.cwd = Some(cwd);
@@ -2175,7 +2175,7 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let room = "codex";
         // Clear first, then a capture supersedes the marker.
-        super::super::session_state::clear_room("codex", &cwd, room);
+        super::super::session_state::clear_room("codex", &cwd, room).unwrap();
         super::super::session_state::upsert("codex", &cwd, room, "fresh-capture-id");
 
         let mut spec = raw_room("codex");

@@ -1897,6 +1897,53 @@ pub(crate) fn restart_room(
     Ok(())
 }
 
+/// Applies the restart a key event asks for, if any, and returns the notice to
+/// show. This is the only place Ctrl+R/F5 turns into a launch, so the decision
+/// can be driven without a terminal.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn restart_key(
+    key: KeyEvent,
+    size: portable_pty::PtySize,
+    focused: usize,
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    codex: &mut [Option<pane::CodexMint>],
+    delivery_gates: &mut [DeliveryGate],
+    last_output: &mut [Option<Instant>],
+    spawned_at: &mut [Instant],
+    room_pulses: &mut [Option<PulseSample>],
+    environments: &[pane::GuestEnvironment],
+    fuse_size: usize,
+    now: Instant,
+) -> Option<(String, NoticeSeverity)> {
+    if !force_restart_requested(key, panes[focused].is_online()) {
+        return None;
+    }
+    let title = panes[focused].title().to_owned();
+    Some(
+        match restart_room(
+            focused,
+            size,
+            panes,
+            router,
+            codex,
+            delivery_gates,
+            last_output,
+            spawned_at,
+            room_pulses,
+            environments,
+            fuse_size,
+            now,
+        ) {
+            Ok(()) => (format!("{title} restarted"), NoticeSeverity::Info),
+            Err(error) => (
+                format!("Could not restart {title}: {error}"),
+                NoticeSeverity::Failure,
+            ),
+        },
+    )
+}
+
 /// Sends doorbell mail to a native room through the router. This is the only
 /// native delivery path: a room never falls back to terminal paste, not even
 /// when the router cannot take the message.
@@ -3475,9 +3522,10 @@ fn run_rooms(
                     terminal.autoresize()?;
                     let (rooms, _, _) = content_areas(terminal.size()?.into());
                     let area = pane_areas(rooms, room_count)[focused];
-                    match restart_room(
-                        focused,
+                    if let Some((text, severity)) = restart_key(
+                        key,
                         pane_size(area),
+                        focused,
                         &mut panes,
                         router.as_mut(),
                         &mut codex,
@@ -3489,21 +3537,7 @@ fn run_rooms(
                         fuse_size,
                         Instant::now(),
                     ) {
-                        Ok(()) => {
-                            notice.push(
-                                format!("{} restarted", panes[focused].title()),
-                                NoticeSeverity::Info,
-                            );
-                        }
-                        Err(error) => {
-                            notice.push(
-                                format!(
-                                    "Could not restart {}: {error}",
-                                    panes[focused].title()
-                                ),
-                                NoticeSeverity::Failure,
-                            );
-                        }
+                        notice.push(text, severity);
                     }
                 }
 

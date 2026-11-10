@@ -254,8 +254,10 @@ restarted (F5, or Ctrl+R while it is offline), cleared and resumed in place.
 Restart and resume bring back the stored thread; clear durably marks the old
 thread cleared, then mints a new one with `codex exec` and reopens the room in
 it. Every relaunch binds under a new generation, so mail saved for the earlier
-launch stays `HELD`. A native Codex room's model and effort still cannot be
-changed in place, and the delivery pause and fuse still apply.
+launch stays `HELD`. If the cleared marker cannot be saved, the clear fails with
+a visible error and starts nothing, so the previous session stays the one a later
+resume uses. A native Codex room's model and effort still cannot be changed in
+place, and the delivery pause and fuse still apply.
 
 ```toml
 [[rooms]]

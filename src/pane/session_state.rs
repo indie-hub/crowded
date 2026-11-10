@@ -380,16 +380,28 @@ pub(super) const FRESH_STATE_MARKER: &str = "__fresh__";
 /// Replaces the room's persisted entry (if any) with a [`FRESH_STATE_MARKER`]
 /// so that a later resume reads the marker instead of a stale pre-clear id.
 /// A subsequent successful capture supersedes the marker with the real id.
-#[allow(dead_code)]
-pub(super) fn clear_room(vendor: &str, cwd: &Path, room: &str) {
-    let Ok(_guard) = STATE_LOCK.lock() else {
-        return;
-    };
-    let Ok(mut state) = load_state_for_update() else {
-        return;
-    };
+///
+/// The caller must treat an error as "not cleared": a later resume would still
+/// restore the old session, so starting a fresh one anyway could lose it.
+pub(super) fn clear_room(vendor: &str, cwd: &Path, room: &str) -> io::Result<()> {
+    let _guard = STATE_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("session state is poisoned"))?;
+    let mut state = load_state_for_update().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "the session state could not be read, so the cleared marker was not saved and the existing file was left unchanged: {error}"
+            ),
+        )
+    })?;
     state.upsert(vendor, &cwd.to_string_lossy(), room, FRESH_STATE_MARKER, false);
-    let _ = save_state(&state);
+    save_state(&state).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("the cleared marker could not be saved, so the room was not cleared: {error}"),
+        )
+    })
 }
 
 /// Record or supersede the captured session id for `(vendor, cwd, room)`.
@@ -931,13 +943,16 @@ mod tests {
     }
 
     #[test]
-    fn the_best_effort_writers_also_leave_malformed_state_alone() {
+    fn malformed_state_is_left_alone_and_a_clear_reports_it() {
         let _state = StateRootGuard::isolated();
         let path = state_path();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"{ not json").unwrap();
         upsert("codex", Path::new("/repo"), "Codex · 1", MINTED);
-        clear_room("codex", Path::new("/repo"), "Codex · 1");
+        // A clear is not best-effort: it must report that it was not recorded,
+        // and the unreadable file stays byte-for-byte intact.
+        let error = clear_room("codex", Path::new("/repo"), "Codex · 1").unwrap_err();
+        assert!(error.to_string().contains("could not be read"), "{error}");
         assert_eq!(fs::read(&path).unwrap(), b"{ not json");
     }
 
@@ -1105,7 +1120,7 @@ mod tests {
 
         // A durable clear marker must not seed: the room starts fresh until a
         // genuine capture supersedes the marker.
-        clear_room("claude", cwd, room);
+        clear_room("claude", cwd, room).unwrap();
         assert!(!has_captured_session(&initial_capture_cell(
             "claude", cwd, room
         )));
@@ -1680,7 +1695,7 @@ mod tests {
         );
 
         // Clear replaces the stale id with the marker.
-        clear_room("claude", cwd, room);
+        clear_room("claude", cwd, room).unwrap();
         assert_eq!(
             lookup("claude", cwd, room).as_deref(),
             Some(FRESH_STATE_MARKER)
@@ -1716,7 +1731,7 @@ mod tests {
         upsert("claude", cwd, "Claude · 1", "id-room-1");
         upsert("claude", cwd, "Claude · 2", "id-room-2");
 
-        clear_room("claude", cwd, "Claude · 1");
+        clear_room("claude", cwd, "Claude · 1").unwrap();
 
         assert_eq!(
             lookup("claude", cwd, "Claude · 1").as_deref(),
@@ -1738,7 +1753,7 @@ mod tests {
         let cwd = Path::new("/repo");
         assert_eq!(lookup("claude", cwd, "Claude · 1"), None);
 
-        clear_room("claude", cwd, "Claude · 1");
+        clear_room("claude", cwd, "Claude · 1").unwrap();
         assert_eq!(
             lookup("claude", cwd, "Claude · 1").as_deref(),
             Some(FRESH_STATE_MARKER)
