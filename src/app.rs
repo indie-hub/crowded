@@ -1788,6 +1788,115 @@ pub(crate) fn complete_mints(
     Ok(())
 }
 
+/// Relaunches one native Codex room in place. A trusted stored session starts
+/// at once; a mint runs on its own worker and the next pass binds the room when
+/// it finishes. A clear's durable marker is already written by then.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn relaunch_codex_room(
+    action: pane::CodexRelaunch,
+    index: usize,
+    size: portable_pty::PtySize,
+    prompt: &str,
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    codex: &mut [Option<pane::CodexMint>],
+    delivery_gates: &mut [DeliveryGate],
+    last_output: &mut [Option<Instant>],
+    spawned_at: &mut [Instant],
+    room_pulses: &mut [Option<PulseSample>],
+    environments: &[pane::GuestEnvironment],
+    now: Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (spec, mint) = panes[index].relaunch_codex(action, prompt, index + 1)?;
+    panes[index].cleanup();
+    // A room that cannot start again is replaced by the visible reason, never
+    // left half-bound to the session it could not launch.
+    let (started, failure) = match spawn_room(
+        &mut LivePanes,
+        spec.clone(),
+        size,
+        environments[index].clone(),
+        None,
+        Some(&mint),
+    ) {
+        Ok(started) => (started, None),
+        Err(error) => {
+            let reason = format!("could not relaunch the room: {error}");
+            let failed = pane::CodexMint::Failed(reason.clone());
+            let failed = spawn_room(
+                &mut LivePanes,
+                spec,
+                size,
+                environments[index].clone(),
+                None,
+                Some(&failed),
+            )?;
+            (failed, Some(reason))
+        }
+    };
+    panes[index] = started;
+    let mint = match &failure {
+        Some(reason) => pane::CodexMint::Failed(reason.clone()),
+        None => mint,
+    };
+    if let Some(router) = router {
+        pane::bind_codex_room(router, panes, index, &mint)?;
+    }
+    codex[index] = Some(mint);
+    delivery_gates[index] = DeliveryGate::new(false);
+    last_output[index] = None;
+    spawned_at[index] = now;
+    room_pulses[index] = Some(PulseSample::now(PulseState::Starting, None));
+    match failure {
+        Some(reason) => Err(io::Error::other(reason).into()),
+        None => Ok(()),
+    }
+}
+
+/// Revives one room after F5 or an offline Ctrl+R. A native Codex room comes
+/// back into its session; every other room respawns exactly as before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn restart_room(
+    index: usize,
+    size: portable_pty::PtySize,
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    codex: &mut [Option<pane::CodexMint>],
+    delivery_gates: &mut [DeliveryGate],
+    last_output: &mut [Option<Instant>],
+    spawned_at: &mut [Instant],
+    room_pulses: &mut [Option<PulseSample>],
+    environments: &[pane::GuestEnvironment],
+    fuse_size: usize,
+    now: Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if panes[index].codex_native() {
+        let roster = welcome_roster(panes, room_pulses, now);
+        let prompt = house_rules(index + 1, &roster, fuse_size);
+        return relaunch_codex_room(
+            pane::CodexRelaunch::Restart,
+            index,
+            size,
+            &prompt,
+            panes,
+            router,
+            codex,
+            delivery_gates,
+            last_output,
+            spawned_at,
+            room_pulses,
+            environments,
+            now,
+        );
+    }
+    panes[index].restart(size)?;
+    delivery_gates[index] = DeliveryGate::new(panes[index].needs_intro());
+    last_output[index] = None;
+    spawned_at[index] = now;
+    room_pulses[index] = Some(PulseSample::now(PulseState::Starting, None));
+    Ok(())
+}
+
 /// Sends doorbell mail to a native room through the router. This is the only
 /// native delivery path: a room never falls back to terminal paste, not even
 /// when the router cannot take the message.
@@ -2606,19 +2715,64 @@ pub(crate) fn run_rooms_iteration<D: DoorbellSource>(
                     continue;
                 }
                 let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
-                    if let Some(term) = terminal.as_mut() {
-                        term.autoresize()?;
-                        let (rooms, _, _) = content_areas(term.size()?.into());
-                        let size = pane_size(pane_areas(rooms, room_count)[control.to]);
-                        match &control.action {
-                            ControlAction::ClearContext => panes[control.to].clear_context(size).map(|_| false),
-                            ControlAction::Resume => panes[control.to].resume_context(size),
-                            ControlAction::Configure { model, effort } => panes[control.to]
-                                .configure(model.as_deref(), effort.as_ref().map(|e| e.label()), size)
-                                .map(|_| false),
+                    let size = match terminal.as_mut() {
+                        Some(term) => {
+                            term.autoresize()?;
+                            let (rooms, _, _) = content_areas(term.size()?.into());
+                            pane_size(pane_areas(rooms, room_count)[control.to])
                         }
+                        None => pane_sizes[control.to],
+                    };
+                    let codex_native = panes[control.to].codex_native();
+                    let prompt = if codex_native {
+                        house_rules(
+                            control.to + 1,
+                            &welcome_roster(panes, room_pulses, now),
+                            fuse_size,
+                        )
                     } else {
-                        Ok(false)
+                        String::new()
+                    };
+                    match &control.action {
+                        ControlAction::ClearContext if codex_native => relaunch_codex_room(
+                            pane::CodexRelaunch::Clear,
+                            control.to,
+                            size,
+                            &prompt,
+                            panes,
+                            router.as_mut(),
+                            codex,
+                            delivery_gates,
+                            last_output,
+                            spawned_at,
+                            room_pulses,
+                            environments,
+                            now,
+                        )
+                        .map(|()| false),
+                        ControlAction::Resume if codex_native => relaunch_codex_room(
+                            pane::CodexRelaunch::Resume,
+                            control.to,
+                            size,
+                            &prompt,
+                            panes,
+                            router.as_mut(),
+                            codex,
+                            delivery_gates,
+                            last_output,
+                            spawned_at,
+                            room_pulses,
+                            environments,
+                            now,
+                        )
+                        .map(|()| true),
+                        ControlAction::ClearContext => {
+                            panes[control.to].clear_context(size).map(|_| false)
+                        }
+                        ControlAction::Resume => panes[control.to].resume_context(size),
+                        ControlAction::Configure { model, effort } => panes[control.to]
+                            .configure(model.as_deref(), effort.as_ref().map(|e| e.label()), size)
+                            .map(|_| false),
                     }
                 })();
                 match result {
@@ -2627,7 +2781,9 @@ pub(crate) fn run_rooms_iteration<D: DoorbellSource>(
                         last_output[control.to] = None;
                         spawned_at[control.to] = Instant::now();
                         room_pulses[control.to] = match &control.action {
-                            ControlAction::Resume => None,
+                            // A native room's process is new even when its
+                            // conversation is the same one.
+                            ControlAction::Resume if !panes[control.to].is_native() => None,
                             _ => Some(PulseSample::now(PulseState::Starting, None)),
                         };
                         control.reply_applied();
@@ -3319,14 +3475,21 @@ fn run_rooms(
                     terminal.autoresize()?;
                     let (rooms, _, _) = content_areas(terminal.size()?.into());
                     let area = pane_areas(rooms, room_count)[focused];
-                    match panes[focused].restart(pane_size(area)) {
+                    match restart_room(
+                        focused,
+                        pane_size(area),
+                        &mut panes,
+                        router.as_mut(),
+                        &mut codex,
+                        &mut delivery_gates,
+                        &mut last_output,
+                        &mut spawned_at,
+                        &mut room_pulses,
+                        &environments,
+                        fuse_size,
+                        Instant::now(),
+                    ) {
                         Ok(()) => {
-                            delivery_gates[focused] =
-                                DeliveryGate::new(panes[focused].needs_intro());
-                            last_output[focused] = None;
-                            spawned_at[focused] = Instant::now();
-                            room_pulses[focused] =
-                                Some(PulseSample::now(PulseState::Starting, None));
                             notice.push(
                                 format!("{} restarted", panes[focused].title()),
                                 NoticeSeverity::Info,
@@ -4927,7 +5090,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let log = root.path().join("writes");
-        let stub = report_test_stub(root.path(), "room", &log);
+        // Named `codex` so the room has a control adapter and can resume.
+        let stub = report_test_stub(root.path(), "codex", &log);
         let first = report_test_pane(
             report_test_spec(&stub, cwd.path(), "Room A", false),
             None,

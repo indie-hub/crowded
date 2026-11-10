@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- A native Codex room can be restarted (F5, or Ctrl+R while it is offline), cleared and resumed in place. Restart and resume bring back the session Crowded stored for the room; clear durably marks the old thread cleared, then mints a new one with `codex exec` and reopens the room in it. Each relaunch binds the room under a new generation, so mail saved for the earlier launch stays `HELD`. Changing a native room's model or effort is still refused, and OpenCode native rooms still cannot be restarted, cleared or resumed in place.
 
 ## [0.45.0] - 2026-11-05
 

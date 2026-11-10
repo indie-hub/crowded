@@ -398,6 +398,15 @@ impl NativeRouter {
                     );
                 }
                 None => {
+                    // A room that cannot start must drop the launch it replaces:
+                    // an old binding would otherwise go on taking mail.
+                    if let Some((_, stale)) = self.rooms.remove(&entry.index) {
+                        self.bindings.remove(&stale.room);
+                        self.codex.remove(&stale.room);
+                        self.pending_rooms.remove(&stale.room);
+                    }
+                    self.codex_rooms.remove(&entry.index);
+                    self.codex_live.remove(&entry.index);
                     let reason = entry.reason.unwrap_or_else(|| UNBOUND_CODEX.to_owned());
                     self.unbound.insert(entry.index, (entry.title, reason));
                 }

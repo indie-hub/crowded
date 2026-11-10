@@ -705,6 +705,17 @@ pub(crate) enum CodexUpdate {
     Failed { index: usize, reason: String },
 }
 
+/// How a native Codex room comes back when it is relaunched in place.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexRelaunch {
+    /// Keep a trusted stored session; mint one only when there is none.
+    Restart,
+    /// Always start a new thread, after clearing the old one durably.
+    Clear,
+    /// Resume the stored session, and fail when there is none.
+    Resume,
+}
+
 /// The hold reason shown while a room's session is still being created.
 pub(crate) const CODEX_STARTING: &str = "`codex exec` is still creating this room's session";
 
@@ -836,32 +847,40 @@ pub(crate) fn start_codex_mints(
             results[index] = Some(CodexMint::Failed(format!("{}: {error}", spec.title)));
             continue;
         }
-        let (program, arguments) = mint_command(spec, &prompt);
-        let variables = codex_phase_variables(spec, &environments[index]);
-        let title = spec.title.clone();
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let result = codex_native::start_session(
-                &program,
-                &arguments,
-                &cwd,
-                &variables,
-                CODEX_MINT_TIMEOUT,
-            )
-            .and_then(|uuid| {
-                // A room is only ready once its session is durably stored, or
-                // a restart would mint a different one.
-                session_state::upsert_minted("codex", &cwd, &title, &uuid)
-                    .map(|()| uuid.clone())
-                    .map_err(|error| {
-                        format!("minted session {uuid} could not be saved: {error}")
-                    })
-            });
-            let _ = sender.send(result);
-        });
-        results[index] = Some(CodexMint::Pending(receiver));
+        results[index] = Some(start_codex_mint(spec, cwd, &environments[index], prompt));
     }
     results
+}
+
+/// Runs one room's `codex exec` mint on its own worker. The room stays
+/// unavailable until the session is durably saved, because a restart would
+/// otherwise mint a different one.
+fn start_codex_mint(
+    spec: &RoomSpec,
+    cwd: PathBuf,
+    environment: &GuestEnvironment,
+    prompt: String,
+) -> CodexMint {
+    let (program, arguments) = mint_command(spec, &prompt);
+    let variables = codex_phase_variables(spec, environment);
+    let title = spec.title.clone();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = codex_native::start_session(
+            &program,
+            &arguments,
+            &cwd,
+            &variables,
+            CODEX_MINT_TIMEOUT,
+        )
+        .and_then(|uuid| {
+            session_state::upsert_minted("codex", &cwd, &title, &uuid)
+                .map(|()| uuid.clone())
+                .map_err(|error| format!("minted session {uuid} could not be saved: {error}"))
+        });
+        let _ = sender.send(result);
+    });
+    CodexMint::Pending(receiver)
 }
 
 /// Collects every mint that finished since the previous pass.
@@ -1806,6 +1825,52 @@ impl Pane {
 
     pub(crate) fn poll_exit(&mut self) -> io::Result<()> {
         self.child.poll_exit().map(|_| ())
+    }
+
+    /// Prepares this native Codex room's next launch without starting it.
+    ///
+    /// The returned spec already carries the resume arguments when a session is
+    /// reused. A clear writes the durable cleared marker before anything runs,
+    /// so a later `crowded resume` cannot restore the old thread. A session is
+    /// trusted only when Crowded minted it or the room's own hook reported it,
+    /// for this vendor, directory and title.
+    pub(crate) fn relaunch_codex(
+        &self,
+        action: CodexRelaunch,
+        prompt: &str,
+        room: usize,
+    ) -> io::Result<(RoomSpec, CodexMint)> {
+        let stored = || {
+            session_state::lookup_minted("codex", &self.cwd, &self.spec.title)
+                .or_else(|| session_state::lookup_reported("codex", &self.cwd, &self.spec.title))
+                .filter(|id| codex_native::valid_uuid(id))
+        };
+        let mut spec = self.spec.clone();
+        let session = match action {
+            CodexRelaunch::Clear => {
+                session_state::clear_room("codex", &self.cwd, &self.spec.title);
+                None
+            }
+            CodexRelaunch::Resume => Some(stored().ok_or_else(|| {
+                io::Error::other(format!(
+                    "{}: no stored Codex session to resume; use control {room} clear to start a new one",
+                    self.spec.title
+                ))
+            })?),
+            CodexRelaunch::Restart => stored(),
+        };
+        if let Some(uuid) = session {
+            controls::set_resume_session(&mut spec, &uuid)?;
+            return Ok((spec, CodexMint::Ready(uuid)));
+        }
+        controls::clear_resume_args(&mut spec)?;
+        let mint = start_codex_mint(
+            &spec,
+            self.cwd.clone(),
+            &self.environment,
+            prompt.to_owned(),
+        );
+        Ok((spec, mint))
     }
 
     pub(crate) fn clear_context(
@@ -3769,6 +3834,49 @@ mod tests {
             answers
         }
 
+        fn push_control(&mut self, action: crate::doorbell::ControlAction) {
+            let (reply, _answers) = std::sync::mpsc::sync_channel(1);
+            self.doorbell
+                .events
+                .push_back(crate::doorbell::DoorbellEvent::Control(
+                    crate::doorbell::DoorbellControl {
+                        from: 0,
+                        to: 0,
+                        action,
+                        reply,
+                    },
+                ));
+        }
+
+        /// Replaces room 1 with a real Codex pane started in `resume`'s thread.
+        fn codex_pane_online(
+            &mut self,
+            program: &Path,
+            cwd: &Path,
+            title: &str,
+            mint: &str,
+            resume: &str,
+        ) {
+            let spec = codex_mint_spec(program, cwd, title, mint);
+            self.panes[0] = crate::app::spawn_room(
+                &mut crate::app::LivePanes,
+                spec,
+                small_size(),
+                GuestEnvironment::new([]),
+                None,
+                Some(&CodexMint::Ready(resume.to_owned())),
+            )
+            .unwrap();
+        }
+
+        /// Replaces room 1 with the placeholder a crashed native room shows.
+        fn codex_pane_offline(&mut self, program: &Path, cwd: &Path, title: &str, mint: &str) {
+            let spec = codex_mint_spec(program, cwd, title, mint);
+            self.panes[0] =
+                Pane::spawn_unavailable(spec, small_size(), GuestEnvironment::new([]), "offline")
+                    .unwrap();
+        }
+
         fn iterate(&mut self) {
             let now = Instant::now();
             crate::app::run_rooms_iteration(
@@ -3990,6 +4098,334 @@ mod tests {
             Some(CodexMint::Failed(reason)) => Some(reason),
             _ => None,
         }
+    }
+
+    /// A stand-in codex whose exec waits for a gate, so a relaunch can be
+    /// observed while its mint is still running.
+    #[cfg(unix)]
+    fn gated_codex_stub(root: &Path, log: &Path, gate: &Path, queued_for: &str) -> PathBuf {
+        codex_stub_for_pane(
+            root,
+            "codex",
+            &format!(
+                "printf '%s\\n' \"$@\" >> '{log}'\n\
+                 case \"$1\" in\n\
+                 resume) exec sleep 30 ;;\n\
+                 queue) printf 'Queued message sub_1 for thread {queued_for}.\\n' ; exit 0 ;;\n\
+                 esac\n\
+                 while [ ! -e '{gate}' ]; do sleep 0.05; done\n\
+                 printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$CROWDED_TEST_MINT\"\n\
+                 printf '{{\"type\":\"turn.completed\"}}\\n'",
+                log = log.display(),
+                gate = gate.display(),
+            ),
+        )
+    }
+
+    /// Ctrl+R on an offline native Codex room comes back in its stored thread,
+    /// under a new generation, with no second exec.
+    #[cfg(unix)]
+    #[test]
+    fn restarting_an_offline_codex_room_resumes_its_stored_session() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("argv.log");
+        let stub = gated_codex_stub(root.path(), &log, &root.path().join("gate"), MINTED_A);
+        session_state::upsert_minted("codex", cwd.path(), "Room A", MINTED_A).unwrap();
+
+        let mut rig = IterationHarness::new(root.path());
+        rig.codex_pane_offline(&stub, cwd.path(), "Room A", MINTED_B);
+        let old = crate::native_launch::GenerationAllocator::new(session_state::state_directory())
+            .next()
+            .unwrap();
+        rig.bind(
+            Some(IterationHarness::healthy_room(&stub, cwd.path(), UNRELATED)),
+            old,
+            None,
+        );
+
+        crate::app::restart_room(
+            0,
+            small_size(),
+            &mut rig.panes,
+            rig.router.as_mut(),
+            &mut rig.codex,
+            &mut rig.gates,
+            &mut rig.last_output,
+            &mut rig.spawned_at,
+            &mut rig.pulses,
+            &rig.environments,
+            100,
+            Instant::now(),
+        )
+        .unwrap();
+
+        // The terminal came back in the stored thread, not a minted one.
+        let args: Vec<String> = rig.panes[0]
+            .room_spec()
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.ends_with(&["resume".to_owned(), MINTED_A.to_owned()]),
+            "{args:?}"
+        );
+        assert!(rig.panes[0].is_online());
+        let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        assert_eq!(binding.session, MINTED_A);
+        assert!(binding.generation > old, "a relaunch gets a new generation");
+        // The resumed terminal names the stored thread; no exec ran.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let log_text = fs::read_to_string(&log).unwrap_or_default();
+            if log_text.lines().any(|line| line == "resume") {
+                assert!(!log_text.lines().any(|line| line == "exec"), "{log_text}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the resumed terminal never started: {log_text}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// `crowded control N clear` mints a new thread, marks the old one cleared
+    /// before relaunching, rebinds under a new generation, and never delivers
+    /// mail saved for the old thread.
+    #[cfg(unix)]
+    #[test]
+    fn clearing_a_codex_room_mints_a_new_thread_and_holds_old_mail() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("argv.log");
+        let gate = root.path().join("gate");
+        let stub = gated_codex_stub(root.path(), &log, &gate, MINTED_B);
+        session_state::upsert_minted("codex", cwd.path(), "Room A", MINTED_A).unwrap();
+
+        let mut rig = IterationHarness::new(root.path());
+        rig.codex_pane_online(&stub, cwd.path(), "Room A", MINTED_B, MINTED_A);
+        let old = crate::native_launch::GenerationAllocator::new(session_state::state_directory())
+            .next()
+            .unwrap();
+        rig.bind(
+            Some(IterationHarness::healthy_room(&stub, cwd.path(), MINTED_A)),
+            old,
+            None,
+        );
+        // One pass so the router sees the room as running.
+        rig.iterate();
+
+        // Delivery stays paused until after the clear, so this mail is saved
+        // for the old thread and not sent.
+        rig.paused = true;
+        let _ = rig.send("saved before the clear");
+        rig.iterate();
+
+        rig.push_control(crate::doorbell::ControlAction::ClearContext);
+        rig.iterate();
+
+        // The durable cleared marker is written before the mint finishes, so
+        // `crowded resume` can no longer restore the old thread.
+        assert_eq!(
+            session_state::lookup_minted("codex", cwd.path(), "Room A"),
+            None
+        );
+        assert_eq!(
+            session_state::lookup("codex", cwd.path(), "Room A").as_deref(),
+            Some(session_state::FRESH_STATE_MARKER)
+        );
+        assert!(!rig.panes[0].is_online(), "the room shows itself starting");
+
+        // Let the mint finish; the room comes back in the new thread.
+        rig.paused = false;
+        fs::write(&gate, b"go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            rig.iterate();
+            let bound = rig
+                .router
+                .as_ref()
+                .and_then(|router| router.binding_for(0))
+                .is_some_and(|binding| binding.session == MINTED_B);
+            if bound {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the new thread was never bound");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        assert!(binding.generation > old, "a relaunch gets a new generation");
+        assert_eq!(
+            session_state::lookup_minted("codex", cwd.path(), "Room A").as_deref(),
+            Some(MINTED_B)
+        );
+
+        // Exactly one exec created the new thread; the old mail is held.
+        let log_text = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            log_text.lines().filter(|line| *line == "exec").count(),
+            1,
+            "{log_text}"
+        );
+        rig.pump_until("old mail held", |view| {
+            view.contains("HELD: sent for an earlier launch")
+        });
+        assert!(
+            !log_text.lines().any(|line| line == "queue"),
+            "old mail reached Codex"
+        );
+
+        // A reintroduction now reaches the new thread.
+        crate::app::reintroduce_native_room(
+            "Room A",
+            rig.router.as_mut().unwrap(),
+            &mut rig.mailroom,
+            0,
+            "House rules",
+        );
+        rig.pump_until("reintroduction", |view| view.contains("ACCEPTED by Codex"));
+        let log_text = fs::read_to_string(&log).unwrap();
+        assert!(
+            log_text.lines().any(|line| line == MINTED_B),
+            "the reintroduction must name the new thread: {log_text}"
+        );
+    }
+
+    /// A clear whose mint fails leaves the room offline, unbound and named,
+    /// never half-bound to the thread it could not create.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_clear_mint_leaves_the_room_offline_with_its_reason() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = codex_stub_for_pane(
+            root.path(),
+            "codex",
+            "if [ \"$1\" = resume ]; then exec sleep 30; fi\n\
+             printf 'Error: mint failed\\n' >&2\nexit 1",
+        );
+        session_state::upsert_minted("codex", cwd.path(), "Room A", MINTED_A).unwrap();
+
+        let mut rig = IterationHarness::new(root.path());
+        rig.codex_pane_online(&stub, cwd.path(), "Room A", MINTED_B, MINTED_A);
+        let old = crate::native_launch::GenerationAllocator::new(session_state::state_directory())
+            .next()
+            .unwrap();
+        rig.bind(
+            Some(IterationHarness::healthy_room(&stub, cwd.path(), MINTED_A)),
+            old,
+            None,
+        );
+        rig.iterate();
+
+        rig.push_control(crate::doorbell::ControlAction::ClearContext);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            rig.iterate();
+            let view = rig.notice.ordered_lines().join("; ");
+            if view.contains("the room was not started") {
+                assert!(view.contains("mint failed"), "{view}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "the failed mint was never shown");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!rig.panes[0].is_online());
+        assert!(
+            rig.router.as_ref().unwrap().binding_for(0).is_none(),
+            "a failed relaunch must not keep a binding"
+        );
+        assert_eq!(
+            session_state::lookup("codex", cwd.path(), "Room A").as_deref(),
+            Some(session_state::FRESH_STATE_MARKER)
+        );
+    }
+
+    /// Resume means the stored session; with none, the room stays as it was
+    /// and the error names the missing session.
+    #[cfg(unix)]
+    #[test]
+    fn resuming_a_codex_room_without_a_stored_session_names_the_problem() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("argv.log");
+        let stub = gated_codex_stub(root.path(), &log, &root.path().join("gate"), MINTED_A);
+
+        let mut rig = IterationHarness::new(root.path());
+        rig.codex_pane_offline(&stub, cwd.path(), "Room A", MINTED_A);
+        // A sibling entry makes the durable state file exist, so a write by the
+        // refused resume would show up as changed bytes.
+        session_state::upsert_minted("codex", cwd.path(), "Sibling", MINTED_B).unwrap();
+        let state_before = fs::read(session_state::state_path()).unwrap();
+        let old = crate::native_launch::GenerationAllocator::new(session_state::state_directory())
+            .next()
+            .unwrap();
+        rig.bind(
+            Some(IterationHarness::healthy_room(&stub, cwd.path(), MINTED_B)),
+            old,
+            None,
+        );
+        let args_before = rig.panes[0].room_spec().args.clone();
+
+        rig.push_control(crate::doorbell::ControlAction::Resume);
+        rig.iterate();
+
+        let text = rig.notice.ordered_lines().join("; ");
+        assert!(
+            text.contains("no stored Codex session to resume; use control 1 clear"),
+            "{text}"
+        );
+        // Nothing was launched or changed: same pane, same binding, same bytes.
+        assert!(!rig.panes[0].is_online());
+        assert_eq!(rig.panes[0].room_spec().args, args_before);
+        assert!(!log.exists());
+        let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        assert_eq!(
+            (binding.session.as_str(), binding.generation),
+            (MINTED_B, old)
+        );
+        assert_eq!(fs::read(session_state::state_path()).unwrap(), state_before);
+        assert_eq!(session_state::lookup("codex", cwd.path(), "Room A"), None);
+    }
+
+    /// A Codex room still refuses model and effort changes; the refusal comes
+    /// before any state is written.
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_room_still_refuses_model_and_effort_changes() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = gated_codex_stub(
+            root.path(),
+            &root.path().join("argv.log"),
+            &root.path().join("gate"),
+            MINTED_A,
+        );
+
+        let mut rig = IterationHarness::new(root.path());
+        rig.codex_pane_offline(&stub, cwd.path(), "Room A", MINTED_A);
+
+        rig.push_control(crate::doorbell::ControlAction::Configure {
+            model: Some("provider/model".to_owned()),
+            effort: None,
+        });
+        rig.iterate();
+
+        let text = rig.notice.ordered_lines().join("; ");
+        assert!(
+            text.contains(
+                "native delivery rooms cannot be restarted, cleared, resumed or reconfigured yet"
+            ),
+            "{text}"
+        );
+        assert_eq!(session_state::lookup("codex", cwd.path(), "Room A"), None);
     }
 
     #[cfg(unix)]

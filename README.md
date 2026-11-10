@@ -172,10 +172,10 @@ locally, not delivered.
 
 A restart of Crowded gives each native room a new server and session. Mail
 saved for an earlier launch stays in the log as `HELD` or `UNCERTAIN`; it is not
-delivered to the new session and does not block it. A native room still cannot be
-restarted, cleared, resumed or reconfigured in place, and `crowded resume` starts
-a new session and says so. There is not yet a way to release or discard held mail
-from inside Crowded.
+delivered to the new session and does not block it. A native OpenCode room still
+cannot be restarted, cleared, resumed or reconfigured in place, and `crowded
+resume` starts it a new session and says so. There is not yet a way to release or
+discard held mail from inside Crowded.
 
 When Crowded is hung up on, interrupted or terminated (SIGHUP, SIGINT,
 SIGTERM) it leaves the same way as after Ctrl+Q, and its owned servers go with
@@ -249,9 +249,13 @@ failure with a message to update it; Crowded never falls back to paste.
 `native_delivery` needs `transport = "raw"`. If the bound room's process exits,
 new mail is refused and saved mail is held with that reason; it is never queued
 into the old thread. Each launch binds with its own generation, so mail saved
-for an earlier launch can never match a later session. A native Codex room still
-cannot be restarted, cleared, resumed or reconfigured in place, and the delivery
-pause and fuse still apply.
+for an earlier launch can never match a later session. A native Codex room can be
+restarted (F5, or Ctrl+R while it is offline), cleared and resumed in place.
+Restart and resume bring back the stored thread; clear durably marks the old
+thread cleared, then mints a new one with `codex exec` and reopens the room in
+it. Every relaunch binds under a new generation, so mail saved for the earlier
+launch stays `HELD`. A native Codex room's model and effort still cannot be
+changed in place, and the delivery pause and fuse still apply.
 
 ```toml
 [[rooms]]
