@@ -327,8 +327,10 @@ fn inferred_vendor(program: &OsStr) -> &'static str {
     }
 }
 
-/// Native delivery only exists for a raw OpenCode room whose launch Crowded
-/// fully controls, so every conflicting option is a visible configuration error.
+/// Native delivery needs a raw agent room whose launch Crowded can address
+/// exactly: an OpenCode room it serves itself, or a Codex room queued by its
+/// own captured thread. Every conflicting option is a visible configuration
+/// error.
 fn validate_native_delivery(
     program: &OsStr,
     transport: Transport,
@@ -337,11 +339,20 @@ fn validate_native_delivery(
 ) -> io::Result<()> {
     let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_owned());
     let guest = Path::new(program).file_name().unwrap_or(program);
-    if !guest.to_string_lossy().eq_ignore_ascii_case("opencode") {
-        return Err(invalid("native_delivery is supported only for OpenCode rooms"));
+    let guest = guest.to_string_lossy();
+    let codex = guest.eq_ignore_ascii_case("codex");
+    if !guest.eq_ignore_ascii_case("opencode") && !codex {
+        return Err(invalid(
+            "native_delivery is supported only for OpenCode and Codex rooms",
+        ));
     }
     if transport != Transport::Raw {
         return Err(invalid("native_delivery requires transport = \"raw\""));
+    }
+    if codex {
+        // The queue command runs beside the room and takes no server options,
+        // so only the room's transport and identity need to be exact.
+        return Ok(());
     }
     // The wrapped server is owned by proving it is the wrapper's direct child;
     // that check is not implemented on Windows.
@@ -855,7 +866,7 @@ transport = "raw"
     }
 
     #[test]
-    fn native_delivery_is_opt_in_and_only_for_raw_opencode_rooms() {
+    fn native_delivery_is_opt_in_and_only_for_raw_agent_rooms() {
         let rooms = room_specs_from_toml(
             r#"
                 [[rooms]]
@@ -873,6 +884,16 @@ transport = "raw"
         assert!(rooms[0].native_delivery);
         assert!(!rooms[1].native_delivery);
 
+        // A Codex room is queued through its own captured thread, so it needs
+        // no owned server and is accepted as it is.
+        let codex = room_specs_from_toml(
+            "[[rooms]]\ncommand = \"codex\"\ntransport = \"raw\"\nnative_delivery = true\n\n[[rooms]]\ncommand = \"claude\"\ntransport = \"raw\"",
+        )
+        .unwrap()
+        .specs;
+        assert!(codex[0].native_delivery);
+        assert!(!codex[0].use_headroom);
+
         // Headroom is allowed in a native room wherever the wrapped server's
         // parent can be checked.
         let headroom = "[[rooms]]\ncommand = \"opencode\"\ntransport = \"raw\"\nnative_delivery = true\nuse_headroom = true\n\n[[rooms]]\ncommand = \"claude\"\ntransport = \"raw\"";
@@ -889,8 +910,8 @@ transport = "raw"
 
         for (rooms, expected) in [
             (
-                "command = \"codex\"\ntransport = \"raw\"\nnative_delivery = true",
-                "only for OpenCode",
+                "command = \"claude\"\ntransport = \"raw\"\nnative_delivery = true",
+                "only for OpenCode and Codex",
             ),
             (
                 "command = \"opencode\"\ntransport = \"shell\"\nnative_delivery = true",

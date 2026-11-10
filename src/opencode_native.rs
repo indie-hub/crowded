@@ -9,7 +9,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
     path::Path,
     process::{Child, Stdio},
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -464,7 +464,7 @@ pub(crate) struct Server {
     client: Arc<Client>,
     session: String,
     url: String,
-    binding: Option<LaunchBinding>,
+    binding: Mutex<Option<LaunchBinding>>,
     /// The authenticated server's own pid; when it differs from the spawned
     /// child (a wrapper sits in between), it is stopped explicitly on drop.
     server_pid: Option<u32>,
@@ -505,7 +505,12 @@ impl Server {
     }
 
     pub(crate) fn claim(&mut self, room: String, generation: u64) -> io::Result<Binding> {
-        if self.binding.is_some() {
+        if self
+            .binding
+            .lock()
+            .map_err(|_| io::Error::other("server binding state is poisoned"))?
+            .is_some()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "server already bound",
@@ -532,7 +537,10 @@ impl Server {
                 generation,
             })?
             .clone();
-        self.binding = Some(binding);
+        *self
+            .binding
+            .lock()
+            .map_err(|_| io::Error::other("server binding state is poisoned"))? = Some(binding);
         Ok(result)
     }
 
@@ -549,17 +557,52 @@ impl Server {
         rx
     }
 
+    /// Moves this owned server to a session the room reported, without
+    /// relaunching it or copying credentials: the launch binding already
+    /// proved ownership of the server process, and the report only changes
+    /// which session on that same server the room uses. The room and endpoint
+    /// must still match the bound ones, so a report can never aim this server
+    /// at another room or server.
+    pub(crate) fn adopt(&self, binding: &Binding) -> io::Result<()> {
+        let mut owned = self
+            .binding
+            .lock()
+            .map_err(|_| io::Error::other("server binding state is poisoned"))?;
+        let Some(launch) = owned.as_mut() else {
+            return Err(io::Error::other("server is not bound"));
+        };
+        if launch
+            .bound()
+            .is_some_and(|current| current.endpoint != binding.endpoint)
+        {
+            return Err(io::Error::other(
+                "a session report cannot move a server to another endpoint",
+            ));
+        }
+        launch.adopt_report(
+            binding.room.clone(),
+            binding.generation,
+            binding.session.clone(),
+        )?;
+        Ok(())
+    }
+
     pub fn queue_async(
         &self,
         binding: &Binding,
         message_id: String,
         text: String,
     ) -> mpsc::Receiver<Delivery> {
-        if self
+        let owned = self
             .binding
-            .as_ref()
-            .is_some_and(|owned| owned.accepts(binding))
-        {
+            .lock()
+            .map(|guard| {
+                guard
+                    .as_ref()
+                    .is_some_and(|owned| owned.accepts(binding))
+            })
+            .unwrap_or(false);
+        if owned {
             return self
                 .client
                 .clone()
@@ -576,11 +619,16 @@ impl Server {
         message_id: String,
         text: String,
     ) -> mpsc::Receiver<Delivery> {
-        if self
+        let owned = self
             .binding
-            .as_ref()
-            .is_some_and(|owned| owned.accepts(binding))
-        {
+            .lock()
+            .map(|guard| {
+                guard
+                    .as_ref()
+                    .is_some_and(|owned| owned.accepts(binding))
+            })
+            .unwrap_or(false);
+        if owned {
             return self
                 .client
                 .clone()
@@ -668,7 +716,7 @@ impl Server {
                 client,
                 session,
                 url,
-                binding: None,
+                binding: Mutex::new(None),
                 server_pid: Some(server_pid),
             }),
             Err(error) => {
@@ -1242,7 +1290,7 @@ mod tests {
             client,
             session: "ses_a".into(),
             url: "http://127.0.0.1:1234".into(),
-            binding: None,
+            binding: Mutex::new(None),
             server_pid: None,
         };
         let fake_binding = Binding {
@@ -1327,7 +1375,7 @@ mod tests {
             client,
             session: "ses_a".into(),
             url: "http://127.0.0.1:1234".into(),
-            binding: None,
+            binding: Mutex::new(None),
             server_pid: None,
         };
         let binding = server.claim("room-a".into(), 1).unwrap();
@@ -1403,7 +1451,7 @@ mod tests {
                 client,
                 session: "ses_a".into(),
                 url: "http://127.0.0.1:1234".into(),
-                binding: None,
+                binding: Mutex::new(None),
                 server_pid: None,
             };
             let binding = server.claim("room-a".into(), 1).unwrap();
@@ -1432,30 +1480,37 @@ mod tests {
             let path = dir.path().join("outbox.json");
             let outbox = BackgroundOutbox::start(path.clone(), 4, 4, 1, Arc::new(adapter));
             outbox
-                .try_send(Command::Enqueue {
-                    source: "s".into(),
-                    binding: binding.clone(),
-                    text: "hello".into(),
-                })
+                .try_send(
+                    1,
+                    Command::Enqueue {
+                        source: "s".into(),
+                        binding: binding.clone(),
+                        text: "hello".into(),
+                    },
+                )
                 .ok()
                 .unwrap();
             assert!(matches!(
-                outbox.events.recv_timeout(Duration::from_secs(3)).unwrap(),
+                outbox.events.recv_timeout(Duration::from_secs(3)).unwrap().event,
                 Event::Queued(_)
             ));
             let bindings = HashMap::from([(binding.room.clone(), binding)]);
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
                 outbox
-                    .try_send(Command::Schedule {
-                        bindings: bindings.clone(),
-                        paused: false,
-                        fused: false,
-                    })
+                    .try_send(
+                        2,
+                        Command::Schedule {
+                            bindings: bindings.clone(),
+                            paused: false,
+                            fused: false,
+                            pending: Vec::new(),
+                        },
+                    )
                     .ok()
                     .unwrap();
                 let event = outbox.events.recv_timeout(Duration::from_secs(3)).unwrap();
-                if let Event::Updated(messages) = event {
+                if let Event::Updated(messages) = event.event {
                     if messages[0].status == Status::Uncertain {
                         break;
                     }
@@ -1487,11 +1542,11 @@ mod tests {
             client,
             session: "ses_a".into(),
             url: "http://127.0.0.1:1234".into(),
-            binding: None,
+            binding: Mutex::new(None),
             server_pid: None,
         };
         assert!(server.claim("room".into(), 1).is_err());
-        assert!(server.binding.is_none());
+        assert!(server.binding.lock().unwrap().is_none());
     }
 
     #[cfg(unix)]
@@ -1533,7 +1588,7 @@ mod tests {
             client,
             session: "ses_a".into(),
             url: "http://127.0.0.1:1234".into(),
-            binding: None,
+            binding: Mutex::new(None),
             server_pid: None,
         };
         drop(server);

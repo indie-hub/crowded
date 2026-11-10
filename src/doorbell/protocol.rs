@@ -20,12 +20,14 @@ pub(super) const MAX_MESSAGES_PER_SECOND: usize = 5;
 pub(super) const EVENT_QUEUE_CAPACITY: usize = 100;
 pub(super) const DEDUPE_CAPACITY: usize = 256;
 pub(super) const MAX_MODEL_BYTES: usize = 128;
+pub(super) const MAX_SESSION_BYTES: usize = 128;
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum WireRequest {
     Message(MessageRequest),
     Control(ControlRequest),
     Pulse(PulseRequest),
+    SessionReport(SessionReportRequest),
     Roster(RosterRequest),
 }
 
@@ -56,6 +58,19 @@ pub(super) struct PulseRequest {
     /// payload, so a room's internal detail can be tracked in real time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) detail: Option<Vec<DetailEvent>>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(super) struct SessionReportRequest {
+    pub(super) token: String,
+    pub(super) id: String,
+    /// The room's current session id, when the hook knows one. Absent only
+    /// together with `pending`: the room is between sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) session: Option<String>,
+    /// The room reports it is between sessions; new mail is held.
+    #[serde(default)]
+    pub(super) pending: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -251,7 +266,7 @@ impl PulseState {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(super) struct WireResponse {
+pub(crate) struct WireResponse {
     pub(super) ok: bool,
     pub(super) status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -314,7 +329,14 @@ pub(crate) struct DoorbellControl {
     pub(crate) from: usize,
     pub(crate) to: usize,
     pub(crate) action: ControlAction,
-    pub(super) reply: SyncSender<WireResponse>,
+    pub(crate) reply: SyncSender<WireResponse>,
+}
+
+pub(crate) struct DoorbellSessionReport {
+    pub(crate) from: usize,
+    pub(crate) session: Option<String>,
+    pub(crate) pending: bool,
+    pub(crate) reply: SyncSender<WireResponse>,
 }
 
 pub(crate) struct DoorbellRoster {
@@ -325,6 +347,7 @@ pub(crate) enum DoorbellEvent {
     Message(DoorbellEnvelope),
     Control(DoorbellControl),
     Pulse(DoorbellPulse),
+    SessionReport(DoorbellSessionReport),
     Roster(DoorbellRoster),
 }
 
@@ -388,6 +411,18 @@ impl DoorbellEnvelope {
 impl DoorbellControl {
     pub(crate) fn reply_applied(&self) {
         let _ = self.reply.send(WireResponse::accepted("applied", None));
+    }
+
+    pub(crate) fn reply_failed(&self, error: impl Into<String>) {
+        let _ = self.reply.send(WireResponse::rejected(error));
+    }
+}
+
+impl DoorbellSessionReport {
+    pub(crate) fn reply_recorded(&self, status: &str) {
+        let _ = self
+            .reply
+            .send(WireResponse::accepted(status, None));
     }
 
     pub(crate) fn reply_failed(&self, error: impl Into<String>) {
@@ -499,6 +534,28 @@ fn validate_identity(
         return Err(format!("{kind} id must contain 1..=128 bytes"));
     }
     Ok(from)
+}
+
+pub(super) fn validate_session_report(
+    request: &SessionReportRequest,
+    tokens: &[String],
+) -> Result<usize, String> {
+    if let Some(session) = request.session.as_deref()
+        && (session.is_empty()
+            || session.len() > MAX_SESSION_BYTES
+            || !session
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
+    {
+        return Err(
+            "session id must contain 1..=128 bytes of letters, numbers, `_`, `-` or `.`"
+                .to_owned(),
+        );
+    }
+    if request.session.is_none() && !request.pending {
+        return Err("a session report needs a session id or the pending flag".to_owned());
+    }
+    validate_identity(&request.token, &request.id, "session-report", tokens)
 }
 
 pub(super) fn validate_pulse(request: &PulseRequest, tokens: &[String]) -> Result<usize, String> {
@@ -758,5 +815,57 @@ mod tests {
             }]),
         };
         assert!(validate_pulse(&oversized, &["left".to_owned(), "right".to_owned()]).is_err());
+    }
+
+    fn session_report(
+        token: &str,
+        session: Option<&str>,
+        pending: bool,
+    ) -> SessionReportRequest {
+        SessionReportRequest {
+            token: token.to_owned(),
+            id: "report-1".to_owned(),
+            session: session.map(str::to_owned),
+            pending,
+        }
+    }
+
+    #[test]
+    fn session_report_validation_binds_the_room_and_checks_the_shape() {
+        let tokens = ["left".to_owned(), "right".to_owned()];
+        assert_eq!(
+            validate_session_report(&session_report("left", Some("ses_abc-1.2"), false), &tokens),
+            Ok(0)
+        );
+        assert_eq!(
+            validate_session_report(&session_report("right", None, true), &tokens),
+            Ok(1)
+        );
+        assert_eq!(
+            validate_session_report(&session_report("left", Some("ses-x"), true), &tokens),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn session_report_validation_rejects_what_it_cannot_trust() {
+        let tokens = ["left".to_owned(), "right".to_owned()];
+        // Unknown token: no room is bound.
+        assert!(validate_session_report(&session_report("intruder", Some("ses-x"), false), &tokens).is_err());
+        // Empty, oversized, and strangely-shaped ids never reach a room.
+        for bad in ["", "has space", "has/slash", "semi;colon", "quote\"q", "back\\slash"] {
+            assert!(
+                validate_session_report(&session_report("left", Some(bad), false), &tokens).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        let oversized = "s".repeat(129);
+        assert!(
+            validate_session_report(&session_report("left", Some(&oversized), false), &tokens).is_err()
+        );
+        // Neither an id nor the pending flag: nothing to report.
+        assert!(
+            validate_session_report(&session_report("left", None, false), &tokens).is_err()
+        );
     }
 }

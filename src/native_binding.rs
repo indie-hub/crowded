@@ -72,6 +72,45 @@ impl LaunchBinding {
     pub fn accepts(&self, binding: &Binding) -> bool {
         self.binding.as_ref() == Some(binding)
     }
+
+    /// The verified binding, if this launch has one.
+    pub fn bound(&self) -> Option<&Binding> {
+        self.binding.as_ref()
+    }
+
+    /// Moves an already-owned launch to a session its room reported. The room
+    /// must still match the bound one, so a report can never aim the launch at
+    /// another room; ownership of the process was proven at launch and is not
+    /// re-proven here, only the session changes.
+    pub fn adopt_report(
+        &mut self,
+        room: String,
+        generation: u64,
+        session: String,
+    ) -> io::Result<Binding> {
+        let current = self
+            .binding
+            .as_ref()
+            .ok_or_else(|| io::Error::other("launch is not bound"))?;
+        if current.room != room {
+            return Err(io::Error::other(
+                "a session report cannot move a launch to another room",
+            ));
+        }
+        if session.is_empty() || generation == 0 {
+            return Err(io::Error::other(
+                "a rebinding needs its session and generation",
+            ));
+        }
+        let next = Binding {
+            room,
+            session,
+            endpoint: current.endpoint.clone(),
+            generation,
+        };
+        self.binding = Some(next.clone());
+        Ok(next)
+    }
 }
 
 #[cfg(test)]

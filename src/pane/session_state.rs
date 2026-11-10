@@ -103,6 +103,17 @@ struct SessionEntry {
     /// its own prior entry instead of leaving it stale. See module docs.
     room: String,
     session_id: String,
+    /// True only for a session this program created itself with `codex exec`.
+    /// A generic captured id (older builds, or another tool's entry) is never
+    /// trusted as a native room's binding.
+    #[serde(default)]
+    minted: bool,
+    /// True only for a session id the room's own hook reported after launch
+    /// (for example a Codex SessionStart after a human /clear). Like a minted
+    /// id, a reported id is trusted for resume; a legacy generic entry with
+    /// neither flag is not.
+    #[serde(default)]
+    reported: bool,
 }
 
 /// The stable numeric-room suffix of a `RoomSpec.title` like `OpenCode · 2`
@@ -131,7 +142,19 @@ impl SessionState {
         }
     }
 
-    fn upsert(&mut self, vendor: &str, cwd: &str, room: &str, session_id: &str) {
+    fn upsert(&mut self, vendor: &str, cwd: &str, room: &str, session_id: &str, minted: bool) {
+        self.upsert_full(vendor, cwd, room, session_id, minted, false);
+    }
+
+    fn upsert_full(
+        &mut self,
+        vendor: &str,
+        cwd: &str,
+        room: &str,
+        session_id: &str,
+        minted: bool,
+        reported: bool,
+    ) {
         let identity = room_identity(room);
         // Drop EVERY prior entry for this (cwd, numeric room), not just the
         // first match -- a room can already have more than one on disk (e.g.
@@ -146,6 +169,8 @@ impl SessionState {
             cwd: cwd.to_owned(),
             room: room.to_owned(),
             session_id: session_id.to_owned(),
+            minted,
+            reported,
         });
     }
 
@@ -360,8 +385,10 @@ pub(super) fn clear_room(vendor: &str, cwd: &Path, room: &str) {
     let Ok(_guard) = STATE_LOCK.lock() else {
         return;
     };
-    let mut state = load_state().unwrap_or_else(|_| SessionState::empty());
-    state.upsert(vendor, &cwd.to_string_lossy(), room, FRESH_STATE_MARKER);
+    let Ok(mut state) = load_state_for_update() else {
+        return;
+    };
+    state.upsert(vendor, &cwd.to_string_lossy(), room, FRESH_STATE_MARKER, false);
     let _ = save_state(&state);
 }
 
@@ -373,9 +400,88 @@ pub(super) fn upsert(vendor: &str, cwd: &Path, room: &str, session_id: &str) {
     let Ok(_guard) = STATE_LOCK.lock() else {
         return;
     };
-    let mut state = load_state().unwrap_or_else(|_| SessionState::empty());
-    state.upsert(vendor, &cwd.to_string_lossy(), room, session_id);
+    let Ok(mut state) = load_state_for_update() else {
+        return;
+    };
+    state.upsert(vendor, &cwd.to_string_lossy(), room, session_id, false);
     let _ = save_state(&state);
+}
+
+/// Whether Crowded minted the stored session for `(vendor, cwd, room)`.
+/// A generic capture, a resume entry, or an older build's entry is not minted
+/// and is never used as a native Codex room's binding.
+pub(crate) fn lookup_minted(vendor: &str, cwd: &Path, room: &str) -> Option<String> {
+    let state = load_state().ok()?;
+    let cwd = cwd.to_string_lossy();
+    state
+        .sessions
+        .iter()
+        .find(|entry| {
+            entry.vendor == vendor && entry.cwd == cwd && entry.room == room && entry.minted
+        })
+        .map(|entry| entry.session_id.clone())
+}
+
+/// Record a session id the room's own hook reported after launch, and report
+/// whether it is durably stored. A room must not rebind to a session Crowded
+/// could lose on restart. The existing file is never replaced when it cannot
+/// be read, exactly like a mint: a corrupt file stays byte-for-byte intact.
+pub(crate) fn upsert_reported(
+    vendor: &str,
+    cwd: &Path,
+    room: &str,
+    session_id: &str,
+) -> io::Result<()> {
+    let _guard = STATE_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("session state is poisoned"))?;
+    let mut state = load_state_for_update().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "the session state could not be read, so session {session_id} was not recorded and the existing file was left unchanged: {error}"
+            ),
+        )
+    })?;
+    state.upsert_full(vendor, &cwd.to_string_lossy(), room, session_id, false, true);
+    save_state(&state)
+}
+
+/// Whether the room's own hook reported the stored session for
+/// `(vendor, cwd, room)`. A legacy generic entry is not trusted.
+pub(crate) fn lookup_reported(vendor: &str, cwd: &Path, room: &str) -> Option<String> {
+    let state = load_state().ok()?;
+    let cwd = cwd.to_string_lossy();
+    state
+        .sessions
+        .iter()
+        .find(|entry| {
+            entry.vendor == vendor && entry.cwd == cwd && entry.room == room && entry.reported
+        })
+        .map(|entry| entry.session_id.clone())
+}
+
+/// Record a session this program minted, and report whether it is durably
+/// stored. A native room must not become ready when this fails.
+pub(super) fn upsert_minted(
+    vendor: &str,
+    cwd: &Path,
+    room: &str,
+    session_id: &str,
+) -> io::Result<()> {
+    let _guard = STATE_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("session state is poisoned"))?;
+    let mut state = load_state_for_update().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "the session state could not be read, so session {session_id} was not recorded and the existing file was left unchanged: {error}"
+            ),
+        )
+    })?;
+    state.upsert(vendor, &cwd.to_string_lossy(), room, session_id, true);
+    save_state(&state)
 }
 
 /// The exclude baseline for a fresh capture of `(vendor, cwd)`: every session
@@ -448,8 +554,10 @@ fn capture_once(
     };
     let exclude = claimed_session_ids(vendor.key(), cwd);
     if let Some(id) = controls::discover_session_id(*vendor, cwd, since, &exclude, opencode_model) {
-        let mut state = load_state().unwrap_or_else(|_| SessionState::empty());
-        state.upsert(vendor.key(), &cwd.to_string_lossy(), room, &id);
+        let Ok(mut state) = load_state_for_update() else {
+            return false;
+        };
+        state.upsert(vendor.key(), &cwd.to_string_lossy(), room, &id, false);
         let _ = save_state(&state);
         if let Ok(mut guard) = captured.lock() {
             *guard = Some(id);
@@ -518,6 +626,16 @@ fn load_state() -> io::Result<SessionState> {
     Ok(state)
 }
 
+/// The state to modify and save: empty only when no file exists yet. A file
+/// that is malformed, of another version or unreadable is an error, so a write
+/// never replaces state it could not understand.
+fn load_state_for_update() -> io::Result<SessionState> {
+    match load_state() {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(SessionState::empty()),
+        other => other,
+    }
+}
+
 fn save_state(state: &SessionState) -> io::Result<()> {
     let root = state_root();
     let directory = root.join(SESSION_STATE_DIRECTORY);
@@ -552,7 +670,7 @@ pub(crate) fn state_directory() -> PathBuf {
     state_root().join(SESSION_STATE_DIRECTORY)
 }
 
-fn state_path() -> PathBuf {
+pub(crate) fn state_path() -> PathBuf {
     state_root()
         .join(SESSION_STATE_DIRECTORY)
         .join(SESSION_STATE_FILE)
@@ -625,14 +743,14 @@ static TEST_ROOT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Points the state root at a fresh temp directory while held.
 #[cfg(test)]
-pub(super) struct StateRootGuard {
+pub(crate) struct StateRootGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     directory: PathBuf,
 }
 
 #[cfg(test)]
 impl StateRootGuard {
-    pub(super) fn isolated() -> Self {
+    pub(crate) fn isolated() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let lock = TEST_ROOT_LOCK
             .lock()
@@ -650,6 +768,13 @@ impl StateRootGuard {
             _lock: lock,
             directory,
         }
+    }
+}
+
+#[cfg(test)]
+impl StateRootGuard {
+    pub(super) fn path(&self) -> &Path {
+        &self.directory
     }
 }
 
@@ -686,6 +811,134 @@ mod tests {
     fn set_modified(path: &Path, time: SystemTime) {
         let file = fs::File::options().write(true).open(path).unwrap();
         file.set_modified(time).unwrap();
+    }
+
+    const MINTED: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn stored_state_is_untouched_by_upsert(needle: &str, prepare: impl Fn(&Path)) {
+        let _state = StateRootGuard::isolated();
+        let path = state_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        prepare(&path);
+        let before = fs::read(&path).unwrap_or_default();
+        let error = upsert_minted("codex", Path::new("/repo"), "Codex · 1", MINTED).unwrap_err();
+        assert!(error.to_string().contains(MINTED), "{error}");
+        assert!(error.to_string().contains(needle), "{error}");
+        assert_eq!(fs::read(&path).unwrap_or_default(), before);
+        assert_eq!(lookup_minted("codex", Path::new("/repo"), "Codex · 1"), None);
+    }
+
+    #[test]
+    fn a_malformed_session_state_is_never_replaced_by_a_minted_session() {
+        stored_state_is_untouched_by_upsert("key must be a string", |path| fs::write(path, b"{ not json").unwrap());
+    }
+
+    #[test]
+    fn an_unsupported_session_state_version_is_never_replaced_by_a_minted_session() {
+        stored_state_is_untouched_by_upsert("unsupported session state version", |path| {
+            fs::write(path, br#"{"version":99,"sessions":[]}"#).unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_session_state_is_never_replaced_by_a_minted_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let _state = StateRootGuard::isolated();
+        let path = state_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, br#"{"version":2,"sessions":[]}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = upsert_minted("codex", Path::new("/repo"), "Codex · 1", MINTED);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains(MINTED), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), br#"{"version":2,"sessions":[]}"#);
+    }
+
+    #[test]
+    fn a_missing_session_state_starts_empty_and_records_the_minted_session() {
+        let _state = StateRootGuard::isolated();
+        upsert_minted("codex", Path::new("/repo"), "Codex · 1", MINTED).unwrap();
+        assert_eq!(
+            lookup_minted("codex", Path::new("/repo"), "Codex · 1").as_deref(),
+            Some(MINTED)
+        );
+    }
+
+    #[test]
+    fn a_reported_session_is_trusted_but_stays_distinct_from_a_minted_one() {
+        let _state = StateRootGuard::isolated();
+        // A legacy generic entry is trusted by neither lookup.
+        upsert("codex", Path::new("/repo"), "Codex · 1", MINTED);
+        assert_eq!(lookup_reported("codex", Path::new("/repo"), "Codex · 1"), None);
+        assert_eq!(lookup_minted("codex", Path::new("/repo"), "Codex · 1"), None);
+        // A hook report supersedes the generic entry with reported provenance.
+        upsert_reported("codex", Path::new("/repo"), "Codex · 1", MINTED).unwrap();
+        assert_eq!(
+            lookup_reported("codex", Path::new("/repo"), "Codex · 1").as_deref(),
+            Some(MINTED)
+        );
+        assert_eq!(lookup_minted("codex", Path::new("/repo"), "Codex · 1"), None);
+    }
+
+    #[test]
+    fn a_reported_session_supersedes_a_minted_one_for_the_same_room() {
+        let _state = StateRootGuard::isolated();
+        upsert_minted("codex", Path::new("/repo"), "Codex · 1", MINTED).unwrap();
+        upsert_reported("codex", Path::new("/repo"), "Codex · 1", "thread-reported").unwrap();
+        assert_eq!(
+            lookup_reported("codex", Path::new("/repo"), "Codex · 1").as_deref(),
+            Some("thread-reported")
+        );
+        // The stale mint is gone: exactly one entry survives for the room.
+        assert_eq!(lookup_minted("codex", Path::new("/repo"), "Codex · 1"), None);
+        let state = load_state().unwrap();
+        assert_eq!(
+            state
+                .sessions
+                .iter()
+                .filter(|entry| entry.room == "Codex · 1")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_reported_session_never_replaces_a_malformed_state_file() {
+        let _state = StateRootGuard::isolated();
+        let path = state_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{ not json").unwrap();
+        let error =
+            upsert_reported("codex", Path::new("/repo"), "Codex · 1", "thread-new").unwrap_err();
+        assert!(error.to_string().contains("thread-new"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), b"{ not json");
+        assert_eq!(lookup_reported("codex", Path::new("/repo"), "Codex · 1"), None);
+    }
+
+    #[test]
+    fn a_reported_session_never_replaces_an_unsupported_state_version() {
+        let _state = StateRootGuard::isolated();
+        let path = state_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, br#"{"version":99,"sessions":[]}"#).unwrap();
+        let error =
+            upsert_reported("codex", Path::new("/repo"), "Codex · 1", "thread-new").unwrap_err();
+        assert!(error.to_string().contains("thread-new"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), br#"{"version":99,"sessions":[]}"#);
+        assert_eq!(lookup_reported("codex", Path::new("/repo"), "Codex · 1"), None);
+    }
+
+    #[test]
+    fn the_best_effort_writers_also_leave_malformed_state_alone() {
+        let _state = StateRootGuard::isolated();
+        let path = state_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{ not json").unwrap();
+        upsert("codex", Path::new("/repo"), "Codex · 1", MINTED);
+        clear_room("codex", Path::new("/repo"), "Codex · 1");
+        assert_eq!(fs::read(&path).unwrap(), b"{ not json");
     }
 
     #[test]
@@ -811,10 +1064,10 @@ mod tests {
     #[test]
     fn upsert_merges_by_vendor_cwd_and_room_and_lookup_roundtrips() {
         let mut state = SessionState::empty();
-        state.upsert("claude", "/a", "Claude · 1", "id-a");
-        state.upsert("opencode", "/b", "OpenCode · 3", "id-b");
+        state.upsert("claude", "/a", "Claude · 1", "id-a", false);
+        state.upsert("opencode", "/b", "OpenCode · 3", "id-b", false);
         // Same (vendor, cwd, room) supersedes in place rather than appending.
-        state.upsert("claude", "/a", "Claude · 1", "id-a2");
+        state.upsert("claude", "/a", "Claude · 1", "id-a2", false);
 
         assert_eq!(state.sessions.len(), 2);
         assert_eq!(state.lookup("claude", "/a", "Claude · 1"), Some("id-a2"));
@@ -864,8 +1117,8 @@ mod tests {
     #[test]
     fn upsert_supersedes_a_stale_entry_when_the_same_numeric_room_changes_vendor() {
         let mut state = SessionState::empty();
-        state.upsert("opencode", "/repo", "OpenCode · 2", "ses-opencode-stale");
-        state.upsert("codex", "/repo", "Codex · 2", "ses-codex-fresh");
+        state.upsert("opencode", "/repo", "OpenCode · 2", "ses-opencode-stale", false);
+        state.upsert("codex", "/repo", "Codex · 2", "ses-codex-fresh", false);
 
         assert_eq!(
             state.sessions.len(),
@@ -901,12 +1154,16 @@ mod tests {
             cwd: "/repo".to_owned(),
             room: "OpenCode · 2".to_owned(),
             session_id: "ses-opencode-stale".to_owned(),
+            minted: false,
+            reported: false,
         });
         state.sessions.push(SessionEntry {
             vendor: "codex".to_owned(),
             cwd: "/repo".to_owned(),
             room: "Codex · 2".to_owned(),
             session_id: "ses-codex-old".to_owned(),
+            minted: false,
+            reported: false,
         });
         // A sibling room at the same cwd, and the same room number at a
         // different cwd: both must survive untouched.
@@ -915,15 +1172,19 @@ mod tests {
             cwd: "/repo".to_owned(),
             room: "OpenCode · 3".to_owned(),
             session_id: "ses-sibling".to_owned(),
+            minted: false,
+            reported: false,
         });
         state.sessions.push(SessionEntry {
             vendor: "codex".to_owned(),
             cwd: "/elsewhere".to_owned(),
             room: "Codex · 2".to_owned(),
             session_id: "ses-elsewhere".to_owned(),
+            minted: false,
+            reported: false,
         });
 
-        state.upsert("codex", "/repo", "Codex · 2", "ses-codex-fresh");
+        state.upsert("codex", "/repo", "Codex · 2", "ses-codex-fresh", false);
 
         let room_2_at_repo: Vec<_> = state
             .sessions
@@ -954,8 +1215,8 @@ mod tests {
     #[test]
     fn two_rooms_sharing_vendor_and_cwd_do_not_collide() {
         let mut state = SessionState::empty();
-        state.upsert("opencode", "/shared", "OpenCode · 2", "id-room-2");
-        state.upsert("opencode", "/shared", "OpenCode · 3", "id-room-3");
+        state.upsert("opencode", "/shared", "OpenCode · 2", "id-room-2", false);
+        state.upsert("opencode", "/shared", "OpenCode · 3", "id-room-3", false);
 
         assert_eq!(state.sessions.len(), 2);
         assert_eq!(
@@ -987,7 +1248,7 @@ mod tests {
         let _guard = StateRootGuard::isolated();
 
         let mut state = SessionState::empty();
-        state.upsert("codex", "/repo", "Codex · 2", "ses-codex");
+        state.upsert("codex", "/repo", "Codex · 2", "ses-codex", false);
         save_state(&state).unwrap();
 
         let loaded = load_state().unwrap();

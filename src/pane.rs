@@ -20,6 +20,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use tui_term::vt100::{Parser, Screen};
 
 use crate::{
+    codex_native,
     command::{ResolvedCommand, headroom_on_path},
     config::{RoomScheduling, RoomSpec, Transport},
     doorbell::RoomCapabilities,
@@ -585,6 +586,16 @@ impl GuestEnvironment {
     }
 }
 
+/// Whether this native room runs on a Crowded-owned OpenCode server. A Codex
+/// native room keeps its own process and is queued by its captured thread.
+fn owned_server_room(spec: &RoomSpec) -> bool {
+    spec.native_delivery
+        && matches!(
+            controls::cli_vendor(spec),
+            Ok(controls::CliVendor::OpenCode)
+        )
+}
+
 fn opencode_launch(spec: &RoomSpec) -> io::Result<RoomSpec> {
     let mut launch = spec.clone();
     let guest = Path::new(spec.program.as_os_str())
@@ -657,6 +668,11 @@ pub(crate) fn start_native_router(
     specs: &[RoomSpec],
     natives: &[Option<NativeRoom>],
 ) -> io::Result<Option<crate::native_route::NativeRouter>> {
+    // A native Codex room has no owned server to hand over, but it still needs
+    // the outbox: its mail must be held, never pasted.
+    if !specs.iter().any(|spec| spec.native_delivery) {
+        return Ok(None);
+    }
     let rooms: Vec<crate::native_route::RoomEntry> = specs
         .iter()
         .zip(natives)
@@ -666,24 +682,273 @@ pub(crate) fn start_native_router(
                 index,
                 title: spec.title.clone(),
                 binding: room.binding().clone(),
-                server: room.server(),
+                backend: crate::native_route::Backend::OpenCode(room.server()),
             })
         })
         .collect();
-    if rooms.is_empty() {
-        return Ok(None);
-    }
     crate::native_route::NativeRouter::start(native_outbox_path(), rooms).map(Some)
 }
 
-/// `crowded resume` cannot reattach a native room's earlier session yet, so the
-/// room starts a new one; the user is told instead of it happening silently.
+/// What the launch phase knows about a native Codex room's session.
+pub(crate) enum CodexMint {
+    /// A session Crowded minted earlier for this room; resume it.
+    Ready(String),
+    /// The exec phase is running; its result arrives on this channel.
+    Pending(mpsc::Receiver<Result<String, String>>),
+    /// No session was created, so the room must not start.
+    Failed(String),
+}
+
+/// A mint that completed after the room set was already running.
+pub(crate) enum CodexUpdate {
+    Minted { index: usize },
+    Failed { index: usize, reason: String },
+}
+
+/// The hold reason shown while a room's session is still being created.
+pub(crate) const CODEX_STARTING: &str = "`codex exec` is still creating this room's session";
+
+/// The variables a Codex phase runs with: the room's own, then Crowded's, so
+/// the exec phase sees exactly what the terminal will.
+fn codex_phase_variables(
+    spec: &RoomSpec,
+    environment: &GuestEnvironment,
+) -> Vec<(OsString, OsString)> {
+    let mut variables = spec.variables.clone();
+    for (key, value) in &environment.variables {
+        variables.retain(|(existing, _)| existing != OsStr::new(key));
+        variables.push((OsString::from(*key), value.clone()));
+    }
+    variables
+}
+
+/// A room's capability matrix before a pane exists (its launch does not need
+/// the pane's screen or process).
+pub(crate) fn spec_capabilities(spec: &RoomSpec) -> RoomCapabilities {
+    controls::capabilities(spec)
+}
+
+/// A room's configured model before a pane exists.
+pub(crate) fn spec_model(spec: &RoomSpec) -> Option<String> {
+    controls::current_model(spec)
+}
+
+/// A room's configured effort before a pane exists.
+pub(crate) fn spec_effort(spec: &RoomSpec) -> Option<String> {
+    controls::current_effort(spec)
+}
+
+/// The program and arguments a Codex phase launches with. The exec mint and the
+/// resumed terminal share this decision, so Headroom cannot apply to one and
+/// not the other.
+fn codex_phase_command(spec: &RoomSpec, arguments: &[OsString]) -> (OsString, Vec<OsString>) {
+    let path = environment_value(&spec.variables, "PATH");
+    let path_ext = environment_value(&spec.variables, "PATHEXT");
+    let (program, arguments, _) = headroom_launch(
+        &spec.program,
+        arguments,
+        spec.use_headroom,
+        &spec.headroom_args,
+        &path,
+        &path_ext,
+    );
+    (program, arguments)
+}
+
+/// Points a room's terminal at the session it was given.
+pub(crate) fn resume_session(spec: &mut RoomSpec, uuid: &str) -> io::Result<()> {
+    controls::set_resume_session(spec, uuid)
+}
+
+/// The exact command that mints a room's session: the exec-compatible part of
+/// the room's launch options, through the same wrapper as its terminal.
+fn mint_command(spec: &RoomSpec, prompt: &str) -> (OsString, Vec<OsString>) {
+    let exec = codex_native::exec_arguments(&spec.args, prompt);
+    codex_phase_command(spec, &exec)
+}
+
+/// Whether a spec is a native room that receives mail through Codex.
+pub(crate) fn codex_native_spec(spec: &RoomSpec) -> bool {
+    spec.native_delivery
+        && matches!(controls::cli_vendor(spec), Ok(controls::CliVendor::Codex))
+}
+
+#[cfg(not(test))]
+const CODEX_MINT_TIMEOUT: Duration = Duration::from_secs(180);
+#[cfg(test)]
+const CODEX_MINT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Starts each native Codex room's session without waiting for any of them.
+///
+/// A room with a session this program minted for its own directory and title is
+/// ready at once and runs no exec. Every other room (including one with a
+/// legacy generic capture) spawns a worker that creates a session with
+/// `codex exec` and its initial prompt, saves it durably, and reports the UUID.
+/// Each mint is bounded on its own worker, so a slow room never delays another.
+pub(crate) fn start_codex_mints(
+    specs: &mut [RoomSpec],
+    environments: &[GuestEnvironment],
+    prompts: &[Option<String>],
+) -> Vec<Option<CodexMint>> {
+    let mut results: Vec<Option<CodexMint>> = (0..specs.len()).map(|_| None).collect();
+    for (index, spec) in specs.iter_mut().enumerate() {
+        if !codex_native_spec(spec) {
+            continue;
+        }
+        let cwd = match working_directory(spec.cwd.as_deref()) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                results[index] = Some(CodexMint::Failed(format!(
+                    "could not resolve {}: {error}",
+                    spec.title
+                )));
+                continue;
+            }
+        };
+        // Only a session Crowded minted itself or the room's own hook reported
+        // may be resumed; a generic capture from an older build is not proof
+        // of ownership.
+        let stored = session_state::lookup_minted("codex", &cwd, &spec.title)
+            .or_else(|| session_state::lookup_reported("codex", &cwd, &spec.title))
+            .filter(|id| codex_native::valid_uuid(id));
+        if let Some(uuid) = stored {
+            if controls::set_resume_session(spec, &uuid).is_ok() {
+                results[index] = Some(CodexMint::Ready(uuid));
+            } else {
+                results[index] = Some(CodexMint::Failed(format!(
+                    "{}: could not prepare the stored session",
+                    spec.title
+                )));
+            }
+            continue;
+        }
+        let prompt = match prompts.get(index).and_then(|prompt| prompt.clone()) {
+            Some(prompt) => prompt,
+            None => {
+                results[index] = Some(CodexMint::Failed(format!(
+                    "{}: no initial prompt was available",
+                    spec.title
+                )));
+                continue;
+            }
+        };
+        if let Err(error) = controls::clear_resume_args(spec) {
+            results[index] = Some(CodexMint::Failed(format!("{}: {error}", spec.title)));
+            continue;
+        }
+        let (program, arguments) = mint_command(spec, &prompt);
+        let variables = codex_phase_variables(spec, &environments[index]);
+        let title = spec.title.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = codex_native::start_session(
+                &program,
+                &arguments,
+                &cwd,
+                &variables,
+                CODEX_MINT_TIMEOUT,
+            )
+            .and_then(|uuid| {
+                // A room is only ready once its session is durably stored, or
+                // a restart would mint a different one.
+                session_state::upsert_minted("codex", &cwd, &title, &uuid)
+                    .map(|()| uuid.clone())
+                    .map_err(|error| {
+                        format!("minted session {uuid} could not be saved: {error}")
+                    })
+            });
+            let _ = sender.send(result);
+        });
+        results[index] = Some(CodexMint::Pending(receiver));
+    }
+    results
+}
+
+/// Collects every mint that finished since the previous pass.
+pub(crate) fn poll_codex_mints(mints: &mut [Option<CodexMint>]) -> Vec<CodexUpdate> {
+    let mut updates = Vec::new();
+    for (index, slot) in mints.iter_mut().enumerate() {
+        let Some(CodexMint::Pending(receiver)) = slot else {
+            continue;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(uuid)) => {
+                *slot = Some(CodexMint::Ready(uuid));
+                updates.push(CodexUpdate::Minted { index });
+            }
+            Ok(Err(reason)) => {
+                *slot = Some(CodexMint::Failed(reason.clone()));
+                updates.push(CodexUpdate::Failed { index, reason });
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let reason = "`codex exec` stopped without a result".to_owned();
+                *slot = Some(CodexMint::Failed(reason.clone()));
+                updates.push(CodexUpdate::Failed { index, reason });
+            }
+        }
+    }
+    updates
+}
+
+/// Binds one native Codex room: the minted session when it is ready, otherwise
+/// a held room with the reason it is not.
+pub(crate) fn bind_codex_room(
+    router: &mut crate::native_route::NativeRouter,
+    panes: &mut [Pane],
+    index: usize,
+    mint: &CodexMint,
+) -> io::Result<()> {
+    let title = panes[index].title().to_owned();
+    // Every launch allocates its own generation, so mail saved for an earlier
+    // launch can never match this binding.
+    let generation = GenerationAllocator::new(session_state::state_directory()).next()?;
+    let (room, reason) = match mint {
+        CodexMint::Ready(uuid) => {
+            panes[index].record_session(uuid);
+            let room = crate::codex_native::room(
+                panes[index].spec.program.clone(),
+                panes[index].cwd(),
+                uuid.clone(),
+                panes[index].native_delivery_variables(),
+            );
+            (Some(Arc::new(room)), None)
+        }
+        CodexMint::Pending(_) => (None, Some(CODEX_STARTING.to_owned())),
+        CodexMint::Failed(reason) => (None, Some(reason.clone())),
+    };
+    router.bind_codex(vec![crate::native_route::CodexEntry {
+        index,
+        title,
+        room,
+        generation,
+        reason,
+    }])
+}
+
+/// Binds every native Codex room at startup.
+pub(crate) fn bind_codex_rooms(
+    router: &mut crate::native_route::NativeRouter,
+    panes: &mut [Pane],
+    mints: &[Option<CodexMint>],
+) -> io::Result<()> {
+    for (index, mint) in mints.iter().enumerate() {
+        if let Some(mint) = mint {
+            bind_codex_room(router, panes, index, mint)?;
+        }
+    }
+    Ok(())
+}
+
+/// `crowded resume` cannot reattach an owned-server room's earlier session yet,
+/// so that room starts a new one; the user is told instead of it happening
+/// silently. A native Codex room resumes the session Crowded stored for it.
 pub(crate) fn native_resume_notice(specs: &[RoomSpec]) -> Option<String> {
     // Room numbers, not titles, so a long list still fits a narrow status line.
     let rooms: Vec<String> = specs
         .iter()
         .enumerate()
-        .filter(|(_, spec)| spec.native_delivery)
+        .filter(|(_, spec)| owned_server_room(spec))
         .map(|(index, _)| (index + 1).to_string())
         .collect();
     if rooms.is_empty() {
@@ -714,7 +979,7 @@ pub(crate) fn launch_native_rooms(
     let mut launches = Vec::with_capacity(specs.len());
     let mut allocator = None;
     for (index, (spec, environment)) in specs.iter().zip(environments).enumerate() {
-        if !spec.native_delivery {
+        if !owned_server_room(spec) {
             launches.push(None);
             continue;
         }
@@ -1070,8 +1335,11 @@ impl Pane {
         environment: GuestEnvironment,
         native: Option<NativeRoom>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        if spec.native_delivery != native.is_some() {
-            return Err(io::Error::other(if spec.native_delivery {
+        // Only an OpenCode native room runs on a Crowded-owned server. A Codex
+        // native room keeps its own process and is queued through the CLI.
+        let owned_server = owned_server_room(&spec);
+        if owned_server != native.is_some() {
+            return Err(io::Error::other(if owned_server {
                 "native delivery room has no owned server"
             } else {
                 "owned server given to a room without native delivery"
@@ -1092,14 +1360,19 @@ impl Pane {
         }
         let path = environment_value(&guest.variables, "PATH");
         let path_ext = environment_value(&guest.variables, "PATHEXT");
-        let (program, args, tui_headroom) = headroom_launch(
-            &spec.program,
-            &guest.args,
-            spec.use_headroom && !native_room,
-            &spec.headroom_args,
-            &path,
-            &path_ext,
-        );
+        let (program, args, tui_headroom) = if codex_native_spec(&spec) {
+            let (program, args) = codex_phase_command(&spec, &guest.args);
+            (program, args, spec_uses_headroom(&spec))
+        } else {
+            headroom_launch(
+                &spec.program,
+                &guest.args,
+                spec.use_headroom && !native_room,
+                &spec.headroom_args,
+                &path,
+                &path_ext,
+            )
+        };
         let headroom_active = if native_room {
             spec_uses_headroom(&spec)
         } else {
@@ -1150,8 +1423,10 @@ impl Pane {
         // gate is true immediately instead of only after an intro-triggered
         // capture -- which a resume deliberately skips.
                 let captured_session = match controls::cli_vendor(&spec) {
-            // A native room never trusts a legacy persisted id.
-            Ok(vendor) if native.is_none() => {
+            // A native room's session is the one it creates on this launch, so a
+            // persisted legacy id is never trusted. Codex captures the new
+            // thread itself; OpenCode's owned server creates it.
+            Ok(vendor) if !spec.native_delivery => {
                 session_state::initial_capture_cell(vendor.key(), &cwd, &spec.title)
             }
             _ => session_state::fresh_capture_cell(),
@@ -1174,6 +1449,64 @@ impl Pane {
             headroom_active,
             _opencode_config: opencode_config,
             native,
+        })
+    }
+
+    /// A native room whose session is still being created. It has no child and
+    /// receives no input; its mail is held until the session arrives.
+    pub(crate) fn spawn_pending(
+        spec: RoomSpec,
+        size: PtySize,
+        environment: GuestEnvironment,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_placeholder(spec, size, environment, "starting session...")
+    }
+
+    /// A native room whose session could not be created. It has no child and
+    /// never receives terminal input: the reason is painted into its screen and
+    /// its mail is held by the router.
+    pub(crate) fn spawn_unavailable(
+        spec: RoomSpec,
+        size: PtySize,
+        environment: GuestEnvironment,
+        reason: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_placeholder(spec, size, environment, reason)
+    }
+
+    fn spawn_placeholder(
+        spec: RoomSpec,
+        size: PtySize,
+        environment: GuestEnvironment,
+        message: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let cwd = working_directory(spec.cwd.as_deref())?;
+        let pty = native_pty_system().openpty(size)?;
+        let writer = PaneWriter::spawn(pty.master.take_writer()?);
+        // No reader and no sender: draining output ends immediately.
+        let (_output_tx, output_rx) = mpsc::channel();
+        let mut parser = Parser::new(size.rows.max(2), size.cols.max(2), SCROLLBACK_LINES);
+        parser.process(format!("{message}\r\n").as_bytes());
+        Ok(Self {
+            spec,
+            cwd,
+            spawned_at: SystemTime::now(),
+            captured_session: session_state::fresh_capture_cell(),
+            environment,
+            child: ChildGuard {
+                child: None,
+                #[cfg(windows)]
+                tree: None,
+            },
+            master: pty.master,
+            writer,
+            output_rx,
+            response_tail: Vec::new(),
+            parser,
+            scroll_offset: 0,
+            headroom_active: false,
+            _opencode_config: None,
+            native: None,
         })
     }
 
@@ -1321,8 +1654,9 @@ impl Pane {
     }
 
         pub(crate) fn needs_intro(&self) -> bool {
-        // The intro is a terminal paste, which a native room never receives.
-        self.spec.transport == Transport::Raw && self.native.is_none()
+        // The intro goes through the selected delivery path; a native room never
+        // receives it as a terminal paste.
+        self.spec.transport == Transport::Raw && !self.spec.native_delivery
     }
 
     pub(crate) fn screen(&self) -> &Screen {
@@ -1399,15 +1733,52 @@ impl Pane {
         output_is_quiet
     }
 
-        /// Whether this room's mail is meant to travel through the native outbox.
+        /// The room's launch configuration, for a path that must start it again
+    /// with a session that became available later.
+    pub(crate) fn room_spec(&self) -> &RoomSpec {
+        &self.spec
+    }
+
+    /// Whether this room's mail is meant to travel through the native outbox.
     pub(crate) fn is_native(&self) -> bool {
-        self.native.is_some()
+        self.spec.native_delivery
+    }
+
+    /// Whether this native room receives mail through `codex queue` rather
+    /// than an owned OpenCode server.
+    pub(crate) fn codex_native(&self) -> bool {
+        codex_native_spec(&self.spec)
+    }
+
+    /// Records the session this room was given, so the pulse cost and detail
+    /// read the right one without waiting for a capture.
+    pub(crate) fn record_session(&self, uuid: &str) {
+        if let Ok(mut guard) = self.captured_session.lock() {
+            *guard = Some(uuid.to_owned());
+        }
+    }
+
+    /// The queue target for the room's current process after its hook reported
+    /// a new thread: same program, directory and environment, new session.
+    pub(crate) fn codex_room_for(&self, thread: String) -> codex_native::Room {
+        codex_native::room(
+            self.spec.program.clone(),
+            &self.cwd,
+            thread,
+            self.native_delivery_variables(),
+        )
+    }
+
+    /// The environment the queue command must see: the same variables as the
+    /// room's own process, so it reads the same session store.
+    pub(crate) fn native_delivery_variables(&self) -> Vec<(OsString, OsString)> {
+        codex_phase_variables(&self.spec, &self.environment)
     }
 
     /// Until native routing exists, no automated terminal input may reach a
     /// native room; the human's own typing is a different path and unaffected.
     fn refuse_native_paste(&self) -> io::Result<()> {
-        if self.native.is_some() {
+        if self.spec.native_delivery {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 NATIVE_PASTE_REFUSED,
@@ -1535,7 +1906,7 @@ impl Pane {
     /// in place would need a second, asynchronous launch, so it is refused
     /// visibly rather than falling back to a private server.
     fn refuse_native_relaunch(&self) -> io::Result<()> {
-        if self.native.is_some() {
+        if self.spec.native_delivery {
             return Err(io::Error::other(
                 "native delivery rooms cannot be restarted, cleared, resumed or reconfigured yet",
             ));
@@ -2146,12 +2517,17 @@ mod tests {
         // Every native room is named, by number, in a short line.
         let mut many: Vec<RoomSpec> = (0..8).map(|_| room_spec("claude", &[])).collect();
         for index in [1, 4, 7] {
+            many[index] = room_spec("opencode", &[]);
             many[index].native_delivery = true;
         }
         let notice = native_resume_notice(&many).unwrap();
         assert_eq!(notice, "Resume: native room 2,5,8 started a new session");
         assert!(notice.len() < 60);
         assert!(native_resume_notice(&specs[1..]).is_none());
+        // A native Codex room resumes its stored session, so it is not named.
+        let mut codex = room_spec("codex", &[]);
+        codex.native_delivery = true;
+        assert!(native_resume_notice(&[codex]).is_none());
     }
 
     fn arguments(spec: &RoomSpec) -> Vec<String> {
@@ -3097,6 +3473,1443 @@ mod tests {
     }
 
     #[test]
+    fn a_native_codex_pane_never_writes_automated_text_to_its_terminal() {
+        let (mut pane, captured) = pane_with_capture(4, 20);
+        pane.spec.program = "codex".into();
+        pane.spec.native_delivery = true;
+        assert!(pane.codex_native() && pane.is_native());
+        // The intro is agent text: it goes through the router, never the PTY.
+        assert!(!pane.needs_intro());
+        let error = pane.send_whisper("Room A", "hello").unwrap_err();
+        assert!(error.to_string().contains(NATIVE_PASTE_REFUSED), "{error}");
+        // Neither may a resubmit or a relaunch paste into it.
+        assert!(pane.resend_whisper_submit().is_err());
+        assert!(pane.restart(PtySize {
+            rows: 4,
+            cols: 20,
+            pixel_width: 0,
+            pixel_height: 0,
+        }).is_err());
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    fn codex_stub_for_pane(root: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn pump_router(
+        router: &mut crate::native_route::NativeRouter,
+        mailroom: &mut Mailroom,
+        done: impl Fn(&str) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            router.tick(Instant::now(), mailroom, false, false);
+            let summary = mailroom.summary();
+            if done(&summary) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "never finished:\n{summary}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The exact code the event loop runs for a doorbell message never touches
+    /// a native room's terminal, whatever state its mail is in.
+    #[cfg(unix)]
+    #[test]
+    fn the_doorbell_message_path_never_writes_to_a_native_terminal() {
+        use crate::app::{DeliveryFuse, DeliveryGate, route_doorbell_message};
+        use crate::doorbell::DoorbellEnvelope;
+        use crate::native_route::{CodexEntry, NativeRouter};
+        use std::collections::VecDeque;
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut pane, captured) = pane_with_capture(4, 20);
+        pane.spec.program = "codex".into();
+        pane.spec.native_delivery = true;
+        let mut panes = vec![pane];
+        let mut mailroom = Mailroom::new(50);
+        let path = root.path().join("state").join("native-outbox.json");
+        let mut router = NativeRouter::start(path, Vec::new()).unwrap();
+        let mut fuse = DeliveryFuse::new(0);
+        let mut paused = false;
+        let mut notice = crate::app::Notices::default();
+        let mut deliver = |panes: &mut Vec<Pane>, router: &mut NativeRouter, mailroom: &mut Mailroom, body: &str| {
+            let (mut envelope, _answers) = DoorbellEnvelope::for_test();
+            envelope.from = 0;
+            envelope.to = 0;
+            envelope.body = body.to_owned();
+            let mut gates = vec![DeliveryGate::new(false)];
+            let mut pending = VecDeque::new();
+            let mut submits = VecDeque::new();
+            route_doorbell_message(
+                envelope,
+                panes,
+                Some(router),
+                mailroom,
+                &mut gates,
+                &[true],
+                &mut pending,
+                &mut submits,
+                &mut fuse,
+                &mut paused,
+                &mut notice,
+                Instant::now(),
+            );
+            assert!(pending.is_empty() && submits.is_empty(), "native mail was queued for paste");
+            // The writer thread is asynchronous; give a stray write time to land.
+            thread::sleep(Duration::from_millis(100));
+            notice.ordered_lines().join("; ")
+        };
+
+        // Unbound: the router does not know the room at all.
+        deliver(&mut panes, &mut router, &mut mailroom, "unbound");
+        assert!(captured.lock().unwrap().is_empty(), "unbound mail reached the terminal");
+
+        // Not started: refused with the launch's reason, nothing pasted.
+        router
+            .bind_codex(vec![CodexEntry {
+                index: 0,
+                title: "Room A".into(),
+                room: None,
+                generation: 1,
+                reason: Some("`codex exec` failed: model unavailable".into()),
+            }])
+            .unwrap();
+        let notice = deliver(&mut panes, &mut router, &mut mailroom, "unstarted");
+        assert!(notice.contains("not saved") && notice.contains("model unavailable"), "{notice}");
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "unstarted mail reached the terminal"
+        );
+
+        // Failed: the CLI rejects it; the failure is visible and nothing is pasted.
+        let failing = codex_stub_for_pane(
+            root.path(),
+            "failing",
+            "printf 'Error: no rollout found\\n' >&2\nexit 1",
+        );
+        let room = crate::codex_native::room(
+            failing.into_os_string(),
+            cwd.path(),
+            "thread-a".into(),
+            Vec::new(),
+        );
+        router
+            .bind_codex(vec![CodexEntry {
+                index: 0,
+                title: "Room A".into(),
+                room: Some(Arc::new(room)),
+                generation: 2,
+                reason: None,
+            }])
+            .unwrap();
+        let notice = deliver(&mut panes, &mut router, &mut mailroom, "failing");
+        assert!(notice.contains("saved for native delivery"), "{notice}");
+        pump_router(&mut router, &mut mailroom, |view| {
+            view.contains("FAILED: no rollout found")
+        });
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "failed mail reached the terminal"
+        );
+
+        // Uncertain: it may have submitted, so it is never resent or pasted.
+        let hanging = codex_stub_for_pane(
+            root.path(),
+            "hanging",
+            "printf 'Queued message sub_1 for thread %s.\\n' 'thread-b'\nexec sleep 30",
+        );
+        let room = crate::codex_native::room(
+            hanging.into_os_string(),
+            cwd.path(),
+            "thread-b".into(),
+            Vec::new(),
+        );
+        router
+            .bind_codex(vec![CodexEntry {
+                index: 0,
+                title: "Room A".into(),
+                room: Some(Arc::new(room)),
+                generation: 3,
+                reason: None,
+            }])
+            .unwrap();
+        deliver(&mut panes, &mut router, &mut mailroom, "hanging");
+        pump_router(&mut router, &mut mailroom, |view| {
+            view.contains("UNCERTAIN: may have been accepted")
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "uncertain mail reached the terminal"
+        );
+    }
+
+    /// A doorbell source the test fills by hand; the real loop polls it the
+    /// same way it polls the production doorbell.
+    #[cfg(unix)]
+    struct FakeDoorbell {
+        events: std::collections::VecDeque<crate::doorbell::DoorbellEvent>,
+    }
+
+    #[cfg(unix)]
+    impl crate::app::DoorbellSource for FakeDoorbell {
+        fn try_recv(
+            &mut self,
+        ) -> Result<crate::doorbell::DoorbellEvent, std::sync::mpsc::TryRecvError> {
+            self.events
+                .pop_front()
+                .ok_or(std::sync::mpsc::TryRecvError::Empty)
+        }
+    }
+
+    /// One native Codex room driven by the real per-pass event-loop body, with
+    /// its terminal captured so any paste is visible.
+    #[cfg(unix)]
+    struct IterationHarness {
+        panes: Vec<Pane>,
+        captured: Arc<Mutex<Vec<u8>>>,
+        router: Option<crate::native_route::NativeRouter>,
+        mailroom: Mailroom,
+        gates: Vec<crate::app::DeliveryGate>,
+        last_output: Vec<Option<Instant>>,
+        spawned_at: Vec<Instant>,
+        pulses: Vec<Option<crate::app::PulseSample>>,
+        details: Vec<crate::room_detail::RoomDetail>,
+        pending: std::collections::VecDeque<(u64, usize)>,
+        submits: std::collections::VecDeque<(Instant, usize, bool)>,
+        fuse: crate::app::DeliveryFuse,
+        paused: bool,
+        notice: crate::app::Notices,
+        input_ready_out: Vec<bool>,
+        codex: Vec<Option<CodexMint>>,
+        sizes: [PtySize; 1],
+        environments: Vec<GuestEnvironment>,
+        doorbell: FakeDoorbell,
+    }
+
+    #[cfg(unix)]
+    impl IterationHarness {
+        fn new(state: &Path) -> Self {
+            let (mut pane, captured) = pane_with_capture(4, 20);
+            pane.spec.program = "codex".into();
+            pane.spec.native_delivery = true;
+            let router = crate::native_route::NativeRouter::start(
+                state.join("native-outbox.json"),
+                Vec::new(),
+            )
+            .unwrap();
+            let now = Instant::now();
+            Self {
+                panes: vec![pane],
+                captured,
+                router: Some(router),
+                mailroom: Mailroom::new(50),
+                gates: vec![crate::app::DeliveryGate::new(false)],
+                last_output: vec![None],
+                spawned_at: vec![now],
+                pulses: vec![None],
+                details: vec![crate::room_detail::RoomDetail::default()],
+                pending: std::collections::VecDeque::new(),
+                submits: std::collections::VecDeque::new(),
+                fuse: crate::app::DeliveryFuse::new(0),
+                paused: false,
+                notice: crate::app::Notices::default(),
+                input_ready_out: Vec::new(),
+                codex: vec![None],
+                sizes: [small_size(); 1],
+                environments: vec![GuestEnvironment::new([])],
+                doorbell: FakeDoorbell {
+                    events: std::collections::VecDeque::new(),
+                },
+            }
+        }
+
+        fn router_mut(&mut self) -> &mut crate::native_route::NativeRouter {
+            self.router.as_mut().expect("the router stays mounted")
+        }
+
+        fn bind(&mut self, room: Option<std::sync::Arc<crate::codex_native::Room>>, generation: u64, reason: Option<String>) {
+            use crate::native_route::CodexEntry;
+            self.router_mut()
+                .bind_codex(vec![CodexEntry {
+                    index: 0,
+                    title: "Room A".into(),
+                    room,
+                    generation,
+                    reason,
+                }])
+                .unwrap();
+        }
+
+        fn healthy_room(program: &Path, cwd: &Path, thread: &str) -> std::sync::Arc<crate::codex_native::Room> {
+            std::sync::Arc::new(crate::codex_native::room(
+                program.as_os_str().to_owned(),
+                cwd,
+                thread.to_owned(),
+                Vec::new(),
+            ))
+        }
+
+        fn send(&mut self, body: &str) -> crate::doorbell::TestAnswers {
+            use crate::doorbell::DoorbellEnvelope;
+            let (mut envelope, answers) = DoorbellEnvelope::for_test();
+            envelope.from = 0;
+            envelope.to = 0;
+            envelope.body = body.to_owned();
+            self.doorbell.events.push_back(crate::doorbell::DoorbellEvent::Message(envelope));
+            answers
+        }
+
+        fn iterate(&mut self) {
+            let now = Instant::now();
+            crate::app::run_rooms_iteration(
+                &mut self.doorbell,
+                None,
+                &mut self.panes,
+                &mut self.router,
+                &mut self.mailroom,
+                &mut self.gates,
+                &mut self.last_output,
+                &mut self.spawned_at,
+                &mut self.pulses,
+                &mut self.details,
+                &mut self.pending,
+                &mut self.submits,
+                &mut self.fuse,
+                &mut self.paused,
+                &mut self.notice,
+                &mut self.input_ready_out,
+                &mut self.codex,
+                &self.sizes,
+                &self.environments,
+                &[],
+                100,
+                1,
+                now,
+            )
+            .unwrap();
+        }
+
+        fn pump_until(&mut self, what: &str, done: impl Fn(&str) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                self.iterate();
+                if done(&self.mailroom.summary()) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{what} never finished:\n{}",
+                    self.mailroom.summary()
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn assert_silent(&self, what: &str) {
+            // The writer thread is asynchronous; give a stray write time to land.
+            thread::sleep(Duration::from_millis(100));
+            assert!(
+                self.captured.lock().unwrap().is_empty(),
+                "{what} reached the terminal"
+            );
+        }
+    }
+
+    /// The real event-loop pass routes every native Codex state through the
+    /// router; none of unbound, not-started, failed or uncertain mail may
+    /// touch the room's terminal.
+    #[cfg(unix)]
+    #[test]
+    fn run_rooms_iteration_never_writes_native_codex_mail_to_the_terminal() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut rig = IterationHarness::new(root.path());
+
+        // Unbound: the router does not know the room at all.
+        let answers = rig.send("unbound");
+        rig.iterate();
+        assert!(answers.read().1 == "rejected", "unbound mail must be refused");
+        rig.assert_silent("unbound mail");
+
+        // Not started: refused with the launch's reason, nothing pasted.
+        rig.bind(None, 1, Some("`codex exec` failed: model unavailable".into()));
+        let answers = rig.send("unstarted");
+        rig.iterate();
+        let (_, status, _, error) = answers.read();
+        assert_eq!(status, "rejected");
+        assert!(error.unwrap().contains("model unavailable"), "the reason must stay visible");
+        assert!(rig.notice.ordered_lines().join("; ").contains("model unavailable"));
+        rig.assert_silent("unstarted mail");
+
+        // Failed: the CLI rejects it; the failure is visible, nothing pasted.
+        let failing = codex_stub_for_pane(
+            root.path(),
+            "failing",
+            "printf 'Error: no rollout found\\n' >&2\nexit 1",
+        );
+        rig.bind(Some(IterationHarness::healthy_room(&failing, cwd.path(), "thread-a")), 2, None);
+        rig.send("failing");
+        rig.pump_until("failed mail", |view| view.contains("FAILED: no rollout found"));
+        rig.assert_silent("failed mail");
+
+        // Uncertain: it may have submitted, so it is never resent or pasted.
+        let hanging = codex_stub_for_pane(
+            root.path(),
+            "hanging",
+            "printf 'Queued message sub_1 for thread %s.\\n' 'thread-b'\nexec sleep 30",
+        );
+        rig.bind(Some(IterationHarness::healthy_room(&hanging, cwd.path(), "thread-b")), 3, None);
+        rig.send("hanging");
+        rig.pump_until("uncertain mail", |view| {
+            view.contains("UNCERTAIN: may have been accepted")
+        });
+        rig.assert_silent("uncertain mail");
+    }
+
+    /// The same real pass delivers a healthy room's mail through the router:
+    /// the doorbell hears "accepted" and the terminal still sees nothing.
+    #[cfg(unix)]
+    #[test]
+    fn run_rooms_iteration_delivers_healthy_codex_mail_through_the_router() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let program = codex_stub_for_pane(
+            root.path(),
+            "codex",
+            "printf 'Queued message sub_1 for thread thread-a.\\n'",
+        );
+        let mut rig = IterationHarness::new(root.path());
+        rig.bind(Some(IterationHarness::healthy_room(&program, cwd.path(), "thread-a")), 1, None);
+        let answers = rig.send("hello healthy");
+        rig.pump_until("healthy mail", |view| view.contains("ACCEPTED by Codex"));
+        let (ok, status, _, _) = answers.read();
+        assert!(ok && status == "accepted", "healthy mail must be accepted through the router");
+        rig.assert_silent("healthy mail");
+    }
+
+    #[cfg(unix)]
+    const MINTED_A: &str = "11111111-1111-4111-8111-111111111111";
+    #[cfg(unix)]
+    const MINTED_B: &str = "22222222-2222-4222-8222-222222222222";
+    #[cfg(unix)]
+    const MINTED_C: &str = "55555555-5555-4555-8555-555555555555";
+    #[cfg(unix)]
+    const UNRELATED: &str = "33333333-3333-4333-8333-333333333333";
+    #[cfg(unix)]
+    const LEGACY: &str = "44444444-4444-4444-8444-444444444444";
+
+    #[cfg(unix)]
+    fn codex_mint_spec(program: &Path, cwd: &Path, title: &str, token: &str) -> RoomSpec {
+        let mut spec = room_spec("codex", &[]);
+        spec.title = title.to_owned();
+        spec.program = program.as_os_str().to_owned();
+        spec.cwd = Some(cwd.to_path_buf());
+        spec.native_delivery = true;
+        spec.variables = vec![(
+            OsString::from("CROWDED_TEST_MINT"),
+            OsString::from(token),
+        )];
+        spec
+    }
+
+    /// A stand-in codex: `exec` reports the room's own token, and a `resume`
+    /// terminal stays alive so the pane is online.
+    #[cfg(unix)]
+    fn mint_stub(root: &Path, log: &Path, delay: &str) -> PathBuf {
+        codex_stub_for_pane(
+            root,
+            "codex",
+            &format!(
+                "if [ \"$1\" = resume ]; then exec sleep 30; fi\nprintf '%s\\n' \"$@\" >> '{log}'\n{delay}\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$CROWDED_TEST_MINT\"\nprintf '{{\"type\":\"turn.completed\"}}\\n'",
+                log = log.display()
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    fn unrelated_rollout(home: &Path, cwd: &Path, id: &str) {
+        let day = home.join(".codex/sessions/2026/08/07");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-unrelated.jsonl"),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{}\"}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn args_after<'a>(args: &'a [OsString], flag: &str) -> &'a [OsString] {
+        let index = args.iter().position(|arg| arg == flag).unwrap();
+        &args[index + 1..]
+    }
+
+    /// Starts the production mint path and waits for every worker to report.
+    #[cfg(unix)]
+    fn mint_all(
+        specs: &mut [RoomSpec],
+        environments: &[GuestEnvironment],
+        prompts: &[Option<String>],
+    ) -> Vec<Option<CodexMint>> {
+        let mut mints = start_codex_mints(specs, environments, prompts);
+        let deadline = Instant::now() + Duration::from_secs(9);
+        while mints
+            .iter()
+            .any(|mint| matches!(mint, Some(CodexMint::Pending(_))))
+        {
+            let _ = poll_codex_mints(&mut mints);
+            assert!(Instant::now() < deadline, "a mint never finished");
+            thread::sleep(Duration::from_millis(10));
+        }
+        mints
+    }
+
+    #[cfg(unix)]
+    fn ready(mint: &Option<CodexMint>) -> Option<&str> {
+        match mint {
+            Some(CodexMint::Ready(uuid)) => Some(uuid),
+            _ => None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn failed(mint: &Option<CodexMint>) -> Option<&str> {
+        match mint {
+            Some(CodexMint::Failed(reason)) => Some(reason),
+            _ => None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_codex_rooms_in_one_directory_mint_and_resume_only_their_own_session() {
+        let cwd = tempfile::tempdir().unwrap();
+        // Both room orders, with an unrelated rollout already in the directory.
+        for order in [[MINTED_A, MINTED_B], [MINTED_B, MINTED_A]] {
+            let _state = session_state::StateRootGuard::isolated();
+            let home = controls::HomeDirGuard::isolated();
+            unrelated_rollout(home.path(), cwd.path(), UNRELATED);
+            let root = tempfile::tempdir().unwrap();
+            let log = root.path().join("exec.log");
+            let stub = mint_stub(root.path(), &log, "sleep 0.2");
+            let mut specs: Vec<RoomSpec> = order
+                .iter()
+                .enumerate()
+                .map(|(index, token)| {
+                    codex_mint_spec(&stub, cwd.path(), &format!("Codex · {}", index + 1), token)
+                })
+                .collect();
+            let environments = vec![GuestEnvironment::new([]), GuestEnvironment::new([])];
+            let prompts = vec![Some("House rules".to_owned()), Some("House rules".to_owned())];
+            let mints = mint_all(&mut specs, &environments, &prompts);
+
+            for (index, token) in order.iter().enumerate() {
+                assert_eq!(ready(&mints[index]), Some(*token), "room {index}");
+                assert_eq!(
+                    session_state::lookup_minted("codex", cwd.path(), &specs[index].title)
+                        .as_deref(),
+                    Some(*token)
+                );
+                // The terminal phase resumes exactly the minted session.
+                resume_session(&mut specs[index], token).unwrap();
+                assert_eq!(args_after(&specs[index].args, "resume"), [OsString::from(*token)]);
+            }
+            // One exec per room; the unrelated rollout is never adopted.
+            let execs = fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .filter(|line| *line == "exec")
+                .count();
+            assert_eq!(execs, 2, "one exec per room");
+            for mint in mints.iter().flatten() {
+                if let CodexMint::Ready(uuid) = mint {
+                    assert_ne!(uuid, UNRELATED);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_generic_mapping_is_not_trusted_and_the_room_mints_a_new_session() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("exec-ran");
+        let stub = codex_stub_for_pane(
+            root.path(),
+            "codex",
+            &format!(
+                "if [ \"$1\" = resume ]; then exec sleep 30; fi\ntouch '{marker}'\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$CROWDED_TEST_MINT\"",
+                marker = marker.display()
+            ),
+        );
+        // An entry written by the old generic capture, with no provenance.
+        session_state::upsert("codex", cwd.path(), "Codex · 1", LEGACY);
+        assert_eq!(
+            session_state::lookup_minted("codex", cwd.path(), "Codex · 1"),
+            None
+        );
+        let mut specs = vec![codex_mint_spec(&stub, cwd.path(), "Codex · 1", MINTED_A)];
+        let prompts = vec![Some("House rules".to_owned())];
+        let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts);
+        assert_eq!(ready(&mints[0]), Some(MINTED_A));
+        assert!(marker.exists(), "a legacy entry must not skip the exec");
+        assert_eq!(
+            session_state::lookup_minted("codex", cwd.path(), "Codex · 1").as_deref(),
+            Some(MINTED_A)
+        );
+        resume_session(&mut specs[0], MINTED_A).unwrap();
+        assert_eq!(args_after(&specs[0].args, "resume"), [OsString::from(MINTED_A)]);
+        assert_ne!(LEGACY, MINTED_A);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_exec_leaves_the_room_not_started_and_unbound() {
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let failing = codex_stub_for_pane(
+            root.path(),
+            "codex",
+            "printf 'warning: noise\\nError: model unavailable\\n' >&2\nexit 1",
+        );
+        let mut specs = vec![codex_mint_spec(&failing, cwd.path(), "Codex · 1", MINTED_A)];
+        let prompts = vec![Some("House rules".to_owned())];
+        let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts);
+        let reason = failed(&mints[0]).expect("the room must not be started").to_owned();
+        assert!(reason.contains("model unavailable"), "{reason}");
+        assert_eq!(session_state::lookup_minted("codex", cwd.path(), "Codex · 1"), None);
+        assert!(!specs[0].args.iter().any(|arg| arg == "resume"));
+
+        // The production startup decision starts no process for this room.
+        let mut pane = crate::app::spawn_room(
+            &mut crate::app::LivePanes,
+            specs.remove(0),
+            PtySize {
+                rows: 6,
+                cols: 60,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            GuestEnvironment::new([]),
+            None,
+            mints[0].as_ref(),
+        )
+        .unwrap();
+        assert!(!pane.is_online() && pane.is_native() && !pane.needs_intro());
+        assert!(pane.screen().contents().contains("model unavailable"));
+        assert!(pane.send_whisper("Sender", "hello").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_resumes_the_minted_session_without_another_exec() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("exec-ran");
+        let stub = codex_stub_for_pane(
+            root.path(),
+            "codex",
+            &format!(
+                "if [ \"$1\" = resume ]; then exec sleep 30; fi\ntouch '{marker}'\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$CROWDED_TEST_MINT\"",
+                marker = marker.display()
+            ),
+        );
+        session_state::upsert_minted("codex", cwd.path(), "Codex · 1", MINTED_A).unwrap();
+        let mut specs = vec![codex_mint_spec(&stub, cwd.path(), "Codex · 1", MINTED_B)];
+        let prompts = vec![Some("House rules".to_owned())];
+        let mints = start_codex_mints(&mut specs, &[GuestEnvironment::new([])], &prompts);
+        assert_eq!(ready(&mints[0]), Some(MINTED_A));
+        assert!(!marker.exists(), "a restart must not run exec again");
+        assert_eq!(args_after(&specs[0].args, "resume"), [OsString::from(MINTED_A)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_resumes_the_reported_session_without_another_exec() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("exec-ran");
+        let stub = codex_stub_for_pane(
+            root.path(),
+            "codex",
+            &format!(
+                "if [ \"$1\" = resume ]; then exec sleep 30; fi\ntouch '{marker}'\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$CROWDED_TEST_MINT\"",
+                marker = marker.display()
+            ),
+        );
+        session_state::upsert_reported(
+            "codex",
+            cwd.path(),
+            "Codex · 1",
+            "33333333-3333-4333-8333-333333333333",
+        )
+        .unwrap();
+        let mut specs = vec![codex_mint_spec(&stub, cwd.path(), "Codex · 1", MINTED_B)];
+        let prompts = vec![Some("House rules".to_owned())];
+        let mints = start_codex_mints(&mut specs, &[GuestEnvironment::new([])], &prompts);
+        assert_eq!(
+            ready(&mints[0]),
+            Some("33333333-3333-4333-8333-333333333333")
+        );
+        assert!(!marker.exists(), "a restart must not run exec again");
+        assert_eq!(
+            args_after(&specs[0].args, "resume"),
+            [OsString::from("33333333-3333-4333-8333-333333333333")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_mint_command_keeps_interactive_options_out_of_exec_and_on_resume() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("exec.log");
+        // Rejects any interactive-only option after exec, like the real CLI.
+        let stub = codex_stub_for_pane(
+            root.path(),
+            "codex",
+            &format!(
+                "for a in \"$@\"; do case \"$a\" in --search|--ask-for-approval|--no-alt-screen|-a) echo \"unexpected argument $a\" >&2; exit 2;; esac; done\nprintf '%s\\n' \"$@\" >> '{log}'\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$CROWDED_TEST_MINT\"",
+                log = log.display()
+            ),
+        );
+        let mut specs = vec![codex_mint_spec(&stub, cwd.path(), "Codex · 1", MINTED_A)];
+        specs[0].args = vec![
+            "--search".into(),
+            "--ask-for-approval".into(),
+            "never".into(),
+            "--no-alt-screen".into(),
+            "-c".into(),
+            "model_reasoning_effort=\"high\"".into(),
+            "-m".into(),
+            "gpt-5".into(),
+            "-s".into(),
+            "workspace-write".into(),
+        ];
+        let prompts = vec![Some("House rules".to_owned())];
+        let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts);
+        assert_eq!(ready(&mints[0]), Some(MINTED_A), "{:?}", failed(&mints[0]));
+        // Exec received the accepted options only.
+        let executed = fs::read_to_string(&log).unwrap();
+        for kept in ["-c", "model_reasoning_effort", "-m", "gpt-5", "-s", "workspace-write"] {
+            assert!(executed.contains(kept), "{kept} missing from exec: {executed}");
+        }
+        for dropped in ["--search", "--ask-for-approval", "--no-alt-screen", "never"] {
+            assert!(!executed.lines().any(|line| line == dropped), "{dropped} reached exec");
+        }
+        // The resumed terminal keeps every interactive option.
+        resume_session(&mut specs[0], MINTED_A).unwrap();
+        assert_eq!(args_after(&specs[0].args, "resume"), [OsString::from(MINTED_A)]);
+        for kept in [
+            "--search",
+            "--ask-for-approval",
+            "never",
+            "--no-alt-screen",
+            "-c",
+            "-m",
+            "-s",
+        ] {
+            assert!(specs[0].args.iter().any(|arg| arg == kept), "{kept} missing from resume");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mint_that_cannot_be_saved_leaves_the_room_not_started() {
+        let state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = codex_stub_for_pane(
+            root.path(),
+            "codex",
+            &format!(
+                "if [ \"$1\" = resume ]; then exec sleep 30; fi\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$CROWDED_TEST_MINT\""
+            ),
+        );
+        // The state directory cannot be created, so the minted session cannot
+        // be stored.
+        fs::write(state.path().join(".crowded"), b"in the way").unwrap();
+        let mut specs = vec![codex_mint_spec(&stub, cwd.path(), "Codex · 1", MINTED_A)];
+        let prompts = vec![Some("House rules".to_owned())];
+        let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts);
+        drop(state);
+        let reason = failed(&mints[0]).expect("an unsaved session must not be ready").to_owned();
+        assert!(reason.contains(MINTED_A), "{reason}");
+        assert!(reason.contains("could not be saved"), "{reason}");
+        assert_eq!(session_state::lookup_minted("codex", cwd.path(), "Codex · 1"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_mint_does_not_delay_the_rooms_whose_mints_finished() {
+        // The mints store their sessions under the process-wide state root, which
+        // other tests replace or break; holding the guard keeps this test on its
+        // own directory.
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = mint_stub(root.path(), &root.path().join("exec.log"), "sleep 30");
+        let fast_a = codex_mint_spec(&stub, cwd.path(), "Codex · 1", MINTED_A);
+        let fast_b = codex_mint_spec(&stub, cwd.path(), "Codex · 2", MINTED_B);
+        let hung = codex_mint_spec(&stub, cwd.path(), "Codex · 3", MINTED_C);
+        // Rooms 1 and 2 finish at once; room 3's stub hangs.
+        let mut specs = vec![fast_a, fast_b, hung];
+        for (index, spec) in specs.iter_mut().enumerate() {
+            if index < 2 {
+                spec.variables.push((
+                    OsString::from("CROWDED_TEST_DELAY"),
+                    OsString::from("0"),
+                ));
+            }
+        }
+        // The stub sleeps only when asked; the hung room asks for a long wait
+        // through its own delay variable.
+        specs[2].variables.push((
+            OsString::from("CROWDED_TEST_DELAY"),
+            OsString::from("30"),
+        ));
+        let stub_path = stub.clone();
+        let script = fs::read_to_string(&stub_path).unwrap();
+        fs::write(
+            &stub_path,
+            script.replace("sleep 30", "sleep \"${CROWDED_TEST_DELAY:-0}\"\nif [ \"$1\" = resume ]; then exec sleep 30; fi"),
+        )
+        .unwrap();
+
+        let environments = vec![
+            GuestEnvironment::new([]),
+            GuestEnvironment::new([]),
+            GuestEnvironment::new([]),
+        ];
+        let prompts = vec![
+            Some("House rules".to_owned()),
+            Some("House rules".to_owned()),
+            Some("House rules".to_owned()),
+        ];
+        let started = Instant::now();
+        let mut mints = start_codex_mints(&mut specs, &environments, &prompts);
+        assert!(started.elapsed() < Duration::from_secs(1), "minting blocked startup");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while ready(&mints[0]).is_none() || ready(&mints[1]).is_none() {
+            let _ = poll_codex_mints(&mut mints);
+            assert!(
+                Instant::now() < deadline,
+                "fast rooms waited for the hung one: {:?} {:?}",
+                failed(&mints[0]),
+                failed(&mints[1])
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(mints[2], Some(CodexMint::Pending(_))));
+        // The finished rooms can start now; the pending room is held.
+        for index in 0..2 {
+            let pane = crate::app::spawn_room(
+                &mut crate::app::LivePanes,
+                specs[index].clone(),
+                PtySize {
+                    rows: 4,
+                    cols: 20,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                GuestEnvironment::new([]),
+                None,
+                mints[index].as_ref(),
+            )
+            .unwrap();
+            assert!(pane.is_online());
+        }
+    }
+
+    /// Records which kind of pane the production start code asks for, and hands
+    /// back a pane that has no process.
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct RecordingPanes {
+        calls: Vec<(&'static str, String, Vec<OsString>)>,
+    }
+
+    #[cfg(unix)]
+    impl RecordingPanes {
+        fn record(&mut self, kind: &'static str, spec: RoomSpec) -> Pane {
+            self.calls.push((kind, spec.title.clone(), spec.args.clone()));
+            let (mut pane, _) = pane_with_capture(4, 20);
+            pane.spec = spec;
+            // Only an interactive pane has a process, as in production.
+            if kind != "interactive" {
+                pane.child.child = None;
+            }
+            pane
+        }
+
+        fn kinds(&self) -> Vec<&'static str> {
+            self.calls.iter().map(|call| call.0).collect()
+        }
+    }
+
+    #[cfg(unix)]
+    impl crate::app::PaneFactory for RecordingPanes {
+        fn interactive(
+            &mut self,
+            spec: RoomSpec,
+            _size: PtySize,
+            _environment: GuestEnvironment,
+            _native: Option<NativeRoom>,
+        ) -> Result<Pane, Box<dyn std::error::Error>> {
+            Ok(self.record("interactive", spec))
+        }
+
+        fn pending(
+            &mut self,
+            spec: RoomSpec,
+            _size: PtySize,
+            _environment: GuestEnvironment,
+        ) -> Result<Pane, Box<dyn std::error::Error>> {
+            Ok(self.record("pending", spec))
+        }
+
+        fn unavailable(
+            &mut self,
+            spec: RoomSpec,
+            _size: PtySize,
+            _environment: GuestEnvironment,
+            _reason: &str,
+        ) -> Result<Pane, Box<dyn std::error::Error>> {
+            Ok(self.record("unavailable", spec))
+        }
+    }
+
+    #[cfg(unix)]
+    fn small_size() -> PtySize {
+        PtySize {
+            rows: 4,
+            cols: 20,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_starts_an_interactive_codex_only_for_a_completed_mint() {
+        let cwd = tempfile::tempdir().unwrap();
+        let program = Path::new("codex");
+        let specs: Vec<RoomSpec> = (1..=4)
+            .map(|number| codex_mint_spec(program, cwd.path(), &format!("Codex · {number}"), MINTED_A))
+            .collect();
+        let (_sender, receiver) = mpsc::channel();
+        let codex = vec![
+            Some(CodexMint::Pending(receiver)),
+            Some(CodexMint::Failed("`codex exec` failed".to_owned())),
+            Some(CodexMint::Ready(MINTED_B.to_owned())),
+            None,
+        ];
+        let mut factory = RecordingPanes::default();
+        let mut last_output = vec![None; 4];
+        let (panes, spawned) = crate::app::start_rooms(
+            &mut factory,
+            specs,
+            &[small_size(); 4],
+            &vec![GuestEnvironment::new([]); 4],
+            vec![None, None, None, None],
+            &codex,
+            &mut last_output,
+            false,
+            std::time::Duration::from_millis(5),
+            &mut crate::app::Notices::default(),
+        )
+        .unwrap();
+        assert_eq!(panes.len(), 4);
+        assert_eq!(spawned.len(), 4);
+        // Pending and failed mints start no process; the completed one resumes
+        // exactly its minted session; a room that never had a mint is unchanged.
+        assert_eq!(factory.kinds(), ["pending", "unavailable", "interactive", "interactive"]);
+        assert_eq!(args_after(&factory.calls[2].2, "resume"), [OsString::from(MINTED_B)]);
+        assert!(!factory.calls[3].2.iter().any(|arg| arg == "resume"));
+    }
+
+    /// Runs the startup loop with the Windows Headroom lane on, and reports
+    /// whether it finished within `wait`.
+    #[cfg(unix)]
+    fn headroom_startup_finishes(codex: Vec<Option<CodexMint>>, wait: Duration, deadline: Duration) -> bool {
+        let cwd = tempfile::tempdir().unwrap();
+        let (_directory, path, _ext) = headroom_path();
+        let specs: Vec<RoomSpec> = (0..codex.len())
+            .map(|index| {
+                let mut spec = codex_mint_spec(
+                    Path::new("codex"),
+                    cwd.path(),
+                    &format!("Codex · {}", index + 1),
+                    MINTED_A,
+                );
+                spec.use_headroom = true;
+                spec.variables.push((OsString::from("PATH"), path.clone().unwrap()));
+                assert!(spec_uses_headroom(&spec));
+                spec
+            })
+            .collect();
+        let count = specs.len();
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            let mut last_output = vec![None; count];
+            let result = crate::app::start_rooms(
+                &mut RecordingPanes::default(),
+                specs,
+                &vec![small_size(); count],
+                &vec![GuestEnvironment::new([]); count],
+                (0..count).map(|_| None).collect(),
+                &codex,
+                &mut last_output,
+                true,
+                deadline,
+                &mut crate::app::Notices::default(),
+            );
+            let _ = done.send(result.is_ok());
+        });
+        finished.recv_timeout(wait) == Ok(true)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_headroom_lane_never_waits_on_a_placeholder_room() {
+        let (_sender, receiver) = mpsc::channel();
+        let codex = vec![
+            Some(CodexMint::Pending(receiver)),
+            Some(CodexMint::Failed("`codex exec` failed".to_owned())),
+            Some(CodexMint::Ready(MINTED_B.to_owned())),
+        ];
+        assert!(
+            headroom_startup_finishes(codex, Duration::from_secs(5), Duration::from_millis(5)),
+            "a later Headroom room waited for a room that has no process"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_running_headroom_room_proceeds_after_the_injected_deadline() {
+        let codex = vec![None, None];
+        assert!(
+            headroom_startup_finishes(codex, Duration::from_millis(500), Duration::from_millis(5)),
+            "a silent running Headroom room did not proceed after the injected deadline"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_headroom_lane_still_waits_on_a_running_room() {
+        // Both rooms have a process, and the first never reports ready.
+        let codex = vec![None, None];
+        assert!(
+            !headroom_startup_finishes(codex, Duration::from_millis(500), Duration::from_secs(10)),
+            "the lane stopped waiting for a running Headroom room"
+        );
+    }
+
+    /// An exited pane has no process left to become ready, so the lane must
+    /// not wait on it at all.
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_headroom_ready_returns_promptly_when_the_pane_has_exited() {
+        let (mut pane, _) = pane_with_capture(4, 20);
+        pane.child.child = None;
+        assert!(!pane.is_online(), "the pane must have no process");
+        let mut last_output = None;
+        let started = Instant::now();
+        let timed_out =
+            crate::app::wait_for_headroom_ready(&mut pane, &mut last_output, Duration::from_secs(30))
+                .unwrap();
+        assert!(!timed_out, "an exited pane must never be waited on");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "an exited pane must return promptly"
+        );
+    }
+
+    /// A pane that is already quiet-and-ready must not burn the deadline.
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_headroom_ready_returns_promptly_once_the_pane_is_ready() {
+        let (mut pane, _) = pane_with_capture(4, 20);
+        assert!(pane.is_online(), "the pane must still be running");
+        // Quiet long past any threshold; the fixture guest is not OpenCode,
+        // so quiet output alone means ready.
+        let mut last_output = Some(Instant::now() - Duration::from_secs(60));
+        let started = Instant::now();
+        let timed_out =
+            crate::app::wait_for_headroom_ready(&mut pane, &mut last_output, Duration::from_secs(30))
+                .unwrap();
+        assert!(!timed_out, "a ready pane must never be waited on");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a ready pane must return promptly"
+        );
+    }
+
+    /// A silent but live predecessor still holds the lane for the injected
+    /// deadline, then yields: the next room starts and the notice names the
+    /// room it held for.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_headroom_predecessor_yields_after_the_deadline_and_names_its_room() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (_directory, path, _ext) = headroom_path();
+        let specs: Vec<RoomSpec> = (0..2)
+            .map(|index| {
+                let mut spec = codex_mint_spec(
+                    Path::new("codex"),
+                    cwd.path(),
+                    &format!("Codex · {}", index + 1),
+                    MINTED_A,
+                );
+                spec.use_headroom = true;
+                spec.variables.push((OsString::from("PATH"), path.clone().unwrap()));
+                assert!(spec_uses_headroom(&spec));
+                spec
+            })
+            .collect();
+        let codex = vec![None, None];
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            let mut factory = RecordingPanes::default();
+            let mut last_output = vec![None; 2];
+            let mut notice = crate::app::Notices::default();
+            let result = crate::app::start_rooms(
+                &mut factory,
+                specs,
+                &vec![small_size(); 2],
+                &vec![GuestEnvironment::new([]); 2],
+                vec![None, None],
+                &codex,
+                &mut last_output,
+                true,
+                Duration::from_millis(500),
+                &mut notice,
+            );
+            let _ = done.send((result.is_ok(), factory.kinds(), notice));
+        });
+        let (started, kinds, notice) = finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("start_rooms yields after the injected deadline");
+        assert!(started, "both rooms start once the deadline passes");
+        assert_eq!(kinds, ["interactive", "interactive"]);
+        let notice = notice.ordered_lines().join("; ");
+        assert!(
+            notice.contains("Codex · 1") && notice.contains("Headroom did not become ready"),
+            "{notice}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_completed_mint_starts_one_resume_and_binds_without_dropping_earlier_rooms() {
+        use crate::app::{DeliveryGate, PulseSample, start_rooms};
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let stubs: Vec<PathBuf> = (0..3)
+            .map(|index| {
+                fs::create_dir(root.path().join(format!("room{index}"))).unwrap();
+                codex_stub_for_pane(
+                    &root.path().join(format!("room{index}")),
+                    "codex",
+                    &format!(
+                        "printf '%s\\n' \"$@\" >> '{log}'\nprintf 'Queued message sub_1 for thread %s.\\n' x",
+                        log = root.path().join(format!("queue{index}")).display()
+                    ),
+                )
+            })
+            .collect();
+        let specs: Vec<RoomSpec> = stubs
+            .iter()
+            .enumerate()
+            .map(|(index, stub)| {
+                codex_mint_spec(stub, cwd.path(), &format!("Codex · {}", index + 1), MINTED_A)
+            })
+            .collect();
+        let senders: Vec<_> = (0..3).map(|_| mpsc::channel()).collect();
+        let (senders, receivers): (Vec<_>, Vec<_>) = senders.into_iter().unzip();
+        let mut codex: Vec<Option<CodexMint>> =
+            receivers.into_iter().map(|rx| Some(CodexMint::Pending(rx))).collect();
+        let mut factory = RecordingPanes::default();
+        let mut last_output = vec![None; 3];
+        let environments = vec![GuestEnvironment::new([]); 3];
+        let sizes = [small_size(); 3];
+        let (mut panes, mut spawned_at) = start_rooms(
+            &mut factory,
+            specs,
+            &sizes,
+            &environments,
+            vec![None, None, None],
+            &codex,
+            &mut last_output,
+            false,
+            std::time::Duration::from_millis(5),
+            &mut crate::app::Notices::default(),
+        )
+        .unwrap();
+        assert_eq!(factory.kinds(), ["pending"; 3]);
+        factory.calls.clear();
+
+        let path = root.path().join("state").join("native-outbox.json");
+        let mut router = crate::native_route::NativeRouter::start(path, Vec::new()).unwrap();
+        bind_codex_rooms(&mut router, &mut panes, &codex).unwrap();
+        let mut gates: Vec<DeliveryGate> = (0..3).map(|_| DeliveryGate::new(false)).collect();
+        let mut pulses: Vec<Option<PulseSample>> = vec![None; 3];
+        let mut notice = crate::app::Notices::default();
+        let mut complete = |factory: &mut RecordingPanes,
+                            codex: &mut Vec<Option<CodexMint>>,
+                            panes: &mut Vec<Pane>,
+                            router: &mut crate::native_route::NativeRouter| {
+            crate::app::complete_mints(
+                factory,
+                codex,
+                panes,
+                Some(router),
+                &mut gates,
+                &mut spawned_at,
+                &mut last_output,
+                &mut pulses,
+                &sizes,
+                &environments,
+                &mut notice,
+                Instant::now(),
+            )
+            .unwrap();
+        };
+
+        // Nothing has finished: no process starts.
+        complete(&mut factory, &mut codex, &mut panes, &mut router);
+        assert!(factory.calls.is_empty());
+
+        // Room 1 finishes: exactly one resume of its own session.
+        senders[0].send(Ok(MINTED_A.to_owned())).unwrap();
+        complete(&mut factory, &mut codex, &mut panes, &mut router);
+        assert_eq!(factory.kinds(), ["interactive"]);
+        assert_eq!(args_after(&factory.calls[0].2, "resume"), [OsString::from(MINTED_A)]);
+
+        // Room 2 fails and room 3 is still pending: neither starts a process.
+        senders[1].send(Err("`codex exec` failed".to_owned())).unwrap();
+        complete(&mut factory, &mut codex, &mut panes, &mut router);
+        assert_eq!(factory.kinds(), ["interactive", "unavailable"]);
+
+        // Room 3 finishes later; room 1 must still be deliverable.
+        senders[2].send(Ok(MINTED_B.to_owned())).unwrap();
+        complete(&mut factory, &mut codex, &mut panes, &mut router);
+        assert_eq!(factory.kinds(), ["interactive", "unavailable", "interactive"]);
+        assert_eq!(args_after(&factory.calls[2].2, "resume"), [OsString::from(MINTED_B)]);
+
+        let mut mailroom = Mailroom::new(50);
+        for index in [0usize, 2] {
+            router.send(&mut mailroom, "Sender", index, "hi", None).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(root.path().join("queue0").exists() && root.path().join("queue2").exists()) {
+            router.tick(Instant::now(), &mut mailroom, false, false);
+            assert!(Instant::now() < deadline, "an earlier room was dropped:\n{}", mailroom.summary());
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!root.path().join("queue1").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn headroom_wraps_the_exec_and_resume_phases_identically() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let headroom = bin.join("headroom");
+        fs::write(&headroom, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&headroom, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let cwd = tempfile::tempdir().unwrap();
+        let mut spec = codex_mint_spec(&headroom, cwd.path(), "Codex · 1", MINTED_A);
+        spec.program = "codex".into();
+        spec.use_headroom = true;
+        spec.headroom_args = vec![OsString::from("--no-serena")];
+        spec.variables
+            .push((OsString::from("PATH"), bin.as_os_str().to_owned()));
+
+        let exec = crate::codex_native::exec_arguments(
+            &[OsString::from("--dangerously-bypass-approvals-and-sandbox")],
+            "House rules",
+        );
+        let resume: Vec<OsString> = vec![OsString::from("resume"), OsString::from(MINTED_A)];
+        let (exec_program, exec_args) = codex_phase_command(&spec, &exec);
+        let (resume_program, resume_args) = codex_phase_command(&spec, &resume);
+        assert_eq!(exec_program, OsString::from("headroom"));
+        assert_eq!(resume_program, OsString::from("headroom"));
+        let prefix = [
+            OsString::from("wrap"),
+            OsString::from("codex"),
+            OsString::from("--no-serena"),
+        ];
+        assert_eq!(&exec_args[..3], prefix);
+        assert_eq!(&resume_args[..3], prefix);
+        assert_eq!(&exec_args[3..], exec);
+        assert_eq!(&resume_args[3..], resume);
+
+        // The exec phase sees the same variables as the terminal phase.
+        let environment = GuestEnvironment::new([
+            ("PATH", bin.as_os_str().to_owned()),
+            ("CROWDED_ROOM", OsString::from("1")),
+        ]);
+        let variables = codex_phase_variables(&spec, &environment);
+        let look = |name: &str| {
+            variables
+                .iter()
+                .filter(|(key, _)| key == OsStr::new(name))
+                .count()
+        };
+        assert_eq!(look("PATH"), 1, "the environment replaces the room value");
+        assert_eq!(look("CROWDED_ROOM"), 1);
+        assert_eq!(look("CROWDED_TEST_MINT"), 1);
+
+        // With Headroom off both phases run the guest directly.
+        spec.use_headroom = false;
+        let (exec_program, exec_args) = codex_phase_command(&spec, &exec);
+        let (resume_program, resume_args) = codex_phase_command(&spec, &resume);
+        assert_eq!(exec_program, OsString::from("codex"));
+        assert_eq!(resume_program, OsString::from("codex"));
+        assert_eq!(exec_args, exec);
+        assert_eq!(resume_args, resume);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_mint_runs_through_the_same_headroom_wrapper_as_the_terminal() {
+        use std::os::unix::fs::PermissionsExt;
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("headroom.log");
+        let codex = mint_stub(root.path(), &root.path().join("exec.log"), "sleep 0");
+        let bin = root.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let headroom = bin.join("headroom");
+        fs::write(
+            &headroom,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{log}'\nshift\nexec \"$@\"\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&headroom, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut spec = codex_mint_spec(&codex, cwd.path(), "Codex · 1", MINTED_A);
+        spec.use_headroom = true;
+        spec.headroom_args = vec![OsString::from("--no-serena")];
+        spec.variables
+            .push((OsString::from("PATH"), bin.as_os_str().to_owned()));
+        let prompts = vec![Some("House rules".to_owned())];
+        let mints = mint_all(&mut [spec], &[GuestEnvironment::new([])], &prompts);
+        assert_eq!(ready(&mints[0]), Some(MINTED_A));
+        let wrapped = fs::read_to_string(&log).expect("the mint ran without Headroom");
+        let lines: Vec<&str> = wrapped.lines().collect();
+        assert_eq!(lines[0], "wrap");
+        assert_eq!(lines[2], "--no-serena");
+        assert_eq!(lines[3], "exec");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_child_is_marked_dead_before_the_native_outbox_is_ticked() {
+        use crate::native_route::{CodexEntry, NativeRouter};
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let count = root.path().join("count");
+        let program = codex_stub_for_pane(
+            root.path(),
+            "codex",
+            &format!(
+                "printf x >> '{}'\nprintf 'Queued message sub_1 for thread %s.\\n' 'thread-a'",
+                count.display()
+            ),
+        );
+        let mut router = NativeRouter::start(
+            root.path().join("state").join("native-outbox.json"),
+            Vec::new(),
+        )
+        .unwrap();
+        router
+            .bind_codex(vec![CodexEntry {
+                index: 0,
+                title: "Room A".into(),
+                room: Some(Arc::new(crate::codex_native::room(
+                    program.into_os_string(),
+                    cwd.path(),
+                    "thread-a".into(),
+                    Vec::new(),
+                ))),
+                generation: 1,
+                reason: None,
+            }])
+            .unwrap();
+        let (mut pane, _captured) = pane_with_capture(4, 20);
+        pane.spec.program = "codex".into();
+        pane.spec.native_delivery = true;
+        let mut panes = vec![pane];
+        let mut mailroom = Mailroom::new(50);
+        router.send(&mut mailroom, "Sender", 0, "queued", None).unwrap();
+        // Paused passes save the message without sending it.
+        for _ in 0..20 {
+            crate::app::tick_native(
+                &mut router,
+                &panes,
+                Instant::now(),
+                &mut mailroom,
+                true,
+                false,
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // The child is reaped before the next pass.
+        panes[0].child.child = None;
+        assert!(!panes[0].is_online());
+        crate::app::tick_native(
+            &mut router,
+            &panes,
+            Instant::now(),
+            &mut mailroom,
+            false,
+            false,
+        );
+        pump_router(&mut router, &mut mailroom, |view| {
+            view.contains("HELD: the Codex room process is no longer running")
+        });
+        assert!(!count.exists(), "mail was sent to a dead room's thread");
+
+        // The pass must refresh liveness before it lets the outbox schedule:
+        // a child reaped in the previous iteration is already gone here.
+        let source = include_str!("app.rs");
+        let production = &source[..source.find("#[cfg(test)]").unwrap()];
+        let body = &production[production.find("pub(crate) fn tick_native(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let refresh = body.find("refresh_codex_liveness(panes, router)").unwrap();
+        let tick = body.find("router.tick(").unwrap();
+        assert!(refresh < tick, "liveness must be refreshed before the outbox is ticked");
+    }
+
+    #[test]
     fn scroll_retains_history_and_clamps_at_both_limits() {
         let mut pane = scroll_fixture(4, 20);
         for index in 0..10 {
@@ -3678,12 +5491,16 @@ mod tests {
 
     // A writer that blocks its first write until released, then drains
     // instantly: it lets a test fill a pane's write queue and later drain it.
+    // It raises `entered` on its first write, proving the writer thread has
+    // taken a job and cannot free another slot until released.
     struct GatedWriter {
         reading: Arc<AtomicBool>,
+        entered: Arc<AtomicBool>,
     }
 
     impl std::io::Write for GatedWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.entered.store(true, Ordering::SeqCst);
             while !self.reading.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(5));
             }
@@ -3695,21 +5512,84 @@ mod tests {
         }
     }
 
-    fn pane_with_gated_writer(rows: u16, cols: u16, reading: bool) -> (Pane, Arc<AtomicBool>) {
+    fn pane_with_gated_writer(
+        rows: u16,
+        cols: u16,
+        reading: bool,
+    ) -> (Pane, Arc<AtomicBool>, Arc<AtomicBool>) {
         let (mut pane, _captured) = pane_with_capture(rows, cols);
         let gate = Arc::new(AtomicBool::new(reading));
+        let entered = Arc::new(AtomicBool::new(false));
         pane.writer = PaneWriter::spawn(Box::new(GatedWriter {
             reading: Arc::clone(&gate),
+            entered: Arc::clone(&entered),
         }));
-        (pane, gate)
+        (pane, gate, entered)
     }
 
-    fn fill_pane_queue(pane: &mut Pane) {
-        let job = vec![b'x'; 16 * 1024];
-        loop {
-            if pane.write_bytes(&job).is_err() {
-                break;
+    // A writer that models a slowly scheduled thread: its first write parks
+    // for `delay` before proceeding, then blocks like the gate. The queue
+    // fills while it parks, so a fill that returns before it proceeds leaves
+    // a slot the writer frees afterwards.
+    struct DelayedGatedWriter {
+        delay: Duration,
+        reading: Arc<AtomicBool>,
+        entered: Arc<AtomicBool>,
+    }
+
+    impl std::io::Write for DelayedGatedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.entered.load(Ordering::SeqCst) {
+                thread::sleep(self.delay);
+                self.entered.store(true, Ordering::SeqCst);
             }
+            while !self.reading.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn pane_with_delayed_writer(
+        rows: u16,
+        cols: u16,
+        delay: Duration,
+    ) -> (Pane, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let (mut pane, _captured) = pane_with_capture(rows, cols);
+        let gate = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicBool::new(false));
+        pane.writer = PaneWriter::spawn(Box::new(DelayedGatedWriter {
+            delay,
+            reading: Arc::clone(&gate),
+            entered: Arc::clone(&entered),
+        }));
+        (pane, gate, entered)
+    }
+
+    fn fill_pane_queue(pane: &mut Pane, entered: &AtomicBool) {
+        let job = vec![b'x'; 16 * 1024];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            while pane.write_bytes(&job).is_ok() {}
+            // The writer thread may take a queued job the moment filling
+            // stops, freeing a slot the next production write could use.
+            // Only return once the writer is known to hold a job (its first
+            // write ran, so it cannot take another while blocked) and a
+            // further write is still refused; any slot it frees while waiting
+            // is refilled by the loop above. The sleeps are poll granularity,
+            // not timing: correctness comes from the observed condition.
+            if entered.load(Ordering::SeqCst) && pane.write_bytes(&job).is_err() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the write queue never stayed full"
+            );
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -3739,8 +5619,8 @@ mod tests {
     // Mailroom status stays queued, not failed.
     #[test]
     fn a_would_block_delivery_stays_pending_and_queued() {
-        let (mut pane, gate) = pane_with_gated_writer(4, 20, false);
-        fill_pane_queue(&mut pane);
+        let (mut pane, gate, entered) = pane_with_gated_writer(4, 20, false);
+        fill_pane_queue(&mut pane, &entered);
         let mut mailroom = Mailroom::new(100);
         let id = mailroom.queue(
             "Room A".into(),
@@ -3772,8 +5652,8 @@ mod tests {
     // once on a later pass.
     #[test]
     fn a_requeued_delivery_is_later_injected_exactly_once() {
-        let (mut pane, gate) = pane_with_gated_writer(4, 20, false);
-        fill_pane_queue(&mut pane);
+        let (mut pane, gate, entered) = pane_with_gated_writer(4, 20, false);
+        fill_pane_queue(&mut pane, &entered);
         let mut mailroom = Mailroom::new(100);
         let id = mailroom.queue(
             "Room A".into(),
@@ -3818,9 +5698,9 @@ mod tests {
     // in the same pass is still delivered.
     #[test]
     fn a_blocked_room_keeps_order_while_another_room_still_delivers() {
-        let (mut busy, busy_gate) = pane_with_gated_writer(4, 20, false);
-        fill_pane_queue(&mut busy);
-        let (free, _free_gate) = pane_with_gated_writer(4, 20, true);
+        let (mut busy, busy_gate, busy_entered) = pane_with_gated_writer(4, 20, false);
+        fill_pane_queue(&mut busy, &busy_entered);
+        let (free, _free_gate, _free_entered) = pane_with_gated_writer(4, 20, true);
         let mut mailroom = Mailroom::new(100);
         let first = mailroom.queue(
             "Room A".into(),
@@ -3861,6 +5741,43 @@ mod tests {
         busy_gate.store(true, Ordering::SeqCst);
     }
 
+    // The fill waits for a slowly scheduled writer instead of trusting one
+    // instant: with a 150 ms delayed start the queue is still full after the
+    // fill returns, because the writer was observed holding a job first. The
+    // old 20 ms settle returns before the writer proceeds, so a write then
+    // succeeds once the writer takes its job.
+    #[test]
+    fn a_fill_survives_a_slow_writer_start_of_150_ms() {
+        let (mut pane, gate, entered) = pane_with_delayed_writer(4, 20, Duration::from_millis(150));
+        fill_pane_queue(&mut pane, &entered);
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "the fill returns only after the writer took a job"
+        );
+        assert!(
+            pane.write_bytes(&vec![b'x'; 16 * 1024]).is_err(),
+            "the queue stays full after a slow writer start"
+        );
+        gate.store(true, Ordering::SeqCst);
+    }
+
+    // Same as above with a 500 ms delayed start: the wait is a condition,
+    // not a tuned sleep, so a longer delay only waits longer.
+    #[test]
+    fn a_fill_survives_a_slow_writer_start_of_500_ms() {
+        let (mut pane, gate, entered) = pane_with_delayed_writer(4, 20, Duration::from_millis(500));
+        fill_pane_queue(&mut pane, &entered);
+        assert!(
+            entered.load(Ordering::SeqCst),
+            "the fill returns only after the writer took a job"
+        );
+        assert!(
+            pane.write_bytes(&vec![b'x'; 16 * 1024]).is_err(),
+            "the queue stays full after a slow writer start"
+        );
+        gate.store(true, Ordering::SeqCst);
+    }
+
     // A non-WouldBlock error is still a hard failure: dropped, counted failed,
     // and marked failed.
     #[test]
@@ -3897,8 +5814,8 @@ mod tests {
     // though the pending path records the same error as QUEUED.
     #[test]
     fn a_direct_delivery_marks_would_block_as_failed() {
-        let (mut pane, gate) = pane_with_gated_writer(4, 20, false);
-        fill_pane_queue(&mut pane);
+        let (mut pane, gate, entered) = pane_with_gated_writer(4, 20, false);
+        fill_pane_queue(&mut pane, &entered);
         let mut mailroom = Mailroom::new(100);
         let (_, result) = mailroom.deliver("Room A".to_owned(), &mut pane, "hello".to_owned());
         assert_eq!(
@@ -3963,7 +5880,7 @@ mod tests {
     // finishes it.
     #[test]
     fn unwritten_input_is_reported_until_the_writer_drains() {
-        let (mut pane, gate) = pane_with_gated_writer(4, 20, false);
+        let (mut pane, gate, _entered) = pane_with_gated_writer(4, 20, false);
         pane.send_whisper("Room A", "hello").unwrap();
         assert!(pane.has_unwritten_input(), "a queued whisper is unwritten");
         gate.store(true, Ordering::SeqCst);
@@ -4071,7 +5988,7 @@ mod tests {
     // WouldBlock rejection, never underflowing.
     #[test]
     fn the_unwritten_counter_returns_to_zero() {
-        let (mut pane, _gate) = pane_with_gated_writer(4, 20, true);
+        let (mut pane, _gate, _entered) = pane_with_gated_writer(4, 20, true);
         for _ in 0..100 {
             let _ = pane.write_bytes(b"x");
         }
@@ -4079,8 +5996,8 @@ mod tests {
             wait_for_no_unwritten_input(&pane),
             "counter never returned to zero after enqueues"
         );
-        let (mut pane, gate) = pane_with_gated_writer(4, 20, false);
-        fill_pane_queue(&mut pane);
+        let (mut pane, gate, entered) = pane_with_gated_writer(4, 20, false);
+        fill_pane_queue(&mut pane, &entered);
         gate.store(true, Ordering::SeqCst);
         assert!(
             wait_for_no_unwritten_input(&pane),

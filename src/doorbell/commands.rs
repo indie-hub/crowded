@@ -4,7 +4,12 @@ use std::{
     env,
     io::{self, IsTerminal, Read},
     process,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc, Mutex, mpsc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Deserialize;
@@ -369,6 +374,317 @@ fn hook_detail_events(payload: &HookPayload) -> Vec<DetailEvent> {
     events
 }
 
+const SESSION_REPORT_USAGE: &str = "usage: crowded session-report [--session ID] [--pending] [--ack] (the id may also arrive as JSON on stdin with session_id or sessionID). Without --ack the command is silent and always exits 0, so a hook never breaks its CLI. With --ack it exits 0 only when Crowded accepted the report: 2 usage or nothing to report, 3 invalid session id, 4 not configured (no token or unusable environment), 5 Crowded unreachable or silent for 4 seconds, 6 report rejected";
+
+/// The most a report exchange (connect, write, read) may take. A hook must
+/// never hang, and a server that accepts the request and never answers would
+/// otherwise block the command forever. The shared clients set no deadline, so
+/// `session-report` bounds the whole exchange itself: a worker thread does the
+/// exchange and the command stops waiting for it, which works the same on the
+/// Unix socket and the Windows pipe, where std has no connect timeout.
+const SESSION_REPORT_DEADLINE: Duration = Duration::from_secs(4);
+
+fn send_within(request: WireRequest, deadline: Duration) -> Result<WireResponse, String> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(send_request(&request).map_err(|error| error.to_string()));
+    });
+    receiver.recv_timeout(deadline).unwrap_or_else(|_| {
+        Err(format!(
+            "Crowded did not answer within {} seconds",
+            deadline.as_secs()
+        ))
+    })
+}
+
+/// How `--ack` reports a failed report: each cause has its own exit status so a
+/// caller that needs proof of delivery can tell them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReportFailure {
+    Usage,
+    InvalidId,
+    NotConfigured,
+    Unreachable,
+    Rejected,
+}
+
+impl ReportFailure {
+    fn exit_code(self) -> i32 {
+        match self {
+            ReportFailure::Usage => 2,
+            ReportFailure::InvalidId => 3,
+            ReportFailure::NotConfigured => 4,
+            ReportFailure::Unreachable => 5,
+            ReportFailure::Rejected => 6,
+        }
+    }
+}
+
+/// What the hook reported: a session id, a between-sessions mark, or both.
+struct SessionReport {
+    session: Option<String>,
+    pending: bool,
+}
+
+fn parse_session_report_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<SessionReport, String> {
+    let mut args = args.into_iter();
+    let mut session = None;
+    let mut pending = false;
+    let mut ack = false;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--session" => {
+                let value = args.next().ok_or_else(|| "--session requires an ID".to_owned())?;
+                if session.replace(value).is_some() {
+                    return Err("--session may appear only once".to_owned());
+                }
+            }
+            "--pending" => {
+                if pending {
+                    return Err("--pending may appear only once".to_owned());
+                }
+                pending = true;
+            }
+            "--ack" => {
+                if ack {
+                    return Err("--ack may appear only once".to_owned());
+                }
+                ack = true;
+            }
+            _ => return Err(SESSION_REPORT_USAGE.to_owned()),
+        }
+    }
+    Ok(SessionReport { session, pending })
+}
+
+/// What stdin said, when the caller gave no `--session`. A hook either pipes
+/// a JSON payload and closes, or leaves the pipe open; the read below is
+/// bounded so an open pipe can never hang the hook.
+enum StdinSession {
+    /// Nothing arrived, or nothing parseable: proceed without a session id.
+    Absent,
+    /// A session key arrived but its value is unusable: reject before
+    /// contacting the server, even with `--pending`.
+    Invalid,
+    /// A usable session id from `session_id` (Codex) or `sessionID`.
+    Valid(String),
+}
+
+/// How long a piped stdin may take to deliver its bytes before the command
+/// proceeds without them. Genuine hook payloads are already waiting; only an
+/// open pipe that never delivers anything waits the whole bound. This is the
+/// bound for `--pending`, which can answer from the mark alone and must never
+/// make a hook wait.
+const STDIN_WAIT: Duration = Duration::from_millis(500);
+
+/// How long `session-report` waits for stdin when stdin is the only place a
+/// report can come from: no `--session` and no `--pending`, so a JSON payload
+/// on the pipe is the whole report. A hook that creates a session during a
+/// slow frame may write well after the command starts, so this bound is long
+/// enough to catch such a payload and still ends the process in time.
+const STDIN_REPORT_WAIT: Duration = Duration::from_secs(5);
+
+/// Reads a hook payload from already-collected stdin bytes. Unknown fields
+/// are ignored so the same reader works for Claude, Codex, and any future
+/// hook shape. Only a truncated or malformed document counts as absent,
+/// never a false rejection: a key that is present with any non-string
+/// value, `null` included, is invalid, and only a missing key is absent.
+fn parse_session_payload(bytes: &[u8]) -> StdinSession {
+    if bytes.is_empty() {
+        return StdinSession::Absent;
+    }
+    // Anything that is not one whole JSON document has not arrived yet, so
+    // the caller keeps waiting rather than calling it absent.
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return StdinSession::Absent;
+    };
+    for key in ["session_id", "sessionID"] {
+        match payload.get(key) {
+            // Only a missing key is absent.
+            None => {}
+            Some(serde_json::Value::String(id)) => {
+                return if valid_session_id(id) {
+                    StdinSession::Valid(id.clone())
+                } else {
+                    StdinSession::Invalid
+                };
+            }
+            // Present with a value no session id can have, null included:
+            // reject it before contacting the server instead of pretending
+            // the key was not there.
+            Some(_) => return StdinSession::Invalid,
+        }
+    }
+    StdinSession::Absent
+}
+
+/// Whether stdin already holds one whole JSON document. The payload is then
+/// as complete as it will ever get, so waiting for EOF would add nothing.
+fn payload_is_complete(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && serde_json::from_slice::<serde_json::Value>(bytes).is_ok()
+}
+
+/// Collects stdin until the payload is complete, EOF arrives, or `bound`
+/// expires. An open pipe that never delivers anything yields whatever
+/// (possibly nothing) arrived in time.
+fn read_stdin_bounded(bound: Duration) -> Vec<u8> {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let worker = Arc::clone(&buffer);
+    let at_end = Arc::new(AtomicBool::new(false));
+    let worker_at_end = Arc::clone(&at_end);
+    let (arrival, arrived) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        let stdin = io::stdin();
+        let mut locked = stdin.lock();
+        loop {
+            match locked.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    worker
+                        .lock()
+                        .expect("stdin buffer is never poisoned")
+                        .extend_from_slice(&chunk[..count]);
+                    let _ = arrival.send(());
+                }
+                Err(_) => break,
+            }
+        }
+        worker_at_end.store(true, Ordering::SeqCst);
+        let _ = arrival.send(());
+    });
+    let started = Instant::now();
+    loop {
+        {
+            let held = buffer.lock().expect("stdin buffer is never poisoned");
+            if at_end.load(Ordering::SeqCst) || payload_is_complete(&held) {
+                return held.clone();
+            }
+        }
+        let remaining = bound.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let _ = arrived.recv_timeout(remaining);
+    }
+    buffer.lock().expect("stdin buffer is never poisoned").clone()
+}
+
+/// A hook may deliver the id as JSON on stdin, as `session_id` (Codex) or
+/// `sessionID` (Claude/OpenCode). Anything else yields no id.
+/// Test-only now: production reads through [`parse_session_payload`].
+#[cfg(test)]
+fn session_id_from_reader<R: io::Read>(mut input: R) -> Option<String> {
+    let mut text = Vec::new();
+    input.read_to_end(&mut text).ok()?;
+    match parse_session_payload(&text) {
+        StdinSession::Valid(id) => Some(id),
+        StdinSession::Absent | StdinSession::Invalid => None,
+    }
+}
+
+/// A session id is an opaque hook string: non-empty, bounded, and a
+/// conservative charset. Anything else is rejected before contacting the
+/// server, so a malformed payload can never rebind a room.
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_SESSION_BYTES
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// Reports this room's session to Crowded from a hook. Silent on stdout in
+/// every outcome: hook stdout can become model context. Failures get at most
+/// one short stderr line. Without `--ack` it always exits 0, so a hook never
+/// breaks its CLI; with `--ack` the exit status says whether Crowded accepted
+/// the report (see `SESSION_REPORT_USAGE`).
+pub(crate) fn session_report_command() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().skip(2).collect();
+    let ack = args.iter().any(|argument| argument == "--ack");
+    match deliver_session_report(args) {
+        Ok(()) => Ok(()),
+        Err((failure, message)) => {
+            eprintln!("crowded session-report: {message}");
+            if ack {
+                process::exit(failure.exit_code());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn deliver_session_report(args: Vec<String>) -> Result<(), (ReportFailure, String)> {
+    let report = parse_session_report_args(args).map_err(|error| (ReportFailure::Usage, error))?;
+    let malformed = || (ReportFailure::InvalidId, "ignoring a malformed session id".to_owned());
+    let session = match report.session {
+        Some(id) => {
+            if !valid_session_id(&id) {
+                return Err(malformed());
+            }
+            Some(id)
+        }
+        // An explicit id needs no stdin at all, and a terminal never carries
+        // a hook payload. Otherwise read whatever piped stdin holds, bounded
+        // so an open pipe can never hang the hook: `--pending` may still be
+        // answered by the mark alone, so it keeps the short bound, while
+        // without either flag stdin is the report's only possible input and
+        // gets the longer one.
+        None if io::stdin().is_terminal() => None,
+        None => {
+            let bound = if report.pending {
+                STDIN_WAIT
+            } else {
+                STDIN_REPORT_WAIT
+            };
+            match parse_session_payload(&read_stdin_bounded(bound)) {
+                StdinSession::Absent => None,
+                StdinSession::Valid(id) => Some(id),
+                StdinSession::Invalid => return Err(malformed()),
+            }
+        }
+    };
+    if session.is_none() && !report.pending {
+        return Err((
+            ReportFailure::Usage,
+            "nothing to report: pass --session, --pending, or JSON on stdin".to_owned(),
+        ));
+    }
+    let token = env::var("CROWDED_TOKEN").map_err(|_| {
+        (ReportFailure::NotConfigured, "CROWDED_TOKEN is not set".to_owned())
+    })?;
+    let room = env::var("CROWDED_ROOM").unwrap_or_else(|_| "external".to_owned());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| {
+            (
+                ReportFailure::NotConfigured,
+                "the system clock is before the epoch".to_owned(),
+            )
+        })?
+        .as_nanos();
+    let response = send_within(
+        WireRequest::SessionReport(SessionReportRequest {
+            token,
+            id: format!("{room}-session-report-{now}"),
+            session,
+            pending: report.pending,
+        }),
+        SESSION_REPORT_DEADLINE,
+    )
+    .map_err(|error| (ReportFailure::Unreachable, error))?;
+    if response.ok {
+        Ok(())
+    } else {
+        Err((
+            ReportFailure::Rejected,
+            response.error.unwrap_or_else(|| response.status.clone()),
+        ))
+    }
+}
+
 pub(crate) fn roster_command() -> Result<(), Box<dyn std::error::Error>> {
     match (env::args().nth(2).as_deref(), env::args().nth(3)) {
         (None, None) | (Some("--json"), None) => {}
@@ -515,6 +831,124 @@ mod tests {
     }
 
     #[test]
+    fn session_report_args_parse_each_shape_once() {
+        let parsed = parse_session_report_args(["--session", "ses-x"].map(str::to_owned)).unwrap();
+        assert_eq!(parsed.session.as_deref(), Some("ses-x"));
+        assert!(!parsed.pending);
+        let parsed = parse_session_report_args(["--pending".to_owned()]).unwrap();
+        assert_eq!(parsed.session, None);
+        assert!(parsed.pending);
+        let parsed = parse_session_report_args(
+            ["--session", "ses-x", "--pending"].map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(parsed.session.as_deref(), Some("ses-x"));
+        assert!(parsed.pending);
+        assert!(parse_session_report_args(Vec::<String>::new()).is_ok());
+        assert!(parse_session_report_args(["--session".to_owned()]).is_err());
+        assert!(parse_session_report_args(
+            ["--session", "a", "--session", "b"].map(str::to_owned)
+        )
+        .is_err());
+        assert!(parse_session_report_args(
+            ["--pending", "--pending"].map(str::to_owned)
+        )
+        .is_err());
+        assert!(parse_session_report_args(["--model", "x"].map(str::to_owned)).is_err());
+        assert!(parse_session_report_args(["ses-x".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn session_stdin_distinguishes_absent_from_invalid() {
+        assert!(matches!(parse_session_payload(b""), StdinSession::Absent));
+        assert!(matches!(parse_session_payload(b"not json"), StdinSession::Absent));
+        assert!(matches!(parse_session_payload(br#"{}"#,), StdinSession::Absent));
+        assert!(matches!(parse_session_payload(br#"{"other":1}"#), StdinSession::Absent));
+        assert!(matches!(
+            parse_session_payload(br#"{"session_id":"ses-x"}"#),
+            StdinSession::Valid(_)
+        ));
+        assert!(matches!(
+            parse_session_payload(br#"{"sessionID":"ses-x"}"#),
+            StdinSession::Valid(_)
+        ));
+        // A present but unusable id is Invalid, never silently dropped.
+        assert!(matches!(
+            parse_session_payload(br#"{"session_id":""}"#),
+            StdinSession::Invalid
+        ));
+        assert!(matches!(
+            parse_session_payload(br#"{"session_id":"has space"}"#),
+            StdinSession::Invalid
+        ));
+        assert!(matches!(
+            parse_session_payload(br#"{"sessionID":"bad/id"}"#),
+            StdinSession::Invalid
+        ));
+        let oversized = format!(r#"{{"session_id":"{}"}}"#, "s".repeat(129));
+        assert!(matches!(parse_session_payload(oversized.as_bytes()), StdinSession::Invalid));
+        // A truncated payload is absent, not a false rejection.
+        assert!(matches!(parse_session_payload(br#"{"session_id":"se"#,), StdinSession::Absent));
+    }
+
+    #[test]
+    fn session_report_reads_either_session_key_from_stdin() {
+        assert_eq!(
+            session_id_from_reader(br#"{"session_id":"ses-codex-1"}"#.as_slice()),
+            Some("ses-codex-1".to_owned())
+        );
+        assert_eq!(
+            session_id_from_reader(br#"{"sessionID":"ses-open-2"}"#.as_slice()),
+            Some("ses-open-2".to_owned())
+        );
+        assert_eq!(
+            session_id_from_reader(
+                br#"{"session_id":"first","sessionID":"second"}"#.as_slice()
+            ),
+            Some("first".to_owned())
+        );
+        assert_eq!(session_id_from_reader(br#"{}"#.as_slice()), None);
+        assert_eq!(session_id_from_reader(b"not json".as_slice()), None);
+        assert_eq!(session_id_from_reader(b"".as_slice()), None);
+        assert_eq!(
+            session_id_from_reader(br#"{"session_id":""}"#.as_slice()),
+            None
+        );
+        assert_eq!(
+            session_id_from_reader(br#"{"session_id":"has space"}"#.as_slice()),
+            None
+        );
+    }
+
+    #[test]
+    fn session_report_allows_only_conservative_session_characters() {
+        for good in ["ses_abc", "ses-ABC.1", "11111111-2222-3333-4444-555555555555", "x"] {
+            assert!(valid_session_id(good), "{good} must pass");
+        }
+        for bad in ["", "has space", "tab\there", "semi;colon", "quote\"q"] {
+            assert!(!valid_session_id(bad), "{bad:?} must fail");
+        }
+        assert!(!valid_session_id(&"s".repeat(129)));
+        assert!(valid_session_id(&"s".repeat(128)));
+    }
+
+    #[test]
+    fn session_report_command_never_prints_to_stdout() {
+        // Hook stdout can become model context, so the whole command body is
+        // held to silence: no println!, only eprintln! for the single short
+        // stderr line. The production CLI returns Ok(()) on every path.
+        let source = include_str!("commands.rs");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        let command = &production[production.find("fn session_report_command(").unwrap()..];
+        let command = &command[..command.find("\npub(crate) fn ").unwrap()];
+        let without_stderr = command.replace("eprintln!", "");
+        assert!(
+            !without_stderr.contains("println!"),
+            "session-report must stay silent on stdout"
+        );
+    }
+
+    #[test]
     fn applying_hooked_events_builds_the_room_detail() {
         let mut detail = crate::room_detail::RoomDetail::default();
         for event in hook_payload_detail(
@@ -533,4 +967,6 @@ mod tests {
         assert_eq!(detail.todos.len(), 1);
         assert_eq!(detail.todos[0].content, "Build");
     }
+
+
 }

@@ -119,6 +119,15 @@ enum Resume {
     Fresh,
 }
 
+/// Relaunch targeting exactly `session_id`, replacing any resume form already
+/// present.
+pub(super) fn set_resume_session(spec: &mut RoomSpec, session_id: &str) -> io::Result<()> {
+    let vendor = cli_vendor(spec)?;
+    clear_resume_args(spec)?;
+    spec.args.extend(session_resume_args(vendor, session_id));
+    Ok(())
+}
+
 /// The ambiguous "resume most recent conversation" args for each vendor.
 fn recent_resume_args(vendor: CliVendor) -> Vec<OsString> {
     match vendor {
@@ -477,26 +486,33 @@ fn claude_session_id(
     newest.map(|(_, stem)| stem)
 }
 
-fn codex_session_id(
+/// Every rollout in `sessions_dir` that names `cwd`, was modified after
+/// `since`, and is not in `exclude`, newest first. Delivery by process
+/// ownership needs the whole set, not just the newest one: a second eligible
+/// rollout means another room or process could own it.
+fn codex_session_candidates(
     sessions_dir: &Path,
     cwd: &Path,
     since: SystemTime,
     exclude: &[String],
-) -> Option<String> {
+) -> Vec<(SystemTime, String)> {
     let mut candidates: Vec<(SystemTime, String)> = Vec::new();
-    for year in fs::read_dir(sessions_dir).ok()?.flatten() {
+    let Ok(years) = fs::read_dir(sessions_dir) else {
+        return candidates;
+    };
+    for year in years.flatten() {
         if !year.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
             continue;
         }
-        for month in fs::read_dir(year.path()).ok()?.flatten() {
+        for month in fs::read_dir(year.path()).ok().into_iter().flatten().flatten() {
             if !month.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
                 continue;
             }
-            for day in fs::read_dir(month.path()).ok()?.flatten() {
+            for day in fs::read_dir(month.path()).ok().into_iter().flatten().flatten() {
                 if !day.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
                     continue;
                 }
-                for entry in fs::read_dir(day.path()).ok()?.flatten() {
+                for entry in fs::read_dir(day.path()).ok().into_iter().flatten().flatten() {
                     let path = entry.path();
                     if path.extension().and_then(OsStr::to_str) != Some("jsonl") {
                         continue;
@@ -523,7 +539,18 @@ fn codex_session_id(
         }
     }
     candidates.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    candidates.first().map(|(_, id)| id.clone())
+    candidates
+}
+
+fn codex_session_id(
+    sessions_dir: &Path,
+    cwd: &Path,
+    since: SystemTime,
+    exclude: &[String],
+) -> Option<String> {
+    codex_session_candidates(sessions_dir, cwd, since, exclude)
+        .first()
+        .map(|(_, id)| id.clone())
 }
 
 /// Parse a Codex rollout file's first line: `{"type":"session_meta","payload":
