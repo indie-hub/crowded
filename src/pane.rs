@@ -864,13 +864,22 @@ fn set_claude_new_session(spec: &mut RoomSpec, session_id: &str) -> io::Result<(
     Ok(())
 }
 
+/// What a native Claude room's launch decided before its terminal starts.
+#[derive(Clone, Debug)]
+pub(crate) enum ClaudeStart {
+    /// The session the room starts with; already saved and bound.
+    Ready(String),
+    /// The room must not start, with the reason to show.
+    Failed(String),
+}
+
 /// Chooses each native Claude room's session before its terminal starts: the
-/// stored one to resume, otherwise a fresh id Crowded saves first. Returns the
-/// session per room and a notice per room that cannot start.
+/// stored one to resume, otherwise a fresh id Crowded saves first. Returns one
+/// explicit decision per room, so a failure can never look like a plain start.
 pub(crate) fn start_claude_sessions(
     specs: &mut [RoomSpec],
-) -> (Vec<Option<String>>, Vec<String>) {
-    let mut sessions = vec![None; specs.len()];
+) -> (Vec<Option<ClaudeStart>>, Vec<String>) {
+    let mut starts = (0..specs.len()).map(|_| None).collect::<Vec<_>>();
     let mut notices = Vec::new();
     for (index, spec) in specs.iter_mut().enumerate() {
         if !claude_native_spec(spec) {
@@ -890,11 +899,15 @@ pub(crate) fn start_claude_sessions(
             Ok(session)
         })();
         match prepared {
-            Ok(session) => sessions[index] = Some(session),
-            Err(error) => notices.push(format!("{}: {error}; the room was not started", spec.title)),
+            Ok(session) => starts[index] = Some(ClaudeStart::Ready(session)),
+            Err(error) => {
+                let reason = format!("{}: {error}", spec.title);
+                notices.push(format!("{reason}; the room was not started"));
+                starts[index] = Some(ClaudeStart::Failed(reason));
+            }
         }
     }
-    (sessions, notices)
+    (starts, notices)
 }
 
 /// Binds one Claude room under a new launch generation.
@@ -916,17 +929,33 @@ pub(crate) fn bind_claude_room(
     }])
 }
 
+/// Binds every native Claude room before its terminal starts: a ready room to
+/// its session under a fresh generation, a failed one to its reason so its mail
+/// is held instead of pasted.
 pub(crate) fn bind_claude_rooms(
     router: &mut crate::native_route::NativeRouter,
-    panes: &mut [Pane],
-    sessions: &[Option<String>],
+    specs: &[RoomSpec],
+    starts: &[Option<ClaudeStart>],
 ) -> io::Result<()> {
-    for (index, session) in sessions.iter().enumerate() {
-        if let Some(session) = session {
-            bind_claude_room(router, panes, index, session)?;
-        }
+    let mut entries = Vec::new();
+    for (index, start) in starts.iter().enumerate() {
+        let Some(start) = start else {
+            continue;
+        };
+        let generation = GenerationAllocator::new(session_state::state_directory()).next()?;
+        let (session, reason) = match start {
+            ClaudeStart::Ready(session) => (Some(session.clone()), None),
+            ClaudeStart::Failed(reason) => (None, Some(reason.clone())),
+        };
+        entries.push(crate::native_route::ClaudeEntry {
+            index,
+            title: specs[index].title.clone(),
+            session,
+            generation,
+            reason,
+        });
     }
-    Ok(())
+    router.bind_claude(entries)
 }
 
 /// Whether a spec is a native room that receives mail through Codex.
@@ -4065,6 +4094,7 @@ mod tests {
                 GuestEnvironment::new([]),
                 None,
                 Some(&CodexMint::Ready(resume.to_owned())),
+                None,
             )
             .unwrap();
         }
@@ -4529,7 +4559,9 @@ mod tests {
 
         let (sessions, notices) = start_claude_sessions(&mut specs);
         assert!(notices.is_empty(), "{notices:?}");
-        let session = sessions[0].clone().expect("a session is chosen");
+        let Some(ClaudeStart::Ready(session)) = sessions[0].clone() else {
+            panic!("a session is chosen: {:?}", sessions[0]);
+        };
         assert_eq!(
             session_state::lookup_minted("claude", cwd.path(), "Claude · 1").as_deref(),
             Some(session.as_str()),
@@ -4548,6 +4580,7 @@ mod tests {
                 GuestEnvironment::new([]),
                 None,
                 None,
+                None,
             )
             .unwrap(),
         ];
@@ -4559,17 +4592,64 @@ mod tests {
         bind_claude_room(&mut router, &mut panes, 0, &session).unwrap();
         assert_eq!(router.binding_for(0).unwrap().session, session);
         let mut mailroom = Mailroom::new(10);
-        router.send(&mut mailroom, "Sender", 0, "hi", None).unwrap();
-        let shown = mailroom.summary();
-        assert!(
-            shown.contains("HELD: no Claude mod connected"),
-            "{shown}"
+        let (replied, reply) = std::sync::mpsc::sync_channel(1);
+        router
+            .send(
+                &mut mailroom,
+                "Sender",
+                0,
+                "hi",
+                Some(Box::new(move |_, reply| {
+                    let _ = replied.send(reply);
+                })),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let outcome = loop {
+            router.tick(Instant::now(), &mut mailroom, false, false);
+            if let Ok(outcome) = reply.try_recv() {
+                break outcome;
+            }
+            assert!(Instant::now() < deadline, "the hold was never answered");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            outcome,
+            crate::native_route::NativeReply::Held("no Claude mod connected".to_owned()),
+            "a Claude room never accepts or queues mail"
         );
+        let shown = mailroom.summary();
+        assert!(shown.contains("HELD: no Claude mod connected"), "{shown}");
+        // The hold is durable: the saved outbox still carries the message.
+        drop(router);
+        let mut restarted = crate::native_route::NativeRouter::start(
+            session_state::state_directory().join("native-outbox.json"),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut mailroom = Mailroom::new(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            restarted.tick(Instant::now(), &mut mailroom, true, false);
+            let shown = mailroom.summary();
+            if shown.contains("hi") {
+                assert!(shown.contains("HELD"), "{shown}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the held mail did not survive a router restart: {shown}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
 
         // A later start of the same room resumes the stored id, not a new one.
         let mut again = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
-        let (sessions, _) = start_claude_sessions(&mut again);
-        assert_eq!(sessions[0].as_deref(), Some(session.as_str()));
+        let (again_starts, _) = start_claude_sessions(&mut again);
+        assert!(
+            matches!(&again_starts[0], Some(ClaudeStart::Ready(id)) if id == &session),
+            "{again_starts:?}"
+        );
         assert_eq!(
             args_after(&again[0].args, "--resume"),
             [OsString::from(&session)]
@@ -4588,14 +4668,123 @@ mod tests {
         let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         spec.args = vec!["--resume".into(), MINTED_A.into()];
 
-        let (sessions, notices) = start_claude_sessions(std::slice::from_mut(&mut spec));
-        assert_eq!(sessions[0], None);
+        let (starts, notices) = start_claude_sessions(std::slice::from_mut(&mut spec));
+        assert!(
+            matches!(&starts[0], Some(ClaudeStart::Failed(_))),
+            "{starts:?}"
+        );
         let shown = notices.join("; ");
         assert!(shown.contains("session is chosen by Crowded"), "{shown}");
         assert_eq!(
             session_state::lookup("claude", cwd.path(), "Claude · 1"),
             None
         );
+    }
+
+    /// A Claude room whose preparation fails is not started: the production
+    /// decisions reach start_rooms as an explicit failure and no process runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_claude_preparation_starts_no_process() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("claude.log");
+        let stub = codex_stub_for_pane(
+            root.path(),
+            "claude",
+            &format!(
+                "printf '%s\\n' \"$@\" >> '{}'\nexec sleep 30",
+                log.display()
+            ),
+        );
+        for rejected in [false, true] {
+            let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
+            if rejected {
+                spec.args = vec!["--resume".into(), MINTED_A.into()];
+            } else {
+                // A leftover temp file makes the session save fail.
+                fs::create_dir_all(session_state::state_directory()).unwrap();
+                fs::write(
+                    session_state::state_directory()
+                        .join(format!("session-state.{}.tmp", std::process::id())),
+                    b"blocked",
+                )
+                .unwrap();
+            }
+            let (starts, notices) = start_claude_sessions(std::slice::from_mut(&mut spec));
+            assert!(
+                matches!(&starts[0], Some(ClaudeStart::Failed(_))),
+                "rejected={rejected}: {starts:?}"
+            );
+            let mut factory = RecordingPanes::default();
+            let mut last_output = vec![None];
+            crate::app::start_rooms(
+                &mut factory,
+                vec![spec],
+                &[small_size()],
+                &[GuestEnvironment::new([])],
+                vec![None],
+                &[None],
+                &starts,
+                &mut last_output,
+                false,
+                Duration::from_millis(5),
+                &mut crate::app::Notices::default(),
+            )
+            .unwrap();
+            assert_eq!(factory.kinds(), ["unavailable"], "rejected={rejected}");
+            assert!(!notices.is_empty());
+            assert!(!log.exists(), "rejected={rejected}: a process was spawned");
+            let _ = fs::remove_file(
+                session_state::state_directory()
+                    .join(format!("session-state.{}.tmp", std::process::id())),
+            );
+        }
+    }
+
+    /// The event loop's own restart arm turns a real F5 key into the relaunch.
+    #[cfg(unix)]
+    #[test]
+    fn the_event_loop_restart_arm_relaunches_a_claude_room() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
+        let mut rig = IterationHarness::new(root.path());
+        rig.panes[0] =
+            Pane::spawn_unavailable(spec, small_size(), GuestEnvironment::new([]), "offline")
+                .unwrap();
+        bind_claude_room(rig.router.as_mut().unwrap(), &mut rig.panes, 0, MINTED_A).unwrap();
+
+        let f5 = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(5),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let restarted = crate::app::restart_key_arm(
+            f5,
+            small_size(),
+            0,
+            &mut rig.panes,
+            rig.router.as_mut(),
+            &mut rig.codex,
+            &mut rig.gates,
+            &mut rig.last_output,
+            &mut rig.spawned_at,
+            &mut rig.pulses,
+            &rig.environments,
+            100,
+            &mut rig.notice,
+            Instant::now(),
+        );
+        assert!(restarted, "F5 must reach the launch");
+        assert_eq!(
+            args_after(&rig.panes[0].room_spec().args, "--resume"),
+            [OsString::from(MINTED_A)]
+        );
+        assert!(rig.notice.ordered_lines().join("; ").contains("restarted"));
     }
 
     /// Restart resumes the stored id, resume without one fails visibly, and a
@@ -4657,6 +4846,15 @@ mod tests {
         );
         let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
         assert!(binding.generation > old.generation);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !log.exists() {
+            rig.iterate();
+            assert!(
+                Instant::now() < deadline,
+                "the fake claude was never launched"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         rig.paused = false;
         // Every Claude message is held until the mod exists, so the guarantee
         // here is that it was never delivered, while the generation moved.
@@ -4669,7 +4867,10 @@ mod tests {
         rig.push_control(crate::doorbell::ControlAction::Resume);
         rig.iterate();
         let shown = rig.notice.ordered_lines().join("; ");
-        assert!(shown.contains("no stored Claude session to resume"), "{shown}");
+        assert!(
+            shown.contains("no stored Claude session to resume"),
+            "{shown}"
+        );
         assert!(shown.contains("control 1 clear"), "{shown}");
 
         // A clear whose marker cannot be saved starts nothing.
@@ -4703,6 +4904,16 @@ mod tests {
         rig.iterate();
         let fresh = session_state::lookup_minted("claude", cwd.path(), "Claude · 1")
             .expect("a clear saves the new id");
+        // One start per relaunch, and the failed clear started none.
+        let launches = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            launches
+                .lines()
+                .filter(|line| *line == "--resume" || *line == "--session-id")
+                .count(),
+            2,
+            "{launches}"
+        );
         assert_ne!(fresh, MINTED_A);
         assert_eq!(
             args_after(&rig.panes[0].room_spec().args, "--session-id"),
@@ -5230,6 +5441,7 @@ mod tests {
             GuestEnvironment::new([]),
             None,
             mints[0].as_ref(),
+            None,
         )
         .unwrap();
         assert!(!pane.is_online() && pane.is_native() && !pane.needs_intro());
@@ -5455,6 +5667,7 @@ mod tests {
                 GuestEnvironment::new([]),
                 None,
                 mints[index].as_ref(),
+                None,
             )
             .unwrap();
             assert!(pane.is_online());
@@ -5553,6 +5766,7 @@ mod tests {
             &vec![GuestEnvironment::new([]); 4],
             vec![None, None, None, None],
             &codex,
+            &[None, None, None, None],
             &mut last_output,
             false,
             std::time::Duration::from_millis(5),
@@ -5599,6 +5813,7 @@ mod tests {
                 &vec![GuestEnvironment::new([]); count],
                 (0..count).map(|_| None).collect(),
                 &codex,
+                &(0..count).map(|_| None).collect::<Vec<_>>(),
                 &mut last_output,
                 true,
                 deadline,
@@ -5720,6 +5935,7 @@ mod tests {
                 &vec![GuestEnvironment::new([]); 2],
                 vec![None, None],
                 &codex,
+                &[None, None],
                 &mut last_output,
                 true,
                 Duration::from_millis(500),
@@ -5781,6 +5997,7 @@ mod tests {
             &environments,
             vec![None, None, None],
             &codex,
+            &[None, None, None],
             &mut last_output,
             false,
             std::time::Duration::from_millis(5),

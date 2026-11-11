@@ -52,28 +52,36 @@ pub(crate) struct SwitchAdapter {
 struct Routing {
     opencode: OpenCodeAdapter,
     codex: CodexAdapter,
+    /// Claude rooms whose mail is saved by the outbox and refused here, so it
+    /// stays held durably until the room-side mod exists.
+    claude: HashSet<String>,
 }
 
 impl Routing {
     fn new(rooms: Vec<RoomEntry>) -> io::Result<Self> {
         let mut opencode = Vec::new();
         let mut codex = Vec::new();
+        let mut claude = HashSet::new();
         for room in rooms {
             match room.backend {
                 Backend::OpenCode(server) => opencode.push((room.binding, server)),
                 Backend::Codex(native) => codex.push((room.binding, (*native).clone())),
-                // A Claude room's mail never reaches the outbox: the router
-                // holds it before enqueueing, until the room-side mod exists.
-                Backend::Claude => {}
+                Backend::Claude => {
+                    claude.insert(room.binding.room.clone());
+                }
             }
         }
         Ok(Self {
             opencode: OpenCodeAdapter::new(opencode)?,
             codex: CodexAdapter::new(codex)?,
+            claude,
         })
     }
 
     fn send(&self, message: Message) -> AdapterResult {
+        if self.claude.contains(&message.destination) {
+            return AdapterResult::Dropped(UNBOUND_CLAUDE.to_owned());
+        }
         if self.codex.has_room(&message.destination) {
             self.codex.send(message)
         } else {
@@ -781,21 +789,6 @@ impl NativeRouter {
             }
             return Err(error);
         };
-        if self.claude.contains(&binding.room) {
-            // There is no way into a Claude process yet, so the mail is saved
-            // and explained instead of being queued or pasted.
-            let reason = UNBOUND_CLAUDE.to_owned();
-            let envelope = mailroom.record_native(
-                from.to_owned(),
-                title,
-                message.to_owned(),
-                held_text(&reason),
-            );
-            if let Some(reply) = reply {
-                reply(envelope, NativeReply::Held(reason));
-            }
-            return Ok(());
-        }
         let envelope = mailroom.record_native(
             from.to_owned(),
             title,

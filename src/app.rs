@@ -1639,7 +1639,11 @@ pub(crate) fn spawn_room(
     environment: pane::GuestEnvironment,
     native: Option<crate::native_launch::NativeRoom>,
     codex: Option<&pane::CodexMint>,
+    claude: Option<&pane::ClaudeStart>,
 ) -> Result<Pane, Box<dyn std::error::Error>> {
+    if let Some(pane::ClaudeStart::Failed(reason)) = claude {
+        return factory.unavailable(spec, size, environment, reason);
+    }
     match codex {
         Some(pane::CodexMint::Failed(reason)) => {
             factory.unavailable(spec, size, environment, reason)
@@ -1662,6 +1666,7 @@ pub(crate) fn start_rooms(
     environments: &[pane::GuestEnvironment],
     natives: Vec<Option<crate::native_launch::NativeRoom>>,
     codex: &[Option<pane::CodexMint>],
+    claude: &[Option<pane::ClaudeStart>],
     last_output: &mut [Option<Instant>],
     serialize_headroom: bool,
     headroom_ready_timeout: Duration,
@@ -1710,6 +1715,7 @@ pub(crate) fn start_rooms(
             environments[index].clone(),
             native,
             codex[index].as_ref(),
+            claude[index].as_ref(),
         )?);
         spawned_at.push(Instant::now());
         // A placeholder has no process and never produces output, so a later
@@ -1750,6 +1756,7 @@ pub(crate) fn complete_mints(
                     environments[index].clone(),
                     None,
                     codex[index].as_ref(),
+                    None,
                 ) {
                     Ok(started) => {
                         panes[index] = started;
@@ -1818,6 +1825,7 @@ pub(crate) fn relaunch_codex_room(
         environments[index].clone(),
         None,
         Some(&mint),
+        None,
     ) {
         Ok(started) => (started, None),
         Err(error) => {
@@ -1830,6 +1838,7 @@ pub(crate) fn relaunch_codex_room(
                 environments[index].clone(),
                 None,
                 Some(&failed),
+                None,
             )?;
             (failed, Some(reason))
         }
@@ -1876,6 +1885,7 @@ pub(crate) fn relaunch_claude_room(
         spec,
         size,
         environments[index].clone(),
+        None,
         None,
         None,
     )?;
@@ -1994,6 +2004,47 @@ pub(crate) fn restart_key(
             ),
         },
     )
+}
+
+/// The event loop's force-restart arm: the one place a key event becomes a
+/// launch. run_rooms calls this in one statement, so a test drives exactly what
+/// the loop drives.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn restart_key_arm(
+    key: KeyEvent,
+    size: portable_pty::PtySize,
+    focused: usize,
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    codex: &mut [Option<pane::CodexMint>],
+    delivery_gates: &mut [DeliveryGate],
+    last_output: &mut [Option<Instant>],
+    spawned_at: &mut [Instant],
+    room_pulses: &mut [Option<PulseSample>],
+    environments: &[pane::GuestEnvironment],
+    fuse_size: usize,
+    notice: &mut Notices,
+    now: Instant,
+) -> bool {
+    let Some((text, severity)) = restart_key(
+        key,
+        size,
+        focused,
+        panes,
+        router,
+        codex,
+        delivery_gates,
+        last_output,
+        spawned_at,
+        room_pulses,
+        environments,
+        fuse_size,
+        now,
+    ) else {
+        return false;
+    };
+    notice.push(text, severity);
+    true
 }
 
 /// Sends doorbell mail to a native room through the router. This is the only
@@ -3036,7 +3087,7 @@ fn run_rooms(
     }
     // A native Claude room's session id is Crowded's to choose, so it is fixed
     // and saved before the terminal starts: no model turn is involved.
-    let (claude_sessions, mut claude_notices) = pane::start_claude_sessions(&mut specs);
+    let (claude_starts, mut claude_notices) = pane::start_claude_sessions(&mut specs);
     for message in &claude_notices {
         eprintln!("{message}");
     }
@@ -3059,6 +3110,10 @@ fn run_rooms(
     if let Some(text) = startup_notice {
         notice.push(text, NoticeSeverity::Info);
     }
+    // Every Claude session and binding exists before any terminal starts.
+    if let Some(router) = router.as_mut() {
+        pane::bind_claude_rooms(router, &specs, &claude_starts)?;
+    }
     let (mut panes, mut spawned_at) = start_rooms(
         &mut LivePanes,
         specs,
@@ -3066,6 +3121,7 @@ fn run_rooms(
         &environments,
         natives,
         &codex,
+        &claude_starts,
         &mut last_output,
         cfg!(windows),
         HEADROOM_READY_TIMEOUT,
@@ -3093,7 +3149,6 @@ fn run_rooms(
     // its reason, so its mail is held instead of being pasted.
     if let Some(router) = router.as_mut() {
         pane::bind_codex_rooms(router, &mut panes, &codex)?;
-        pane::bind_claude_rooms(router, &mut panes, &claude_sessions)?;
     }
     let mut mailroom = Mailroom::new(100);
     let mut fuse = DeliveryFuse::new(fuse_size);
@@ -3639,7 +3694,7 @@ fn run_rooms(
                     terminal.autoresize()?;
                     let (rooms, _, _) = content_areas(terminal.size()?.into());
                     let area = pane_areas(rooms, room_count)[focused];
-                    if let Some((text, severity)) = restart_key(
+                    restart_key_arm(
                         key,
                         pane_size(area),
                         focused,
@@ -3652,10 +3707,9 @@ fn run_rooms(
                         &mut room_pulses,
                         &environments,
                         fuse_size,
+                        &mut notice,
                         Instant::now(),
-                    ) {
-                        notice.push(text, severity);
-                    }
+                    );
                 }
 
                 Event::Key(key) => match &mut input_mode {
@@ -4103,6 +4157,7 @@ mod tests {
             pane::GuestEnvironment::new([]),
             native,
             codex,
+            None,
         )
         .unwrap()
     }
@@ -5715,6 +5770,7 @@ mod tests {
                 spec,
                 size,
                 pane::GuestEnvironment::new([]),
+                None,
                 None,
                 None,
             )
