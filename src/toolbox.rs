@@ -1030,11 +1030,12 @@ fn merge_hooks(original: Option<&str>, path: &Path, vendor: Vendor) -> io::Resul
             )));
         }
         handlers.push(entry);
-        if vendor == Vendor::Codex && event == "SessionStart" {
+        if matches!(vendor, Vendor::Codex | Vendor::Claude) && event == "SessionStart" {
             // A second SessionStart hook reports the new thread id to Crowded
             // (`crowded session-report` reads the session id from stdin). It
             // is a separate entry from the pulse so each can evolve alone;
-            // like the pulse, it carries no matcher.
+            // like the pulse, it carries no matcher. Only Codex needs the
+            // Windows spelling, as for the pulse.
             let mut report = serde_json::json!({
                 "type": "command",
                 "command": "\"$CROWDED_BIN\" session-report",
@@ -2165,10 +2166,23 @@ export const CrowdedPulse = async () => {
             &fs::read_to_string(root.join(".claude/settings.local.json")).unwrap(),
         )
         .unwrap();
+        let claude_starts = claude_hooks_again["hooks"]["SessionStart"]
+            .as_array()
+            .expect("claude SessionStart hooks");
+        assert_eq!(claude_starts.len(), 2);
+        let claude_report = claude_starts
+            .iter()
+            .find(|entry| entry["hooks"][0]["command"] == "\"$CROWDED_BIN\" session-report")
+            .expect("claude SessionStart session-report");
+        assert!(claude_report.get("matcher").is_none());
         assert!(
-            !serde_json::to_string(&claude_hooks_again["hooks"]).unwrap().contains("session-report"),
-            "Claude hooks must not gain a session report"
+            claude_report["hooks"][0].get("commandWindows").is_none(),
+            "the Claude pulse carries no commandWindows, so its report must not either"
         );
+        assert_eq!(claude_report["hooks"][0]["timeout"], 3);
+        assert!(claude_starts.iter().any(|entry| {
+            entry["hooks"][0]["command"] == "\"$CROWDED_BIN\" pulse starting --hook-stdin"
+        }));
         let pulse_plugin =
             fs::read_to_string(root.join(".opencode/plugins/crowded-pulse.js")).unwrap();
         assert!(pulse_plugin.contains("ctx.session.hook(\"prompt\""));
@@ -2215,6 +2229,8 @@ export const CrowdedPulse = async () => {
             claude["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             "external-hook"
         );
+        assert_eq!(claude["hooks"].as_object().unwrap().len(), 1);
+        assert!(claude["hooks"].get("SessionStart").is_none());
         assert!(!root.join(".codex/hooks.json").exists());
         assert!(!root.join(".opencode/plugins/crowded-pulse.js").exists());
         assert!(!root.join(".opencode/plugins/crowded-tui/tui.js").exists());
@@ -2400,6 +2416,69 @@ export const CrowdedPulse = async () => {
         assert!(!root.join(".claude/settings.local.json").exists());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_session_start_reports_its_session_once() {
+        let root = test_directory();
+        fs::write(
+            root.join("crowded.toml"),
+            r#"
+                [[rooms]]
+                command = "claude"
+                transport = "raw"
+
+                [[rooms]]
+                command = "/bin/zsh"
+                transport = "shell"
+            "#,
+        )
+        .unwrap();
+
+        sync(&root).unwrap();
+        let path = root.join(".claude/settings.local.json");
+        let reports = |text: &str| -> usize {
+            serde_json::from_str::<Value>(text).unwrap()["hooks"]["SessionStart"]
+                .as_array()
+                .expect("claude SessionStart hooks")
+                .iter()
+                .filter(|entry| entry["hooks"][0]["command"] == "\"$CROWDED_BIN\" session-report")
+                .count()
+        };
+        assert_eq!(reports(&fs::read_to_string(&path).unwrap()), 1);
+
+        // A resync keeps exactly one copy, and a hook added by hand survives it.
+        let mut edited: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        edited["hooks"]["SessionStart"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "hooks": [{"type": "command", "command": "mine"}]
+            }));
+        fs::write(&path, serde_json::to_string_pretty(&edited).unwrap()).unwrap();
+        resync(&root).unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(reports(&after), 1);
+        assert!(after.contains("\"mine\""));
+
+        remove(&root).unwrap();
+        assert!(!path.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn codex_hook_file_is_pinned_byte_for_byte() {
+        use sha2::{Digest, Sha256};
+
+        // A change to this file voids the hook trust the user already approved,
+        // so the whole generated document is pinned rather than its shape.
+        let generated = merge_hooks(None, Path::new(".codex/hooks.json"), Vendor::Codex).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(generated.as_bytes())),
+            "c60a075c43cbe3e229bb5ee07fc72cb9d8b8b1ad64721d2ce4a45570d15be7f8",
+            "the generated Codex hook file changed; that voids hook trust the user already approved"
+        );
     }
 
     #[test]

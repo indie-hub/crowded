@@ -303,6 +303,10 @@ it always exits 0: a hook must never break its CLI, so the Codex
 contacted (non-empty, at most 128 bytes, letters, digits, `-`, `_` or `.`);
 anything else is ignored on the spot.
 
+Crowded writes the same `SessionStart` entry for a Claude room, next to the
+pulse entry, in `.claude/settings.local.json`. Claude rooms are not native
+rooms yet, so a report from one is ignored and changes nothing.
+
 Pass `--ack` when the caller needs proof of delivery (the OpenCode plugin
 does, on every report). With it the exit status is 0 only when Crowded
 accepted the report, and a failure exits with its own code:
