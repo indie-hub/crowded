@@ -1878,22 +1878,29 @@ pub(crate) fn relaunch_claude_room(
     environments: &[pane::GuestEnvironment],
     now: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // A relaunch is transactional: whatever fails after this point restores the
-    // stored id and the router binding the room had before the call.
+    // The program must exist before anything is written: the resolver alone
+    // accepts a path that is gone.
+    pane::preflight_program(panes[index].room_spec())?;
     let cwd = panes[index].cwd().to_path_buf();
     let title = panes[index].title().to_owned();
     let minted = pane::session_state::lookup_minted("claude", &cwd, &title);
     let reported = pane::session_state::lookup_reported("claude", &cwd, &title);
     let previous_binding = router.as_ref().and_then(|router| router.binding_for(index));
+    // Only state this call actually wrote is restored: a failure before the
+    // first durable write must leave the saved file byte-identical.
+    let wrote = std::cell::Cell::new(false);
     let mut spec = panes[index].room_spec().clone();
     let launched = (|| -> Result<(), Box<dyn std::error::Error>> {
         let generation = pane::next_generation()?;
-        let (next, session) = panes[index].relaunch_claude(action, index + 1)?;
+        let (next, session) = panes[index].relaunch_claude(action, index + 1, &wrote)?;
         spec = next;
         if let Some(router) = router.as_deref_mut() {
             pane::bind_claude_room_at(router, panes, index, &session, generation)?;
         }
         panes[index].cleanup();
+        if pane::FAIL_CLAUDE_SPAWN.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::other("injected Claude spawn failure").into());
+        }
         let started = spawn_room(
             &mut LivePanes,
             spec.clone(),
@@ -1907,16 +1914,34 @@ pub(crate) fn relaunch_claude_room(
         Ok(())
     })();
     if let Err(error) = launched {
-        pane::restore_claude_state(&cwd, &title, minted.as_deref(), reported.as_deref());
+        if !wrote.get() {
+            return Err(error);
+        }
+        let mut failures = Vec::new();
+        if let Err(restore) =
+            pane::restore_claude_state(&cwd, &title, minted.as_deref(), reported.as_deref())
+        {
+            failures.push(format!("the stored session could not be restored: {restore}"));
+        }
         if let (Some(router), Some(binding)) = (router, previous_binding) {
-            let _ = router.rebind_room(crate::native_route::RoomEntry {
+            if let Err(rebind) = router.rebind_room(crate::native_route::RoomEntry {
                 index,
                 title: title.clone(),
                 binding,
                 backend: crate::native_route::Backend::Claude,
-            });
+            }) {
+                failures.push(format!("the old binding could not be restored: {rebind}"));
+            }
         }
-        return Err(error);
+        if failures.is_empty() {
+            return Err(error);
+        }
+        return Err(io::Error::other(format!(
+            "{error}; {}; the room may be recorded on a session that did not start; use control {} clear to start a new one",
+            failures.join("; "),
+            index + 1
+        ))
+        .into());
     }
     delivery_gates[index] = DeliveryGate::new(false);
     last_output[index] = None;
