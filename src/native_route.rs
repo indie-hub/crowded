@@ -62,6 +62,9 @@ impl Routing {
             match room.backend {
                 Backend::OpenCode(server) => opencode.push((room.binding, server)),
                 Backend::Codex(native) => codex.push((room.binding, (*native).clone())),
+                // A Claude room's mail never reaches the outbox: the router
+                // holds it before enqueueing, until the room-side mod exists.
+                Backend::Claude => {}
             }
         }
         Ok(Self {
@@ -150,6 +153,9 @@ pub(crate) enum Backend {
     OpenCode(Arc<Server>),
     /// The room's own Codex process is queued through the CLI.
     Codex(Arc<Room>),
+    /// The room's own Claude process. Crowded cannot deliver into it until the
+    /// room-side mod exists, so every message is held with a plain reason.
+    Claude,
 }
 
 /// A Codex room handed to the router. Without a verified thread the room is
@@ -167,6 +173,22 @@ pub(crate) struct CodexEntry {
 
 const UNBOUND_CODEX: &str =
     "this room has no Codex session; restart Crowded and send again";
+
+/// A Claude room handed to the router. Crowded chose the session id itself, so
+/// the room is bound as soon as it starts; a room that could not start carries
+/// the reason instead.
+pub(crate) struct ClaudeEntry {
+    pub(crate) index: usize,
+    pub(crate) title: String,
+    pub(crate) session: Option<String>,
+    /// The launch generation this session belongs to; it never repeats, so mail
+    /// saved for an earlier launch can never match a later binding.
+    pub(crate) generation: u64,
+    /// Why the room has no session, when it has none.
+    pub(crate) reason: Option<String>,
+}
+
+const UNBOUND_CLAUDE: &str = "no Claude mod connected";
 
 enum Waiting {
     Enqueue { envelope: u64, reply: Option<Reply> },
@@ -197,6 +219,10 @@ pub(crate) struct NativeRouter {
     /// The bound Codex rooms, kept whole so every rebuild of the adapter's
     /// routing table includes the ones bound earlier.
     codex_rooms: HashMap<usize, RoomEntry>,
+    /// Destination keys of the Claude rooms, whose mail is always held.
+    claude: HashSet<String>,
+    /// The bound Claude rooms, kept whole for the same reason as the Codex ones.
+    claude_rooms: HashMap<usize, RoomEntry>,
     /// Native rooms with no verified Codex thread, and the reason.
     unbound: HashMap<usize, (String, String)>,
     /// Rooms that reported themselves between sessions, keyed by destination.
@@ -292,6 +318,8 @@ impl NativeRouter {
         let mut codex = HashSet::new();
         let mut codex_live = HashMap::new();
         let mut codex_rooms = HashMap::new();
+        let mut claude = HashSet::new();
+        let mut claude_rooms = HashMap::new();
         for room in &rooms {
             bindings.insert(room.binding.room.clone(), room.binding.clone());
             titles.insert(room.binding.room.clone(), room.title.clone());
@@ -303,6 +331,10 @@ impl NativeRouter {
                     codex.insert(room.binding.room.clone());
                     codex_live.insert(room.index, Arc::clone(&native.live));
                     codex_rooms.insert(room.index, room.clone());
+                }
+                Backend::Claude => {
+                    claude.insert(room.binding.room.clone());
+                    claude_rooms.insert(room.index, room.clone());
                 }
             }
             by_index.insert(room.index, (room.title.clone(), room.binding.clone()));
@@ -316,6 +348,8 @@ impl NativeRouter {
             servers: Reaped::new(servers),
             codex,
             codex_rooms,
+            claude,
+            claude_rooms,
             unbound: HashMap::new(),
             pending_rooms: HashSet::new(),
             codex_live,
@@ -408,6 +442,49 @@ impl NativeRouter {
                     self.codex_rooms.remove(&entry.index);
                     self.codex_live.remove(&entry.index);
                     let reason = entry.reason.unwrap_or_else(|| UNBOUND_CODEX.to_owned());
+                    self.unbound.insert(entry.index, (entry.title, reason));
+                }
+            }
+        }
+        self.adapter.get().rebind(self.entries())
+    }
+
+    /// Binds the Claude rooms once each launch has its session id. Mail for a
+    /// Claude room is held by `send`; the binding exists so restart, resume and
+    /// session reports agree on one session per launch generation.
+    pub(crate) fn bind_claude(&mut self, entries: Vec<ClaudeEntry>) -> io::Result<()> {
+        for entry in entries {
+            let destination = (entry.index + 1).to_string();
+            match entry.session {
+                Some(session) => {
+                    let binding =
+                        crate::codex_native::binding(&destination, &session, entry.generation);
+                    self.unbound.remove(&entry.index);
+                    self.claude.insert(destination.clone());
+                    self.titles
+                        .insert(destination.clone(), entry.title.clone());
+                    self.bindings
+                        .insert(destination.clone(), binding.clone());
+                    self.rooms
+                        .insert(entry.index, (entry.title.clone(), binding.clone()));
+                    self.claude_rooms.insert(
+                        entry.index,
+                        RoomEntry {
+                            index: entry.index,
+                            title: entry.title,
+                            binding,
+                            backend: Backend::Claude,
+                        },
+                    );
+                }
+                None => {
+                    if let Some((_, stale)) = self.rooms.remove(&entry.index) {
+                        self.bindings.remove(&stale.room);
+                        self.claude.remove(&stale.room);
+                        self.pending_rooms.remove(&stale.room);
+                    }
+                    self.claude_rooms.remove(&entry.index);
+                    let reason = entry.reason.unwrap_or_else(|| UNBOUND_CLAUDE.to_owned());
                     self.unbound.insert(entry.index, (entry.title, reason));
                 }
             }
@@ -580,6 +657,10 @@ impl NativeRouter {
                 self.codex_live.insert(index, Arc::clone(&native.live));
                 self.codex_rooms.insert(index, entry.clone());
             }
+            Backend::Claude => {
+                self.claude.insert(destination.clone());
+                self.claude_rooms.insert(index, entry.clone());
+            }
         }
         self.unbound.remove(&index);
         self.pending_rooms.remove(&destination);
@@ -603,6 +684,7 @@ impl NativeRouter {
             })
             .collect();
         entries.extend(self.codex_rooms.values().cloned());
+        entries.extend(self.claude_rooms.values().cloned());
         entries
     }
 
@@ -617,6 +699,8 @@ impl NativeRouter {
         self.rooms.clear();
         self.codex.clear();
         self.codex_rooms.clear();
+        self.claude.clear();
+        self.claude_rooms.clear();
         self.unbound.clear();
         self.codex_live.clear();
         for room in &rooms {
@@ -634,6 +718,10 @@ impl NativeRouter {
                     self.codex.insert(room.binding.room.clone());
                     self.codex_live.insert(room.index, Arc::clone(&native.live));
                     self.codex_rooms.insert(room.index, room.clone());
+                }
+                Backend::Claude => {
+                    self.claude.insert(room.binding.room.clone());
+                    self.claude_rooms.insert(room.index, room.clone());
                 }
             }
         }
@@ -693,6 +781,21 @@ impl NativeRouter {
             }
             return Err(error);
         };
+        if self.claude.contains(&binding.room) {
+            // There is no way into a Claude process yet, so the mail is saved
+            // and explained instead of being queued or pasted.
+            let reason = UNBOUND_CLAUDE.to_owned();
+            let envelope = mailroom.record_native(
+                from.to_owned(),
+                title,
+                message.to_owned(),
+                held_text(&reason),
+            );
+            if let Some(reply) = reply {
+                reply(envelope, NativeReply::Held(reason));
+            }
+            return Ok(());
+        }
         let envelope = mailroom.record_native(
             from.to_owned(),
             title,

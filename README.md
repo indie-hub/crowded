@@ -266,6 +266,27 @@ transport = "raw"
 native_delivery = true
 ```
 
+### Native Claude rooms (lifecycle only, not yet configurable)
+
+A Claude room can be given a session id by Crowded: it starts with
+`claude --session-id <uuid>` and the binding is saved before its terminal
+starts. Successive launches behave like a native Codex room's: restart resumes
+the stored id with `claude --resume <id>`, `control N clear` writes the durable
+cleared marker first and then starts a new id, and `control N resume` without a
+stored id fails with a visible reason and mints nothing. The room's own
+SessionStart hook can report a new id after `/clear`, which rebinds it under a
+new launch generation. A user-supplied `--resume`, `--continue`,
+`--session-id` or `--fork-session` is refused for such a room, because the
+session is Crowded's to choose.
+
+Delivery is not implemented yet: every message to a Claude room is saved and
+shown as held with the reason `no Claude mod connected`, never queued or pasted.
+`native_delivery` therefore still rejects Claude rooms in `crowded.toml`; the
+lifecycle above is exercised by the test suite until the room-side mod ships.
+Because a stored id is trusted without any existence check, an id whose
+transcript no longer exists makes the launch fail and the room stays offline
+with the CLI's reason: Crowded does not scan `~/.claude` to guess.
+
 ### Session reports: following /clear and session switches
 
 When a human clears a native room (`/clear`) or its CLI starts a new

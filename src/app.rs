@@ -1853,6 +1853,43 @@ pub(crate) fn relaunch_codex_room(
     }
 }
 
+/// Relaunches one native Claude room in place. The session id is known before
+/// the terminal starts, so the room is bound at once and its mail is held there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn relaunch_claude_room(
+    action: pane::ClaudeRelaunch,
+    index: usize,
+    size: portable_pty::PtySize,
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    delivery_gates: &mut [DeliveryGate],
+    last_output: &mut [Option<Instant>],
+    spawned_at: &mut [Instant],
+    room_pulses: &mut [Option<PulseSample>],
+    environments: &[pane::GuestEnvironment],
+    now: Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (spec, session) = panes[index].relaunch_claude(action, index + 1)?;
+    panes[index].cleanup();
+    let started = spawn_room(
+        &mut LivePanes,
+        spec,
+        size,
+        environments[index].clone(),
+        None,
+        None,
+    )?;
+    panes[index] = started;
+    if let Some(router) = router {
+        pane::bind_claude_room(router, panes, index, &session)?;
+    }
+    delivery_gates[index] = DeliveryGate::new(false);
+    last_output[index] = None;
+    spawned_at[index] = now;
+    room_pulses[index] = Some(PulseSample::now(PulseState::Starting, None));
+    Ok(())
+}
+
 /// Revives one room after F5 or an offline Ctrl+R. A native Codex room comes
 /// back into its session; every other room respawns exactly as before.
 #[allow(clippy::too_many_arguments)]
@@ -1870,6 +1907,21 @@ pub(crate) fn restart_room(
     fuse_size: usize,
     now: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if panes[index].claude_native() {
+        return relaunch_claude_room(
+            pane::ClaudeRelaunch::Restart,
+            index,
+            size,
+            panes,
+            router,
+            delivery_gates,
+            last_output,
+            spawned_at,
+            room_pulses,
+            environments,
+            now,
+        );
+    }
     if panes[index].codex_native() {
         let roster = welcome_roster(panes, room_pulses, now);
         let prompt = house_rules(index + 1, &roster, fuse_size);
@@ -2014,7 +2066,7 @@ fn apply_session_report(
     let title = panes[from].title().to_owned();
     if !panes[from].is_native() {
         return Ok(format!(
-            "ignored: {title} is not a native OpenCode or Codex room"
+            "ignored: {title} is not a native OpenCode, Codex or Claude room"
         ));
     }
     let current = router.binding_for(from);
@@ -2053,6 +2105,11 @@ fn apply_session_report(
             "ignored: the reported session is not a Codex thread id"
         ));
     }
+    if panes[from].claude_native() && !crate::codex_native::valid_uuid(&session) {
+        return Ok(format!(
+            "ignored: the reported session is not a Claude session id"
+        ));
+    }
     let generation = crate::native_launch::GenerationAllocator::new(
         crate::pane::session_state::state_directory(),
     )
@@ -2078,6 +2135,27 @@ fn apply_session_report(
                 title: title.clone(),
                 binding: crate::codex_native::binding(&destination, &session, generation),
                 backend: crate::native_route::Backend::Codex(Arc::new(room)),
+            })
+            .map_err(|error| format!("{title} could not be rebound: {error}"))?;
+    } else if panes[from].claude_native() {
+        // The room's own hook is the only other source of a Claude id.
+        if let Err(error) = crate::pane::session_state::upsert_reported(
+            "claude",
+            panes[from].cwd(),
+            &title,
+            &session,
+        ) {
+            let reason = format!("session report for {session} could not be saved: {error}");
+            let _ = router.unbind_room(from, reason.clone());
+            return Err(reason);
+        }
+        panes[from].record_session(&session);
+        router
+            .rebind_room(crate::native_route::RoomEntry {
+                index: from,
+                title: title.clone(),
+                binding: crate::codex_native::binding(&destination, &session, generation),
+                backend: crate::native_route::Backend::Claude,
             })
             .map_err(|error| format!("{title} could not be rebound: {error}"))?;
     } else {
@@ -2771,6 +2849,7 @@ pub(crate) fn run_rooms_iteration<D: DoorbellSource>(
                         None => pane_sizes[control.to],
                     };
                     let codex_native = panes[control.to].codex_native();
+                    let claude_native = panes[control.to].claude_native();
                     let prompt = if codex_native {
                         house_rules(
                             control.to + 1,
@@ -2781,6 +2860,34 @@ pub(crate) fn run_rooms_iteration<D: DoorbellSource>(
                         String::new()
                     };
                     match &control.action {
+                        ControlAction::ClearContext if claude_native => relaunch_claude_room(
+                            pane::ClaudeRelaunch::Clear,
+                            control.to,
+                            size,
+                            panes,
+                            router.as_mut(),
+                            delivery_gates,
+                            last_output,
+                            spawned_at,
+                            room_pulses,
+                            environments,
+                            now,
+                        )
+                        .map(|()| false),
+                        ControlAction::Resume if claude_native => relaunch_claude_room(
+                            pane::ClaudeRelaunch::Resume,
+                            control.to,
+                            size,
+                            panes,
+                            router.as_mut(),
+                            delivery_gates,
+                            last_output,
+                            spawned_at,
+                            room_pulses,
+                            environments,
+                            now,
+                        )
+                        .map(|()| true),
                         ControlAction::ClearContext if codex_native => relaunch_codex_room(
                             pane::CodexRelaunch::Clear,
                             control.to,
@@ -2927,6 +3034,12 @@ fn run_rooms(
     for message in &mint_notices {
         eprintln!("{message}");
     }
+    // A native Claude room's session id is Crowded's to choose, so it is fixed
+    // and saved before the terminal starts: no model turn is involved.
+    let (claude_sessions, mut claude_notices) = pane::start_claude_sessions(&mut specs);
+    for message in &claude_notices {
+        eprintln!("{message}");
+    }
         // `?` returns early on an error. The guards below still run their Drop code.
         let ((natives, router), _terminal_guard) = launch_then_enter(
         || {
@@ -2972,11 +3085,15 @@ fn run_rooms(
     for message in mint_notices.drain(..) {
         notice.push(message, NoticeSeverity::Failure);
     }
+    for message in claude_notices.drain(..) {
+        notice.push(message, NoticeSeverity::Failure);
+    }
     // A Codex room is bound to the session the launch phase gave it before any
     // mail is sent. A room that was not started stays native and unbound with
     // its reason, so its mail is held instead of being pasted.
     if let Some(router) = router.as_mut() {
         pane::bind_codex_rooms(router, &mut panes, &codex)?;
+        pane::bind_claude_rooms(router, &mut panes, &claude_sessions)?;
     }
     let mut mailroom = Mailroom::new(100);
     let mut fuse = DeliveryFuse::new(fuse_size);
@@ -5573,6 +5690,63 @@ mod tests {
         }
     }
 
+    /// A Claude room's own report is the only other source of its session: a
+    /// valid id rebinds under a new generation and is saved as reported; a
+    /// non-UUID is ignored.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_claude_session_report_rebinds_and_a_non_uuid_is_ignored() {
+        const FIRST: &str = "6a1d2f74-1f52-4e0f-9d61-0a1b2c3d4e5f";
+        const SECOND: &str = "7b2e3a85-2a63-4f10-8e72-1b2c3d4e5f60";
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let program = report_test_stub(root.path(), "claude", &root.path().join("calls"));
+        let spec = report_test_spec(&program, cwd.path(), "Claude · 1", true);
+        let size = PtySize {
+            rows: 6,
+            cols: 60,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let mut panes = vec![
+            spawn_room(
+                &mut LivePanes,
+                spec,
+                size,
+                pane::GuestEnvironment::new([]),
+                None,
+                None,
+            )
+            .unwrap(),
+        ];
+        let mut router = NativeRouter::start(root.path().join("outbox.json"), Vec::new()).unwrap();
+        pane::bind_claude_room(&mut router, &mut panes, 0, FIRST).unwrap();
+        let old = router.binding_for(0).unwrap();
+        let mut rig = ReportDispatch::new(panes, Some(router));
+
+        let shown = {
+            rig.push_report(0, Some("not-a-uuid"), false);
+            rig.dispatch()
+        };
+        assert!(shown.contains("not a Claude session id"), "{shown}");
+        assert_eq!(
+            rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
+            FIRST
+        );
+
+        rig.push_report(0, Some(SECOND), false);
+        rig.dispatch();
+        let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        assert_eq!(binding.session, SECOND);
+        assert!(binding.generation > old.generation);
+        assert_eq!(
+            crate::pane::session_state::lookup_reported("claude", cwd.path(), "Claude · 1")
+                .as_deref(),
+            Some(SECOND)
+        );
+    }
+
     #[cfg(all(test, unix))]
     #[test]
     fn session_reports_never_touch_a_terminal() {
@@ -5651,7 +5825,7 @@ mod tests {
         rig.push_report(1, Some("ses-x"), false);
         let notice = rig.dispatch();
         assert!(
-            notice.contains("is not a native OpenCode or Codex room"),
+            notice.contains("is not a native OpenCode, Codex or Claude room"),
             "{notice}"
         );
         // A room's PTY hands bytes to its child only on a line boundary, so
@@ -5977,7 +6151,7 @@ mod tests {
             report_test_pane(specs.remove(0), natives.remove(0), None),
         ];
         let notice = apply_test_report(&mut panes, router.as_mut(), 1, Some("ses-x"), false);
-        assert!(notice.contains("not a native OpenCode or Codex room"), "{notice}");
+        assert!(notice.contains("not a native OpenCode, Codex or Claude room"), "{notice}");
         assert!(router.as_ref().unwrap().binding_for(1).is_none());
     }
 
