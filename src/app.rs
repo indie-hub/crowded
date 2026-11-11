@@ -1870,7 +1870,7 @@ pub(crate) fn relaunch_claude_room(
     index: usize,
     size: portable_pty::PtySize,
     panes: &mut [Pane],
-    router: Option<&mut NativeRouter>,
+    mut router: Option<&mut NativeRouter>,
     delivery_gates: &mut [DeliveryGate],
     last_output: &mut [Option<Instant>],
     spawned_at: &mut [Instant],
@@ -1878,28 +1878,46 @@ pub(crate) fn relaunch_claude_room(
     environments: &[pane::GuestEnvironment],
     now: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // The generation is the only fallible part of binding, so it is allocated
-    // before anything is persisted: a failure here writes nothing.
-    let generation = pane::next_generation()?;
-    let (spec, session) = panes[index].relaunch_claude(action, index + 1)?;
-    // The binding exists before any terminal does: a failure here leaves the
-    // old pane untouched and starts no process.
-    // shortcut: a rare adapter-rebind failure here leaves the freshly minted
-    // id recorded; upgrade if that ever strands a room.
-    if let Some(router) = router {
-        pane::bind_claude_room_at(router, panes, index, &session, generation)?;
+    // A relaunch is transactional: whatever fails after this point restores the
+    // stored id and the router binding the room had before the call.
+    let cwd = panes[index].cwd().to_path_buf();
+    let title = panes[index].title().to_owned();
+    let minted = pane::session_state::lookup_minted("claude", &cwd, &title);
+    let reported = pane::session_state::lookup_reported("claude", &cwd, &title);
+    let previous_binding = router.as_ref().and_then(|router| router.binding_for(index));
+    let mut spec = panes[index].room_spec().clone();
+    let launched = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let generation = pane::next_generation()?;
+        let (next, session) = panes[index].relaunch_claude(action, index + 1)?;
+        spec = next;
+        if let Some(router) = router.as_deref_mut() {
+            pane::bind_claude_room_at(router, panes, index, &session, generation)?;
+        }
+        panes[index].cleanup();
+        let started = spawn_room(
+            &mut LivePanes,
+            spec.clone(),
+            size,
+            environments[index].clone(),
+            None,
+            None,
+            None,
+        )?;
+        panes[index] = started;
+        Ok(())
+    })();
+    if let Err(error) = launched {
+        pane::restore_claude_state(&cwd, &title, minted.as_deref(), reported.as_deref());
+        if let (Some(router), Some(binding)) = (router, previous_binding) {
+            let _ = router.rebind_room(crate::native_route::RoomEntry {
+                index,
+                title: title.clone(),
+                binding,
+                backend: crate::native_route::Backend::Claude,
+            });
+        }
+        return Err(error);
     }
-    panes[index].cleanup();
-    let started = spawn_room(
-        &mut LivePanes,
-        spec,
-        size,
-        environments[index].clone(),
-        None,
-        None,
-        None,
-    )?;
-    panes[index] = started;
     delivery_gates[index] = DeliveryGate::new(false);
     last_output[index] = None;
     spawned_at[index] = now;

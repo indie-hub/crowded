@@ -949,6 +949,26 @@ pub(crate) fn bind_claude_room_at(
 /// Binds every native Claude room before its terminal starts: a ready room to
 /// its session under a fresh generation, a failed one to its reason so its mail
 /// is held instead of pasted.
+/// Puts a Claude room's stored session back the way a snapshot found it.
+pub(crate) fn restore_claude_state(
+    cwd: &Path,
+    title: &str,
+    minted: Option<&str>,
+    reported: Option<&str>,
+) {
+    match (minted, reported) {
+        (Some(id), _) => {
+            let _ = session_state::upsert_minted("claude", cwd, title, id);
+        }
+        (_, Some(id)) => {
+            let _ = session_state::upsert_reported("claude", cwd, title, id);
+        }
+        _ => {
+            let _ = session_state::clear_room("claude", cwd, title);
+        }
+    }
+}
+
 pub(crate) fn bind_claude_rooms(
     router: &mut crate::native_route::NativeRouter,
     specs: &[RoomSpec],
@@ -4822,6 +4842,42 @@ mod tests {
             "the old binding stays"
         );
         let _ = fs::remove_file(session_state::state_directory().join("native-generation"));
+    }
+
+    /// A clear whose terminal cannot start leaves the stored id, the binding
+    /// and the pane exactly as they were.
+    #[cfg(unix)]
+    #[test]
+    fn a_clear_that_cannot_spawn_leaves_everything_as_it_was() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
+        let mut rig = IterationHarness::new(root.path());
+        rig.panes[0] =
+            Pane::spawn_unavailable(spec, small_size(), GuestEnvironment::new([]), "offline")
+                .unwrap();
+        bind_claude_room(rig.router.as_mut().unwrap(), &mut rig.panes, 0, MINTED_A).unwrap();
+        let old = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        let args_before = rig.panes[0].room_spec().args.clone();
+        // The executable disappears before the relaunch can start it.
+        fs::remove_file(&stub).unwrap();
+
+        rig.push_control(crate::doorbell::ControlAction::ClearContext);
+        rig.iterate();
+
+        assert!(!rig.panes[0].is_online(), "no terminal may start");
+        assert_eq!(rig.panes[0].room_spec().args, args_before);
+        assert_eq!(
+            session_state::lookup_minted("claude", cwd.path(), "Claude · 1").as_deref(),
+            Some(MINTED_A),
+            "the old id is restored"
+        );
+        let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        assert_eq!(binding.session, MINTED_A, "the old binding is restored");
+        assert_eq!(binding.generation, old.generation);
     }
 
     /// A clear whose generation cannot be allocated fails before anything is
