@@ -1878,11 +1878,16 @@ pub(crate) fn relaunch_claude_room(
     environments: &[pane::GuestEnvironment],
     now: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // The generation is the only fallible part of binding, so it is allocated
+    // before anything is persisted: a failure here writes nothing.
+    let generation = pane::next_generation()?;
     let (spec, session) = panes[index].relaunch_claude(action, index + 1)?;
-    // The new generation and binding exist before any terminal does: a failure
-    // here leaves the old pane untouched and starts no process.
+    // The binding exists before any terminal does: a failure here leaves the
+    // old pane untouched and starts no process.
+    // shortcut: a rare adapter-rebind failure here leaves the freshly minted
+    // id recorded; upgrade if that ever strands a room.
     if let Some(router) = router {
-        pane::bind_claude_room(router, panes, index, &session)?;
+        pane::bind_claude_room_at(router, panes, index, &session, generation)?;
     }
     panes[index].cleanup();
     let started = spawn_room(

@@ -911,14 +911,31 @@ pub(crate) fn start_claude_sessions(
 }
 
 /// Binds one Claude room under a new launch generation.
+#[cfg(test)]
 pub(crate) fn bind_claude_room(
     router: &mut crate::native_route::NativeRouter,
     panes: &mut [Pane],
     index: usize,
     session: &str,
 ) -> io::Result<()> {
+    let generation = next_generation()?;
+    bind_claude_room_at(router, panes, index, session, generation)
+}
+
+/// The launch generation a Claude binding is given, allocated before anything
+/// is persisted so a failure here writes nothing.
+pub(crate) fn next_generation() -> io::Result<u64> {
+    GenerationAllocator::new(session_state::state_directory()).next()
+}
+
+pub(crate) fn bind_claude_room_at(
+    router: &mut crate::native_route::NativeRouter,
+    panes: &mut [Pane],
+    index: usize,
+    session: &str,
+    generation: u64,
+) -> io::Result<()> {
     let title = panes[index].title().to_owned();
-    let generation = GenerationAllocator::new(session_state::state_directory()).next()?;
     panes[index].record_session(session);
     router.bind_claude(vec![crate::native_route::ClaudeEntry {
         index,
@@ -4803,6 +4820,56 @@ mod tests {
             rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
             MINTED_A,
             "the old binding stays"
+        );
+        let _ = fs::remove_file(session_state::state_directory().join("native-generation"));
+    }
+
+    /// A clear whose generation cannot be allocated fails before anything is
+    /// written: no process, the old pane and old id unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn a_clear_that_cannot_take_a_generation_persists_nothing() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("claude.log");
+        let stub = codex_stub_for_pane(
+            root.path(),
+            "claude",
+            &format!(
+                "printf '%s\\n' \"$@\" >> '{}'\\nexec sleep 30",
+                log.display()
+            ),
+        );
+        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
+        let mut rig = IterationHarness::new(root.path());
+        rig.panes[0] =
+            Pane::spawn_unavailable(spec, small_size(), GuestEnvironment::new([]), "offline")
+                .unwrap();
+        bind_claude_room(rig.router.as_mut().unwrap(), &mut rig.panes, 0, MINTED_A).unwrap();
+        let args_before = rig.panes[0].room_spec().args.clone();
+        fs::create_dir_all(session_state::state_directory()).unwrap();
+        fs::write(
+            session_state::state_directory().join("native-generation"),
+            b"not-a-number",
+        )
+        .unwrap();
+
+        rig.push_control(crate::doorbell::ControlAction::ClearContext);
+        rig.iterate();
+
+        assert!(!rig.panes[0].is_online(), "no terminal may start");
+        assert_eq!(rig.panes[0].room_spec().args, args_before);
+        assert!(!log.exists(), "no process was spawned");
+        assert_eq!(
+            session_state::lookup_minted("claude", cwd.path(), "Claude · 1").as_deref(),
+            Some(MINTED_A),
+            "the old id is untouched"
+        );
+        assert_eq!(
+            rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
+            MINTED_A
         );
         let _ = fs::remove_file(session_state::state_directory().join("native-generation"));
     }
