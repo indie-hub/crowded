@@ -913,6 +913,9 @@ mod tests {
 
 /// The hold reason of mail whose binding is no longer the room's current one.
 pub(crate) const STALE_HOLD: &str = "sent for an earlier launch of this room; not delivered";
+
+/// The hold reason a Claude room's mail carries until the room-side mod exists.
+pub(crate) const CLAUDE_HOLD: &str = "no Claude mod connected";
 /// Mail held for an earlier launch never counts toward the live capacity, so
 /// this separate bound keeps it from growing without limit. Nothing is evicted;
 /// reaching it refuses new mail with a clear error.
@@ -1706,7 +1709,8 @@ impl Outbox {
                     });
                 }
                                 // Held mail of an earlier launch does not stand in front of newer mail.
-                Status::Queued { hold: Some(reason) } if reason == STALE_HOLD => {}
+                Status::Queued { hold: Some(reason) }
+                    if reason == STALE_HOLD || reason == CLAUDE_HOLD => {}
                 Status::Queued { .. } | Status::Sending | Status::Uncertain => {
                     blocked.insert(room.clone());
                 }

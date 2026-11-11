@@ -80,7 +80,7 @@ impl Routing {
 
     fn send(&self, message: Message) -> AdapterResult {
         if self.claude.contains(&message.destination) {
-            return AdapterResult::Dropped(UNBOUND_CLAUDE.to_owned());
+            return AdapterResult::Dropped(crate::native_outbox::CLAUDE_HOLD.to_owned());
         }
         if self.codex.has_room(&message.destination) {
             self.codex.send(message)

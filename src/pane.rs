@@ -4656,6 +4656,157 @@ mod tests {
         );
     }
 
+    /// Every message to a Claude room is held, not just the first: the hold
+    /// must not queue later mail for delivery.
+    #[cfg(unix)]
+    #[test]
+    fn every_message_to_a_claude_room_is_held() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+        let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
+        let (starts, _) = start_claude_sessions(std::slice::from_mut(&mut spec));
+        let mut panes = vec![
+            crate::app::spawn_room(
+                &mut crate::app::LivePanes,
+                spec,
+                small_size(),
+                GuestEnvironment::new([]),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        ];
+        let mut router = crate::native_route::NativeRouter::start(
+            session_state::state_directory().join("native-outbox.json"),
+            Vec::new(),
+        )
+        .unwrap();
+        let session = match &starts[0] {
+            Some(ClaudeStart::Ready(id)) => id.clone(),
+            other => panic!("{other:?}"),
+        };
+        bind_claude_room(&mut router, &mut panes, 0, &session).unwrap();
+
+        let mut mailroom = Mailroom::new(10);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        for body in ["first", "second", "third"] {
+            let (replied, reply) = std::sync::mpsc::sync_channel(1);
+            router
+                .send(
+                    &mut mailroom,
+                    "Sender",
+                    0,
+                    body,
+                    Some(Box::new(move |_, reply| {
+                        let _ = replied.send(reply);
+                    })),
+                )
+                .unwrap();
+            loop {
+                router.tick(Instant::now(), &mut mailroom, false, false);
+                if let Ok(outcome) = reply.try_recv() {
+                    assert_eq!(
+                        outcome,
+                        crate::native_route::NativeReply::Held(
+                            "no Claude mod connected".to_owned()
+                        ),
+                        "{body}"
+                    );
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{body} was never answered");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let shown = mailroom.summary();
+        assert_eq!(shown.matches("HELD:").count(), 3, "{shown}");
+        assert!(!shown.contains("QUEUED"), "{shown}");
+        drop(router);
+        let mut restarted = crate::native_route::NativeRouter::start(
+            session_state::state_directory().join("native-outbox.json"),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut mailroom = Mailroom::new(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            restarted.tick(Instant::now(), &mut mailroom, true, false);
+            let shown = mailroom.summary();
+            if shown.matches("HELD:").count() == 3 && shown.contains("third") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "not durable: {shown}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A relaunch whose new generation cannot be allocated starts no process
+    /// and leaves the old pane exactly as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_relaunch_that_cannot_take_a_generation_starts_nothing() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("claude.log");
+        let stub = codex_stub_for_pane(
+            root.path(),
+            "claude",
+            &format!(
+                "printf '%s\\n' \"$@\" >> '{}'\\nexec sleep 30",
+                log.display()
+            ),
+        );
+        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
+        let mut rig = IterationHarness::new(root.path());
+        rig.panes[0] =
+            Pane::spawn_unavailable(spec, small_size(), GuestEnvironment::new([]), "offline")
+                .unwrap();
+        bind_claude_room(rig.router.as_mut().unwrap(), &mut rig.panes, 0, MINTED_A).unwrap();
+        let args_before = rig.panes[0].room_spec().args.clone();
+        // A corrupt generation counter makes the next allocation fail.
+        fs::create_dir_all(session_state::state_directory()).unwrap();
+        fs::write(
+            session_state::state_directory().join("native-generation"),
+            b"not-a-number",
+        )
+        .unwrap();
+
+        let f5 = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(5),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let outcome = crate::app::restart_key(
+            f5,
+            small_size(),
+            0,
+            &mut rig.panes,
+            rig.router.as_mut(),
+            &mut rig.codex,
+            &mut rig.gates,
+            &mut rig.last_output,
+            &mut rig.spawned_at,
+            &mut rig.pulses,
+            &rig.environments,
+            100,
+            Instant::now(),
+        );
+        assert!(outcome.is_some(), "the failure must be reported");
+        assert!(!rig.panes[0].is_online(), "no terminal may start");
+        assert_eq!(rig.panes[0].room_spec().args, args_before);
+        assert!(!log.exists(), "no process was spawned");
+        assert_eq!(
+            rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
+            MINTED_A,
+            "the old binding stays"
+        );
+        let _ = fs::remove_file(session_state::state_directory().join("native-generation"));
+    }
+
     /// A native Claude room's session is Crowded's: a user resume form is
     /// refused with a plain reason and nothing is saved.
     #[cfg(unix)]
@@ -4763,7 +4914,7 @@ mod tests {
             crossterm::event::KeyCode::F(5),
             crossterm::event::KeyModifiers::NONE,
         );
-        let restarted = crate::app::restart_key_arm(
+        let (text, _) = crate::app::restart_key(
             f5,
             small_size(),
             0,
@@ -4776,15 +4927,14 @@ mod tests {
             &mut rig.pulses,
             &rig.environments,
             100,
-            &mut rig.notice,
             Instant::now(),
-        );
-        assert!(restarted, "F5 must reach the launch");
+        )
+        .expect("F5 must reach the launch");
+        assert!(text.ends_with("restarted"), "{text}");
         assert_eq!(
             args_after(&rig.panes[0].room_spec().args, "--resume"),
             [OsString::from(MINTED_A)]
         );
-        assert!(rig.notice.ordered_lines().join("; ").contains("restarted"));
     }
 
     /// Restart resumes the stored id, resume without one fails visibly, and a
@@ -4905,15 +5055,19 @@ mod tests {
         let fresh = session_state::lookup_minted("claude", cwd.path(), "Claude · 1")
             .expect("a clear saves the new id");
         // One start per relaunch, and the failed clear started none.
-        let launches = fs::read_to_string(&log).unwrap();
-        assert_eq!(
-            launches
+        let launches = || {
+            fs::read_to_string(&log)
+                .unwrap_or_default()
                 .lines()
                 .filter(|line| *line == "--resume" || *line == "--session-id")
-                .count(),
-            2,
-            "{launches}"
-        );
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while launches() < 2 {
+            assert!(Instant::now() < deadline, "the clear never launched");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(launches(), 2, "one start per relaunch");
         assert_ne!(fresh, MINTED_A);
         assert_eq!(
             args_after(&rig.panes[0].room_spec().args, "--session-id"),

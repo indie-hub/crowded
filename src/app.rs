@@ -1879,6 +1879,11 @@ pub(crate) fn relaunch_claude_room(
     now: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (spec, session) = panes[index].relaunch_claude(action, index + 1)?;
+    // The new generation and binding exist before any terminal does: a failure
+    // here leaves the old pane untouched and starts no process.
+    if let Some(router) = router {
+        pane::bind_claude_room(router, panes, index, &session)?;
+    }
     panes[index].cleanup();
     let started = spawn_room(
         &mut LivePanes,
@@ -1890,9 +1895,6 @@ pub(crate) fn relaunch_claude_room(
         None,
     )?;
     panes[index] = started;
-    if let Some(router) = router {
-        pane::bind_claude_room(router, panes, index, &session)?;
-    }
     delivery_gates[index] = DeliveryGate::new(false);
     last_output[index] = None;
     spawned_at[index] = now;
@@ -2004,47 +2006,6 @@ pub(crate) fn restart_key(
             ),
         },
     )
-}
-
-/// The event loop's force-restart arm: the one place a key event becomes a
-/// launch. run_rooms calls this in one statement, so a test drives exactly what
-/// the loop drives.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn restart_key_arm(
-    key: KeyEvent,
-    size: portable_pty::PtySize,
-    focused: usize,
-    panes: &mut [Pane],
-    router: Option<&mut NativeRouter>,
-    codex: &mut [Option<pane::CodexMint>],
-    delivery_gates: &mut [DeliveryGate],
-    last_output: &mut [Option<Instant>],
-    spawned_at: &mut [Instant],
-    room_pulses: &mut [Option<PulseSample>],
-    environments: &[pane::GuestEnvironment],
-    fuse_size: usize,
-    notice: &mut Notices,
-    now: Instant,
-) -> bool {
-    let Some((text, severity)) = restart_key(
-        key,
-        size,
-        focused,
-        panes,
-        router,
-        codex,
-        delivery_gates,
-        last_output,
-        spawned_at,
-        room_pulses,
-        environments,
-        fuse_size,
-        now,
-    ) else {
-        return false;
-    };
-    notice.push(text, severity);
-    true
 }
 
 /// Sends doorbell mail to a native room through the router. This is the only
@@ -3694,7 +3655,7 @@ fn run_rooms(
                     terminal.autoresize()?;
                     let (rooms, _, _) = content_areas(terminal.size()?.into());
                     let area = pane_areas(rooms, room_count)[focused];
-                    restart_key_arm(
+                    if let Some((text, severity)) = restart_key(
                         key,
                         pane_size(area),
                         focused,
@@ -3707,9 +3668,10 @@ fn run_rooms(
                         &mut room_pulses,
                         &environments,
                         fuse_size,
-                        &mut notice,
                         Instant::now(),
-                    );
+                    ) {
+                        notice.push(text, severity);
+                    }
                 }
 
                 Event::Key(key) => match &mut input_mode {
