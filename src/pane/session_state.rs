@@ -404,25 +404,6 @@ pub(super) fn clear_room(vendor: &str, cwd: &Path, room: &str) -> io::Result<()>
     })
 }
 
-/// Remove one room's stored entry and nothing else. A relaunch that finds no
-/// entry must restore that absence literally, not by writing a marker.
-pub(super) fn remove_room(vendor: &str, cwd: &Path, room: &str) -> io::Result<()> {
-    let _guard = STATE_LOCK
-        .lock()
-        .map_err(|_| io::Error::other("session state is poisoned"))?;
-    let mut state = load_state_for_update().map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("the session state could not be read, so nothing was removed: {error}"),
-        )
-    })?;
-    let cwd = cwd.to_string_lossy();
-    state
-        .sessions
-        .retain(|entry| !(entry.vendor == vendor && entry.cwd == cwd && entry.room == room));
-    save_state(&state)
-}
-
 /// Record or supersede the captured session id for `(vendor, cwd, room)`.
 /// Called from background capture threads, so writes are serialized and saved
 /// atomically (temp file + rename).

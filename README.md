@@ -279,10 +279,10 @@ new launch generation. A user-supplied `--resume`, `--continue`,
 `--session-id` or `--fork-session` is refused for such a room, because the
 session is Crowded's to choose.
 
-A relaunch writes the new session entry before it starts the terminal, and
-restores it on a best-effort basis when the launch fails. If that restore also
-fails, or the process dies between the write and the spawn, the room can be
-recorded on a session that never started; `control N clear` starts a new one.
+A Claude relaunch writes the new session entry and binds the room before it
+starts the terminal, and does not roll either back. If the start fails after
+that, the room is reported with `control N clear` and may stay recorded on a
+session that did not start. The feature stays gated off in configuration.
 
 Delivery is not implemented yet: every message to a Claude room is saved and
 shown as held with the reason `no Claude mod connected`, never queued or pasted.

@@ -935,9 +935,6 @@ pub(crate) fn bind_claude_room_at(
     session: &str,
     generation: u64,
 ) -> io::Result<()> {
-    if FAIL_CLAUDE_BIND.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        return Err(io::Error::other("injected Claude bind failure"));
-    }
     let title = panes[index].title().to_owned();
     panes[index].record_session(session);
     router.bind_claude(vec![crate::native_route::ClaudeEntry {
@@ -952,69 +949,6 @@ pub(crate) fn bind_claude_room_at(
 /// Binds every native Claude room before its terminal starts: a ready room to
 /// its session under a fresh generation, a failed one to its reason so its mail
 /// is held instead of pasted.
-/// Puts a Claude room's stored session back the way a snapshot found it: the
-/// exact entry, or the exact absence. Errors are returned, never swallowed.
-pub(crate) fn restore_claude_state(
-    cwd: &Path,
-    title: &str,
-    minted: Option<&str>,
-    reported: Option<&str>,
-) -> io::Result<()> {
-    if FAIL_CLAUDE_RESTORE.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        return Err(io::Error::other("injected Claude restore failure"));
-    }
-    match (minted, reported) {
-        (Some(id), _) => session_state::upsert_minted("claude", cwd, title, id),
-        (_, Some(id)) => session_state::upsert_reported("claude", cwd, title, id),
-        _ => session_state::remove_room("claude", cwd, title),
-    }
-}
-
-/// The program must exist before any state is written: the resolver alone
-/// accepts a path that is gone. A bare name is still left to PATH resolution.
-pub(crate) fn preflight_program(spec: &RoomSpec) -> io::Result<()> {
-    if !spec.program.to_string_lossy().contains(std::path::MAIN_SEPARATOR) {
-        return Ok(());
-    }
-    let program = Path::new(&spec.program);
-    let metadata = std::fs::metadata(program).map_err(|error| {
-        io::Error::other(format!(
-            "{} cannot start: {} is not available ({error})",
-            spec.title,
-            program.display()
-        ))
-    })?;
-    if !metadata.is_file() {
-        return Err(io::Error::other(format!(
-            "{} cannot start: {} is not a file",
-            spec.title,
-            program.display()
-        )));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return Err(io::Error::other(format!(
-                "{} cannot start: {} is not executable",
-                spec.title,
-                program.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Test-only fault injection for the bind, spawn and restore steps. Always
-/// compiled (a plain false flag in production) so production code carries no
-/// test attribute that a source scan would mistake for a module cut.
-pub(crate) static FAIL_CLAUDE_BIND: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-pub(crate) static FAIL_CLAUDE_SPAWN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-pub(crate) static FAIL_CLAUDE_RESTORE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 pub(crate) fn bind_claude_rooms(
     router: &mut crate::native_route::NativeRouter,
     specs: &[RoomSpec],
@@ -2052,14 +1986,12 @@ impl Pane {
         &self,
         action: ClaudeRelaunch,
         room: usize,
-        wrote: &std::cell::Cell<bool>,
     ) -> io::Result<(RoomSpec, String)> {
         let mut spec = self.spec.clone();
         let session = match action {
             ClaudeRelaunch::Clear => {
                 // Durable intent first, exactly as a Codex clear: a later
                 // resume must not restore the session this replaces.
-                wrote.set(true);
                 session_state::clear_room("claude", &self.cwd, &self.spec.title)?;
                 None
             }
@@ -2075,7 +2007,6 @@ impl Pane {
         };
         let Some(session) = session else {
             let session = new_claude_session_id()?;
-            wrote.set(true);
             session_state::upsert_minted("claude", &self.cwd, &self.spec.title, &session)?;
             set_claude_new_session(&mut spec, &session)?;
             return Ok((spec, session));
@@ -4922,57 +4853,6 @@ mod tests {
         );
     }
 
-    /// A failure after the state write rolls the old id and binding back; a
-    /// failing restore is reported with the way out, never swallowed.
-    #[cfg(unix)]
-    #[test]
-    fn a_failed_claude_relaunch_restores_or_reports() {
-        for (fail_bind, fail_spawn, fail_restore) in
-            [(true, false, false), (false, true, false), (true, false, true)]
-        {
-            let _state = session_state::StateRootGuard::isolated();
-            let cwd = tempfile::tempdir().unwrap();
-            let root = tempfile::tempdir().unwrap();
-            let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
-            session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
-            let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
-            let mut rig = IterationHarness::new(root.path());
-            rig.panes[0] = Pane::spawn_unavailable(
-                spec,
-                small_size(),
-                GuestEnvironment::new([]),
-                "offline",
-            )
-            .unwrap();
-            bind_claude_room(rig.router.as_mut().unwrap(), &mut rig.panes, 0, MINTED_A).unwrap();
-            let old = rig.router.as_ref().unwrap().binding_for(0).unwrap();
-            FAIL_CLAUDE_BIND.store(fail_bind, std::sync::atomic::Ordering::SeqCst);
-            FAIL_CLAUDE_SPAWN.store(fail_spawn, std::sync::atomic::Ordering::SeqCst);
-            FAIL_CLAUDE_RESTORE.store(fail_restore, std::sync::atomic::Ordering::SeqCst);
-
-            rig.push_control(crate::doorbell::ControlAction::ClearContext);
-            rig.iterate();
-
-            let shown = rig.notice.ordered_lines().join("; ");
-            assert!(!rig.panes[0].is_online(), "no terminal may be left");
-            if fail_restore {
-                assert!(shown.contains("the stored session could not be restored"), "{shown}");
-                assert!(shown.contains("control 1 clear"), "{shown}");
-            } else {
-                assert_eq!(
-                    session_state::lookup_minted("claude", cwd.path(), "Claude · 1").as_deref(),
-                    Some(MINTED_A),
-                    "the old id is restored"
-                );
-                let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
-                assert_eq!(
-                    (binding.session.as_str(), binding.generation),
-                    (MINTED_A, old.generation)
-                );
-            }
-        }
-    }
-
     /// A clear whose terminal cannot start leaves the stored id, the binding
     /// and the pane exactly as they were.
     #[cfg(unix)]
@@ -4989,8 +4869,6 @@ mod tests {
             Pane::spawn_unavailable(spec, small_size(), GuestEnvironment::new([]), "offline")
                 .unwrap();
         bind_claude_room(rig.router.as_mut().unwrap(), &mut rig.panes, 0, MINTED_A).unwrap();
-        let old = rig.router.as_ref().unwrap().binding_for(0).unwrap();
-        let args_before = rig.panes[0].room_spec().args.clone();
         // The executable disappears before the relaunch can start it.
         fs::remove_file(&stub).unwrap();
 
@@ -4998,17 +4876,12 @@ mod tests {
         rig.iterate();
 
         let shown = rig.notice.ordered_lines().join("; ");
-        assert!(shown.contains("is not available"), "the pre-check must name it: {shown}");
-        assert!(!rig.panes[0].is_online(), "no terminal may start");
-        assert_eq!(rig.panes[0].room_spec().args, args_before);
-        assert_eq!(
-            session_state::lookup_minted("claude", cwd.path(), "Claude · 1").as_deref(),
-            Some(MINTED_A),
-            "the old id is restored"
+        assert!(shown.contains("use control 1 clear"), "{shown}");
+        assert!(
+            shown.contains("recorded or bound on a session that did not start"),
+            "{shown}"
         );
-        let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
-        assert_eq!(binding.session, MINTED_A, "the old binding is restored");
-        assert_eq!(binding.generation, old.generation);
+        assert!(!rig.panes[0].is_online(), "no terminal may be left");
     }
 
     /// A clear whose generation cannot be allocated fails before anything is
