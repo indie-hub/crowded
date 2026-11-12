@@ -2,6 +2,7 @@ let connection = null;
 let receiver = null;
 let busy = false;
 let stopped = false;
+let started = false;
 
 async function request($, path, data) {
   const response = await $.http.fetch(connection.url + path, {
@@ -15,17 +16,28 @@ async function request($, path, data) {
     throw err;
   }
   const text = typeof response.text === "function" ? await response.text() : response.text;
-  return text ? JSON.parse(text) : {};
+  if (!text) return {};
+  if (new TextEncoder().encode(text).length > 65536) {
+    throw new Error("Response exceeds 64 KiB");
+  }
+  return JSON.parse(text);
+}
+
+function validMessage(message) {
+  return message && typeof message === "object" && typeof message.id === "string" && typeof message.text === "string" && typeof message.sha256 === "string";
 }
 
 async function poll($) {
   if (busy || stopped) return;
   busy = true;
-  let claimed = false;
   try {
     const message = await request($, "/next", { receiver });
     if (!message) return;
-    claimed = true;
+    if (!validMessage(message)) {
+      stopped = true;
+      $.ui.status("Delivery uncertain. No automatic resend.");
+      return;
+    }
     const result = await $.prompt.submit({ text: message.text });
     if (result && result.drop) {
       await request($, "/receipt", { receiver, id: message.id, sha256: message.sha256, state: "held", reason: result.drop });
@@ -35,11 +47,6 @@ async function poll($) {
     }
     await request($, "/receipt", { receiver, id: message.id, sha256: message.sha256, state: "started", reason: "" });
   } catch {
-    if (claimed) {
-      stopped = true;
-      $.ui.status("Delivery uncertain. No automatic resend.");
-      return;
-    }
     stopped = true;
     $.ui.status("Delivery uncertain. No automatic resend.");
   } finally {
@@ -60,6 +67,8 @@ function validUrl(urlStr) {
 
 export function register(on) {
   on("session.start", async ($, e, next) => {
+    if (started) return next(e);
+    started = true;
     if (!e.isInteractive) return next(e);
     const cwd = e.cwd;
     try {
@@ -78,8 +87,13 @@ export function register(on) {
       }
       connection = { url: origin, token };
       try {
-        receiver = (await request($, "/register", { session: sessionId })).receiver;
-      } catch (err) {
+        const reg = await request($, "/register", { session: sessionId });
+        if (!reg || typeof reg.receiver !== "string") {
+          $.ui.status("Crowded inbox not connected");
+          return next(e);
+        }
+        receiver = reg.receiver;
+      } catch {
         $.ui.status("Crowded inbox not connected");
         return next(e);
       }

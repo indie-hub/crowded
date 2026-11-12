@@ -62,13 +62,13 @@ async function createContractInbox(token, { registerConflict = false } = {}) {
   };
 }
 
-function makeHost({ inbox, fileContent, fileExists = true, sessionId = "session-1", interactive = true, submitImpl }) {
+function makeHost({ inbox, fileContent, fileExists = true, sessionId = "session-1", interactive = true, submitImpl, fetchImpl }) {
   const timers = [], statuses = [], submits = [], fetchCalls = [];
   return {
     host: {
       fs: { exists: async () => fileExists, read: async () => fileContent ?? JSON.stringify({ url: inbox.url, token: inbox.token }) },
       session: { id: async () => sessionId },
-      http: { fetch: async (url, init) => { fetchCalls.push(url); const r = await fetch(url, init); return { ok: r.ok, status: r.status, text: await r.text() }; } },
+      http: { fetch: async (url, init) => { fetchCalls.push(url); if (fetchImpl) return fetchImpl(url, init, fetchCalls.length); const r = await fetch(url, init); return { ok: r.ok, status: r.status, text: await r.text() }; } },
       clock: { every: (ms, cb) => { timers.push({ ms, cb }); } },
       ui: { status: (t) => { statuses.push(t); } },
       prompt: { submit: async (input) => { submits.push(input); if (submitImpl) return submitImpl(input, submits.length); return {}; } },
@@ -221,4 +221,100 @@ test("/clear case: delivery continues with same receiver", async (t) => {
   assert.deepEqual(ctx.submits.map((s) => s.text), ["first", "second"]);
   assert.equal(inbox.calls.register, 1);
   assert.equal(ctx.timers.length, 1);
+});
+
+test("R1 bad /next shape -> uncertain, no submit, stopped", async (t) => {
+  const token = "3".repeat(64);
+  const bads = [{}, { id: "1", text: 1, sha256: "x" }, { id: "1", text: "hi" }];
+  for (const bad of bads) {
+    const inbox = await createContractInbox(token);
+    t.after(() => inbox.close());
+    const fetchImpl = async (url, init) => {
+      const u = new URL(url);
+      if (u.pathname === "/next") return { ok: true, status: 200, text: JSON.stringify(bad) };
+      const r = await fetch(url, init);
+      return { ok: r.ok, status: r.status, text: await r.text() };
+    };
+    const ctx = await startMod({ inbox, fetchImpl });
+    await ctx.timers[0].cb();
+    assert.equal(ctx.submits.length, 0, JSON.stringify(bad));
+    assert.ok(ctx.statuses.some((s) => /uncertain/i.test(s)), JSON.stringify(bad));
+    await ctx.timers[0].cb();
+    assert.equal(ctx.submits.length, 0, JSON.stringify(bad));
+  }
+});
+
+test("R1 missing receiver from register -> inert/uncertain, no submit", async (t) => {
+  const token = "4".repeat(64);
+  const inbox = await createContractInbox(token);
+  t.after(() => inbox.close());
+  const fetchImpl = async (url, init) => {
+    const u = new URL(url);
+    if (u.pathname === "/register") return { ok: true, status: 200, text: JSON.stringify({}) };
+    const r = await fetch(url, init);
+    return { ok: r.ok, status: r.status, text: await r.text() };
+  };
+  const ctx = await startMod({ inbox, fetchImpl });
+  assert.equal(ctx.timers.length, 0);
+  assert.ok(ctx.statuses.includes("Crowded inbox not connected"));
+});
+
+test("R2 second session.start is once-only", async (t) => {
+  const inbox = await createContractInbox("5".repeat(64));
+  t.after(() => inbox.close());
+  const mod = await import(`./hooks/deliver.mjs?i=${randomUUID()}`);
+  const hooks = new Map();
+  const ctx = makeHost({ inbox });
+  mod.register((e, fn) => hooks.set(e, fn));
+  await hooks.get("session.start")(ctx.host, ctx.event, async (e) => e);
+  await hooks.get("session.start")(ctx.host, ctx.event, async (e) => e);
+  assert.equal(inbox.calls.register, 1);
+  assert.equal(ctx.timers.length, 1);
+});
+
+test("R4 oversize /next response refused", async (t) => {
+  const inbox = await createContractInbox("6".repeat(64));
+  t.after(() => inbox.close());
+  const big = "x".repeat(70000);
+  const fetchImpl = async (url, init) => {
+    const u = new URL(url);
+    if (u.pathname === "/next") return { ok: true, status: 200, text: JSON.stringify({ id: "m", text: big, sha256: "h" }) };
+    const r = await fetch(url, init);
+    return { ok: r.ok, status: r.status, text: await r.text() };
+  };
+  const ctx = await startMod({ inbox, fetchImpl });
+  await ctx.timers[0].cb();
+  assert.equal(ctx.submits.length, 0);
+  assert.ok(ctx.statuses.some((s) => /uncertain/i.test(s)));
+  await ctx.timers[0].cb();
+  assert.equal(ctx.submits.length, 0);
+});
+
+test("R5 receipt failure after submit and id/sha echoed", async (t) => {
+  const inbox = await createContractInbox("7".repeat(64));
+  t.after(() => inbox.close());
+  inbox.enqueue("m1", "hi");
+  const fetchImpl = async (url, init) => {
+    const u = new URL(url);
+    if (u.pathname === "/receipt") return { ok: false, status: 500, text: JSON.stringify({ error: "boom" }) };
+    const r = await fetch(url, init);
+    return { ok: r.ok, status: r.status, text: await r.text() };
+  };
+  const ctx = await startMod({ inbox, fetchImpl });
+  await ctx.timers[0].cb();
+  assert.equal(ctx.submits.length, 1);
+  assert.ok(ctx.statuses.some((s) => /uncertain/i.test(s)));
+  inbox.enqueue("m2", "later");
+  await ctx.timers[0].cb();
+  assert.equal(ctx.submits.length, 1);
+});
+
+test("R5 receipt body echoes id and sha256", async (t) => {
+  const inbox = await createContractInbox("8".repeat(64));
+  t.after(() => inbox.close());
+  inbox.enqueue("m1", "echo");
+  const ctx = await startMod({ inbox });
+  await ctx.timers[0].cb();
+  assert.equal(inbox.receipts[0].id, "m1");
+  assert.equal(inbox.receipts[0].sha256, sha("echo"));
 });
