@@ -1,0 +1,23 @@
+{
+  "register": {
+    "request": { "session": "session-123" },
+    "response": { "receiver": "receiver-abc" },
+    "conflict": { "status": 409, "body": { "error": "receiver exists" } }
+  },
+  "next": {
+    "request": { "receiver": "receiver-abc" },
+    "empty": null,
+    "response": { "id": "msg-1", "text": "hello", "sha256": "sha256hex" }
+  },
+  "receipt": {
+    "started": {
+      "request": { "receiver": "receiver-abc", "id": "msg-1", "sha256": "sha256hex", "state": "started", "reason": "" },
+      "response": {}
+    },
+    "held": {
+      "request": { "receiver": "receiver-abc", "id": "msg-1", "sha256": "sha256hex", "state": "held", "reason": "dropped" },
+      "response": {}
+    },
+    "conflict": { "status": 409, "body": { "error": "id/sha/state mismatch or an unclaimed id" } }
+  }
+}
