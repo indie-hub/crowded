@@ -328,9 +328,9 @@ fn inferred_vendor(program: &OsStr) -> &'static str {
 }
 
 /// Native delivery needs a raw agent room whose launch Crowded can address
-/// exactly: an OpenCode room it serves itself, or a Codex room queued by its
-/// own captured thread. Every conflicting option is a visible configuration
-/// error.
+/// exactly: an OpenCode room it serves itself, a Codex room queued by its
+/// own captured thread, or a Claude room carrying Crowded's own delivery mod.
+/// Every conflicting option is a visible configuration error.
 fn validate_native_delivery(
     program: &OsStr,
     transport: Transport,
@@ -341,9 +341,10 @@ fn validate_native_delivery(
     let guest = Path::new(program).file_name().unwrap_or(program);
     let guest = guest.to_string_lossy();
     let codex = guest.eq_ignore_ascii_case("codex");
-    if !guest.eq_ignore_ascii_case("opencode") && !codex {
+    let claude = guest.eq_ignore_ascii_case("claude");
+    if !guest.eq_ignore_ascii_case("opencode") && !codex && !claude {
         return Err(invalid(
-            "native_delivery is supported only for OpenCode and Codex rooms",
+            "native_delivery is supported only for OpenCode, Codex and Claude rooms",
         ));
     }
     if transport != Transport::Raw {
@@ -352,6 +353,10 @@ fn validate_native_delivery(
     if codex {
         // The queue command runs beside the room and takes no server options,
         // so only the room's transport and identity need to be exact.
+        return Ok(());
+    }
+    if claude {
+        // The delivery mod ships inside the binary, so no server options apply.
         return Ok(());
     }
     // The wrapped server is owned by proving it is the wrapper's direct child;
@@ -908,11 +913,15 @@ transport = "raw"
             assert!(error.to_string().contains("Windows"), "{error}");
         }
 
+        // A Claude room carries Crowded's own delivery mod, so it is accepted.
+        let claude = room_specs_from_toml(
+            "[[rooms]]\ncommand = \"claude\"\ntransport = \"raw\"\nnative_delivery = true\n\n[[rooms]]\ncommand = \"codex\"\ntransport = \"raw\"",
+        )
+        .unwrap()
+        .specs;
+        assert!(claude[0].native_delivery);
+
         for (rooms, expected) in [
-            (
-                "command = \"claude\"\ntransport = \"raw\"\nnative_delivery = true",
-                "only for OpenCode and Codex",
-            ),
             (
                 "command = \"opencode\"\ntransport = \"shell\"\nnative_delivery = true",
                 "transport",

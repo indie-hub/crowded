@@ -3,6 +3,7 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
+    fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -864,6 +865,98 @@ fn set_claude_new_session(spec: &mut RoomSpec, session_id: &str) -> io::Result<(
     Ok(())
 }
 
+/// The mod Crowded embeds for its Claude rooms: the manifest, the hook
+/// registration and the delivery script, exactly as validated.
+const MOD_MANIFEST: &str = include_str!("claude_mod/.claude-plugin/plugin.json");
+const MOD_HOOKS: &str = include_str!("claude_mod/hooks/hooks.json");
+const MOD_DELIVER: &str = include_str!("claude_mod/hooks/deliver.mjs");
+const CLAUDE_MOD_FILES: &[(&str, &str)] = &[
+    (".claude-plugin/plugin.json", MOD_MANIFEST),
+    ("hooks/hooks.json", MOD_HOOKS),
+    ("hooks/deliver.mjs", MOD_DELIVER),
+];
+
+/// The digest of the embedded mod bundle, so a launch rewrites the extracted
+/// files only when their content differs.
+fn claude_mod_digest() -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for (name, contents) in CLAUDE_MOD_FILES {
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        digest.update(contents.as_bytes());
+        digest.update([0]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// The digest of the extracted files, or `None` when one is missing or
+/// unreadable.
+fn extracted_mod_digest(dir: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for (name, _) in CLAUDE_MOD_FILES {
+        let contents = fs::read(dir.join(name)).ok()?;
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        digest.update(&contents);
+        digest.update([0]);
+    }
+    Some(format!("{:x}", digest.finalize()))
+}
+
+/// Extracts the embedded Claude mod into the room's directory, rewriting the
+/// files only when their content digest differs. A room whose mod cannot be
+/// written must not start, like the other Claude start failures.
+fn ensure_claude_mod(cwd: &Path) -> io::Result<PathBuf> {
+    let dir = cwd.join(".crowded").join("claude-mod");
+    session_state::create_private_directory(&dir)?;
+    if extracted_mod_digest(&dir).as_deref() != Some(&claude_mod_digest()) {
+        for (name, contents) in CLAUDE_MOD_FILES {
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                session_state::create_private_directory(parent)?;
+            }
+            crate::claude_inbox::write_private(&path, contents)?;
+        }
+    }
+    Ok(dir)
+}
+
+/// Extracts the mod and equips the spec, in one step so no launch path can
+/// pass the flag without the files behind it. A spec with an explicit user
+/// `--plugin-dir` keeps it and gets no Crowded mod; Crowded's own flag from
+/// an earlier launch is replaced so the order stays deterministic.
+fn equip_claude_mod(spec: &mut RoomSpec, cwd: &Path) -> io::Result<()> {
+    let dir = cwd.join(".crowded").join("claude-mod");
+    let own = dir.to_string_lossy().into_owned();
+    let mut kept: Vec<OsString> = Vec::with_capacity(spec.args.len());
+    let mut skipped = spec.args.iter();
+    while let Some(arg) = skipped.next() {
+        let text = arg.to_string_lossy();
+        if text == "--plugin-dir" {
+            let pair = skipped.next();
+            if pair.is_some_and(|value| value.to_string_lossy() == own) {
+                continue;
+            }
+            // A user value: keep the flag and stop managing this spec.
+            return Ok(());
+        }
+        if text == format!("--plugin-dir={own}") {
+            continue;
+        }
+        if text.starts_with("--plugin-dir=") {
+            return Ok(());
+        }
+        kept.push(arg.clone());
+    }
+    spec.args = kept;
+    let dir = ensure_claude_mod(cwd)?;
+    spec.args.push("--plugin-dir".into());
+    spec.args.push(dir.to_string_lossy().into_owned().into());
+    Ok(())
+}
+
 /// What a native Claude room's launch decided before its terminal starts.
 #[derive(Clone, Debug)]
 pub(crate) enum ClaudeStart {
@@ -890,12 +983,14 @@ pub(crate) fn start_claude_sessions(
             let cwd = working_directory(spec.cwd.as_deref())?;
             if let Some(stored) = stored_claude_session(&cwd, &spec.title) {
                 controls::set_resume_session(spec, &stored)?;
+                equip_claude_mod(spec, &cwd)?;
                 return Ok(stored);
             }
             let session = new_claude_session_id()?;
             // Saved before the terminal starts, so a crash cannot lose the id.
             session_state::upsert_minted("claude", &cwd, &spec.title, &session)?;
             set_claude_new_session(spec, &session)?;
+            equip_claude_mod(spec, &cwd)?;
             Ok(session)
         })();
         match prepared {
@@ -2039,9 +2134,11 @@ impl Pane {
             let session = new_claude_session_id()?;
             session_state::upsert_minted("claude", &self.cwd, &self.spec.title, &session)?;
             set_claude_new_session(&mut spec, &session)?;
+            equip_claude_mod(&mut spec, &self.cwd)?;
             return Ok((spec, session));
         };
         controls::set_resume_session(&mut spec, &session)?;
+        equip_claude_mod(&mut spec, &self.cwd)?;
         Ok((spec, session))
     }
 
@@ -4615,8 +4712,8 @@ mod tests {
             "the id is saved before the terminal starts"
         );
         assert_eq!(
-            args_after(&specs[0].args, "--session-id"),
-            [OsString::from(&session)]
+            args_after(&specs[0].args, "--session-id").first(),
+            Some(&OsString::from(&session))
         );
 
         let mut panes = vec![
@@ -4698,8 +4795,8 @@ mod tests {
             "{again_starts:?}"
         );
         assert_eq!(
-            args_after(&again[0].args, "--resume"),
-            [OsString::from(&session)]
+            args_after(&again[0].args, "--resume").first(),
+            Some(&OsString::from(&session))
         );
     }
 
@@ -5126,8 +5223,8 @@ mod tests {
         .expect("F5 must reach the launch");
         assert!(text.ends_with("restarted"), "{text}");
         assert_eq!(
-            args_after(&rig.panes[0].room_spec().args, "--resume"),
-            [OsString::from(MINTED_A)]
+            args_after(&rig.panes[0].room_spec().args, "--resume").first(),
+            Some(&OsString::from(MINTED_A))
         );
     }
 
@@ -5184,8 +5281,8 @@ mod tests {
         .expect("F5 restarts the room");
         assert!(text.ends_with("restarted"), "{text}");
         assert_eq!(
-            args_after(&rig.panes[0].room_spec().args, "--resume"),
-            [OsString::from(MINTED_A)],
+            args_after(&rig.panes[0].room_spec().args, "--resume").first(),
+            Some(&OsString::from(MINTED_A)),
             "a restart resumes the stored id"
         );
         let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
@@ -5264,8 +5361,8 @@ mod tests {
         assert_eq!(launches(), 2, "one start per relaunch");
         assert_ne!(fresh, MINTED_A);
         assert_eq!(
-            args_after(&rig.panes[0].room_spec().args, "--session-id"),
-            [OsString::from(&fresh)]
+            args_after(&rig.panes[0].room_spec().args, "--session-id").first(),
+            Some(&OsString::from(&fresh))
         );
     }
 
@@ -7846,5 +7943,285 @@ mod tests {
         let relaunched = crate::claude_inbox::mod_of(cwd.path(), SECOND);
         let fresh = crate::claude_inbox::FakeMod::register(&relaunched.url, &relaunched.token);
         assert!(!fresh.receiver.is_empty());
+    }
+
+    #[cfg(unix)]
+    fn claude_started_spec(
+        root: &Path,
+        cwd: &Path,
+        title: &str,
+    ) -> (Vec<RoomSpec>, Vec<Option<ClaudeStart>>, String) {
+        let stub = codex_stub_for_pane(root, "claude", "exec sleep 30");
+        let mut specs = vec![claude_native_spec_for(&stub, cwd, title)];
+        let (starts, notices) = start_claude_sessions(&mut specs);
+        assert!(notices.is_empty(), "{notices:?}");
+        let session = match &starts[0] {
+            Some(ClaudeStart::Ready(session)) => session.clone(),
+            other => panic!("{other:?}"),
+        };
+        (specs, starts, session)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_start_extracts_its_mod_and_passes_plugin_dir() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (specs, _, session) = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        let dir = cwd.path().join(".crowded").join("claude-mod");
+        assert_eq!(
+            specs[0].args,
+            vec![
+                OsString::from("--session-id"),
+                OsString::from(&session),
+                OsString::from("--plugin-dir"),
+                dir.as_os_str().into(),
+            ]
+        );
+        for (name, contents) in CLAUDE_MOD_FILES {
+            let bytes = fs::read(dir.join(name)).unwrap();
+            assert_eq!(&String::from_utf8(bytes.clone()).unwrap(), contents);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{name} is private"
+                );
+            }
+        }
+        // A second start with the same bundle rewrites nothing.
+        let before: Vec<std::time::SystemTime> = CLAUDE_MOD_FILES
+            .iter()
+            .map(|(name, _)| fs::metadata(dir.join(name)).unwrap().modified().unwrap())
+            .collect();
+        let _ = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        for ((name, _), stamped) in CLAUDE_MOD_FILES.iter().zip(&before) {
+            assert_eq!(
+                &fs::metadata(dir.join(name)).unwrap().modified().unwrap(),
+                stamped,
+                "{name} was rewritten without a content change"
+            );
+        }
+        // A changed file is restored on the next start.
+        fs::write(dir.join("hooks/deliver.mjs"), "tampered").unwrap();
+        let _ = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        assert_eq!(
+            fs::read_to_string(dir.join("hooks/deliver.mjs")).unwrap(),
+            CLAUDE_MOD_FILES[2].1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_spawn_passes_plugin_dir_once() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("argv.log");
+        let body = format!("echo \"$*\" >> '{0}'\nexec sleep 30", marker.display());
+        let stub = codex_stub_for_pane(root.path(), "claude", &body);
+        let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
+        let (starts, notices) = start_claude_sessions(&mut specs);
+        assert!(notices.is_empty(), "{notices:?}");
+        let pane = crate::app::spawn_room(
+            &mut crate::app::LivePanes,
+            specs.remove(0),
+            small_size(),
+            GuestEnvironment::new([]),
+            None,
+            None,
+            starts[0].as_ref(),
+        )
+        .unwrap();
+        let argv = wait_for_file(&marker);
+        let want = cwd.path().join(".crowded").join("claude-mod");
+        let flag = format!("--plugin-dir {}", want.display());
+        assert_eq!(argv.matches("--plugin-dir").count(), 1, "{argv}");
+        assert!(argv.contains(&flag), "{argv}");
+        drop(pane);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_claude_relaunch_passes_plugin_dir() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fn plugin_dir_args(flag: &str, session: &str, dir: &Path) -> Vec<OsString> {
+            vec![
+                OsString::from(flag),
+                OsString::from(session),
+                OsString::from("--plugin-dir"),
+                dir.as_os_str().into(),
+            ]
+        }
+        let (mut specs, _, stored) = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        let dir = cwd.path().join(".crowded").join("claude-mod");
+        let pane = Pane::spawn_unavailable(
+            specs.remove(0),
+            small_size(),
+            GuestEnvironment::new([]),
+            "offline",
+        )
+        .unwrap();
+        let (spec, session) = pane.relaunch_claude(ClaudeRelaunch::Resume, 1).unwrap();
+        assert_eq!(session, stored);
+        assert_eq!(spec.args, plugin_dir_args("--resume", &stored, &dir));
+        let (spec, session) = pane.relaunch_claude(ClaudeRelaunch::Restart, 1).unwrap();
+        assert_eq!(session, stored);
+        assert_eq!(spec.args, plugin_dir_args("--resume", &stored, &dir));
+        let (spec, cleared) = pane.relaunch_claude(ClaudeRelaunch::Clear, 1).unwrap();
+        assert_ne!(cleared, stored);
+        assert_eq!(spec.args, plugin_dir_args("--session-id", &cleared, &dir));
+        // A title with no stored session still fails instead of starting.
+        let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+        let fresh = Pane::spawn_unavailable(
+            claude_native_spec_for(&stub, cwd.path(), "Claude · 2"),
+            small_size(),
+            GuestEnvironment::new([]),
+            "offline",
+        )
+        .unwrap();
+        let error = match fresh.relaunch_claude(ClaudeRelaunch::Resume, 2) {
+            Ok(_) => panic!("a resume without a session must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("control 2 clear"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_user_plugin_dir_is_left_alone() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+        let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
+        spec.args = vec!["--plugin-dir".into(), "/user/mod".into()];
+        let mut specs = vec![spec];
+        let (starts, notices) = start_claude_sessions(&mut specs);
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(matches!(&starts[0], Some(ClaudeStart::Ready(_))));
+        let mut plugin_dirs = 0;
+        for arg in &specs[0].args {
+            plugin_dirs += usize::from(arg == "--plugin-dir");
+        }
+        assert_eq!(plugin_dirs, 1);
+        assert!(
+            !cwd.path().join(".crowded").join("claude-mod").exists(),
+            "no mod is extracted for an explicit user choice"
+        );
+        // A room whose mod directory cannot be written does not start.
+        let stuck = tempfile::tempdir().unwrap();
+        fs::create_dir_all(stuck.path().join(".crowded")).unwrap();
+        fs::write(stuck.path().join(".crowded").join("claude-mod"), "blocked").unwrap();
+        let mut specs = vec![claude_native_spec_for(&stub, stuck.path(), "Claude · 2")];
+        let (starts, notices) = start_claude_sessions(&mut specs);
+        assert!(matches!(&starts[0], Some(ClaudeStart::Failed(_))));
+        assert!(notices.iter().any(|n| n.contains("was not started")));
+    }
+
+    /// The real embedded mod delivers through a production-bound room, then
+    /// again after a session-report rebind through the same receiver.
+    #[cfg(unix)]
+    #[test]
+    fn the_embedded_mod_delivers_through_a_report_rebind() {
+        use std::process::Command;
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("SKIP: node is not on PATH, cannot run the embedded mod");
+            return;
+        }
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (specs, mut starts, first) = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        let mut router = crate::native_route::NativeRouter::start(
+            session_state::state_directory().join("native-outbox.json"),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            bind_claude_rooms(&mut router, &specs, &mut starts)
+                .unwrap()
+                .is_empty()
+        );
+        let here = std::env::current_dir().unwrap();
+        let mod_path = here.join("src/claude_mod/hooks/deliver.mjs");
+        let driver = root.path().join("drive-mod.mjs");
+        let marker = root.path().join("mod.log");
+        fs::write(
+            &driver,
+            r#"import { appendFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
+const [modPath, cwd, session, marker] = process.argv.slice(2);
+const { register } = await import(pathToFileURL(modPath).href);
+const log = (t) => appendFileSync(marker, `${t}\n`);
+const $ = {
+  fs: { exists: async (p) => readFile(p).then(() => true, () => false), read: (p) => readFile(p, "utf8") },
+  session: { id: async () => session },
+  http: { fetch: async (url, init) => fetch(url, init).then(async (r) => ({ ok: r.ok, status: r.status, text: await r.text() })) },
+  clock: { every: (ms, cb) => setInterval(() => { void cb(); }, ms) },
+  ui: { status: (t) => log(`STATUS ${t}`) },
+  prompt: { submit: async (input) => { log(`SUBMITTED ${input.text}`); return {}; } },
+};
+let handler = null;
+register((event, fn) => { handler = fn; });
+await handler($, { cwd, isInteractive: true }, async (e) => e);
+"#,
+        )
+        .unwrap();
+        let mut child = Command::new("node")
+            .arg(&driver)
+            .arg(mod_path)
+            .arg(cwd.path())
+            .arg(&first)
+            .arg(&marker)
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("node runs the driver");
+        // The mod's own poll is the only clock; the bound only stops a broken
+        // driver hanging the suite.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if fs::read_to_string(&marker)
+                .unwrap_or_default()
+                .contains("STATUS Crowded inbox connected")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the mod never connected");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let mut mailroom = Mailroom::new(50);
+        router
+            .send(&mut mailroom, "Sender", 0, "first", None)
+            .unwrap();
+        pump_router(&mut router, &mut mailroom, |shown| {
+            shown.contains("ACCEPTED by Claude (submitted; not proof it was acted on)")
+        });
+        const SECOND: &str = "3f8f8f8f-3333-4333-8333-333333333333";
+        let generation = next_generation().unwrap();
+        let title = "Claude · 1".to_owned();
+        router.rebind_claude(0, title, SECOND, generation).unwrap();
+        router
+            .send(&mut mailroom, "Sender", 0, "second", None)
+            .unwrap();
+        pump_router(&mut router, &mut mailroom, |shown| {
+            shown.matches("ACCEPTED by Claude (submitted;").count() == 2
+        });
+        child.kill().ok();
+        let _ = child.wait();
+        let log = fs::read_to_string(&marker).unwrap();
+        for want in [
+            "STATUS Crowded inbox connected",
+            "SUBMITTED [whisper from Sender] first",
+            "SUBMITTED [whisper from Sender] second",
+        ] {
+            assert!(log.contains(want), "{log}");
+        }
     }
 }

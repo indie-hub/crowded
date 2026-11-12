@@ -245,7 +245,7 @@ pub(crate) fn connection_file(cwd: &Path, session: &str) -> io::Result<PathBuf> 
         .join(format!("{session}.json")))
 }
 
-fn write_private(path: &Path, contents: &str) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("the Claude inbox file has no directory"))?;

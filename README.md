@@ -161,6 +161,7 @@ status:
 | `QUEUED` | Saved here, not sent yet (waiting its turn, or delivery is paused or the fuse has tripped). |
 | `SENDING` | A request is in flight. |
 | `ACCEPTED by OpenCode` / `ACCEPTED by Codex` | The room's own CLI admitted it into its queue. This is not proof the agent read it. |
+`ACCEPTED by Claude (submitted; not proof it was acted on)` | Crowded's own mod submitted the prompt to the Claude session. Submission is not proof the agent acted on it. |
 | `UNCERTAIN` | The reply was lost, so it may have been accepted. It is never resent. Crowded looks for it in OpenCode's inbox with a read-only request and settles it if it is found; until then later mail to that room waits behind it. |
 | `HELD` | Saved but not sent (the request could not be made, or the mail belongs to an earlier launch of the room). It is kept and is never moved to another session. |
 | `FAILED` | Rejected, for example by a wrong login (HTTP 401) or because OpenCode holds different content under the message ID. |
@@ -266,7 +267,7 @@ transport = "raw"
 native_delivery = true
 ```
 
-### Native Claude rooms (lifecycle only, not yet configurable)
+### Native Claude rooms (opt-in)
 
 A Claude room can be given a session id by Crowded: it starts with
 `claude --session-id <uuid>` and the binding is saved before its terminal
@@ -279,18 +280,39 @@ new launch generation. A user-supplied `--resume`, `--continue`,
 `--session-id` or `--fork-session` is refused for such a room, because the
 session is Crowded's to choose.
 
+With `native_delivery = true` the launch also passes `--plugin-dir
+<cwd>/.crowded/claude-mod`: the delivery mod ships inside the Crowded binary
+and is extracted there at launch, rewritten only when its content digest
+differs. Both the directory and the files are private to the user where the
+platform supports it, and a room whose mod cannot be written does not start.
+Every launch passes `--plugin-dir` exactly once; a user-supplied
+`--plugin-dir` is left alone and gets no Crowded mod.
+
 A Claude relaunch writes the new session entry and binds the room before it
 starts the terminal, and does not roll either back. If the start fails after
 that, the room is reported with `control N clear` and may stay recorded on a
-session that did not start. The feature stays gated off in configuration.
+session that did not start.
 
-Delivery is not implemented yet: every message to a Claude room is saved and
-shown as held with the reason `no Claude mod connected`, never queued or pasted.
-`native_delivery` therefore still rejects Claude rooms in `crowded.toml`; the
-lifecycle above is exercised by the test suite until the room-side mod ships.
-Because a stored id is trusted without any existence check, an id whose
-transcript no longer exists makes the launch fail and the room stays offline
-with the CLI's reason: Crowded does not scan `~/.claude` to guess.
+Mail to a Claude room is saved first in `.crowded/native-outbox.json`, then
+handed to the room's loopback inbox, which its mod polls every 500 ms and
+submits with the prompt API. A receipt of `started` means the prompt was
+submitted, not that the agent acted on it: the mail log shows `ACCEPTED by
+Claude (submitted; not proof it was acted on)`. A refused submission stays
+`HELD`; a collected-but-unreceipted one stays `UNCERTAIN`, never resent. Mail
+saved for an earlier generation stays held, never delivered to a new session.
+A stored id is trusted without an existence check: an id whose transcript is
+gone makes the launch fail and the room stays offline with the CLI's reason.
+
+The mod reads one connection file, `<cwd>/.crowded/claude-inbox/<session
+id>.json`, holding the inbox URL and the room's token. It is written at
+launch, removed when its launch is replaced and on exit; a session-report
+rebind keeps the same file and receiver. The mod is inert outside Crowded:
+with no live file it registers and submits nothing. Both live under
+`.crowded/`, which `crowded init` already adds to the project's `.gitignore`.
+
+This needs a Claude Code that loads `--plugin-dir` plugins and exposes the mod
+prompt API (validated on 2.1.322). Not verified: approval or trust prompts for
+a brand-new user, Windows, and a real TUI `/clear` in a Crowded pane.
 
 ### Session reports: following /clear and session switches
 
@@ -319,7 +341,7 @@ either spelling -- is rejected before anything is contacted, even with
 reports on its own when neither key is there. The room
 is never taken from an argument: the report is
 authenticated by the calling room's own token, and a bad token, an unknown
-room, a non-native room, or a vendor other than OpenCode or Codex is
+room, a non-native room, or a vendor other than OpenCode, Codex or Claude is
 rejected or ignored with a short reason that changes nothing.
 
 The command is silent on stdout in every outcome (hook output can become
@@ -330,8 +352,9 @@ contacted (non-empty, at most 128 bytes, letters, digits, `-`, `_` or `.`);
 anything else is ignored on the spot.
 
 Crowded writes the same `SessionStart` entry for a Claude room, next to the
-pulse entry, in `.claude/settings.local.json`. Claude rooms are not native
-rooms yet, so a report from one is ignored and changes nothing.
+pulse entry, in `.claude/settings.local.json`. A report from a Claude room
+rebinds it under a new launch generation, pending first like the other
+vendors.
 
 Pass `--ack` when the caller needs proof of delivery (the OpenCode plugin
 does, on every report). With it the exit status is 0 only when Crowded
@@ -419,7 +442,8 @@ the room); existence is not re-checked against the server.
 
 No path in this feature writes to a PTY or retries an accepted message:
 pending, failed, uncertain, stale and unbound mail never becomes a paste.
-Claude rooms are not covered yet: their reports are ignored.
+A report from a Claude room rebinds it under a new generation, like the other
+native rooms.
 
 ## Run rooms
 
@@ -533,8 +557,8 @@ yours. `remove` works the same way, taking away only what Crowded wrote.
 ## Session reporting after /clear
 
 A human `/clear` starts a fresh CLI session that Crowded otherwise never
-learns. Two emitters close that gap for native OpenCode and Codex rooms
-(Claude rooms are not covered):
+learns. Three emitters close that gap for native OpenCode, Codex and Claude
+rooms:
 
 - Codex rooms get a second `SessionStart` hook entry in `.codex/hooks.json`
   that runs `crowded session-report`, which reads the new thread id from the
