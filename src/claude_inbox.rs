@@ -531,6 +531,12 @@ fn error_body(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
 }
 
+/// How long a test client waits for an answer before calling it missing. It is
+/// a liveness bound, not a deadline assertion, so a loaded machine cannot break
+/// a test that would pass on an idle one.
+#[cfg(test)]
+const GENEROUS: Duration = Duration::from_secs(30);
+
 /// One raw HTTP request, as the room's mod makes it.
 #[cfg(test)]
 pub(crate) fn request(
@@ -552,9 +558,7 @@ pub(crate) fn request(
     }
     head += &format!("\r\n{body}");
     let mut stream = TcpStream::connect(url.trim_start_matches("http://")).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    stream.set_read_timeout(Some(GENEROUS)).unwrap();
     stream.write_all(head.as_bytes()).unwrap();
     let mut response = String::new();
     let _ = stream.read_to_string(&mut response);
@@ -685,7 +689,7 @@ mod tests {
     use super::*;
     use crate::native_outbox::Binding;
     use sha2::{Digest, Sha256};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     fn inbox(wait: Duration) -> Arc<ClaudeInbox> {
         let inbox = ClaudeInbox::open(Arc::new(Instant::now), wait).unwrap();
@@ -929,32 +933,51 @@ mod tests {
         ));
     }
 
-    /// A client that trickles its headers cannot hold the listener: a whole
-    /// request has one deadline, so a legitimate poll is still answered.
+    /// A client that trickles its headers cannot hold the listener: its own
+    /// connection is cut off by the request deadline, and a legitimate request
+    /// on the same inbox is answered. The proofs are the trickle's 408 and the
+    /// answer that follows it; the only clock involved is a liveness bound far
+    /// beyond the deadline, so a loaded machine cannot make this flaky.
     #[test]
     fn a_trickling_client_cannot_hold_the_listener() {
         let inbox = inbox(Duration::from_millis(200));
-        let trickle = TcpStream::connect(inbox.url.trim_start_matches("http://")).unwrap();
+        let address = inbox.url.trim_start_matches("http://").to_owned();
+        let mut trickle = TcpStream::connect(&address).unwrap();
+        trickle
+            .set_read_timeout(Some(GENEROUS))
+            .expect("a readable trickle");
+        trickle.write_all(b"POST /next HTTP/1.1\r\n").unwrap();
+        // One byte at a time, faster than a per-read timeout would fire.
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let mut piped = trickle.try_clone().unwrap();
         let writer = thread::spawn(move || {
-            let mut trickle = trickle;
-            let _ = trickle.write_all(b"POST /next HTTP/1.1\r\n");
-            let end = Instant::now() + Duration::from_secs(8);
-            while Instant::now() < end {
-                if trickle.write_all(b"x").is_err() {
+            while !flag.load(Ordering::SeqCst) {
+                if piped.write_all(b"x").is_err() {
                     break;
                 }
-                thread::sleep(Duration::from_millis(200));
+                thread::sleep(Duration::from_millis(20));
             }
         });
-        thread::sleep(Duration::from_millis(100));
-        let started = Instant::now();
-        let (status, _) = request(&inbox.url, Some(&inbox.token), "/register", "{}", None);
-        assert_eq!(status, 200, "a legitimate request must still be answered");
+        // A legitimate request while the trickle is still open.
+        let (url, token) = (inbox.url.clone(), inbox.token.clone());
+        let legitimate = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            request(&url, Some(&token), "/register", "{}", None).0
+        });
+
+        let mut response = String::new();
+        let _ = trickle.read_to_string(&mut response);
         assert!(
-            started.elapsed() < REQUEST_DEADLINE + Duration::from_secs(2),
-            "waited {:?} behind a trickling client",
-            started.elapsed()
+            response.starts_with("HTTP/1.1 408"),
+            "the trickle was not cut off by the deadline: {response:?}"
         );
+        stop.store(true, Ordering::SeqCst);
         writer.join().unwrap();
+        assert_eq!(
+            legitimate.join().unwrap(),
+            200,
+            "a legitimate request must still be answered"
+        );
     }
 }
