@@ -1147,6 +1147,18 @@ fn held_text(reason: &str) -> String {
     format!("HELD: {reason}")
 }
 
+#[cfg(test)]
+impl NativeRouter {
+    pub(crate) fn poison_switching_adapter(&self) {
+        let adapter = Arc::clone(self.adapter.get());
+        let _ = std::thread::spawn(move || {
+            let _guard = adapter.current.lock().unwrap();
+            panic!("poison switching adapter");
+        })
+        .join();
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
