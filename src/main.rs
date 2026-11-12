@@ -2,6 +2,7 @@
 
 mod app;
 mod checker;
+mod claude_inbox;
 mod codex_native;
 mod command;
 mod config;

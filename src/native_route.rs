@@ -16,6 +16,7 @@ use std::{
 };
 
 use crate::{
+    claude_inbox::ClaudeInbox,
     codex_native::{CodexAdapter, Room},
     mailroom::Mailroom,
     native_launch::Reaped,
@@ -52,22 +53,24 @@ pub(crate) struct SwitchAdapter {
 struct Routing {
     opencode: OpenCodeAdapter,
     codex: CodexAdapter,
-    /// Claude rooms whose mail is saved by the outbox and refused here, so it
-    /// stays held durably until the room-side mod exists.
-    claude: HashSet<String>,
+    /// Claude rooms and the inbox their mail is delivered through.
+    claude: HashMap<String, Arc<ClaudeInbox>>,
 }
 
 impl Routing {
     fn new(rooms: Vec<RoomEntry>) -> io::Result<Self> {
         let mut opencode = Vec::new();
         let mut codex = Vec::new();
-        let mut claude = HashSet::new();
+        let mut claude = HashMap::new();
         for room in rooms {
             match room.backend {
                 Backend::OpenCode(server) => opencode.push((room.binding, server)),
                 Backend::Codex(native) => codex.push((room.binding, (*native).clone())),
-                Backend::Claude => {
-                    claude.insert(room.binding.room.clone());
+                Backend::Claude(inbox) => {
+                    // A rebind to another launch generation leaves no receiver
+                    // and no earlier launch's mail behind.
+                    inbox.begin_generation(room.binding.generation);
+                    claude.insert(room.binding.room.clone(), inbox);
                 }
             }
         }
@@ -79,8 +82,8 @@ impl Routing {
     }
 
     fn send(&self, message: Message) -> AdapterResult {
-        if self.claude.contains(&message.destination) {
-            return AdapterResult::Dropped(crate::native_outbox::CLAUDE_HOLD.to_owned());
+        if let Some(inbox) = self.claude.get(&message.destination) {
+            return inbox.deliver(&message);
         }
         if self.codex.has_room(&message.destination) {
             self.codex.send(message)
@@ -161,9 +164,9 @@ pub(crate) enum Backend {
     OpenCode(Arc<Server>),
     /// The room's own Codex process is queued through the CLI.
     Codex(Arc<Room>),
-    /// The room's own Claude process. Crowded cannot deliver into it until the
-    /// room-side mod exists, so every message is held with a plain reason.
-    Claude,
+    /// The room's own Claude process, reached through the loopback inbox its
+    /// mod polls.
+    Claude(Arc<ClaudeInbox>),
 }
 
 /// A Codex room handed to the router. Without a verified thread the room is
@@ -227,10 +230,13 @@ pub(crate) struct NativeRouter {
     /// The bound Codex rooms, kept whole so every rebuild of the adapter's
     /// routing table includes the ones bound earlier.
     codex_rooms: HashMap<usize, RoomEntry>,
-    /// Destination keys of the Claude rooms, whose mail is always held.
+    /// Destination keys of the Claude rooms, for vendor-specific status text.
     claude: HashSet<String>,
     /// The bound Claude rooms, kept whole for the same reason as the Codex ones.
     claude_rooms: HashMap<usize, RoomEntry>,
+    /// Each Claude room's inbox, kept across relaunches: the token names the
+    /// room, not one launch.
+    claude_inboxes: HashMap<usize, Arc<ClaudeInbox>>,
     /// Native rooms with no verified Codex thread, and the reason.
     unbound: HashMap<usize, (String, String)>,
     /// Rooms that reported themselves between sessions, keyed by destination.
@@ -328,6 +334,7 @@ impl NativeRouter {
         let mut codex_rooms = HashMap::new();
         let mut claude = HashSet::new();
         let mut claude_rooms = HashMap::new();
+        let mut claude_inboxes = HashMap::new();
         for room in &rooms {
             bindings.insert(room.binding.room.clone(), room.binding.clone());
             titles.insert(room.binding.room.clone(), room.title.clone());
@@ -340,8 +347,9 @@ impl NativeRouter {
                     codex_live.insert(room.index, Arc::clone(&native.live));
                     codex_rooms.insert(room.index, room.clone());
                 }
-                Backend::Claude => {
+                Backend::Claude(inbox) => {
                     claude.insert(room.binding.room.clone());
+                    claude_inboxes.insert(room.index, Arc::clone(inbox));
                     claude_rooms.insert(room.index, room.clone());
                 }
             }
@@ -358,6 +366,7 @@ impl NativeRouter {
             codex_rooms,
             claude,
             claude_rooms,
+            claude_inboxes,
             unbound: HashMap::new(),
             pending_rooms: HashSet::new(),
             codex_live,
@@ -457,14 +466,23 @@ impl NativeRouter {
         self.adapter.get().rebind(self.entries())
     }
 
-    /// Binds the Claude rooms once each launch has its session id. Mail for a
-    /// Claude room is held by `send`; the binding exists so restart, resume and
-    /// session reports agree on one session per launch generation.
+    /// Binds the Claude rooms once each launch has its session id and inbox.
+    /// A room without an inbox stays unbound: its mail is held, never pasted.
     pub(crate) fn bind_claude(&mut self, entries: Vec<ClaudeEntry>) -> io::Result<()> {
         for entry in entries {
             let destination = (entry.index + 1).to_string();
             match entry.session {
                 Some(session) => {
+                    let Some(inbox) = self.claude_inboxes.get(&entry.index).cloned() else {
+                        self.unbound.insert(
+                            entry.index,
+                            (
+                                entry.title,
+                                "this room has no Claude inbox; restart Crowded".to_owned(),
+                            ),
+                        );
+                        continue;
+                    };
                     let binding =
                         crate::codex_native::binding(&destination, &session, entry.generation);
                     self.unbound.remove(&entry.index);
@@ -481,7 +499,7 @@ impl NativeRouter {
                             index: entry.index,
                             title: entry.title,
                             binding,
-                            backend: Backend::Claude,
+                            backend: Backend::Claude(inbox),
                         },
                     );
                 }
@@ -518,6 +536,35 @@ impl NativeRouter {
     pub(crate) fn server_for(&self, index: usize) -> Option<Arc<Server>> {
         let binding = self.binding_for(index)?;
         self.servers.get().get(&binding.room).cloned()
+    }
+
+    /// The room's Claude inbox, bound on first use and then kept: its token
+    /// names the room, so a relaunch reuses it.
+    pub(crate) fn claude_inbox(&mut self, index: usize) -> io::Result<Arc<ClaudeInbox>> {
+        if let Some(inbox) = self.claude_inboxes.get(&index) {
+            return Ok(Arc::clone(inbox));
+        }
+        let inbox = Arc::new(ClaudeInbox::start()?);
+        self.claude_inboxes.insert(index, Arc::clone(&inbox));
+        Ok(inbox)
+    }
+
+    /// Rebinds a Claude room to a session its own hook reported. The inbox
+    /// starts a new generation, so an earlier receiver and its mail are gone.
+    pub(crate) fn rebind_claude(
+        &mut self,
+        index: usize,
+        title: String,
+        session: &str,
+        generation: u64,
+    ) -> io::Result<()> {
+        let inbox = self.claude_inbox(index)?;
+        self.rebind_room(RoomEntry {
+            index,
+            title,
+            binding: crate::codex_native::binding(&(index + 1).to_string(), session, generation),
+            backend: Backend::Claude(inbox),
+        })
     }
 
     /// Whether the room reported itself between sessions. Its new mail is
@@ -665,7 +712,8 @@ impl NativeRouter {
                 self.codex_live.insert(index, Arc::clone(&native.live));
                 self.codex_rooms.insert(index, entry.clone());
             }
-            Backend::Claude => {
+            Backend::Claude(inbox) => {
+                inbox.begin_generation(entry.binding.generation);
                 self.claude.insert(destination.clone());
                 self.claude_rooms.insert(index, entry.clone());
             }
@@ -727,8 +775,10 @@ impl NativeRouter {
                     self.codex_live.insert(room.index, Arc::clone(&native.live));
                     self.codex_rooms.insert(room.index, room.clone());
                 }
-                Backend::Claude => {
+                Backend::Claude(inbox) => {
+                    inbox.begin_generation(room.binding.generation);
                     self.claude.insert(room.binding.room.clone());
+                    self.claude_inboxes.insert(room.index, Arc::clone(inbox));
                     self.claude_rooms.insert(room.index, room.clone());
                 }
             }
@@ -1069,6 +1119,8 @@ impl NativeRouter {
             Status::Accepted => {
                 if self.codex.contains(&message.destination) {
                     "ACCEPTED by Codex (queued there; not proof it was read)".to_owned()
+                } else if self.claude.contains(&message.destination) {
+                    "ACCEPTED by Claude (submitted; not proof it was acted on)".to_owned()
                 } else {
                     "ACCEPTED by OpenCode (queued there; not proof it was read)".to_owned()
                 }
@@ -2578,6 +2630,120 @@ mod tests {
                 .contains("HELD: the Codex room process is no longer running"),
             "{}",
             mailroom.summary()
+        );
+    }
+
+    const CLAUDE_A: &str = "1f8f8f8f-1111-4111-8111-111111111111";
+    const CLAUDE_B: &str = "2f8f8f8f-2222-4222-8222-222222222222";
+
+    /// A router with one bound Claude room, and the file its mod reads.
+    fn claude_router(root: &Path, cwd: &Path) -> NativeRouter {
+        let mut router = NativeRouter::start(state_path(root), Vec::new()).unwrap();
+        router
+            .claude_inbox(0)
+            .unwrap()
+            .attach(cwd, CLAUDE_A, 1)
+            .unwrap();
+        router
+            .bind_claude(vec![ClaudeEntry {
+                index: 0,
+                title: "Claude · 1".to_owned(),
+                session: Some(CLAUDE_A.to_owned()),
+                generation: 1,
+                reason: None,
+            }])
+            .unwrap();
+        router
+    }
+
+    fn answered_with(router: &mut NativeRouter, mailroom: &mut Mailroom, log: &Log) -> NativeReply {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            router.tick(Instant::now(), mailroom, false, false);
+            if let Some((_, outcome)) = log.borrow_mut().pop() {
+                return outcome;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never answered:\n{}",
+                mailroom.summary()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A Claude room's mail is held until its mod receipts it, accepted once it
+    /// does, and held again when a reported session starts a new generation.
+    #[test]
+    fn a_claude_room_is_accepted_only_when_its_mod_receipts() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut router = claude_router(root.path(), cwd.path());
+        let mut mailroom = Mailroom::new(50);
+
+        let log = Log::default();
+        router
+            .send(&mut mailroom, "Sender", 0, "first", recorder(&log))
+            .unwrap();
+        assert_eq!(
+            answered_with(&mut router, &mut mailroom, &log),
+            NativeReply::Held(crate::native_outbox::CLAUDE_HOLD.to_owned())
+        );
+
+        // The mod reads the room's own connection file, registers and polls.
+        let connection = crate::claude_inbox::mod_of(cwd.path(), CLAUDE_A);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (registered, flag) = (
+            crate::claude_inbox::FakeMod::register(&connection.url, &connection.token),
+            Arc::clone(&stop),
+        );
+        let mod_thread = thread::spawn(move || {
+            while !flag.load(Ordering::SeqCst) {
+                match registered.next_claim() {
+                    Some(claim) => {
+                        registered.receipt(&claim, "started", "");
+                    }
+                    None => thread::sleep(Duration::from_millis(20)),
+                }
+            }
+            registered
+        });
+
+        let log = Log::default();
+        router
+            .send(&mut mailroom, "Sender", 0, "second", recorder(&log))
+            .unwrap();
+        assert_eq!(
+            answered_with(&mut router, &mut mailroom, &log),
+            NativeReply::Accepted
+        );
+        let view = mailroom.summary();
+        assert!(
+            view.contains("ACCEPTED by Claude (submitted; not proof it was acted on)"),
+            "{view}"
+        );
+        stop.store(true, Ordering::SeqCst);
+        let old_mod = mod_thread.join().unwrap();
+
+        // A reported session is a new generation: the old receiver is refused,
+        // its file is gone, and the room's mail is held.
+        router
+            .rebind_claude(0, "Claude · 1".to_owned(), CLAUDE_B, 2)
+            .unwrap();
+        assert_eq!(old_mod.next_status(), 401);
+        assert!(
+            !crate::claude_inbox::connection_file(cwd.path(), CLAUDE_A)
+                .unwrap()
+                .exists(),
+            "an earlier launch's connection file is removed"
+        );
+        let log = Log::default();
+        router
+            .send(&mut mailroom, "Sender", 0, "third", recorder(&log))
+            .unwrap();
+        assert_eq!(
+            answered_with(&mut router, &mut mailroom, &log),
+            NativeReply::Held(crate::native_outbox::CLAUDE_HOLD.to_owned())
         );
     }
 }

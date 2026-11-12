@@ -936,6 +936,9 @@ pub(crate) fn bind_claude_room_at(
     generation: u64,
 ) -> io::Result<()> {
     let title = panes[index].title().to_owned();
+    router
+        .claude_inbox(index)?
+        .attach(panes[index].cwd(), session, generation)?;
     panes[index].record_session(session);
     router.bind_claude(vec![crate::native_route::ClaudeEntry {
         index,
@@ -947,23 +950,44 @@ pub(crate) fn bind_claude_room_at(
 }
 
 /// Binds every native Claude room before its terminal starts: a ready room to
-/// its session under a fresh generation, a failed one to its reason so its mail
-/// is held instead of pasted.
+/// its session and inbox under a fresh generation, a failed one to its reason
+/// so its mail is held instead of pasted. A room whose inbox file cannot be
+/// written does not start; its reason is returned as a notice.
 pub(crate) fn bind_claude_rooms(
     router: &mut crate::native_route::NativeRouter,
     specs: &[RoomSpec],
-    starts: &[Option<ClaudeStart>],
-) -> io::Result<()> {
+    starts: &mut [Option<ClaudeStart>],
+) -> io::Result<Vec<String>> {
     let mut entries = Vec::new();
-    for (index, start) in starts.iter().enumerate() {
-        let Some(start) = start else {
+    let mut notices = Vec::new();
+    for (index, start) in starts.iter_mut().enumerate() {
+        let Some(current) = start else {
             continue;
         };
         let generation = GenerationAllocator::new(session_state::state_directory()).next()?;
-        let (session, reason) = match start {
+        let (session, reason) = match current {
             ClaudeStart::Ready(session) => (Some(session.clone()), None),
             ClaudeStart::Failed(reason) => (None, Some(reason.clone())),
         };
+        if let Some(session) = &session {
+            let cwd = working_directory(specs[index].cwd.as_deref())?;
+            let prepared = router
+                .claude_inbox(index)
+                .and_then(|inbox| inbox.attach(&cwd, session, generation));
+            if let Err(error) = prepared {
+                let reason = format!("{}: {error}", specs[index].title);
+                notices.push(format!("{reason}; the room was not started"));
+                *current = ClaudeStart::Failed(reason.clone());
+                entries.push(crate::native_route::ClaudeEntry {
+                    index,
+                    title: specs[index].title.clone(),
+                    session: None,
+                    generation,
+                    reason: Some(reason),
+                });
+                continue;
+            }
+        }
         entries.push(crate::native_route::ClaudeEntry {
             index,
             title: specs[index].title.clone(),
@@ -972,7 +996,8 @@ pub(crate) fn bind_claude_rooms(
             reason,
         });
     }
-    router.bind_claude(entries)
+    router.bind_claude(entries)?;
+    Ok(notices)
 }
 
 /// Whether a spec is a native room that receives mail through Codex.
@@ -1614,6 +1639,11 @@ impl Pane {
         }
         for (key, value) in &environment.variables {
             command.env(key, value);
+        }
+        if claude_native_spec(&spec) {
+            // A nested-session marker would make this Claude Code child stop
+            // keeping transcripts, so the room never inherits one.
+            command.env_remove("CLAUDE_CODE_CHILD_SESSION");
         }
         if let Some(native) = &native {
             native_environment(&mut command, native);
@@ -7672,6 +7702,144 @@ mod tests {
         assert!(
             wait_for_no_unwritten_input(&pane),
             "counter stuck after a WouldBlock rejection and drain"
+        );
+    }
+
+    /// A Claude launch writes the inbox connection file before the terminal
+    /// starts, and its child never inherits the nested-session marker.
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_launch_writes_its_inbox_file_and_a_clean_environment() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("started.log");
+        let stub = codex_stub_for_pane(
+            root.path(),
+            "claude",
+            &format!(
+                "if [ -f .crowded/claude-inbox/*.json ]; then printf 'file\\n' >> '{0}'; else printf 'missing\\n' >> '{0}'; fi\nprintf '%s|%s\\n' \"${{CLAUDE_CODE_CHILD_SESSION-unset}}\" \"${{CROWDED_TEST_KEEP-unset}}\" >> '{0}'\nexec sleep 30",
+                marker.display()
+            ),
+        );
+        let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
+        let (mut starts, _) = start_claude_sessions(&mut specs);
+        let mut router = crate::native_route::NativeRouter::start(
+            session_state::state_directory().join("native-outbox.json"),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            bind_claude_rooms(&mut router, &specs, &mut starts)
+                .unwrap()
+                .is_empty()
+        );
+        let pane = crate::app::spawn_room(
+            &mut crate::app::LivePanes,
+            specs.remove(0),
+            small_size(),
+            GuestEnvironment::new([
+                ("CLAUDE_CODE_CHILD_SESSION", "child".into()),
+                ("CROWDED_TEST_KEEP", "kept".into()),
+            ]),
+            None,
+            None,
+            starts[0].as_ref(),
+        )
+        .unwrap();
+        wait_for_file(&marker);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::read_to_string(&marker).unwrap().lines().count() < 2 {
+            assert!(Instant::now() < deadline, "the stub wrote one line");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "file\nunset|kept\n",
+            "the inbox file exists before the child runs, without the child marker"
+        );
+        drop(pane);
+    }
+
+    /// Clearing a Claude room moves its inbox file to the new launch and leaves
+    /// the old receiver and its mail behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_clear_moves_the_inbox_file_and_holds_old_mail() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+        let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
+        let (mut starts, _) = start_claude_sessions(&mut specs);
+        let first = match &starts[0] {
+            Some(ClaudeStart::Ready(session)) => session.clone(),
+            other => panic!("{other:?}"),
+        };
+        let mut router = crate::native_route::NativeRouter::start(
+            session_state::state_directory().join("native-outbox.json"),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            bind_claude_rooms(&mut router, &specs, &mut starts)
+                .unwrap()
+                .is_empty()
+        );
+        let mut panes = vec![
+            Pane::spawn_unavailable(
+                specs.remove(0),
+                small_size(),
+                GuestEnvironment::new([]),
+                "offline",
+            )
+            .unwrap(),
+        ];
+        let old = crate::claude_inbox::mod_of(cwd.path(), &first);
+        let registered = crate::claude_inbox::FakeMod::register(&old.url, &old.token);
+
+        const SECOND: &str = "3f8f8f8f-3333-4333-8333-333333333333";
+        bind_claude_room_at(
+            &mut router,
+            &mut panes,
+            0,
+            SECOND,
+            next_generation().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(registered.next_status(), 401, "the old receiver is refused");
+        assert!(
+            !crate::claude_inbox::connection_file(cwd.path(), &first)
+                .unwrap()
+                .exists(),
+            "the cleared launch's connection file is removed"
+        );
+        assert!(
+            crate::claude_inbox::connection_file(cwd.path(), SECOND)
+                .unwrap()
+                .exists(),
+            "the new launch has its own connection file"
+        );
+        let mut mailroom = Mailroom::new(10);
+        let (replied, reply) = std::sync::mpsc::sync_channel(1);
+        router
+            .send(
+                &mut mailroom,
+                "Sender",
+                0,
+                "after clear",
+                Some(Box::new(move |_, reply| {
+                    let _ = replied.send(reply);
+                })),
+            )
+            .unwrap();
+        pump_router(&mut router, &mut mailroom, |shown| {
+            shown.contains("HELD: no Claude mod connected")
+        });
+        assert_eq!(
+            reply.recv_timeout(Duration::from_secs(5)).unwrap(),
+            crate::native_route::NativeReply::Held("no Claude mod connected".to_owned())
         );
     }
 }

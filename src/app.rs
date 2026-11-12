@@ -2181,12 +2181,7 @@ fn apply_session_report(
         }
         panes[from].record_session(&session);
         router
-            .rebind_room(crate::native_route::RoomEntry {
-                index: from,
-                title: title.clone(),
-                binding: crate::codex_native::binding(&destination, &session, generation),
-                backend: crate::native_route::Backend::Claude,
-            })
+            .rebind_claude(from, title.clone(), &session, generation)
             .map_err(|error| format!("{title} could not be rebound: {error}"))?;
     } else {
         let Some(current_binding) = current.clone() else {
@@ -3066,7 +3061,7 @@ fn run_rooms(
     }
     // A native Claude room's session id is Crowded's to choose, so it is fixed
     // and saved before the terminal starts: no model turn is involved.
-    let (claude_starts, mut claude_notices) = pane::start_claude_sessions(&mut specs);
+    let (mut claude_starts, mut claude_notices) = pane::start_claude_sessions(&mut specs);
     for message in &claude_notices {
         eprintln!("{message}");
     }
@@ -3091,7 +3086,11 @@ fn run_rooms(
     }
     // Every Claude session and binding exists before any terminal starts.
     if let Some(router) = router.as_mut() {
-        pane::bind_claude_rooms(router, &specs, &claude_starts)?;
+        claude_notices.extend(pane::bind_claude_rooms(
+            router,
+            &specs,
+            &mut claude_starts,
+        )?);
     }
     let (mut panes, mut spawned_at) = start_rooms(
         &mut LivePanes,
