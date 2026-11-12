@@ -7841,5 +7841,10 @@ mod tests {
             reply.recv_timeout(Duration::from_secs(5)).unwrap(),
             crate::native_route::NativeReply::Held("no Claude mod connected".to_owned())
         );
+        // The relaunched process's own mod takes the room: its receiver is a
+        // fresh registration and is never refused as an existing one.
+        let relaunched = crate::claude_inbox::mod_of(cwd.path(), SECOND);
+        let fresh = crate::claude_inbox::FakeMod::register(&relaunched.url, &relaunched.token);
+        assert!(!fresh.receiver.is_empty());
     }
 }

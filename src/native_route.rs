@@ -67,9 +67,6 @@ impl Routing {
                 Backend::OpenCode(server) => opencode.push((room.binding, server)),
                 Backend::Codex(native) => codex.push((room.binding, (*native).clone())),
                 Backend::Claude(inbox) => {
-                    // A rebind to another launch generation leaves no receiver
-                    // and no earlier launch's mail behind.
-                    inbox.begin_generation(room.binding.generation);
                     claude.insert(room.binding.room.clone(), inbox);
                 }
             }
@@ -549,8 +546,9 @@ impl NativeRouter {
         Ok(inbox)
     }
 
-    /// Rebinds a Claude room to a session its own hook reported. The inbox
-    /// starts a new generation, so an earlier receiver and its mail are gone.
+    /// Rebinds a Claude room to a session its own hook reported. The mod's
+    /// process did not restart, so its receiver stays bound and the inbox only
+    /// moves to the reported generation.
     pub(crate) fn rebind_claude(
         &mut self,
         index: usize,
@@ -559,6 +557,7 @@ impl NativeRouter {
         generation: u64,
     ) -> io::Result<()> {
         let inbox = self.claude_inbox(index)?;
+        inbox.retarget(generation);
         self.rebind_room(RoomEntry {
             index,
             title,
@@ -712,8 +711,7 @@ impl NativeRouter {
                 self.codex_live.insert(index, Arc::clone(&native.live));
                 self.codex_rooms.insert(index, entry.clone());
             }
-            Backend::Claude(inbox) => {
-                inbox.begin_generation(entry.binding.generation);
+            Backend::Claude(_) => {
                 self.claude.insert(destination.clone());
                 self.claude_rooms.insert(index, entry.clone());
             }
@@ -776,7 +774,6 @@ impl NativeRouter {
                     self.codex_rooms.insert(room.index, room.clone());
                 }
                 Backend::Claude(inbox) => {
-                    inbox.begin_generation(room.binding.generation);
                     self.claude.insert(room.binding.room.clone());
                     self.claude_inboxes.insert(room.index, Arc::clone(inbox));
                     self.claude_rooms.insert(room.index, room.clone());
@@ -2672,6 +2669,26 @@ mod tests {
         }
     }
 
+    /// A mod that polls in the background and receipts every message as started.
+    fn polling(
+        mod_: crate::claude_inbox::FakeMod,
+    ) -> (Arc<AtomicBool>, thread::JoinHandle<crate::claude_inbox::FakeMod>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !flag.load(Ordering::SeqCst) {
+                match mod_.next_claim() {
+                    Some(claim) => {
+                        mod_.receipt(&claim, "started", "");
+                    }
+                    None => thread::sleep(Duration::from_millis(20)),
+                }
+            }
+            mod_
+        });
+        (stop, handle)
+    }
+
     /// A Claude room's mail is held until its mod receipts it, accepted once it
     /// does, and held again when a reported session starts a new generation.
     #[test]
@@ -2692,23 +2709,8 @@ mod tests {
 
         // The mod reads the room's own connection file, registers and polls.
         let connection = crate::claude_inbox::mod_of(cwd.path(), CLAUDE_A);
-        let stop = Arc::new(AtomicBool::new(false));
-        let (registered, flag) = (
-            crate::claude_inbox::FakeMod::register(&connection.url, &connection.token),
-            Arc::clone(&stop),
-        );
-        let mod_thread = thread::spawn(move || {
-            while !flag.load(Ordering::SeqCst) {
-                match registered.next_claim() {
-                    Some(claim) => {
-                        registered.receipt(&claim, "started", "");
-                    }
-                    None => thread::sleep(Duration::from_millis(20)),
-                }
-            }
-            registered
-        });
-
+        let registered = crate::claude_inbox::FakeMod::register(&connection.url, &connection.token);
+        let (stop, mod_thread) = polling(registered);
         let log = Log::default();
         router
             .send(&mut mailroom, "Sender", 0, "second", recorder(&log))
@@ -2725,25 +2727,34 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         let old_mod = mod_thread.join().unwrap();
 
-        // A reported session is a new generation: the old receiver is refused,
-        // its file is gone, and the room's mail is held.
+        // A reported session keeps the running mod's receiver: its process did
+        // not restart, so it goes on polling, and only new-generation mail is
+        // offered to it. The launch's connection file stays.
         router
             .rebind_claude(0, "Claude · 1".to_owned(), CLAUDE_B, 2)
             .unwrap();
-        assert_eq!(old_mod.next_status(), 401);
+        assert_eq!(
+            old_mod.resumed().next_status(),
+            200,
+            "a report rebind keeps the receiver"
+        );
         assert!(
-            !crate::claude_inbox::connection_file(cwd.path(), CLAUDE_A)
+            crate::claude_inbox::connection_file(cwd.path(), CLAUDE_A)
                 .unwrap()
                 .exists(),
-            "an earlier launch's connection file is removed"
+            "the running process keeps its connection file"
         );
+        let (stop, kept_mod) = polling(old_mod.resumed());
         let log = Log::default();
         router
             .send(&mut mailroom, "Sender", 0, "third", recorder(&log))
             .unwrap();
         assert_eq!(
             answered_with(&mut router, &mut mailroom, &log),
-            NativeReply::Held(crate::native_outbox::CLAUDE_HOLD.to_owned())
+            NativeReply::Accepted,
+            "the kept receiver collects new-generation mail"
         );
+        stop.store(true, Ordering::SeqCst);
+        kept_mod.join().unwrap();
     }
 }

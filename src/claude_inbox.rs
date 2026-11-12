@@ -32,6 +32,12 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const DISCONNECTED_HOLD: &str = "Claude mod disconnected";
 /// The hold for mail no mod collected in time.
 const UNCOLLECTED_HOLD: &str = "Claude mod did not collect the message";
+/// The hold for mail the mod could not receive inside its response limit.
+pub(crate) const TOO_LARGE_HOLD: &str = "the message is too large for the Claude mod";
+/// A whole request must arrive within this, so no client can hold the listener.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
+/// The mod refuses a response over 64 KiB; stay below it with room to spare.
+const RESPONSE_LIMIT: usize = 60 * 1024;
 /// What a started receipt says: submitted is not proof the agent acted on it.
 const STARTED: &str = "submitted";
 
@@ -76,10 +82,16 @@ enum Outcome {
 }
 
 impl State {
-    /// Drops everything that belongs to an earlier launch of the room.
-    fn reset(&mut self, generation: u64) {
+    /// Moves the room to `generation`. Mail and claims of the old generation
+    /// are dropped and their senders told the mail is stale. A report rebind
+    /// keeps the receiver: the mod registers once per process and gets no
+    /// session start after the user clears the session. Only a relaunched
+    /// process replaces it.
+    fn begin(&mut self, generation: u64, keep_receiver: bool) {
         self.generation = generation;
-        self.receiver = None;
+        if !keep_receiver {
+            self.receiver = None;
+        }
         self.queue.clear();
         self.claimed.clear();
         for (_, waiter) in self.waiters.drain() {
@@ -116,7 +128,7 @@ impl ClaudeInbox {
     /// Names the launch generation and writes the file the room's mod reads.
     /// A room whose file cannot be written must not start.
     pub(crate) fn attach(&self, cwd: &Path, session: &str, generation: u64) -> io::Result<()> {
-        self.begin_generation(generation);
+        self.relaunch(generation);
         let path = connection_file(cwd, session)?;
         let parent = path
             .parent()
@@ -130,22 +142,22 @@ impl ClaudeInbox {
         Ok(())
     }
 
-    /// Starts a new launch generation for the room: no receiver, no mail from
+    /// Moves the room to a session its own hook reported. The mod's process
+    /// keeps running and cannot register again, so its receiver stays bound
+    /// while only the new generation's mail is offered.
+    pub(crate) fn retarget(&self, generation: u64) {
+        if let Ok(mut state) = self.state.lock()
+            && state.generation != generation
+        {
+            state.begin(generation, true);
+        }
+    }
+
+    /// Starts a new process of the room: no receiver survives it, no mail from
     /// an earlier launch, and no connection file a stale mod could read.
-    pub(crate) fn begin_generation(&self, generation: u64) {
-        let changed = self
-            .state
-            .lock()
-            .map(|mut state| {
-                if state.generation == generation {
-                    return false;
-                }
-                state.reset(generation);
-                true
-            })
-            .unwrap_or(false);
-        if !changed {
-            return;
+    fn relaunch(&self, generation: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.begin(generation, false);
         }
         if let Ok(mut file) = self.file.lock()
             && let Some(path) = file.take()
@@ -160,6 +172,9 @@ impl ClaudeInbox {
     pub(crate) fn deliver(&self, message: &Message) -> AdapterResult {
         let (sender, receiver) = mpsc::channel();
         {
+            if escaped_size(&message.text) > RESPONSE_LIMIT {
+                return AdapterResult::Dropped(TOO_LARGE_HOLD.to_owned());
+            }
             let Ok(mut state) = self.state.lock() else {
                 return AdapterResult::Uncertain;
             };
@@ -248,6 +263,11 @@ fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// The bytes the text takes in the JSON body /next returns.
+fn escaped_size(text: &str) -> usize {
+    serde_json::to_string(text).map_or(usize::MAX, |escaped| escaped.len())
+}
+
 fn random_hex() -> io::Result<String> {
     let mut bytes = [0_u8; 32];
     #[cfg(unix)]
@@ -274,9 +294,8 @@ fn answer(
     token: &str,
     now: &Clock,
 ) -> io::Result<()> {
-    stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
     stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
-    let (status, body) = match read_request(&mut stream) {
+    let (status, body) = match read_request(&mut stream, Instant::now() + REQUEST_DEADLINE) {
         Ok(request) => respond(request, state, token, now),
         Err((status, message)) => (status, error_body(&message)),
     };
@@ -296,16 +315,37 @@ struct Request {
     body: Vec<u8>,
 }
 
+/// Reads one chunk with only what is left of the request's deadline.
+fn read_some(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> Result<usize, (u16, String)> {
+    let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+        return Err((408, "the request did not arrive in time".to_owned()));
+    };
+    stream
+        .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+        .map_err(|error| (408, error.to_string()))?;
+    stream.read(buffer).map_err(|error| match error.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+            (408, "the request did not arrive in time".to_owned())
+        }
+        _ => (400, error.to_string()),
+    })
+}
+
 /// Reads the head into bounded memory, then the body its Content-Length names.
-fn read_request(stream: &mut TcpStream) -> Result<Request, (u16, String)> {
-    let rejected = |message: io::Error| (400, message.to_string());
+/// Every read gets only what is left of the whole-request deadline, so a client
+/// that trickles cannot stretch one request for ever.
+fn read_request(stream: &mut TcpStream, deadline: Instant) -> Result<Request, (u16, String)> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 4096];
     let end = loop {
         if let Some(end) = buffer.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
             break end;
         }
-        let count = stream.read(&mut chunk).map_err(rejected)?;
+        let count = read_some(stream, &mut chunk, deadline)?;
         if count == 0 {
             return Err((400, "the request ended before its headers".to_owned()));
         }
@@ -344,7 +384,7 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, (u16, String)> {
         return Err((413, "the request body is too large".to_owned()));
     }
     while body.len() < length {
-        let count = stream.read(&mut chunk).map_err(rejected)?;
+        let count = read_some(stream, &mut chunk, deadline)?;
         if count == 0 {
             return Err((400, "the request body ended early".to_owned()));
         }
@@ -478,6 +518,7 @@ fn reason(status: u16) -> &'static str {
         200 => "OK",
         403 => "Forbidden",
         404 => "Not Found",
+        408 => "Request Timeout",
         409 => "Conflict",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
@@ -490,7 +531,6 @@ fn error_body(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
 }
 
-/// One raw HTTP request, as the room's mod makes it.
 /// One raw HTTP request, as the room's mod makes it.
 #[cfg(test)]
 pub(crate) fn request(
@@ -556,6 +596,15 @@ impl FakeMod {
 
     fn post(&self, path: &str, body: String) -> (u16, String) {
         request(&self.url, Some(&self.token), path, &body, None)
+    }
+
+    /// The same receiver, as the mod keeps it across a session-report rebind.
+    pub(crate) fn resumed(&self) -> Self {
+        Self {
+            url: self.url.clone(),
+            token: self.token.clone(),
+            receiver: self.receiver.clone(),
+        }
     }
 
     pub(crate) fn register_again(&self) -> u16 {
@@ -640,7 +689,7 @@ mod tests {
 
     fn inbox(wait: Duration) -> Arc<ClaudeInbox> {
         let inbox = ClaudeInbox::open(Arc::new(Instant::now), wait).unwrap();
-        inbox.begin_generation(1);
+        inbox.retarget(1);
         Arc::new(inbox)
     }
 
@@ -667,6 +716,24 @@ mod tests {
 
     fn delivered(inbox: Arc<ClaudeInbox>, message: Message) -> thread::JoinHandle<AdapterResult> {
         thread::spawn(move || inbox.deliver(&message))
+    }
+
+    /// Waits until a send has queued its message, so a transition under test
+    /// always starts from a known state.
+    fn wait_queued(inbox: &ClaudeInbox, id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let queued = inbox
+                .state
+                .lock()
+                .map(|state| state.queue.iter().any(|mail| mail.id == id))
+                .unwrap_or(false);
+            if queued {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{id} was never queued");
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// The token names the room, an Origin header is refused, and a body beyond
@@ -764,38 +831,23 @@ mod tests {
         );
     }
 
-    /// Liveness is judged by missed polls on the inbox's own clock, and mail
-    /// from an earlier launch is never offered to the next launch's receiver.
+    /// Liveness is judged by missed polls on the inbox's own clock.
     #[test]
-    fn mail_from_an_earlier_generation_is_held_and_never_offered() {
+    fn a_silent_receiver_is_gone_after_missed_polls() {
         let ms = Arc::new(AtomicU64::new(0));
         let base = Instant::now();
         let hand = Arc::clone(&ms);
         let clock: Clock =
             Arc::new(move || base + Duration::from_millis(hand.load(Ordering::SeqCst)));
-        let inbox = Arc::new(ClaudeInbox::open(clock, Duration::from_millis(600)).unwrap());
-        inbox.begin_generation(1);
+        let inbox = Arc::new(ClaudeInbox::open(clock, Duration::from_millis(200)).unwrap());
+        inbox.retarget(1);
         let _mod = FakeMod::register(&inbox.url, &inbox.token);
-
-        let queued = delivered(Arc::clone(&inbox), message(1, "id-5", "old"));
-        thread::sleep(Duration::from_millis(100));
-        inbox.begin_generation(2);
-        assert!(matches!(
-            queued.join().unwrap(),
-            AdapterResult::Dropped(reason) if reason == STALE_HOLD
-        ));
-        let next_launch = FakeMod::register(&inbox.url, &inbox.token);
-        assert!(
-            next_launch.next_claim().is_none(),
-            "older-generation mail reached a receiver"
-        );
-
         ms.store(
             (RECEIVER_TIMEOUT.as_millis() as u64) + 1000,
             Ordering::SeqCst,
         );
         assert!(matches!(
-            inbox.deliver(&message(2, "id-6", "late")),
+            inbox.deliver(&message(1, "id-6", "late")),
             AdapterResult::Dropped(reason) if reason == DISCONNECTED_HOLD
         ));
         assert_eq!(
@@ -803,5 +855,106 @@ mod tests {
             200,
             "a silent receiver is replaced"
         );
+    }
+
+    /// A session-report rebind keeps the room's receiver, because the mod's
+    /// process did not restart and it cannot register again; only the mail of
+    /// the generation it now serves is offered.
+    #[test]
+    fn a_report_rebind_keeps_the_receiver_and_offers_only_new_mail() {
+        let inbox = inbox(Duration::from_millis(600));
+        let mod_ = FakeMod::register(&inbox.url, &inbox.token);
+        let queued = delivered(Arc::clone(&inbox), message(1, "id-7", "old"));
+        wait_queued(&inbox, "id-7");
+        inbox.retarget(2);
+        assert!(matches!(
+            queued.join().unwrap(),
+            AdapterResult::Dropped(reason) if reason == STALE_HOLD
+        ));
+        assert!(
+            mod_.next_claim().is_none(),
+            "the receiver survives without the old mail"
+        );
+
+        let accepted = delivered(Arc::clone(&inbox), message(2, "id-8", "new"));
+        let claim = mod_.claim();
+        assert_eq!(claim.id, "id-8");
+        assert_eq!(mod_.receipt(&claim, "started", ""), 200);
+        assert!(matches!(
+            accepted.join().unwrap(),
+            AdapterResult::Accepted(Some(_))
+        ));
+    }
+
+    /// A message carrying the generation a rebind replaced is held before it
+    /// can be queued, even while the receiver is still registered.
+    #[test]
+    fn a_message_from_the_replaced_generation_is_held() {
+        let inbox = inbox(Duration::from_millis(200));
+        let mod_ = FakeMod::register(&inbox.url, &inbox.token);
+        inbox.retarget(2);
+        assert!(matches!(
+            inbox.deliver(&message(1, "id-9", "stale")),
+            AdapterResult::Dropped(reason) if reason == STALE_HOLD
+        ));
+        assert!(
+            mod_.next_claim().is_none(),
+            "the replaced generation's mail was offered"
+        );
+    }
+
+    /// Mail whose escaped text would not fit the mod's response limit is
+    /// refused before it is queued.
+    #[test]
+    fn mail_too_large_for_the_mod_is_refused_before_it_is_queued() {
+        let inbox = inbox(Duration::from_millis(200));
+        let mod_ = FakeMod::register(&inbox.url, &inbox.token);
+        let huge = "\"".repeat(40_000);
+        assert!(matches!(
+            inbox.deliver(&message(1, "id-10", &huge)),
+            AdapterResult::Dropped(reason) if reason == TOO_LARGE_HOLD
+        ));
+        assert!(
+            mod_.next_claim().is_none(),
+            "an oversized message was offered"
+        );
+
+        let accepted = delivered(Arc::clone(&inbox), message(1, "id-11", "a normal message"));
+        let claim = mod_.claim();
+        assert_eq!(claim.text, "a normal message");
+        assert_eq!(mod_.receipt(&claim, "started", ""), 200);
+        assert!(matches!(
+            accepted.join().unwrap(),
+            AdapterResult::Accepted(Some(_))
+        ));
+    }
+
+    /// A client that trickles its headers cannot hold the listener: a whole
+    /// request has one deadline, so a legitimate poll is still answered.
+    #[test]
+    fn a_trickling_client_cannot_hold_the_listener() {
+        let inbox = inbox(Duration::from_millis(200));
+        let trickle = TcpStream::connect(inbox.url.trim_start_matches("http://")).unwrap();
+        let writer = thread::spawn(move || {
+            let mut trickle = trickle;
+            let _ = trickle.write_all(b"POST /next HTTP/1.1\r\n");
+            let end = Instant::now() + Duration::from_secs(8);
+            while Instant::now() < end {
+                if trickle.write_all(b"x").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        let (status, _) = request(&inbox.url, Some(&inbox.token), "/register", "{}", None);
+        assert_eq!(status, 200, "a legitimate request must still be answered");
+        assert!(
+            started.elapsed() < REQUEST_DEADLINE + Duration::from_secs(2),
+            "waited {:?} behind a trickling client",
+            started.elapsed()
+        );
+        writer.join().unwrap();
     }
 }
