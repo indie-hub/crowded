@@ -2026,43 +2026,58 @@ pub(crate) fn restart_key(
     )
 }
 
-/// The restart arm of the event loop: the only place a key event becomes a
-/// launch. The loop calls this once per restart key; tests drive the same path
-/// with a real KeyEvent and no terminal.
-#[allow(clippy::too_many_arguments)]
+/// The restart-related slice of loop state. The loop hands it to the key seam
+/// without deciding anything about a restart itself.
+pub(crate) struct RestartContext<'a> {
+    pub(crate) focused: usize,
+    pub(crate) fuse_size: usize,
+    pub(crate) pane_size: &'a mut dyn FnMut() -> io::Result<PtySize>,
+    pub(crate) panes: &'a mut [Pane],
+    pub(crate) router: Option<&'a mut NativeRouter>,
+    pub(crate) codex: &'a mut [Option<pane::CodexMint>],
+    pub(crate) delivery_gates: &'a mut [DeliveryGate],
+    pub(crate) last_output: &'a mut [Option<Instant>],
+    pub(crate) spawned_at: &'a mut [Instant],
+    pub(crate) room_pulses: &'a mut [Option<PulseSample>],
+    pub(crate) environments: &'a [pane::GuestEnvironment],
+    pub(crate) notice: &'a mut Notices,
+}
+
+/// The one place an event can restart a room. It owns the guard, the focused
+/// pane, the launcher arguments and the notice, so a test drives the same
+/// decisions the loop makes with a real event and no terminal. Returns whether
+/// the event was consumed.
 pub(crate) fn run_rooms_restart_key(
-    key: KeyEvent,
-    size: portable_pty::PtySize,
-    focused: usize,
-    panes: &mut [Pane],
-    router: Option<&mut NativeRouter>,
-    codex: &mut [Option<pane::CodexMint>],
-    delivery_gates: &mut [DeliveryGate],
-    last_output: &mut [Option<Instant>],
-    spawned_at: &mut [Instant],
-    room_pulses: &mut [Option<PulseSample>],
-    environments: &[pane::GuestEnvironment],
-    fuse_size: usize,
-    now: Instant,
-    notice: &mut Notices,
-) {
-    if let Some((text, severity)) = restart_key(
-        key,
+    event: &Event,
+    context: &mut RestartContext<'_>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Event::Key(key) = event else {
+        return Ok(false);
+    };
+    let focused = context.focused;
+    if !force_restart_requested(*key, context.panes[focused].is_online()) {
+        return Ok(false);
+    }
+    let size = (context.pane_size)()?;
+    let result = restart_key(
+        *key,
         size,
         focused,
-        panes,
-        router,
-        codex,
-        delivery_gates,
-        last_output,
-        spawned_at,
-        room_pulses,
-        environments,
-        fuse_size,
-        now,
-    ) {
-        notice.push(text, severity);
+        context.panes,
+        context.router.as_deref_mut(),
+        context.codex,
+        context.delivery_gates,
+        context.last_output,
+        context.spawned_at,
+        context.room_pulses,
+        context.environments,
+        context.fuse_size,
+        Instant::now(),
+    );
+    if let Some((text, severity)) = result {
+        context.notice.push(text, severity);
     }
+    Ok(true)
 }
 
 /// Sends doorbell mail to a native room through the router. This is the only
@@ -3707,29 +3722,27 @@ fn run_rooms(
                     }
                     }
                 }
-                Event::Key(key) if force_restart_requested(key, panes[focused].is_online()) => {
-                    terminal.autoresize()?;
-                    let (rooms, _, _) = content_areas(terminal.size()?.into());
-                    let area = pane_areas(rooms, room_count)[focused];
-                    run_rooms_restart_key(
-                        key,
-                        pane_size(area),
+                Event::Key(key) if !run_rooms_restart_key(
+                    &Event::Key(key),
+                    &mut RestartContext {
                         focused,
-                        &mut panes,
-                        router.as_mut(),
-                        &mut codex,
-                        &mut delivery_gates,
-                        &mut last_output,
-                        &mut spawned_at,
-                        &mut room_pulses,
-                        &environments,
                         fuse_size,
-                        Instant::now(),
-                        &mut notice,
-                    );
-                }
-
-                Event::Key(key) => match &mut input_mode {
+                        pane_size: &mut || {
+                            terminal.autoresize()?;
+                            let (rooms, _, _) = content_areas(terminal.size()?.into());
+                            Ok(pane_size(pane_areas(rooms, room_count)[focused]))
+                        },
+                        panes: &mut panes,
+                        router: router.as_mut(),
+                        codex: &mut codex,
+                        delivery_gates: &mut delivery_gates,
+                        last_output: &mut last_output,
+                        spawned_at: &mut spawned_at,
+                        room_pulses: &mut room_pulses,
+                        environments: &environments,
+                        notice: &mut notice,
+                    },
+                )? => match &mut input_mode {
                     InputMode::Composing(message) => {
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                             match key.code {
@@ -6352,17 +6365,25 @@ mod tests {
             1,
             "the loop calls the restart seam exactly once"
         );
-        let arm = body
-            .find("Event::Key(key) if force_restart_requested")
-            .expect("the restart key arm is present");
         let call = body.find("run_rooms_restart_key(").unwrap();
-        assert!(call > arm, "the seam is called from the restart key arm");
+        assert!(
+            body[..call].contains("Event::Key(key)"),
+            "the seam is called from the key arm"
+        );
         let seam = &production[production.find("fn run_rooms_restart_key(").unwrap()..];
         let seam = &seam[..seam.find("\n}\n").unwrap()];
         assert_eq!(
             seam.matches("= restart_key(").count(),
             1,
             "the seam owns the single restart_key call"
+        );
+        assert!(
+            seam.contains("force_restart_requested"),
+            "the seam owns the restart guard"
+        );
+        assert!(
+            !body.contains("force_restart_requested"),
+            "the loop leaves the restart decision to the seam"
         );
     }
 

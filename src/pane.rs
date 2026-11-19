@@ -4251,6 +4251,27 @@ mod tests {
                     .unwrap();
         }
 
+        fn restart_context<'a>(
+            &'a mut self,
+            focused: usize,
+            size: &'a mut dyn FnMut() -> io::Result<PtySize>,
+        ) -> crate::app::RestartContext<'a> {
+            crate::app::RestartContext {
+                focused,
+                fuse_size: 100,
+                pane_size: size,
+                panes: &mut self.panes,
+                router: self.router.as_mut(),
+                codex: &mut self.codex,
+                delivery_gates: &mut self.gates,
+                last_output: &mut self.last_output,
+                spawned_at: &mut self.spawned_at,
+                room_pulses: &mut self.pulses,
+                environments: &self.environments,
+                notice: &mut self.notice,
+            }
+        }
+
         fn iterate(&mut self) {
             let now = Instant::now();
             crate::app::run_rooms_iteration(
@@ -5503,23 +5524,9 @@ mod tests {
         bind_claude_room(rig.router.as_mut().unwrap(), &mut rig.panes, 0, MINTED_A).unwrap();
         let old = rig.router.as_ref().unwrap().binding_for(0).unwrap().generation;
 
-        let f5 = KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE);
-        crate::app::run_rooms_restart_key(
-            f5,
-            small_size(),
-            0,
-            &mut rig.panes,
-            rig.router.as_mut(),
-            &mut rig.codex,
-            &mut rig.gates,
-            &mut rig.last_output,
-            &mut rig.spawned_at,
-            &mut rig.pulses,
-            &rig.environments,
-            100,
-            Instant::now(),
-            &mut rig.notice,
-        );
+        let f5 = crossterm::event::Event::Key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
+        let mut size = || Ok(small_size());
+        assert!(crate::app::run_rooms_restart_key(&f5, &mut rig.restart_context(0, &mut size)).unwrap());
 
         let shown = rig.notice.ordered_lines().join("; ");
         assert!(shown.ends_with("restarted"), "{shown}");
@@ -5575,22 +5582,14 @@ mod tests {
             None,
         );
 
-        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
-        crate::app::run_rooms_restart_key(
-            ctrl_r,
-            small_size(),
-            0,
-            &mut rig.panes,
-            rig.router.as_mut(),
-            &mut rig.codex,
-            &mut rig.gates,
-            &mut rig.last_output,
-            &mut rig.spawned_at,
-            &mut rig.pulses,
-            &rig.environments,
-            100,
-            Instant::now(),
-            &mut rig.notice,
+        let ctrl_r = crossterm::event::Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        ));
+        let mut size = || Ok(small_size());
+        assert!(
+            crate::app::run_rooms_restart_key(&ctrl_r, &mut rig.restart_context(0, &mut size))
+                .unwrap()
         );
 
         let shown = rig.notice.ordered_lines().join("; ");
@@ -5615,6 +5614,183 @@ mod tests {
         assert!(!log_text.lines().any(|line| line.starts_with("exec")));
     }
 
+    /// With two native Claude rooms and focus on room 1, F5 relaunches only
+    /// room 1: a wrong focused index or a key sent to the wrong pane is red.
+    #[cfg(unix)]
+    #[test]
+    fn f5_at_focus_one_relaunches_only_the_claude_room() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub_root0 = tempfile::tempdir().unwrap();
+        let stub_root1 = tempfile::tempdir().unwrap();
+        let log0 = stub_root0.path().join("claude.log");
+        let log1 = stub_root1.path().join("claude.log");
+        let stub0 = codex_stub_for_pane(
+            stub_root0.path(),
+            "claude",
+            &format!("printf 'exec\\n' >> '{}'\nexec sleep 30", log0.display()),
+        );
+        let stub1 = codex_stub_for_pane(
+            stub_root1.path(),
+            "claude",
+            &format!("printf 'exec\\n' >> '{}'\nexec sleep 30", log1.display()),
+        );
+        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        session_state::upsert_minted("claude", cwd.path(), "Claude · 2", MINTED_B).unwrap();
+        let mut rig = IterationHarness::new(root.path());
+        rig.panes = vec![
+            Pane::spawn_unavailable(
+                claude_native_spec_for(&stub0, cwd.path(), "Claude · 1"),
+                small_size(),
+                GuestEnvironment::new([]),
+                "offline",
+            )
+            .unwrap(),
+            Pane::spawn_unavailable(
+                claude_native_spec_for(&stub1, cwd.path(), "Claude · 2"),
+                small_size(),
+                GuestEnvironment::new([]),
+                "offline",
+            )
+            .unwrap(),
+        ];
+        rig.gates = vec![crate::app::DeliveryGate::new(false); 2];
+        rig.last_output = vec![None; 2];
+        rig.spawned_at = vec![Instant::now(); 2];
+        rig.pulses = vec![None; 2];
+        rig.details = vec![crate::room_detail::RoomDetail::default(); 2];
+        rig.codex = vec![None, None];
+        rig.environments = vec![GuestEnvironment::new([]), GuestEnvironment::new([])];
+        {
+            let router = rig.router.as_mut().unwrap();
+            bind_claude_room(router, &mut rig.panes, 0, MINTED_A).unwrap();
+            bind_claude_room(router, &mut rig.panes, 1, MINTED_B).unwrap();
+        }
+        let gen0 = rig.router.as_ref().unwrap().binding_for(0).unwrap().generation;
+        let gen1 = rig.router.as_ref().unwrap().binding_for(1).unwrap().generation;
+
+        let f5 = crossterm::event::Event::Key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
+        let mut size = || Ok(small_size());
+        assert!(crate::app::run_rooms_restart_key(&f5, &mut rig.restart_context(1, &mut size)).unwrap());
+
+        let shown = rig.notice.ordered_lines().join("; ");
+        assert!(shown.contains("Claude · 2 restarted"), "{shown}");
+        assert!(!shown.contains("Claude · 1 restarted"), "{shown}");
+        assert_eq!(rig.router.as_ref().unwrap().binding_for(0).unwrap().generation, gen0);
+        assert!(rig.router.as_ref().unwrap().binding_for(1).unwrap().generation > gen1);
+        let launched = |path: &Path| {
+            fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| *line == "exec")
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while launched(&log1) < 1 {
+            assert!(Instant::now() < deadline, "room 1 was never relaunched");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(launched(&log1), 1);
+        assert_eq!(launched(&log0), 0, "room 0 must stay untouched");
+    }
+
+    /// The same two-room focus check for an offline native Codex room: only
+    /// room 1 resumes, under a new generation, with room 0 unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_r_at_focus_one_relaunches_only_the_codex_room() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub_root0 = tempfile::tempdir().unwrap();
+        let stub_root1 = tempfile::tempdir().unwrap();
+        let log0 = stub_root0.path().join("codex.calls");
+        let log1 = stub_root1.path().join("codex.calls");
+        let stub0 = gated_codex_stub(stub_root0.path(), &log0, &stub_root0.path().join("gate"), MINTED_B);
+        let stub1 = gated_codex_stub(stub_root1.path(), &log1, &stub_root1.path().join("gate"), MINTED_C);
+        session_state::upsert_minted("codex", cwd.path(), "Room A", MINTED_A).unwrap();
+        let mut rig = IterationHarness::new(root.path());
+        rig.panes[0] = Pane::spawn_unavailable(
+            codex_mint_spec(&stub0, cwd.path(), "Room A", MINTED_B),
+            small_size(),
+            GuestEnvironment::new([]),
+            "offline",
+        )
+        .unwrap();
+        rig.panes.push(
+            Pane::spawn_unavailable(
+                codex_mint_spec(&stub1, cwd.path(), "Room B", MINTED_C),
+                small_size(),
+                GuestEnvironment::new([]),
+                "offline",
+            )
+            .unwrap(),
+        );
+        rig.gates.push(crate::app::DeliveryGate::new(false));
+        rig.last_output.push(None);
+        rig.spawned_at.push(Instant::now());
+        rig.pulses.push(None);
+        rig.details.push(crate::room_detail::RoomDetail::default());
+        rig.codex.push(None);
+        rig.environments.push(GuestEnvironment::new([]));
+        let gen0 = GenerationAllocator::new(session_state::state_directory())
+            .next()
+            .unwrap();
+        let gen1 = gen0 + 1;
+        rig.router_mut()
+            .bind_codex(vec![
+                crate::native_route::CodexEntry {
+                    index: 0,
+                    title: "Room A".into(),
+                    room: Some(IterationHarness::healthy_room(&stub0, cwd.path(), MINTED_A)),
+                    generation: gen0,
+                    reason: None,
+                },
+                crate::native_route::CodexEntry {
+                    index: 1,
+                    title: "Room B".into(),
+                    room: Some(IterationHarness::healthy_room(&stub1, cwd.path(), MINTED_B)),
+                    generation: gen1,
+                    reason: None,
+                },
+            ])
+            .unwrap();
+
+        let ctrl_r = crossterm::event::Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        ));
+        let mut size = || Ok(small_size());
+        assert!(
+            crate::app::run_rooms_restart_key(&ctrl_r, &mut rig.restart_context(1, &mut size))
+                .unwrap()
+        );
+        let shown = rig.notice.ordered_lines().join("; ");
+        assert!(shown.contains("Room B restarted"), "{shown}");
+        assert!(!shown.contains("Room A restarted"), "{shown}");
+        assert_eq!(rig.router.as_ref().unwrap().binding_for(0).unwrap().generation, gen0);
+        let launched = |path: &Path| {
+            fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.starts_with("exec"))
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while launched(&log1) < 1 {
+            assert!(Instant::now() < deadline, "room 1 was never relaunched");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(launched(&log1), 1);
+        assert_eq!(launched(&log0), 0, "room 0 must stay untouched");
+        let prompt = fs::read_to_string(&log1).unwrap_or_default();
+        assert!(
+            prompt.contains("Automatic delivery pauses after 100 successful messages"),
+            "the seam must pass the loop's fuse size: {prompt}"
+        );
+    }
+
     /// The seam leaves an online Ctrl+R alone and the literal 0x12 byte still
     /// reaches the child, so reverse search keeps working (INV-5).
     #[cfg(unix)]
@@ -5622,26 +5798,30 @@ mod tests {
     fn an_online_ctrl_r_is_not_a_restart_and_forwards_0x12() {
         let (mut pane, captured) = pane_with_capture(4, 20);
         assert!(pane.is_online());
-        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let ctrl_r = crossterm::event::Event::Key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        ));
         let mut notice = crate::app::Notices::default();
-        crate::app::run_rooms_restart_key(
-            ctrl_r,
-            small_size(),
-            0,
-            std::slice::from_mut(&mut pane),
-            None,
-            &mut [None],
-            &mut [crate::app::DeliveryGate::new(false)],
-            &mut [None],
-            &mut [Instant::now()],
-            &mut [None],
-            &[GuestEnvironment::new([])],
-            100,
-            Instant::now(),
-            &mut notice,
-        );
+        let mut size = || Ok(small_size());
+        let mut context = crate::app::RestartContext {
+            focused: 0,
+            fuse_size: 100,
+            pane_size: &mut size,
+            panes: std::slice::from_mut(&mut pane),
+            router: None,
+            codex: &mut [None],
+            delivery_gates: &mut [crate::app::DeliveryGate::new(false)],
+            last_output: &mut [None],
+            spawned_at: &mut [Instant::now()],
+            room_pulses: &mut [None],
+            environments: &[GuestEnvironment::new([])],
+            notice: &mut notice,
+        };
+        assert!(!crate::app::run_rooms_restart_key(&ctrl_r, &mut context).unwrap());
         assert!(notice.ordered_lines().is_empty());
-        assert!(crate::app::forward_key(&mut pane, ctrl_r).is_none());
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(crate::app::forward_key(&mut pane, key).is_none());
         wait_for_captured(&captured, &[0x12]);
     }
 
