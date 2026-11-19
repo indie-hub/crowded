@@ -299,8 +299,13 @@ submitted, not that the agent acted on it: the mail log shows `ACCEPTED by
 Claude (submitted; not proof it was acted on)`. A refused submission stays
 `HELD`; a collected-but-unreceipted one stays `UNCERTAIN`, never resent. Mail
 saved for an earlier generation stays held, never delivered to a new session.
-A stored id is trusted without an existence check: an id whose transcript is
-gone makes the launch fail and the room stays offline with the CLI's reason.
+A stored reported id is resumed only when its exact session file exists: Claude
+keeps sessions at `<config>/projects/<cwd-encoded>/<id>.jsonl`, where
+`<cwd-encoded>` is the cwd with every character that is not a letter or digit
+replaced by `-` (`/Users/bruno/.meridian` becomes `-Users-bruno--meridian`).
+If that file is absent, or the cwd encodes differently (a very long path Claude
+may truncate, for instance), the room starts fresh and the hook reports the new
+session. No id is guessed and no stale id is retried.
 
 Before its session is known, a fresh room's mod reads the per-room bootstrap
 connection file `<cwd>/.crowded/claude-inbox/_bootstrap.<room>.json` (named by

@@ -846,10 +846,22 @@ fn claude_config_dir() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".claude"))
 }
 
+/// The `projects` directory name Claude derives from a cwd: every character
+/// that is not an ASCII letter or digit becomes `-`, so
+/// `/Users/bruno/.meridian` maps to `-Users-bruno--meridian`. A cwd Claude
+/// encodes differently (very long paths it may truncate) matches no directory
+/// and therefore never resumes; only an exact name is accepted.
+fn claude_project_dir_name(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 /// Whether the exact Claude session file for this room's cwd exists. Claude
-/// stores sessions at `<config>/projects/<cwd-encoded>/<session-id>.jsonl`,
-/// where `<cwd-encoded>` is the cwd with `/` replaced by `-`. If the layout or
-/// config dir cannot be determined, this fails safe to `false`.
+/// stores sessions at `<config>/projects/<cwd-encoded>/<session-id>.jsonl`.
+/// If the layout or config dir cannot be determined, this fails safe to
+/// `false`.
 fn claude_session_file_exists(cwd: &Path, session: &str) -> bool {
     if !codex_native::valid_uuid(session) {
         return false;
@@ -857,7 +869,7 @@ fn claude_session_file_exists(cwd: &Path, session: &str) -> bool {
     let Some(config) = claude_config_dir() else {
         return false;
     };
-    let encoded = cwd.to_string_lossy().replace('/', "-");
+    let encoded = claude_project_dir_name(cwd);
     if encoded.is_empty() {
         return false;
     }
@@ -2493,7 +2505,13 @@ mod tests {
 
     #[cfg(unix)]
     fn materialize_claude_session(config_dir: &Path, cwd: &Path, session: &str) {
-        let encoded = cwd.to_string_lossy().replace('/', "-");
+        // Claude's observed directory encoding, spelled out here so this helper
+        // cannot drift together with the production rule it checks.
+        let encoded: String = cwd
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
         let dir = config_dir.join("projects").join(encoded);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(format!("{session}.jsonl")), b"{}\n").unwrap();
@@ -4940,6 +4958,62 @@ mod tests {
             !specs[0].args.iter().any(|a| a == "--session-id"),
             "{:?}",
             specs[0].args
+        );
+    }
+
+    /// Claude encodes a cwd by replacing every character that is not a letter
+    /// or digit with `-`; dotted and underscored cwds still resume.
+    #[cfg(unix)]
+    #[test]
+    fn claude_projects_encode_dotted_and_underscored_cwds() {
+        const MERIDIAN: &str = "/Users/bruno/.meridian";
+        const MERIDIAN_ENCODED: &str = "-Users-bruno--meridian";
+        const UNDERSCORED: &str =
+            "/Users/bruno/Documents/Development/FVR/05_ai-projects/AI-Workshop/workshop-ai-2026";
+        const UNDERSCORED_ENCODED: &str =
+            "-Users-bruno-Documents-Development-FVR-05-ai-projects-AI-Workshop-workshop-ai-2026";
+
+        assert_eq!(
+            claude_project_dir_name(Path::new(MERIDIAN)),
+            MERIDIAN_ENCODED
+        );
+        assert_eq!(
+            claude_project_dir_name(Path::new(UNDERSCORED)),
+            UNDERSCORED_ENCODED
+        );
+
+        let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
+        let base = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+
+        for name in ["plainproject", "dot.project", "under_score_project"] {
+            let cwd = base.path().join(name);
+            fs::create_dir_all(&cwd).unwrap();
+            session_state::upsert_reported("claude", &cwd, "Claude · 1", MINTED_A).unwrap();
+            materialize_claude_session(_claude_config.path(), &cwd, MINTED_A);
+            let mut specs = vec![claude_native_spec_for(&stub, &cwd, "Claude · 1")];
+            let (starts, notices) = start_claude_sessions(&mut specs);
+            assert!(notices.is_empty(), "{notices:?}");
+            assert!(
+                matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A),
+                "{name}: {:?}",
+                starts[0]
+            );
+        }
+
+        // A reported id with no session file for its cwd starts fresh.
+        let absent = base.path().join("abs.ent");
+        fs::create_dir_all(&absent).unwrap();
+        session_state::upsert_reported("claude", &absent, "Claude · 1", MINTED_A).unwrap();
+        let mut specs = vec![claude_native_spec_for(&stub, &absent, "Claude · 1")];
+        let (starts, notices) = start_claude_sessions(&mut specs);
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(
+            matches!(&starts[0], Some(ClaudeStart::Fresh)),
+            "{:?}",
+            starts[0]
         );
     }
 
