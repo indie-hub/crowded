@@ -75,7 +75,12 @@ export function register(on) {
       const sessionId = await $.session.id();
       let file = `${cwd}/.crowded/claude-inbox/${sessionId}.json`;
       if (!(await $.fs.exists(file))) {
-        const bootstrap = `${cwd}/.crowded/claude-inbox/_bootstrap.json`;
+        const room = process.env.CROWDED_ROOM;
+        if (typeof room !== "string" || !/^[0-9]+$/.test(room)) {
+          $.ui.status("Crowded inbox not connected");
+          return next(e);
+        }
+        const bootstrap = `${cwd}/.crowded/claude-inbox/_bootstrap.${room}.json`;
         if (!(await $.fs.exists(bootstrap))) {
           $.ui.status("Crowded inbox not connected");
           return next(e);

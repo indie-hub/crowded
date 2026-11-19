@@ -1907,7 +1907,7 @@ pub(crate) fn relaunch_claude_room(
             Some(session.clone())
         } else {
             inbox
-                .prepare(&cwd, generation)
+                .prepare(&cwd, index + 1, generation)
                 .map_err(|error| launch_failure(&title, index + 1, error))?;
             None
         };
@@ -2291,7 +2291,7 @@ fn apply_session_report(
         }
         panes[from].record_session(&session);
         router
-            .rebind_claude(from, title.clone(), &session, generation)
+            .rebind_claude(from, title.clone(), panes[from].cwd(), &session, generation)
             .map_err(|error| format!("{title} could not be rebound: {error}"))?;
     } else {
         let Some(current_binding) = current.clone() else {

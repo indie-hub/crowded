@@ -1072,9 +1072,10 @@ pub(crate) fn bind_claude_rooms(
             }
             ClaudeStart::Fresh => {
                 let cwd = working_directory(specs[index].cwd.as_deref())?;
+                let room = index + 1;
                 let prepared = router
                     .claude_inbox(index)
-                    .and_then(|inbox| inbox.prepare(&cwd, generation));
+                    .and_then(|inbox| inbox.prepare(&cwd, room, generation));
                 if let Err(error) = prepared {
                     let reason = format!("{}: {error}", specs[index].title);
                     notices.push(format!("{reason}; the room was not started"));
@@ -4767,7 +4768,7 @@ mod tests {
         )
         .unwrap();
         assert!(bind_claude_rooms(&mut router, &specs, &mut sessions).unwrap().is_empty());
-        assert!(crate::claude_inbox::bootstrap_file(cwd.path()).unwrap().exists());
+        assert!(crate::claude_inbox::bootstrap_file(cwd.path(), 1).unwrap().exists());
         assert!(router.binding_for(0).is_none(), "session is learned from the hook");
 
         session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
@@ -4775,6 +4776,77 @@ mod tests {
         let (again_starts, _) = start_claude_sessions(&mut again);
         assert!(matches!(&again_starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A), "{again_starts:?}");
         assert_eq!(args_after(&again[0].args, "--resume").first(), Some(&OsString::from(MINTED_A)));
+    }
+
+    /// Two fresh Claude rooms in the same cwd get distinct per-room bootstrap
+    /// files and inbox endpoints so deliver resolves each room's own connection.
+    /// Rebind promotes a room's bootstrap to its reported session file without
+    /// touching the other room.
+    #[cfg(unix)]
+    #[test]
+    fn two_fresh_claude_rooms_in_one_cwd_have_distinct_bootstrap_inboxes() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+        let mut specs = vec![
+            claude_native_spec_for(&stub, cwd.path(), "Claude · 1"),
+            claude_native_spec_for(&stub, cwd.path(), "Claude · 2"),
+        ];
+
+        let (mut sessions, notices) = start_claude_sessions(&mut specs);
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(matches!(&sessions[0], Some(ClaudeStart::Fresh)), "{:?}", sessions[0]);
+        assert!(matches!(&sessions[1], Some(ClaudeStart::Fresh)), "{:?}", sessions[1]);
+
+        let mut router = crate::native_route::NativeRouter::start(
+            session_state::state_directory().join("native-outbox.json"),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(bind_claude_rooms(&mut router, &specs, &mut sessions).unwrap().is_empty());
+
+        let boot1 = crate::claude_inbox::bootstrap_file(cwd.path(), 1).unwrap();
+        let boot2 = crate::claude_inbox::bootstrap_file(cwd.path(), 2).unwrap();
+        assert!(boot1.exists(), "room 1 bootstrap must exist");
+        assert!(boot2.exists(), "room 2 bootstrap must exist");
+        assert_ne!(boot1, boot2, "bootstrap files must be per room");
+        assert!(
+            !cwd.path().join(".crowded/claude-inbox/_bootstrap.json").exists(),
+            "shared bootstrap file must not exist"
+        );
+
+        let c1: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&boot1).unwrap()).unwrap();
+        let c2: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&boot2).unwrap()).unwrap();
+        assert_ne!(c1["token"], c2["token"], "each room must have its own token");
+        assert!(c1["url"].as_str().is_some_and(|u| u.starts_with("http://")));
+        assert!(c2["url"].as_str().is_some_and(|u| u.starts_with("http://")));
+        // Different inbox instances may bind different loopback ports and always
+        // have different tokens, so each bootstrap resolves to its own endpoint.
+        assert!(
+            c1["url"] != c2["url"] || c1["token"] != c2["token"],
+            "each room must resolve to its own endpoint"
+        );
+
+        // Reporting room 1's session replaces only room 1's bootstrap with its
+        // session file; room 2 remains on its own bootstrap.
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        router
+            .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), MINTED_A, 2)
+            .unwrap();
+        assert!(!boot1.exists(), "room 1 bootstrap must be removed on report");
+        assert!(
+            crate::claude_inbox::connection_file(cwd.path(), MINTED_A)
+                .unwrap()
+                .exists(),
+            "room 1 session connection file must exist"
+        );
+        assert!(boot2.exists(), "room 2 bootstrap must remain untouched");
+        let c2_after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&boot2).unwrap()).unwrap();
+        assert_eq!(c2, c2_after, "room 2 endpoint must be unchanged");
     }
 
     /// Every message to a bound Claude room is held, not just the first.
@@ -8523,7 +8595,9 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         const SECOND: &str = "3f8f8f8f-3333-4333-8333-333333333333";
         let generation = next_generation().unwrap();
         let title = "Claude · 1".to_owned();
-        router.rebind_claude(0, title, SECOND, generation).unwrap();
+        router
+            .rebind_claude(0, title, cwd.path(), SECOND, generation)
+            .unwrap();
         router
             .send(&mut mailroom, "Sender", 0, "second", None)
             .unwrap();

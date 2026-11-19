@@ -50,6 +50,8 @@ pub(crate) struct ClaudeInbox {
     state: Arc<Mutex<State>>,
     /// The connection file the room's mod reads, if one is written.
     file: Mutex<Option<PathBuf>>,
+    /// Bootstrap connection file written before the room's session is known.
+    bootstrap: Mutex<Option<PathBuf>>,
     now: Clock,
     wait: Duration,
 }
@@ -120,6 +122,7 @@ impl ClaudeInbox {
             token,
             state,
             file: Mutex::new(None),
+            bootstrap: Mutex::new(None),
             now,
             wait,
         })
@@ -142,10 +145,33 @@ impl ClaudeInbox {
     }
 
     /// Prepares the inbox for a fresh launch whose session will be learned from
-    /// the room's hook. Writes a bootstrap connection file the mod can find.
-    pub(crate) fn prepare(&self, cwd: &Path, generation: u64) -> io::Result<()> {
+    /// the room's hook. Writes a per-room bootstrap connection file the mod can
+    /// find via `CROWDED_ROOM`.
+    pub(crate) fn prepare(&self, cwd: &Path, room: usize, generation: u64) -> io::Result<()> {
         self.relaunch(generation);
-        let path = bootstrap_file(cwd)?;
+        let path = bootstrap_file(cwd, room)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("the Claude inbox file has no directory"))?;
+        create_private_directory(parent)?;
+        self.write_connection(&path)?;
+        if let Ok(mut bootstrap) = self.bootstrap.lock() {
+            *bootstrap = Some(path);
+        }
+        Ok(())
+    }
+
+    /// Binds a reported session to an inbox already connected via its per-room
+    /// bootstrap file. The mod's receiver stays bound while the bootstrap file
+    /// is replaced by the session-specific connection file.
+    pub(crate) fn adopt_reported_session(
+        &self,
+        cwd: &Path,
+        session: &str,
+        generation: u64,
+    ) -> io::Result<()> {
+        self.retarget(generation);
+        let path = connection_file(cwd, session)?;
         let parent = path
             .parent()
             .ok_or_else(|| io::Error::other("the Claude inbox file has no directory"))?;
@@ -153,6 +179,11 @@ impl ClaudeInbox {
         self.write_connection(&path)?;
         if let Ok(mut file) = self.file.lock() {
             *file = Some(path);
+        }
+        if let Ok(mut bootstrap) = self.bootstrap.lock()
+            && let Some(path) = bootstrap.take()
+        {
+            let _ = fs::remove_file(path);
         }
         Ok(())
     }
@@ -181,6 +212,11 @@ impl ClaudeInbox {
         }
         if let Ok(mut file) = self.file.lock()
             && let Some(path) = file.take()
+        {
+            let _ = fs::remove_file(path);
+        }
+        if let Ok(mut bootstrap) = self.bootstrap.lock()
+            && let Some(path) = bootstrap.take()
         {
             let _ = fs::remove_file(path);
         }
@@ -248,6 +284,11 @@ impl Drop for ClaudeInbox {
         {
             let _ = fs::remove_file(path);
         }
+        if let Ok(mut bootstrap) = self.bootstrap.lock()
+            && let Some(path) = bootstrap.take()
+        {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -265,12 +306,14 @@ pub(crate) fn connection_file(cwd: &Path, session: &str) -> io::Result<PathBuf> 
         .join(format!("{session}.json")))
 }
 
-/// The bootstrap connection file used before the room's session is known.
-pub(crate) fn bootstrap_file(cwd: &Path) -> io::Result<PathBuf> {
+/// The per-room bootstrap connection file used before the room's session is
+/// known. Named by `CROWDED_ROOM` so fresh rooms in the same cwd never share a
+/// connection file.
+pub(crate) fn bootstrap_file(cwd: &Path, room: usize) -> io::Result<PathBuf> {
     Ok(cwd
         .join(".crowded")
         .join("claude-inbox")
-        .join("_bootstrap.json"))
+        .join(format!("_bootstrap.{room}.json")))
 }
 
 pub(crate) fn write_private(path: &Path, contents: &str) -> io::Result<()> {

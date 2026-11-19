@@ -269,16 +269,15 @@ native_delivery = true
 
 ### Native Claude rooms (opt-in)
 
-A Claude room can be given a session id by Crowded: it starts with
-`claude --session-id <uuid>` and the binding is saved before its terminal
-starts. Successive launches behave like a native Codex room's: restart resumes
-the stored id with `claude --resume <id>`, `control N clear` writes the durable
-cleared marker first and then starts a new id, and `control N resume` without a
-stored id fails with a visible reason and mints nothing. The room's own
-SessionStart hook can report a new id after `/clear`, which rebinds it under a
-new launch generation. A user-supplied `--resume`, `--continue`,
-`--session-id` or `--fork-session` is refused for such a room, because the
-session is Crowded's to choose.
+Crowded never guesses a Claude session id. A fresh room starts with no
+`--session-id` and no `--resume`, waits for the room's own hook to report the
+real session, and only then binds native delivery to that reported session.
+`control N restart` and `control N resume` resume a hook-reported session with
+`claude --resume <id>`; `control N resume` without a reported session fails
+with a visible reason and starts nothing. `control N clear` writes the durable
+cleared marker first and then starts fresh without guessing a session. A
+user-supplied `--resume`, `--continue`, `--session-id` or `--fork-session` is
+refused for such a room, because the session is learned from the room's hook.
 
 With `native_delivery = true` the launch also passes `--plugin-dir
 <cwd>/.crowded/claude-mod`: the delivery mod ships inside the Crowded binary
@@ -288,10 +287,10 @@ platform supports it, and a room whose mod cannot be written does not start.
 Every launch passes `--plugin-dir` exactly once; a user-supplied
 `--plugin-dir` is left alone and gets no Crowded mod.
 
-A Claude relaunch writes the new session entry and binds the room before it
-starts the terminal, and does not roll either back. If the start fails after
-that, the room is reported with `control N clear` and may stay recorded on a
-session that did not start.
+A Claude relaunch binds the room before it starts the terminal and does not
+roll either back. If the start fails after that, the room is reported with
+`control N clear` and may stay recorded or bound on a session that did not
+start.
 
 Mail to a Claude room is saved first in `.crowded/native-outbox.json`, then
 handed to the room's loopback inbox, which its mod polls every 500 ms and
@@ -303,12 +302,15 @@ saved for an earlier generation stays held, never delivered to a new session.
 A stored id is trusted without an existence check: an id whose transcript is
 gone makes the launch fail and the room stays offline with the CLI's reason.
 
-The mod reads one connection file, `<cwd>/.crowded/claude-inbox/<session
-id>.json`, holding the inbox URL and the room's token. It is written at
-launch, removed when its launch is replaced and on exit; a session-report
-rebind keeps the same file and receiver. The mod is inert outside Crowded:
-with no live file it registers and submits nothing. Both live under
-`.crowded/`, which `crowded init` already adds to the project's `.gitignore`.
+Before its session is known, a fresh room's mod reads the per-room bootstrap
+connection file `<cwd>/.crowded/claude-inbox/_bootstrap.<room>.json` (named by
+`CROWDED_ROOM`), holding the inbox URL and the room's token. Once the hook
+reports the real session, the bootstrap file is replaced by
+`<cwd>/.crowded/claude-inbox/<session id>.json` and the same receiver stays
+bound. Connection files are removed when their launch is replaced and on exit.
+The mod is inert outside Crowded: with no live file it registers and submits
+nothing. Both live under `.crowded/`, which `crowded init` already adds to the
+project's `.gitignore`.
 
 This needs a Claude Code that loads `--plugin-dir` plugins and exposes the mod
 prompt API (validated on 2.1.322). Not verified: approval or trust prompts for

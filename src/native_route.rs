@@ -547,17 +547,19 @@ impl NativeRouter {
     }
 
     /// Rebinds a Claude room to a session its own hook reported. The mod's
-    /// process did not restart, so its receiver stays bound and the inbox only
-    /// moves to the reported generation.
+    /// process did not restart, so its receiver stays bound while the inbox
+    /// replaces the per-room bootstrap connection file with the reported
+    /// session's connection file.
     pub(crate) fn rebind_claude(
         &mut self,
         index: usize,
         title: String,
+        cwd: &std::path::Path,
         session: &str,
         generation: u64,
     ) -> io::Result<()> {
         let inbox = self.claude_inbox(index)?;
-        inbox.retarget(generation);
+        inbox.adopt_reported_session(cwd, session, generation)?;
         self.rebind_room(RoomEntry {
             index,
             title,
@@ -2731,7 +2733,7 @@ mod tests {
         // not restart, so it goes on polling, and only new-generation mail is
         // offered to it. The launch's connection file stays.
         router
-            .rebind_claude(0, "Claude · 1".to_owned(), CLAUDE_B, 2)
+            .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), CLAUDE_B, 2)
             .unwrap();
         assert_eq!(
             old_mod.resumed().next_status(),
