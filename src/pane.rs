@@ -4251,25 +4251,25 @@ mod tests {
                     .unwrap();
         }
 
-        fn restart_context<'a>(
+        fn loop_state<'a>(
             &'a mut self,
             focused: usize,
-            size: &'a mut dyn FnMut() -> io::Result<PtySize>,
-        ) -> crate::app::RestartContext<'a> {
-            crate::app::RestartContext {
+            size: &'a mut dyn FnMut(usize) -> io::Result<PtySize>,
+        ) -> crate::app::LoopState<'a> {
+            crate::app::loop_state(
                 focused,
-                fuse_size: 100,
-                pane_size: size,
-                panes: &mut self.panes,
-                router: self.router.as_mut(),
-                codex: &mut self.codex,
-                delivery_gates: &mut self.gates,
-                last_output: &mut self.last_output,
-                spawned_at: &mut self.spawned_at,
-                room_pulses: &mut self.pulses,
-                environments: &self.environments,
-                notice: &mut self.notice,
-            }
+                100,
+                size,
+                &mut self.panes,
+                self.router.as_mut(),
+                &mut self.codex,
+                &mut self.gates,
+                &mut self.last_output,
+                &mut self.spawned_at,
+                &mut self.pulses,
+                &self.environments,
+                &mut self.notice,
+            )
         }
 
         fn iterate(&mut self) {
@@ -5525,8 +5525,8 @@ mod tests {
         let old = rig.router.as_ref().unwrap().binding_for(0).unwrap().generation;
 
         let f5 = crossterm::event::Event::Key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
-        let mut size = || Ok(small_size());
-        assert!(crate::app::run_rooms_restart_key(&f5, &mut rig.restart_context(0, &mut size)).unwrap());
+        let mut size = |_index: usize| Ok(small_size());
+        assert!(!crate::app::run_rooms_key_event(&f5, &mut rig.loop_state(0, &mut size)).unwrap());
 
         let shown = rig.notice.ordered_lines().join("; ");
         assert!(shown.ends_with("restarted"), "{shown}");
@@ -5586,9 +5586,9 @@ mod tests {
             KeyCode::Char('r'),
             KeyModifiers::CONTROL,
         ));
-        let mut size = || Ok(small_size());
+        let mut size = |_index: usize| Ok(small_size());
         assert!(
-            crate::app::run_rooms_restart_key(&ctrl_r, &mut rig.restart_context(0, &mut size))
+            !crate::app::run_rooms_key_event(&ctrl_r, &mut rig.loop_state(0, &mut size))
                 .unwrap()
         );
 
@@ -5671,8 +5671,13 @@ mod tests {
         let gen1 = rig.router.as_ref().unwrap().binding_for(1).unwrap().generation;
 
         let f5 = crossterm::event::Event::Key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
-        let mut size = || Ok(small_size());
-        assert!(crate::app::run_rooms_restart_key(&f5, &mut rig.restart_context(1, &mut size)).unwrap());
+        let requested = std::cell::Cell::new(usize::MAX);
+        let mut size = |index: usize| {
+            requested.set(index);
+            Ok(small_size())
+        };
+        assert!(!crate::app::run_rooms_key_event(&f5, &mut rig.loop_state(1, &mut size)).unwrap());
+        assert_eq!(requested.get(), 1, "the step sizes the focused pane");
 
         let shown = rig.notice.ordered_lines().join("; ");
         assert!(shown.contains("Claude · 2 restarted"), "{shown}");
@@ -5761,11 +5766,16 @@ mod tests {
             KeyCode::Char('r'),
             KeyModifiers::CONTROL,
         ));
-        let mut size = || Ok(small_size());
+        let requested = std::cell::Cell::new(usize::MAX);
+        let mut size = |index: usize| {
+            requested.set(index);
+            Ok(small_size())
+        };
         assert!(
-            crate::app::run_rooms_restart_key(&ctrl_r, &mut rig.restart_context(1, &mut size))
+            !crate::app::run_rooms_key_event(&ctrl_r, &mut rig.loop_state(1, &mut size))
                 .unwrap()
         );
+        assert_eq!(requested.get(), 1, "the step sizes the focused pane");
         let shown = rig.notice.ordered_lines().join("; ");
         assert!(shown.contains("Room B restarted"), "{shown}");
         assert!(!shown.contains("Room A restarted"), "{shown}");
@@ -5791,6 +5801,51 @@ mod tests {
         );
     }
 
+    /// An ordinary key is not consumed by the step: it reaches the focused
+    /// pane's input handling, while the other pane sees nothing (INV-5).
+    #[cfg(unix)]
+    #[test]
+    fn an_ordinary_key_is_forwarded_to_the_focused_pane_only() {
+        let (pane0, captured0) = pane_with_capture(4, 20);
+        let (pane1, captured1) = pane_with_capture(4, 20);
+        let mut panes = vec![pane0, pane1];
+        let mut codex = [None, None];
+        let mut gates = [
+            crate::app::DeliveryGate::new(false),
+            crate::app::DeliveryGate::new(false),
+        ];
+        let mut last_output = [None, None];
+        let mut spawned_at = [Instant::now(), Instant::now()];
+        let mut pulses = [None, None];
+        let environments = [GuestEnvironment::new([]), GuestEnvironment::new([])];
+        let mut notice = crate::app::Notices::default();
+        let mut size = |_index: usize| Ok(small_size());
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let event = crossterm::event::Event::Key(key);
+        let mut state = crate::app::loop_state(
+            1,
+            100,
+            &mut size,
+            &mut panes,
+            None,
+            &mut codex,
+            &mut gates,
+            &mut last_output,
+            &mut spawned_at,
+            &mut pulses,
+            &environments,
+            &mut notice,
+        );
+        assert!(crate::app::run_rooms_key_event(&event, &mut state).unwrap());
+        assert!(notice.ordered_lines().is_empty());
+        assert!(crate::app::forward_key(&mut panes[1], key).is_none());
+        wait_for_captured(&captured1, b"a");
+        assert!(
+            captured0.lock().unwrap().is_empty(),
+            "the other pane must see nothing"
+        );
+    }
+
     /// The seam leaves an online Ctrl+R alone and the literal 0x12 byte still
     /// reaches the child, so reverse search keeps working (INV-5).
     #[cfg(unix)]
@@ -5803,22 +5858,28 @@ mod tests {
             KeyModifiers::CONTROL,
         ));
         let mut notice = crate::app::Notices::default();
-        let mut size = || Ok(small_size());
-        let mut context = crate::app::RestartContext {
-            focused: 0,
-            fuse_size: 100,
-            pane_size: &mut size,
-            panes: std::slice::from_mut(&mut pane),
-            router: None,
-            codex: &mut [None],
-            delivery_gates: &mut [crate::app::DeliveryGate::new(false)],
-            last_output: &mut [None],
-            spawned_at: &mut [Instant::now()],
-            room_pulses: &mut [None],
-            environments: &[GuestEnvironment::new([])],
-            notice: &mut notice,
-        };
-        assert!(!crate::app::run_rooms_restart_key(&ctrl_r, &mut context).unwrap());
+        let mut size = |_index: usize| Ok(small_size());
+        let mut codex = [None];
+        let mut gates = [crate::app::DeliveryGate::new(false)];
+        let mut last_output = [None];
+        let mut spawned_at = [Instant::now()];
+        let mut pulses = [None];
+        let environments = [GuestEnvironment::new([])];
+        let mut context = crate::app::loop_state(
+            0,
+            100,
+            &mut size,
+            std::slice::from_mut(&mut pane),
+            None,
+            &mut codex,
+            &mut gates,
+            &mut last_output,
+            &mut spawned_at,
+            &mut pulses,
+            &environments,
+            &mut notice,
+        );
+        assert!(crate::app::run_rooms_key_event(&ctrl_r, &mut context).unwrap());
         assert!(notice.ordered_lines().is_empty());
         let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
         assert!(crate::app::forward_key(&mut pane, key).is_none());
