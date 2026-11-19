@@ -8858,11 +8858,15 @@ mod tests {
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 const [modPath, cwd, session, marker] = process.argv.slice(2);
+// The real Claude mod sandbox has no `process`; hide it so a stray use fails here too.
+const room = process.env.CROWDED_ROOM;
+delete globalThis.process;
 const { register } = await import(pathToFileURL(modPath).href);
 const log = (t) => appendFileSync(marker, `${t}\n`);
 const $ = {
   fs: { exists: async (p) => readFile(p).then(() => true, () => false), read: (p) => readFile(p, "utf8") },
   session: { id: async () => session },
+  env: { get: async (name) => (name === "CROWDED_ROOM" ? room : undefined) },
   http: { fetch: async (url, init) => fetch(url, init).then(async (r) => ({ ok: r.ok, status: r.status, text: await r.text() })) },
   clock: { every: (ms, cb) => setInterval(() => { void cb(); }, ms) },
   ui: { status: (t) => log(`STATUS ${t}`) },
@@ -8980,11 +8984,15 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 const [modPath, cwd, session, marker] = process.argv.slice(2);
+// The real Claude mod sandbox has no `process`; hide it so a stray use fails here too.
+const room = process.env.CROWDED_ROOM;
+delete globalThis.process;
 const { register } = await import(pathToFileURL(modPath).href);
 const log = (t) => appendFileSync(marker, `${t}\n`);
 const $ = {
   fs: { exists: async (p) => readFile(p).then(() => true, () => false), read: (p) => readFile(p, "utf8") },
   session: { id: async () => session },
+  env: { get: async (name) => (name === "CROWDED_ROOM" ? room : undefined) },
   http: { fetch: async (url, init) => fetch(url, init).then(async (r) => ({ ok: r.ok, status: r.status, text: await r.text() })) },
   clock: { every: (ms, cb) => setInterval(() => { void cb(); }, ms) },
   ui: { status: (t) => log(`STATUS ${t}`) },
@@ -9128,11 +9136,15 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 const [modPath, cwd, session, marker] = process.argv.slice(2);
+// The real Claude mod sandbox has no `process`; hide it so a stray use fails here too.
+const room = process.env.CROWDED_ROOM;
+delete globalThis.process;
 const { register } = await import(pathToFileURL(modPath).href);
 const log = (t) => appendFileSync(marker, `${t}\n`);
 const $ = {
   fs: { exists: async (p) => readFile(p).then(() => true, () => false), read: (p) => readFile(p, "utf8") },
   session: { id: async () => session },
+  env: { get: async (name) => (name === "CROWDED_ROOM" ? room : undefined) },
   http: { fetch: async (url, init) => fetch(url, init).then(async (r) => ({ ok: r.ok, status: r.status, text: await r.text() })) },
   clock: { every: (ms, cb) => setInterval(() => { void cb(); }, ms) },
   ui: { status: (t) => log(`STATUS ${t}`) },
@@ -9249,11 +9261,15 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 const [modPath, cwd, session, marker] = process.argv.slice(2);
+// The real Claude mod sandbox has no `process`; hide it so a stray use fails here too.
+const room = process.env.CROWDED_ROOM;
+delete globalThis.process;
 const { register } = await import(pathToFileURL(modPath).href);
 const log = (t) => appendFileSync(marker, `${t}\n`);
 const $ = {
   fs: { exists: async (p) => readFile(p).then(() => true, () => false), read: (p) => readFile(p, "utf8") },
   session: { id: async () => session },
+  env: { get: async (name) => (name === "CROWDED_ROOM" ? room : undefined) },
   http: { fetch: async (url, init) => fetch(url, init).then(async (r) => ({ ok: r.ok, status: r.status, text: await r.text() })) },
   clock: { every: (ms, cb) => setInterval(() => { void cb(); }, ms) },
   ui: { status: (t) => log(`STATUS ${t}`) },

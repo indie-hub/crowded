@@ -62,11 +62,12 @@ async function createContractInbox(token, { registerConflict = false } = {}) {
   };
 }
 
-function makeHost({ inbox, fileContent, fileExists = true, sessionId = "session-1", interactive = true, submitImpl, fetchImpl }) {
+function makeHost({ inbox, fileContent, fileExists = true, sessionId = "session-1", interactive = true, submitImpl, fetchImpl, room = "1" }) {
   const timers = [], statuses = [], submits = [], fetchCalls = [];
   return {
     host: {
-      fs: { exists: async () => fileExists, read: async () => fileContent ?? JSON.stringify({ url: inbox.url, token: inbox.token }) },
+      fs: { exists: async () => fileExists, read: async () => fileContent ?? JSON.stringify({ url: inbox.url, token: inbox.token, room: 1 }) },
+      env: { get: async (name) => (name === "CROWDED_ROOM" ? room ?? undefined : undefined) },
       session: { id: async () => sessionId },
       http: { fetch: async (url, init) => { fetchCalls.push(url); if (fetchImpl) return fetchImpl(url, init, fetchCalls.length); const r = await fetch(url, init); return { ok: r.ok, status: r.status, text: await r.text() }; } },
       clock: { every: (ms, cb) => { timers.push({ ms, cb }); } },
@@ -82,7 +83,14 @@ async function startMod(opts) {
   const hooks = new Map();
   const ctx = makeHost(opts);
   mod.register((event, fn) => hooks.set(event, fn));
-  await hooks.get("session.start")(ctx.host, ctx.event, async (e) => e);
+  // The real Claude mod sandbox has no `process`; run session.start without it.
+  const realProcess = globalThis.process;
+  delete globalThis.process;
+  try {
+    await hooks.get("session.start")(ctx.host, ctx.event, async (e) => e);
+  } finally {
+    globalThis.process = realProcess;
+  }
   return { ...ctx, hooks };
 }
 
@@ -190,6 +198,9 @@ test("missing or invalid file and wrong-shape url/token -> inert", async (t) => 
     { fileContent: JSON.stringify({ url: inbox.url, token: "g".repeat(63) }) },
   ];
   for (const c of cases) {
+    if (c.fileContent) {
+      try { c.fileContent = JSON.stringify({ ...JSON.parse(c.fileContent), room: 1 }); } catch {}
+    }
     const before = inbox.calls.register;
     const ctx = await startMod({ inbox, ...c });
     assert.equal(ctx.timers.length, 0, JSON.stringify(c));
@@ -317,4 +328,26 @@ test("R5 receipt body echoes id and sha256", async (t) => {
   await ctx.timers[0].cb();
   assert.equal(inbox.receipts[0].id, "m1");
   assert.equal(inbox.receipts[0].sha256, sha("echo"));
+});
+
+test("room comes from $.env.get and a missing or non-numeric room fails closed", async (t) => {
+  const inbox = await createContractInbox("a".repeat(64));
+  t.after(() => inbox.close());
+  for (const room of [null, "", "abc", "1x", "2"]) {
+    const before = inbox.calls.register;
+    const ctx = await startMod({ inbox, room });
+    assert.ok(ctx.statuses.includes("Crowded inbox not connected"), String(room));
+    assert.equal(ctx.timers.length, 0, String(room));
+    assert.equal(inbox.calls.register, before, String(room));
+  }
+  const ok = await startMod({ inbox, room: "1" });
+  assert.ok(ok.statuses.includes("Crowded inbox connected"));
+});
+
+test("mod source uses no Node globals the Claude mod sandbox lacks", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("./hooks/deliver.mjs", import.meta.url), "utf8");
+  for (const banned of [/\bprocess\b/, /\brequire\s*\(/, /\bBuffer\b/]) {
+    assert.doesNotMatch(source, banned);
+  }
 });

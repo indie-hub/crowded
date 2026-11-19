@@ -72,7 +72,8 @@ export function register(on) {
     if (!e.isInteractive) return next(e);
     const cwd = e.cwd;
     try {
-      const room = process.env.CROWDED_ROOM;
+      // The mod sandbox has no Node globals; $.env is its only way to the environment.
+      const room = await $.env.get("CROWDED_ROOM");
       if (typeof room !== "string" || !/^[0-9]+$/.test(room)) {
         $.ui.status("Crowded inbox not connected");
         return next(e);
