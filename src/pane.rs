@@ -833,10 +833,54 @@ fn refuse_claude_session_args(spec: &RoomSpec) -> io::Result<()> {
     ))
 }
 
-/// The session the room's own hook reported for this room. Crowded must not
-/// guess sessions.
+/// The Claude config directory: `CLAUDE_CONFIG_DIR` when set, otherwise
+/// `$HOME/.claude`. If it cannot be determined, existence checks fail safe.
+fn claude_config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".claude"))
+}
+
+/// Whether the exact Claude session file for this room's cwd exists. Claude
+/// stores sessions at `<config>/projects/<cwd-encoded>/<session-id>.jsonl`,
+/// where `<cwd-encoded>` is the cwd with `/` replaced by `-`. If the layout or
+/// config dir cannot be determined, this fails safe to `false`.
+fn claude_session_file_exists(cwd: &Path, session: &str) -> bool {
+    if !codex_native::valid_uuid(session) {
+        return false;
+    }
+    let Some(config) = claude_config_dir() else {
+        return false;
+    };
+    let encoded = cwd.to_string_lossy().replace('/', "-");
+    if encoded.is_empty() {
+        return false;
+    }
+    config
+        .join("projects")
+        .join(encoded)
+        .join(format!("{session}.jsonl"))
+        .is_file()
+}
+
+/// The reported Claude session that is safe to resume: only when the room's
+/// hook reported it and its exact session file exists for this cwd. A stale or
+/// unverifiable id is never resumed; it is cleared/ignored so the hook can
+/// replace it.
 fn stored_claude_session(cwd: &Path, title: &str) -> Option<String> {
-    session_state::lookup_reported("claude", cwd, title).filter(|id| codex_native::valid_uuid(id))
+    let session = session_state::lookup_reported("claude", cwd, title)
+        .filter(|id| codex_native::valid_uuid(id))?;
+    if claude_session_file_exists(cwd, &session) {
+        return Some(session);
+    }
+    // Stale reported id (file missing or unverifiable): never resume it.
+    let _ = session_state::clear_room("claude", cwd, title);
+    None
 }
 
 /// The mod Crowded embeds for its Claude rooms: the manifest, the hook
@@ -2399,6 +2443,61 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[cfg(unix)]
+    static CLAUDE_CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    struct ClaudeConfigDirGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        _dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl ClaudeConfigDirGuard {
+        fn new() -> Self {
+            let lock = CLAUDE_CONFIG_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var_os("CLAUDE_CONFIG_DIR");
+            let dir = tempfile::tempdir().unwrap();
+            // Safety: serialized by `CLAUDE_CONFIG_ENV_LOCK` for the test process.
+            unsafe {
+                std::env::set_var("CLAUDE_CONFIG_DIR", dir.path());
+            }
+            Self {
+                _lock: lock,
+                previous,
+                _dir: dir,
+            }
+        }
+
+        fn path(&self) -> &Path {
+            self._dir.path()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ClaudeConfigDirGuard {
+        fn drop(&mut self) {
+            // Safety: serialized by `CLAUDE_CONFIG_ENV_LOCK` for the test process.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+                    None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn materialize_claude_session(config_dir: &Path, cwd: &Path, session: &str) {
+        let encoded = cwd.to_string_lossy().replace('/', "-");
+        let dir = config_dir.join("projects").join(encoded);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{session}.jsonl")), b"{}\n").unwrap();
+    }
 
     fn room_spec(program: &str, args: &[&str]) -> RoomSpec {
         RoomSpec {
@@ -4796,12 +4895,61 @@ mod tests {
         assert!(!specs[0].args.iter().any(|a| a == "--session-id"), "{:?}", specs[0].args);
     }
 
+    /// A reported Claude session is resumed only when its exact session file
+    /// exists for this cwd; a missing/unverifiable session starts fresh.
+    #[cfg(unix)]
+    #[test]
+    fn a_reported_claude_session_resumes_only_when_its_session_file_exists() {
+        let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+
+        // Reported id with no session file: never pass --resume/--session-id.
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
+        let (starts, notices) = start_claude_sessions(&mut specs);
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(matches!(&starts[0], Some(ClaudeStart::Fresh)), "{:?}", starts[0]);
+        assert!(!specs[0].args.iter().any(|a| a == "--resume"), "{:?}", specs[0].args);
+        assert!(!specs[0].args.iter().any(|a| a == "--session-id"), "{:?}", specs[0].args);
+        assert!(
+            session_state::lookup_reported("claude", cwd.path(), "Claude · 1").is_none(),
+            "stale reported id must not remain resumable"
+        );
+
+        // Same reported id with its exact session file present: resume it.
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
+        let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
+        let (starts, notices) = start_claude_sessions(&mut specs);
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(
+            matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A),
+            "{:?}",
+            starts[0]
+        );
+        assert_eq!(
+            args_after(&specs[0].args, "--resume").first(),
+            Some(&OsString::from(MINTED_A)),
+            "{:?}",
+            specs[0].args
+        );
+        assert!(
+            !specs[0].args.iter().any(|a| a == "--session-id"),
+            "{:?}",
+            specs[0].args
+        );
+    }
+
     /// A fresh Claude room starts without guessing a session and learns it
     /// from the hook.
     #[cfg(unix)]
     #[test]
     fn a_native_claude_start_starts_fresh_and_waits_for_report() {
         let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
@@ -4834,6 +4982,7 @@ mod tests {
         );
 
         session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
         let mut again = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
         let (again_starts, _) = start_claude_sessions(&mut again);
         assert!(matches!(&again_starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A), "{again_starts:?}");
@@ -4916,10 +5065,12 @@ mod tests {
     #[test]
     fn every_message_to_a_claude_room_is_held() {
         let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
         session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
         let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let (starts, _) = start_claude_sessions(std::slice::from_mut(&mut spec));
         assert!(matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A), "{:?}", starts[0]);
@@ -5001,6 +5152,7 @@ mod tests {
     #[test]
     fn a_claude_relaunch_that_cannot_take_a_generation_starts_nothing() {
         let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let log = root.path().join("claude.log");
@@ -5013,6 +5165,7 @@ mod tests {
             ),
         );
         session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
         let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let mut rig = IterationHarness::new(root.path());
         rig.panes[0] =
@@ -5128,10 +5281,12 @@ mod tests {
     #[test]
     fn a_clear_whose_bind_fails_after_the_state_write_reports_the_cause_and_control_clear() {
         let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
         session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
         let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let mut rig = IterationHarness::new(root.path());
         rig.panes[0] =
@@ -5162,6 +5317,7 @@ mod tests {
     #[test]
     fn a_clear_that_cannot_take_a_generation_persists_nothing() {
         let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let log = root.path().join("claude.log");
@@ -5174,6 +5330,7 @@ mod tests {
             ),
         );
         session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
         let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let mut rig = IterationHarness::new(root.path());
         rig.panes[0] =
@@ -5278,10 +5435,12 @@ mod tests {
     #[test]
     fn the_event_loop_restart_arm_relaunches_a_claude_room() {
         let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
         session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
         let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let mut rig = IterationHarness::new(root.path());
         rig.panes[0] =
@@ -5322,6 +5481,7 @@ mod tests {
     #[test]
     fn a_native_claude_room_restarts_resumes_and_clears() {
         let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let log = root.path().join("claude.log");
@@ -5334,6 +5494,7 @@ mod tests {
             ),
         );
         session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
         let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
 
         let mut rig = IterationHarness::new(root.path());
@@ -5547,6 +5708,7 @@ mod tests {
     #[test]
     fn f5_drives_the_loop_restart_seam_for_a_native_claude_room() {
         let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let log = root.path().join("claude.exec");
@@ -5560,6 +5722,7 @@ mod tests {
             ),
         );
         session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
         let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let mut rig = IterationHarness::new(root.path());
         rig.panes[0] =
@@ -5661,6 +5824,7 @@ mod tests {
     #[test]
     fn f5_at_focus_one_relaunches_only_the_claude_room() {
         let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let stub_root0 = tempfile::tempdir().unwrap();
@@ -5679,6 +5843,8 @@ mod tests {
         );
         session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
         session_state::upsert_reported("claude", cwd.path(), "Claude · 2", MINTED_B).unwrap();
+        materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
+        materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_B);
         let mut rig = IterationHarness::new(root.path());
         rig.panes = vec![
             Pane::spawn_unavailable(
@@ -8315,10 +8481,12 @@ mod tests {
     #[test]
     fn a_claude_clear_moves_the_inbox_file_and_holds_old_mail() {
         let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
         session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
         let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
         let (mut starts, _) = start_claude_sessions(&mut specs);
         assert!(matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A), "{:?}", starts[0]);
@@ -8397,9 +8565,11 @@ mod tests {
         root: &Path,
         cwd: &Path,
         title: &str,
+        config_dir: &Path,
     ) -> (Vec<RoomSpec>, Vec<Option<ClaudeStart>>, String) {
         let stub = codex_stub_for_pane(root, "claude", "exec sleep 30");
         session_state::upsert_reported("claude", cwd, title, MINTED_A).unwrap();
+        materialize_claude_session(config_dir, cwd, MINTED_A);
         let mut specs = vec![claude_native_spec_for(&stub, cwd, title)];
         let (starts, notices) = start_claude_sessions(&mut specs);
         assert!(notices.is_empty(), "{notices:?}");
@@ -8414,9 +8584,10 @@ mod tests {
     #[test]
     fn a_claude_start_extracts_its_mod_and_passes_plugin_dir() {
         let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let (specs, _, session) = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        let (specs, _, session) = claude_started_spec(root.path(), cwd.path(), "Claude · 1", _claude_config.path());
         let dir = cwd.path().join(".crowded").join("claude-mod");
         assert_eq!(
             specs[0].args,
@@ -8445,7 +8616,7 @@ mod tests {
             .iter()
             .map(|(name, _)| fs::metadata(dir.join(name)).unwrap().modified().unwrap())
             .collect();
-        let _ = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        let _ = claude_started_spec(root.path(), cwd.path(), "Claude · 1", _claude_config.path());
         for ((name, _), stamped) in CLAUDE_MOD_FILES.iter().zip(&before) {
             assert_eq!(
                 &fs::metadata(dir.join(name)).unwrap().modified().unwrap(),
@@ -8455,7 +8626,7 @@ mod tests {
         }
         // A changed file is restored on the next start.
         fs::write(dir.join("hooks/deliver.mjs"), "tampered").unwrap();
-        let _ = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        let _ = claude_started_spec(root.path(), cwd.path(), "Claude · 1", _claude_config.path());
         assert_eq!(
             fs::read_to_string(dir.join("hooks/deliver.mjs")).unwrap(),
             CLAUDE_MOD_FILES[2].1
@@ -8496,6 +8667,7 @@ mod tests {
     #[test]
     fn every_claude_relaunch_passes_plugin_dir() {
         let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         fn resume_args(session: &str, dir: &Path) -> Vec<OsString> {
@@ -8509,7 +8681,8 @@ mod tests {
         fn fresh_args(dir: &Path) -> Vec<OsString> {
             vec![OsString::from("--plugin-dir"), dir.as_os_str().into()]
         }
-        let (mut specs, _, stored) = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        let (mut specs, _, stored) =
+            claude_started_spec(root.path(), cwd.path(), "Claude · 1", _claude_config.path());
         let dir = cwd.path().join(".crowded").join("claude-mod");
         let pane = Pane::spawn_unavailable(
             specs.remove(0),
@@ -8588,7 +8761,9 @@ mod tests {
         let _state = session_state::StateRootGuard::isolated();
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let (specs, mut starts, first) = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        let _claude_config = ClaudeConfigDirGuard::new();
+        let (specs, mut starts, first) =
+            claude_started_spec(root.path(), cwd.path(), "Claude · 1", _claude_config.path());
         let mut router = crate::native_route::NativeRouter::start(
             session_state::state_directory().join("native-outbox.json"),
             Vec::new(),
@@ -8859,7 +9034,9 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         let _state = session_state::StateRootGuard::isolated();
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let (specs, mut starts, session1) = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        let _claude_config = ClaudeConfigDirGuard::new();
+        let (specs, mut starts, session1) =
+            claude_started_spec(root.path(), cwd.path(), "Claude · 1", _claude_config.path());
         let mut router = crate::native_route::NativeRouter::start(
             session_state::state_directory().join("native-outbox.json"),
             Vec::new(),
@@ -8978,7 +9155,9 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         let _state = session_state::StateRootGuard::isolated();
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let (specs, mut starts, session1) = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        let _claude_config = ClaudeConfigDirGuard::new();
+        let (specs, mut starts, session1) =
+            claude_started_spec(root.path(), cwd.path(), "Claude · 1", _claude_config.path());
         let mut router = crate::native_route::NativeRouter::start(
             session_state::state_directory().join("native-outbox.json"),
             Vec::new(),
@@ -9257,6 +9436,7 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         #[test]
         fn the_production_loop_relaunches_only_the_focused_claude_room_on_f5() {
             let _state = session_state::StateRootGuard::isolated();
+            let _claude_config = super::ClaudeConfigDirGuard::new();
             let cwd = tempfile::tempdir().unwrap();
             let root = tempfile::tempdir().unwrap();
             let stub_root0 = tempfile::tempdir().unwrap();
@@ -9275,6 +9455,8 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             );
             session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
             session_state::upsert_reported("claude", cwd.path(), "Claude · 2", MINTED_B).unwrap();
+            super::materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
+            super::materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_B);
             let mut panes = vec![
                 Pane::spawn_unavailable(
                     claude_native_spec_for(&stub0, cwd.path(), "Claude · 1"),
@@ -9516,6 +9698,7 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         #[test]
         fn the_production_loop_sizes_the_focused_pane_not_pane_0_on_restart() {
             let _state = session_state::StateRootGuard::isolated();
+            let _claude_config = super::ClaudeConfigDirGuard::new();
             let cwd = tempfile::tempdir().unwrap();
             let root = tempfile::tempdir().unwrap();
             let stub_root0 = tempfile::tempdir().unwrap();
@@ -9539,6 +9722,9 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
             session_state::upsert_reported("claude", cwd.path(), "Claude · 2", MINTED_B).unwrap();
             session_state::upsert_reported("claude", cwd.path(), "Claude · 3", MINTED_C).unwrap();
+            super::materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
+            super::materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_B);
+            super::materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_C);
             let mut panes = vec![
                 Pane::spawn_unavailable(
                     claude_native_spec_for(&stub0, cwd.path(), "Claude · 1"),
