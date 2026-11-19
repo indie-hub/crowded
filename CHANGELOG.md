@@ -7,6 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-11-19
+
+### Added
+- Native Claude rooms have a lifecycle ahead of delivery: Crowded chooses the session id with `claude --session-id`, saves the binding before the terminal starts, restarts with `claude --resume`, clears through the durable marker into a new id, and rebinds when the room's own SessionStart hook reports a new one.
+- Native Claude rooms take mail: Crowded extracts its embedded delivery mod into `<cwd>/.crowded/claude-mod/` and launches `claude` with `--plugin-dir` for it on every start, restart, clear and resume. A submitted prompt shows `ACCEPTED by Claude (submitted; not proof it was acted on)`; a refused one stays held, and a collected-but-unreceipted one stays uncertain and is never resent. The mod is inert outside Crowded, and the connection file under `.crowded/claude-inbox/` is removed when its launch is replaced and on exit. Needs a Claude Code that loads `--plugin-dir` plugins (validated on 2.1.322); brand-new-user prompts, Windows and a real TUI `/clear` in a Crowded pane are not verified.
+- A Claude room's `.claude/settings.local.json` gets a `SessionStart` hook entry that runs `crowded session-report`, next to the pulse entry, as a Codex room's hooks already had. A report from a Claude room rebinds it under a new launch generation, pending first like the other native rooms.
+- A native Codex room can be restarted (F5, or Ctrl+R while it is offline), cleared and resumed in place. Restart and resume bring back the session Crowded stored for the room; clear durably marks the old thread cleared, then mints a new one with `codex exec` and reopens the room in it. Each relaunch binds the room under a new generation, so mail saved for the earlier launch stays `HELD`. Changing a native room's model or effort is still refused, and OpenCode native rooms still cannot be restarted, cleared or resumed in place.
+### Fixed
+- Clearing a native Codex room fails with a visible error when its cleared marker cannot be saved, and starts no new thread. Two overlapping clears can no longer leave the stored session older than the one the room is bound to.
+
 ## [0.45.0] - 2026-11-05
 
 ### Added

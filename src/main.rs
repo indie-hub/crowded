@@ -2,6 +2,8 @@
 
 mod app;
 mod checker;
+mod claude_inbox;
+mod codex_native;
 mod command;
 mod config;
 mod doorbell;
@@ -32,6 +34,7 @@ Subcommands:
   control    Control a room (clear, resume, model, effort)
   resume     Resume an existing session
   pulse      Send a heartbeat pulse
+  session-report Report the room's session id from a hook
   roster     List rooms and their status
   check      Run pre-flight checks
   init       Initialize a new project
@@ -55,6 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("control") => doorbell::control_command(),
         Some("resume") => app::run_resumed(),
         Some("pulse") => doorbell::pulse_command(),
+    Some("session-report") => doorbell::session_report_command(),
         Some("roster") => doorbell::roster_command(),
         Some("check") => checker::command(),
         Some("init") => initializer::command(),
@@ -72,8 +76,8 @@ mod tests {
     #[test]
     fn help_text_lists_all_subcommands() {
         let expected = [
-            "send", "control", "resume", "pulse", "roster", "check", "init", "mcp", "plugin",
-            "toolbox",
+            "send", "control", "resume", "pulse", "session-report", "roster", "check", "init",
+            "mcp", "plugin", "toolbox",
         ];
         for cmd in expected {
             assert!(USAGE.contains(cmd), "help text missing subcommand: {cmd}",);

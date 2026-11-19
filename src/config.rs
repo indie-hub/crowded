@@ -327,8 +327,10 @@ fn inferred_vendor(program: &OsStr) -> &'static str {
     }
 }
 
-/// Native delivery only exists for a raw OpenCode room whose launch Crowded
-/// fully controls, so every conflicting option is a visible configuration error.
+/// Native delivery needs a raw agent room whose launch Crowded can address
+/// exactly: an OpenCode room it serves itself, a Codex room queued by its
+/// own captured thread, or a Claude room carrying Crowded's own delivery mod.
+/// Every conflicting option is a visible configuration error.
 fn validate_native_delivery(
     program: &OsStr,
     transport: Transport,
@@ -337,11 +339,25 @@ fn validate_native_delivery(
 ) -> io::Result<()> {
     let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_owned());
     let guest = Path::new(program).file_name().unwrap_or(program);
-    if !guest.to_string_lossy().eq_ignore_ascii_case("opencode") {
-        return Err(invalid("native_delivery is supported only for OpenCode rooms"));
+    let guest = guest.to_string_lossy();
+    let codex = guest.eq_ignore_ascii_case("codex");
+    let claude = guest.eq_ignore_ascii_case("claude");
+    if !guest.eq_ignore_ascii_case("opencode") && !codex && !claude {
+        return Err(invalid(
+            "native_delivery is supported only for OpenCode, Codex and Claude rooms",
+        ));
     }
     if transport != Transport::Raw {
         return Err(invalid("native_delivery requires transport = \"raw\""));
+    }
+    if codex {
+        // The queue command runs beside the room and takes no server options,
+        // so only the room's transport and identity need to be exact.
+        return Ok(());
+    }
+    if claude {
+        // The delivery mod ships inside the binary, so no server options apply.
+        return Ok(());
     }
     // The wrapped server is owned by proving it is the wrapper's direct child;
     // that check is not implemented on Windows.
@@ -855,7 +871,7 @@ transport = "raw"
     }
 
     #[test]
-    fn native_delivery_is_opt_in_and_only_for_raw_opencode_rooms() {
+    fn native_delivery_is_opt_in_and_only_for_raw_agent_rooms() {
         let rooms = room_specs_from_toml(
             r#"
                 [[rooms]]
@@ -873,6 +889,16 @@ transport = "raw"
         assert!(rooms[0].native_delivery);
         assert!(!rooms[1].native_delivery);
 
+        // A Codex room is queued through its own captured thread, so it needs
+        // no owned server and is accepted as it is.
+        let codex = room_specs_from_toml(
+            "[[rooms]]\ncommand = \"codex\"\ntransport = \"raw\"\nnative_delivery = true\n\n[[rooms]]\ncommand = \"claude\"\ntransport = \"raw\"",
+        )
+        .unwrap()
+        .specs;
+        assert!(codex[0].native_delivery);
+        assert!(!codex[0].use_headroom);
+
         // Headroom is allowed in a native room wherever the wrapped server's
         // parent can be checked.
         let headroom = "[[rooms]]\ncommand = \"opencode\"\ntransport = \"raw\"\nnative_delivery = true\nuse_headroom = true\n\n[[rooms]]\ncommand = \"claude\"\ntransport = \"raw\"";
@@ -887,11 +913,15 @@ transport = "raw"
             assert!(error.to_string().contains("Windows"), "{error}");
         }
 
+        // A Claude room carries Crowded's own delivery mod, so it is accepted.
+        let claude = room_specs_from_toml(
+            "[[rooms]]\ncommand = \"claude\"\ntransport = \"raw\"\nnative_delivery = true\n\n[[rooms]]\ncommand = \"codex\"\ntransport = \"raw\"",
+        )
+        .unwrap()
+        .specs;
+        assert!(claude[0].native_delivery);
+
         for (rooms, expected) in [
-            (
-                "command = \"codex\"\ntransport = \"raw\"\nnative_delivery = true",
-                "only for OpenCode",
-            ),
             (
                 "command = \"opencode\"\ntransport = \"shell\"\nnative_delivery = true",
                 "transport",

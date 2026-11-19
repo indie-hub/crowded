@@ -1,0 +1,8 @@
+{
+  "name": "crowded-room-inbox",
+  "version": "0.0.1",
+  "description": "Delivers Crowded room mail into a native Claude session through a loopback inbox.",
+  "author": {
+    "name": "Crowded"
+  }
+}

@@ -3,7 +3,7 @@
 use std::{
     collections::VecDeque,
     io::{self, Write},
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
@@ -16,7 +16,7 @@ use crossterm::{
 use portable_pty::PtySize;
 use ratatui::{
     Terminal,
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Text},
@@ -36,7 +36,7 @@ use crate::{
         SupportedControl,
     },
     mailroom::Mailroom,
-    native_route::{self, NativeRouter},
+    native_route::{self, NativeRouter, NoticeSeverity},
     pane::{self, Pane},
     room_detail::{DetailEvent, RoomDetail, apply_detail_event, collect_detail},
 };
@@ -568,8 +568,24 @@ fn headroom_lane_holds(windows: bool, spec_uses_headroom: bool, prior_headroom: 
 /// second wrapper must not start its proxy while the first is still
 /// bootstrapping. Mirrors the main loop's `input_ready` computation so the
 /// lane shares the same ready boundary as intro delivery.
-fn wait_for_headroom_ready(pane: &mut Pane, last_output: &mut Option<Instant>) -> io::Result<()> {
+pub(crate) const HEADROOM_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub(crate) fn wait_for_headroom_ready(
+    pane: &mut Pane,
+    last_output: &mut Option<Instant>,
+    deadline: Duration,
+) -> io::Result<bool> {
+    // Returns Ok(true) when the deadline elapsed without readiness (caller
+    // proceeds and surfaces a notice); Ok(false) on readiness, process exit or
+    // shutdown.
+    let started = Instant::now();
     loop {
+        if crate::shutdown::requested() {
+            return Ok(false);
+        }
+        if !pane.is_online() {
+            return Ok(false);
+        }
         if pane.drain_output()? {
             *last_output = Some(Instant::now());
         }
@@ -577,9 +593,13 @@ fn wait_for_headroom_ready(pane: &mut Pane, last_output: &mut Option<Instant>) -
             Instant::now().duration_since(last) >= quiet_threshold(pane.headroom_active())
         });
         if pane.automation_input_ready(output_is_quiet) {
-            return Ok(());
+            return Ok(false);
         }
-        std::thread::sleep(Duration::from_millis(25));
+        if started.elapsed() >= deadline {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_sub(started.elapsed());
+        std::thread::sleep(Duration::from_millis(25).min(remaining));
     }
 }
 
@@ -623,6 +643,26 @@ fn welcome_roster(panes: &[Pane], pulses: &[Option<PulseSample>], now: Instant) 
                     .as_deref(),
                 controls.contains(&SupportedControl::Model),
                 pane.current_effort().as_deref(),
+                controls.contains(&SupportedControl::Effort),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The welcome roster before any pane exists, read from each room's configured
+/// controls. A fresh native Codex room needs its intro before its terminal
+/// starts, so this cannot wait for live panes.
+fn welcome_roster_specs(specs: &[RoomSpec]) -> String {
+    specs
+        .iter()
+        .map(|spec| {
+            let controls = pane::spec_capabilities(spec).supported_controls;
+            roster_entry(
+                &spec.title,
+                pane::spec_model(spec).as_deref(),
+                controls.contains(&SupportedControl::Model),
+                pane::spec_effort(spec).as_deref(),
                 controls.contains(&SupportedControl::Effort),
             )
         })
@@ -674,7 +714,7 @@ fn message_with_hat(task: Option<&str>, role: Option<&str>, body: &str) -> Strin
 /// optional model the hook reports it is running, which shares the same
 /// freshness window as the state it arrived with.
 #[derive(Clone)]
-struct PulseSample {
+pub(crate) struct PulseSample {
     state: PulseState,
     model: Option<String>,
     received_at: Instant,
@@ -1175,11 +1215,15 @@ pub(crate) fn resend_whisper_submits(
 }
 
 /// Sends one key to a pane, turning an enqueue failure into a user notice so a
-/// transiently full or stopped write queue cannot end the event loop.
-pub(crate) fn forward_key(pane: &mut Pane, key: KeyEvent) -> Option<String> {
-    pane.write_key(key)
-        .err()
-        .map(|error| format!("{} rejected input: {error}", pane.title()))
+/// transiently full or stopped write queue cannot end the event loop. A
+/// rejected key is a failure, chosen here where the text is produced.
+pub(crate) fn forward_key(pane: &mut Pane, key: KeyEvent) -> Option<(String, NoticeSeverity)> {
+    pane.write_key(key).err().map(|error| {
+        (
+            format!("{} rejected input: {error}", pane.title()),
+            NoticeSeverity::Failure,
+        )
+    })
 }
 
 fn pane_size(outer: Rect) -> PtySize {
@@ -1231,6 +1275,27 @@ fn content_areas(area: Rect) -> (Rect, Rect, Rect) {
     (rooms, pulse, status)
 }
 
+/// Opens or closes the mailroom popup for the F2 key and the Esc close path.
+/// Opening resets the scroll but keeps the notice history, so the failures
+/// the status row points at are still there when the popup renders. Closing
+/// is an explicit dismiss and clears the history. The other view changes
+/// that clear (Tab, starting a whisper, opening or leaving settings) keep
+/// doing so; nothing else touches the history.
+fn toggle_mail_log(input_mode: &mut InputMode, mail_scroll: &mut u16, notice: &mut Notices) {
+    match input_mode {
+        InputMode::MailLog => {
+            *input_mode = InputMode::Normal;
+            notice.clear();
+        }
+        InputMode::Normal => {
+            *input_mode = InputMode::MailLog;
+            *mail_scroll = 0;
+        }
+        InputMode::Config(_) => unreachable!(),
+        InputMode::Composing(_) => unreachable!(),
+    }
+}
+
 fn mail_popup_area(area: Rect) -> Rect {
     let [_, middle, _] = Layout::vertical([
         Constraint::Percentage(15),
@@ -1272,7 +1337,7 @@ fn save_config_state(
     panes: &mut [Pane],
     fuse: &mut DeliveryFuse,
     fuse_size: &mut usize,
-    notice: &mut Option<String>,
+    notice: &mut Notices,
 ) -> bool {
     let new_size = match parse_fuse_size_input(&state.fuse_input) {
         Ok(value) => value,
@@ -1365,11 +1430,15 @@ fn save_config_state(
             });
         }
     }
-    *notice = Some(if !fuse_changed && updates.is_empty() {
-        "no config changes to save".to_owned()
-    } else {
-        format!("room {} config saved", state.selected + 1)
-    });
+    append_notice(
+        notice,
+        if !fuse_changed && updates.is_empty() {
+            "no config changes to save".to_owned()
+        } else {
+            format!("room {} config saved", state.selected + 1)
+        },
+        NoticeSeverity::Info,
+    );
     true
 }
 
@@ -1478,11 +1547,11 @@ pub(crate) fn launch_then_enter<N, G>(
     Ok((launched, enter()?))
 }
 
-/// Rooms whose detail panel reads a legacy session entry. A native room has
-/// none, so it is never scheduled.
+/// Rooms whose detail panel reads a legacy session entry. An owned-server room
+/// has none; a Codex native room captures a real thread, so its detail stays.
 pub(crate) fn rooms_needing_detail(panes: &[Pane]) -> Vec<usize> {
     (0..panes.len())
-        .filter(|&index| !panes[index].is_native())
+        .filter(|&index| !panes[index].is_native() || panes[index].codex_native())
         .collect()
 }
 
@@ -1494,6 +1563,929 @@ pub(crate) fn compose_target(panes: &[Pane], focused: usize) -> Result<usize, St
         Ok(target)
     } else {
         Err(format!("{} is offline", panes[target].title()))
+    }
+}
+
+/// The three panes a room can start as. The event loop uses [`LivePanes`];
+/// tests substitute a recorder, so the exact start decisions run without a
+/// terminal.
+pub(crate) trait PaneFactory {
+    /// A running interactive process.
+    fn interactive(
+        &mut self,
+        spec: RoomSpec,
+        size: portable_pty::PtySize,
+        environment: pane::GuestEnvironment,
+        native: Option<crate::native_launch::NativeRoom>,
+    ) -> Result<Pane, Box<dyn std::error::Error>>;
+    /// A placeholder while the room's session is being created.
+    fn pending(
+        &mut self,
+        spec: RoomSpec,
+        size: portable_pty::PtySize,
+        environment: pane::GuestEnvironment,
+    ) -> Result<Pane, Box<dyn std::error::Error>>;
+    /// A placeholder showing why the room was not started.
+    fn unavailable(
+        &mut self,
+        spec: RoomSpec,
+        size: portable_pty::PtySize,
+        environment: pane::GuestEnvironment,
+        reason: &str,
+    ) -> Result<Pane, Box<dyn std::error::Error>>;
+}
+
+/// Starts real processes.
+pub(crate) struct LivePanes;
+
+impl PaneFactory for LivePanes {
+    fn interactive(
+        &mut self,
+        spec: RoomSpec,
+        size: portable_pty::PtySize,
+        environment: pane::GuestEnvironment,
+        native: Option<crate::native_launch::NativeRoom>,
+    ) -> Result<Pane, Box<dyn std::error::Error>> {
+        Pane::spawn_with_native(spec, size, environment, native)
+    }
+
+    fn pending(
+        &mut self,
+        spec: RoomSpec,
+        size: portable_pty::PtySize,
+        environment: pane::GuestEnvironment,
+    ) -> Result<Pane, Box<dyn std::error::Error>> {
+        Pane::spawn_pending(spec, size, environment)
+    }
+
+    fn unavailable(
+        &mut self,
+        spec: RoomSpec,
+        size: portable_pty::PtySize,
+        environment: pane::GuestEnvironment,
+        reason: &str,
+    ) -> Result<Pane, Box<dyn std::error::Error>> {
+        Pane::spawn_unavailable(spec, size, environment, reason)
+    }
+}
+
+/// Starts one room's process for the state its launch reached. Both the
+/// startup path and the mint-completion path call this, so a room without a
+/// session can never start an interactive Codex.
+pub(crate) fn spawn_room(
+    factory: &mut impl PaneFactory,
+    spec: RoomSpec,
+    size: portable_pty::PtySize,
+    environment: pane::GuestEnvironment,
+    native: Option<crate::native_launch::NativeRoom>,
+    codex: Option<&pane::CodexMint>,
+    claude: Option<&pane::ClaudeStart>,
+) -> Result<Pane, Box<dyn std::error::Error>> {
+    if let Some(pane::ClaudeStart::Failed(reason)) = claude {
+        return factory.unavailable(spec, size, environment, reason);
+    }
+    match codex {
+        Some(pane::CodexMint::Failed(reason)) => {
+            factory.unavailable(spec, size, environment, reason)
+        }
+        Some(pane::CodexMint::Pending(_)) => factory.pending(spec, size, environment),
+        Some(pane::CodexMint::Ready(uuid)) => {
+            let mut spec = spec;
+            pane::resume_session(&mut spec, uuid)?;
+            factory.interactive(spec, size, environment, native)
+        }
+        None => factory.interactive(spec, size, environment, native),
+    }
+}
+
+/// Starts every room in order and reports when each one started.
+pub(crate) fn start_rooms(
+    factory: &mut impl PaneFactory,
+    specs: Vec<RoomSpec>,
+    sizes: &[portable_pty::PtySize],
+    environments: &[pane::GuestEnvironment],
+    natives: Vec<Option<crate::native_launch::NativeRoom>>,
+    codex: &[Option<pane::CodexMint>],
+    claude: &[Option<pane::ClaudeStart>],
+    last_output: &mut [Option<Instant>],
+    serialize_headroom: bool,
+    headroom_ready_timeout: Duration,
+    notice: &mut Notices,
+) -> Result<(Vec<Pane>, Vec<Instant>), Box<dyn std::error::Error>> {
+    let mut panes: Vec<Pane> = Vec::with_capacity(specs.len());
+    // Anchors `INTRO_READINESS_CEILING`: each room's own spawn instant, not
+    // a shared one, so a slow room later in this loop isn't penalized for
+    // rooms spawned before it.
+    let mut spawned_at = Vec::with_capacity(specs.len());
+    // Windows serializes Headroom bootstrap: the next Headroom room's spawn
+    // waits for the prior one to reach its ready boundary, so two wrappers
+    // never start their proxies at once. Non-Headroom rooms and every room
+    // on non-Windows spawn immediately, exactly as before.
+    let mut prior_headroom: Option<usize> = None;
+    let mut natives = natives.into_iter();
+    for (index, spec) in specs.into_iter().enumerate() {
+        let headroom = pane::spec_uses_headroom(&spec);
+        if headroom_lane_holds(serialize_headroom, headroom, prior_headroom.is_some()) {
+            if let Some(prior) = prior_headroom {
+                let timed_out = wait_for_headroom_ready(
+                    &mut panes[prior],
+                    &mut last_output[prior],
+                    headroom_ready_timeout,
+                )?;
+                if timed_out {
+                    let room = panes[prior].title().to_owned();
+                    append_notice(
+                        notice,
+                        format!("{room}: Headroom did not become ready in time; continuing"),
+                        NoticeSeverity::Failure,
+                    );
+                }
+            }
+        }
+        // The owned server starts here, before the event loop, because the
+        // loop cannot wait for it; a room that cannot start its server fails
+        // startup instead of falling back to paste or a private server. A
+        // Codex room whose session is still being created, or was not created,
+        // starts no interactive process: its mail is held instead.
+        let native = natives.next().flatten();
+        panes.push(spawn_room(
+            factory,
+            spec,
+            sizes[index],
+            environments[index].clone(),
+            native,
+            codex[index].as_ref(),
+            claude[index].as_ref(),
+        )?);
+        spawned_at.push(Instant::now());
+        // A placeholder has no process and never produces output, so a later
+        // room could wait on it forever.
+        if headroom && panes[index].is_online() {
+            prior_headroom = Some(index);
+        }
+    }
+    Ok((panes, spawned_at))
+}
+
+/// Applies every mint that finished since the previous pass: a room whose
+/// session was still being created becomes usable the moment its own mint
+/// finishes, and nothing waits for a slower room.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn complete_mints(
+    factory: &mut impl PaneFactory,
+    codex: &mut [Option<pane::CodexMint>],
+    panes: &mut [Pane],
+    mut router: Option<&mut NativeRouter>,
+    delivery_gates: &mut [DeliveryGate],
+    spawned_at: &mut [Instant],
+    last_output: &mut [Option<Instant>],
+    room_pulses: &mut [Option<PulseSample>],
+    sizes: &[portable_pty::PtySize],
+    environments: &[pane::GuestEnvironment],
+    notice: &mut Notices,
+    now: Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for update in pane::poll_codex_mints(codex) {
+        let (index, failure) = match update {
+            pane::CodexUpdate::Minted { index } => {
+                let spec = panes[index].room_spec().clone();
+                match spawn_room(
+                    factory,
+                    spec,
+                    sizes[index],
+                    environments[index].clone(),
+                    None,
+                    codex[index].as_ref(),
+                    None,
+                ) {
+                    Ok(started) => {
+                        panes[index] = started;
+                        delivery_gates[index] = DeliveryGate::new(false);
+                        spawned_at[index] = now;
+                        last_output[index] = None;
+                        room_pulses[index] = Some(PulseSample::now(PulseState::Starting, None));
+                        if let (Some(router), Some(mint)) =
+                            (router.as_deref_mut(), codex[index].as_ref())
+                        {
+                            pane::bind_codex_room(router, panes, index, mint)?;
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        let reason = format!("could not start the resumed session: {error}");
+                        codex[index] = Some(pane::CodexMint::Failed(reason.clone()));
+                        (index, reason)
+                    }
+                }
+            }
+            pane::CodexUpdate::Failed { index, reason } => (index, reason),
+        };
+        let spec = panes[index].room_spec().clone();
+        panes[index] = factory.unavailable(spec, sizes[index], environments[index].clone(), &failure)?;
+        delivery_gates[index] = DeliveryGate::new(false);
+        spawned_at[index] = now;
+        last_output[index] = None;
+        if let (Some(router), Some(mint)) = (router.as_deref_mut(), codex[index].as_ref()) {
+            pane::bind_codex_room(router, panes, index, mint)?;
+        }
+        let message = format!("{}: {failure}; the room was not started", panes[index].title());
+        eprintln!("{message}");
+        append_notice(notice, message, NoticeSeverity::Failure);
+    }
+    Ok(())
+}
+
+/// Relaunches one native Codex room in place. A trusted stored session starts
+/// at once; a mint runs on its own worker and the next pass binds the room when
+/// it finishes. A clear's durable marker is already written by then.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn relaunch_codex_room(
+    action: pane::CodexRelaunch,
+    index: usize,
+    size: portable_pty::PtySize,
+    prompt: &str,
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    codex: &mut [Option<pane::CodexMint>],
+    delivery_gates: &mut [DeliveryGate],
+    last_output: &mut [Option<Instant>],
+    spawned_at: &mut [Instant],
+    room_pulses: &mut [Option<PulseSample>],
+    environments: &[pane::GuestEnvironment],
+    now: Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (spec, mint) = panes[index].relaunch_codex(action, prompt, index + 1)?;
+    panes[index].cleanup();
+    // A room that cannot start again is replaced by the visible reason, never
+    // left half-bound to the session it could not launch.
+    let (started, failure) = match spawn_room(
+        &mut LivePanes,
+        spec.clone(),
+        size,
+        environments[index].clone(),
+        None,
+        Some(&mint),
+        None,
+    ) {
+        Ok(started) => (started, None),
+        Err(error) => {
+            let reason = format!("could not relaunch the room: {error}");
+            let failed = pane::CodexMint::Failed(reason.clone());
+            let failed = spawn_room(
+                &mut LivePanes,
+                spec,
+                size,
+                environments[index].clone(),
+                None,
+                Some(&failed),
+                None,
+            )?;
+            (failed, Some(reason))
+        }
+    };
+    panes[index] = started;
+    let mint = match &failure {
+        Some(reason) => pane::CodexMint::Failed(reason.clone()),
+        None => mint,
+    };
+    if let Some(router) = router {
+        pane::bind_codex_room(router, panes, index, &mint)?;
+    }
+    codex[index] = Some(mint);
+    delivery_gates[index] = DeliveryGate::new(false);
+    last_output[index] = None;
+    spawned_at[index] = now;
+    room_pulses[index] = Some(PulseSample::now(PulseState::Starting, None));
+    match failure {
+        Some(reason) => Err(io::Error::other(reason).into()),
+        None => Ok(()),
+    }
+}
+
+/// Relaunches one native Claude room in place. The session id is known before
+/// the terminal starts, so the room is bound at once and its mail is held there.
+#[allow(clippy::too_many_arguments)]
+/// A failure in the relaunch sequence is reported with the way out; nothing
+/// is rolled back, so the room may be left recorded on a session that did not
+/// start.
+fn launch_failure(title: &str, room: usize, cause: impl std::fmt::Display) -> Box<dyn std::error::Error> {
+    io::Error::other(format!(
+        "{title}: {cause}; the room may be recorded or bound on a session that did not start; use control {room} clear to start a new one"
+    ))
+    .into()
+}
+
+pub(crate) fn relaunch_claude_room(
+    action: pane::ClaudeRelaunch,
+    index: usize,
+    size: portable_pty::PtySize,
+    panes: &mut [Pane],
+    mut router: Option<&mut NativeRouter>,
+    delivery_gates: &mut [DeliveryGate],
+    last_output: &mut [Option<Instant>],
+    spawned_at: &mut [Instant],
+    room_pulses: &mut [Option<PulseSample>],
+    environments: &[pane::GuestEnvironment],
+    now: Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let title = panes[index].title().to_owned();
+    // Simple order: choose the id, take the generation, write, bind, start.
+    // Nothing is rolled back; a failure at or after the write is reported with
+    // the way out and the room may stay recorded on a session that never ran.
+    let generation = pane::next_generation()
+        .map_err(|error| launch_failure(&title, index + 1, error))?;
+    let (spec, session) = panes[index]
+        .relaunch_claude(action, index + 1)
+        .map_err(|error| launch_failure(&title, index + 1, error))?;
+    if let Some(router) = router.as_deref_mut() {
+        pane::bind_claude_room_at(router, panes, index, &session, generation)
+            .map_err(|error| launch_failure(&title, index + 1, error))?;
+    }
+    panes[index].cleanup();
+    let started = spawn_room(
+        &mut LivePanes,
+        spec,
+        size,
+        environments[index].clone(),
+        None,
+        None,
+        None,
+    )
+    .map_err(|error| launch_failure(&title, index + 1, error))?;
+    panes[index] = started;
+    delivery_gates[index] = DeliveryGate::new(false);
+    last_output[index] = None;
+    spawned_at[index] = now;
+    room_pulses[index] = Some(PulseSample::now(PulseState::Starting, None));
+    Ok(())
+}
+
+/// Revives one room after F5 or an offline Ctrl+R. A native Codex room comes
+/// back into its session; every other room respawns exactly as before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn restart_room(
+    index: usize,
+    size: portable_pty::PtySize,
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    codex: &mut [Option<pane::CodexMint>],
+    delivery_gates: &mut [DeliveryGate],
+    last_output: &mut [Option<Instant>],
+    spawned_at: &mut [Instant],
+    room_pulses: &mut [Option<PulseSample>],
+    environments: &[pane::GuestEnvironment],
+    fuse_size: usize,
+    now: Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if panes[index].claude_native() {
+        return relaunch_claude_room(
+            pane::ClaudeRelaunch::Restart,
+            index,
+            size,
+            panes,
+            router,
+            delivery_gates,
+            last_output,
+            spawned_at,
+            room_pulses,
+            environments,
+            now,
+        );
+    }
+    if panes[index].codex_native() {
+        let roster = welcome_roster(panes, room_pulses, now);
+        let prompt = house_rules(index + 1, &roster, fuse_size);
+        return relaunch_codex_room(
+            pane::CodexRelaunch::Restart,
+            index,
+            size,
+            &prompt,
+            panes,
+            router,
+            codex,
+            delivery_gates,
+            last_output,
+            spawned_at,
+            room_pulses,
+            environments,
+            now,
+        );
+    }
+    panes[index].restart(size)?;
+    delivery_gates[index] = DeliveryGate::new(panes[index].needs_intro());
+    last_output[index] = None;
+    spawned_at[index] = now;
+    room_pulses[index] = Some(PulseSample::now(PulseState::Starting, None));
+    Ok(())
+}
+
+/// Applies the restart a key event asks for, if any, and returns the notice to
+/// show. This is the only place Ctrl+R/F5 turns into a launch, so the decision
+/// can be driven without a terminal.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn restart_key(
+    key: KeyEvent,
+    size: portable_pty::PtySize,
+    focused: usize,
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    codex: &mut [Option<pane::CodexMint>],
+    delivery_gates: &mut [DeliveryGate],
+    last_output: &mut [Option<Instant>],
+    spawned_at: &mut [Instant],
+    room_pulses: &mut [Option<PulseSample>],
+    environments: &[pane::GuestEnvironment],
+    fuse_size: usize,
+    now: Instant,
+) -> Option<(String, NoticeSeverity)> {
+    if !force_restart_requested(key, panes[focused].is_online()) {
+        return None;
+    }
+    let title = panes[focused].title().to_owned();
+    Some(
+        match restart_room(
+            focused,
+            size,
+            panes,
+            router,
+            codex,
+            delivery_gates,
+            last_output,
+            spawned_at,
+            room_pulses,
+            environments,
+            fuse_size,
+            now,
+        ) {
+            Ok(()) => (format!("{title} restarted"), NoticeSeverity::Info),
+            Err(error) => (
+                format!("Could not restart {title}: {error}"),
+                NoticeSeverity::Failure,
+            ),
+        },
+    )
+}
+
+/// The loop state the per-event step reads. The loop borrows its locals into
+/// this once and never decides a key's fate itself.
+pub(crate) struct LoopState<'a> {
+    pub(crate) focused: usize,
+    pub(crate) fuse_size: usize,
+    pub(crate) pane_size: &'a mut dyn FnMut(usize) -> io::Result<PtySize>,
+    pub(crate) panes: &'a mut [Pane],
+    pub(crate) router: Option<&'a mut NativeRouter>,
+    pub(crate) codex: &'a mut [Option<pane::CodexMint>],
+    pub(crate) delivery_gates: &'a mut [DeliveryGate],
+    pub(crate) last_output: &'a mut [Option<Instant>],
+    pub(crate) spawned_at: &'a mut [Instant],
+    pub(crate) room_pulses: &'a mut [Option<PulseSample>],
+    pub(crate) environments: &'a [pane::GuestEnvironment],
+    pub(crate) notice: &'a mut Notices,
+}
+
+/// Builds the step's state from the loop's locals. Tests call this same wiring
+/// function, so a change to any field it passes is visible to a named test.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn loop_state<'a>(
+    focused: usize,
+    fuse_size: usize,
+    pane_size: &'a mut dyn FnMut(usize) -> io::Result<PtySize>,
+    panes: &'a mut [Pane],
+    router: Option<&'a mut NativeRouter>,
+    codex: &'a mut [Option<pane::CodexMint>],
+    delivery_gates: &'a mut [DeliveryGate],
+    last_output: &'a mut [Option<Instant>],
+    spawned_at: &'a mut [Instant],
+    room_pulses: &'a mut [Option<PulseSample>],
+    environments: &'a [pane::GuestEnvironment],
+    notice: &'a mut Notices,
+) -> LoopState<'a> {
+    LoopState {
+        focused,
+        fuse_size,
+        pane_size,
+        panes,
+        router,
+        codex,
+        delivery_gates,
+        last_output,
+        spawned_at,
+        room_pulses,
+        environments,
+        notice,
+    }
+}
+
+/// The one step the loop calls for a key event. It owns the restart guard, the
+/// focused pane, the launcher arguments and the notice. Returns true when the
+/// key was not consumed and the loop's input handling should still see it.
+pub(crate) fn run_rooms_key_event(
+    event: &Event,
+    state: &mut LoopState<'_>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Event::Key(key) = event else {
+        return Ok(true);
+    };
+    let focused = state.focused;
+    if !force_restart_requested(*key, state.panes[focused].is_online()) {
+        return Ok(true);
+    }
+    let size = (state.pane_size)(focused)?;
+    let result = restart_key(
+        *key,
+        size,
+        focused,
+        state.panes,
+        state.router.as_deref_mut(),
+        state.codex,
+        state.delivery_gates,
+        state.last_output,
+        state.spawned_at,
+        state.room_pulses,
+        state.environments,
+        state.fuse_size,
+        Instant::now(),
+    );
+    if let Some((text, severity)) = result {
+        state.notice.push(text, severity);
+    }
+    Ok(false)
+}
+
+/// Sends doorbell mail to a native room through the router. This is the only
+/// native delivery path: a room never falls back to terminal paste, not even
+/// when the router cannot take the message.
+pub(crate) fn send_native_mail(
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    mailroom: &mut Mailroom,
+    from: &str,
+    to: usize,
+    message: &str,
+    reply: Option<native_route::Reply>,
+) -> Result<(), String> {
+    if let Some(router) = router {
+        return router.send(mailroom, from, to, message, reply);
+    }
+    let error = format!(
+        "{} cannot receive native mail: native delivery is unavailable",
+        panes[to].title()
+    );
+    if let Some(reply) = reply {
+        reply(0, native_route::NativeReply::Failed(error.clone()));
+    }
+    Err(error)
+}
+
+/// Applies one authenticated session report from a room's own hook. The room
+/// is never written to: rebinding only swaps the router's binding (and, for
+/// Codex, the persisted reported id), so no path here can become a paste.
+/// Every outcome is a notice; the wire answer carries the short reason.
+pub(crate) fn report_native_session(
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    report: crate::doorbell::DoorbellSessionReport,
+    notice: &mut Notices,
+) {
+    match apply_session_report(
+        panes,
+        router,
+        report.from,
+        report.session.clone(),
+        report.pending,
+    ) {
+        Ok(status) => {
+            append_notice(notice, status.clone(), NoticeSeverity::Info);
+            report.reply_recorded(&status);
+        }
+        Err(reason) => {
+            append_notice(notice, reason.clone(), NoticeSeverity::Failure);
+            report.reply_failed(reason);
+        }
+    }
+}
+
+/// The rebind decision behind [`report_native_session`]: `Ok` is the status
+/// to record (including ignored reports, which change nothing), `Err` names
+/// a failure that also holds the room with its reason.
+fn apply_session_report(
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    from: usize,
+    session: Option<String>,
+    pending: bool,
+) -> Result<String, String> {
+    let router = router.ok_or_else(|| "native delivery is unavailable".to_owned())?;
+    if from >= panes.len() {
+        return Err("a session report named an unknown room".to_owned());
+    }
+    let title = panes[from].title().to_owned();
+    if !panes[from].is_native() {
+        return Ok(format!(
+            "ignored: {title} is not a native OpenCode, Codex or Claude room"
+        ));
+    }
+    let current = router.binding_for(from);
+    let Some(session) = session else {
+        if !pending {
+            return Ok("ignored: a session report needs a session id or --pending".to_owned());
+        }
+        if current.is_none() {
+            return Ok(format!("ignored: {title} has no native binding to hold"));
+        }
+        router
+            .mark_pending(from)
+            .map_err(|error| format!("{title} could not be held: {error}"))?;
+        return Ok(format!(
+            "{title}: session pending after clear; new mail will be held"
+        ));
+    };
+    if let Some(binding) = current.as_ref()
+        && binding.session == session
+    {
+        // The same id is a no-op for the binding: no generation bump, no
+        // retarget of other mail. Clearing still runs so pending-held mail is
+        // released even if this run never saw the pending mark.
+        let was_pending = router.is_pending(from);
+        router
+            .clear_pending(from)
+            .map_err(|error| format!("{title} could not resume: {error}"))?;
+        return Ok(if was_pending {
+            format!("{title} is back on {session}; pending cleared")
+        } else {
+            format!("{title} is already on {session}")
+        });
+    }
+    if panes[from].codex_native() && !crate::codex_native::valid_uuid(&session) {
+        return Ok(format!(
+            "ignored: the reported session is not a Codex thread id"
+        ));
+    }
+    if panes[from].claude_native() && !crate::codex_native::valid_uuid(&session) {
+        return Ok(format!(
+            "ignored: the reported session is not a Claude session id"
+        ));
+    }
+    let generation = crate::native_launch::GenerationAllocator::new(
+        crate::pane::session_state::state_directory(),
+    )
+    .next()
+    .map_err(|error| format!("{title} could not take a launch generation: {error}"))?;
+    let destination = (from + 1).to_string();
+    if panes[from].codex_native() {
+        if let Err(error) = crate::pane::session_state::upsert_reported(
+            "codex",
+            panes[from].cwd(),
+            &title,
+            &session,
+        ) {
+            let reason = format!("session report for {session} could not be saved: {error}");
+            let _ = router.unbind_room(from, reason.clone());
+            return Err(reason);
+        }
+        let room = panes[from].codex_room_for(session.clone());
+        panes[from].record_session(&session);
+        router
+            .rebind_room(crate::native_route::RoomEntry {
+                index: from,
+                title: title.clone(),
+                binding: crate::codex_native::binding(&destination, &session, generation),
+                backend: crate::native_route::Backend::Codex(Arc::new(room)),
+            })
+            .map_err(|error| format!("{title} could not be rebound: {error}"))?;
+    } else if panes[from].claude_native() {
+        // The room's own hook is the only other source of a Claude id.
+        if let Err(error) = crate::pane::session_state::upsert_reported(
+            "claude",
+            panes[from].cwd(),
+            &title,
+            &session,
+        ) {
+            let reason = format!("session report for {session} could not be saved: {error}");
+            let _ = router.unbind_room(from, reason.clone());
+            return Err(reason);
+        }
+        panes[from].record_session(&session);
+        router
+            .rebind_claude(from, title.clone(), &session, generation)
+            .map_err(|error| format!("{title} could not be rebound: {error}"))?;
+    } else {
+        let Some(current_binding) = current.clone() else {
+            return Ok(format!(
+                "ignored: {title} has no OpenCode binding to rebind"
+            ));
+        };
+        let server = router.server_for(from).ok_or_else(|| {
+            format!("{title} has no owned OpenCode server to rebind")
+        })?;
+        router
+            .rebind_room(crate::native_route::RoomEntry {
+                index: from,
+                title: title.clone(),
+                binding: crate::native_outbox::Binding {
+                    room: current_binding.room.clone(),
+                    session: session.clone(),
+                    endpoint: current_binding.endpoint.clone(),
+                    generation,
+                },
+                backend: crate::native_route::Backend::OpenCode(server),
+            })
+            .map_err(|error| format!("{title} could not be rebound: {error}"))?;
+    }
+    Ok(format!("{title} now follows reported session {session}"))
+}
+
+/// Reintroduces one native room through the router: the house rules travel
+/// exactly like the startup intro, and the result is the notice to show.
+/// The F4 handler calls this; a test runs it directly.
+pub(crate) fn reintroduce_native_room(
+    title: &str,
+    router: &mut NativeRouter,
+    mailroom: &mut Mailroom,
+    to: usize,
+    message: &str,
+) -> (String, NoticeSeverity) {
+    match router.send(mailroom, "The Crowded Room", to, message, None) {
+        Ok(()) => (
+            format!("{title} reintroduced to the room"),
+            NoticeSeverity::Info,
+        ),
+        Err(error) => (
+            format!("Could not reintroduce {title}: {error}"),
+            NoticeSeverity::Failure,
+        ),
+    }
+}
+
+/// Keeps each native Codex room's liveness current. Called before the outbox
+/// is ticked and after a child is reaped, so a queued message can never be sent
+/// into a session whose process is gone.
+pub(crate) fn refresh_codex_liveness(panes: &[Pane], router: &mut NativeRouter) {
+    for (index, pane) in panes.iter().enumerate() {
+        if pane.codex_native() {
+            router.set_codex_live(index, pane.is_online());
+        }
+    }
+}
+
+/// One event-loop pass for the native outbox: liveness first, then scheduling.
+pub(crate) fn tick_native(
+    router: &mut NativeRouter,
+    panes: &[Pane],
+    now: Instant,
+    mailroom: &mut Mailroom,
+    paused: bool,
+    fused: bool,
+) -> Vec<(String, NoticeSeverity)> {
+    refresh_codex_liveness(panes, router);
+    router.tick(now, mailroom, paused, fused)
+}
+
+/// The native doorbell branch in one call. Its whole result, including a
+/// failure, is a notice; nothing here can reach the room's terminal.
+pub(crate) fn deliver_native_doorbell(
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    mailroom: &mut Mailroom,
+    source: &str,
+    target: &str,
+    to: usize,
+    body: &str,
+    reply: Option<native_route::Reply>,
+    fuse: &mut DeliveryFuse,
+    delivery_paused: &mut bool,
+    notice: &mut Notices,
+) {
+    let (text, severity) = match send_native_mail(panes, router, mailroom, source, to, body, reply) {
+        Ok(()) => {
+            fuse.record();
+            if fuse.is_tripped() {
+                *delivery_paused = true;
+                (
+                    format!(
+                        "{source} → {target} saved; delivery fuse tripped at {}",
+                        fuse.limit
+                    ),
+                    NoticeSeverity::Failure,
+                )
+            } else {
+                (
+                    format!("{source} → {target} saved for native delivery"),
+                    NoticeSeverity::Info,
+                )
+            }
+        }
+        Err(error) => (
+            format!("{source} → {target} not saved: {error}"),
+            NoticeSeverity::Failure,
+        ),
+    };
+    append_notice(notice, text, severity);
+}
+
+/// Everything the event loop does with one doorbell message. A native room's
+/// mail only ever goes through the router; the terminal writers below it are
+/// reached only for rooms that are not native, so no native failure, hold or
+/// uncertainty can become a paste.
+pub(crate) fn route_doorbell_message(
+    envelope: crate::doorbell::DoorbellEnvelope,
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    mailroom: &mut Mailroom,
+    delivery_gates: &mut [DeliveryGate],
+    input_ready: &[bool],
+    pending: &mut VecDeque<(u64, usize)>,
+    submit_pending: &mut VecDeque<(Instant, usize, bool)>,
+    fuse: &mut DeliveryFuse,
+    delivery_paused: &mut bool,
+    notice: &mut Notices,
+    now: Instant,
+) {
+    let source = panes[envelope.from].title().to_owned();
+    let target = panes[envelope.to].title().to_owned();
+    let body = message_with_hat(
+        envelope.task.as_deref(),
+        envelope.role.as_deref(),
+        &envelope.body,
+    );
+    if panes[envelope.to].is_native() {
+        let to = envelope.to;
+        deliver_native_doorbell(
+            panes,
+            router,
+            mailroom,
+            &source,
+            &target,
+            to,
+            &body,
+            Some(doorbell_reply(envelope)),
+            fuse,
+            delivery_paused,
+            notice,
+        );
+        return;
+    }
+    if *delivery_paused || !delivery_gates[envelope.to].can_deliver(input_ready[envelope.to]) {
+        if pending.len() >= 100 {
+            envelope.reply_failed("delivery queue is full");
+            return;
+        }
+        let reason = if delivery_gates[envelope.to].is_starting() {
+            "room starting"
+        } else if !input_ready[envelope.to] {
+            "room busy"
+        } else if fuse.is_tripped() {
+            "fuse tripped"
+        } else {
+            "delivery paused"
+        };
+        let id = mailroom.queue(source, target, body, reason);
+        pending.push_back((id, envelope.to));
+        envelope.reply_queued(id);
+        append_notice(
+            notice,
+            format!("Envelope #{id:04} queued: {reason}"),
+            NoticeSeverity::Info,
+        );
+        return;
+    }
+    let (id, result) = mailroom.deliver(source, &mut panes[envelope.to], body);
+    match result {
+        Ok(()) => {
+            envelope.reply_injected(id);
+            delivery_gates[envelope.to].message_sent();
+            submit_pending.push_back((now, envelope.to, false));
+            fuse.record();
+            if fuse.is_tripped() {
+                *delivery_paused = true;
+                append_notice(
+                    notice,
+                    format!(
+                        "Envelope #{id:04} injected; delivery fuse tripped at {}",
+                        fuse.limit
+                    ),
+                    NoticeSeverity::Failure,
+                );
+            } else {
+                append_notice(
+                    notice,
+                    format!(
+                        "Doorbell envelope #{id:04} injected • fuse {}/{}",
+                        fuse.remaining(),
+                        fuse.limit
+                    ),
+                    NoticeSeverity::Info,
+                );
+            }
+        }
+        Err(error) => {
+            envelope.reply_failed(error.to_string());
+            append_notice(
+                notice,
+                format!("Envelope #{id:04} failed: {error}"),
+                NoticeSeverity::Failure,
+            );
+        }
     }
 }
 
@@ -1526,72 +2518,638 @@ fn run_with(
     result
 }
 
-fn run_rooms(
-    specs: Vec<RoomSpec>,
-    resumed: Vec<bool>,
-        mut fuse_size: usize,
-    token_pricing: Vec<TokenPricing>,
-    startup_notice: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let room_count = specs.len();
-    debug_assert_eq!(resumed.len(), room_count);
-    // Each room receives only its own capability token.
-    let doorbell = Doorbell::start(room_count)?;
-    // Owned OpenCode servers start before the terminal is taken over, in
-    // parallel, so a slow start never freezes the event loop; a room that
-    // cannot start fails the launch instead of falling back to paste.
-    let environments = (0..room_count)
-        .map(|index| doorbell.guest_environment(index))
-        .collect::<Result<Vec<_>, _>>()?;
-    if specs.iter().any(|spec| spec.native_delivery) {
-        eprintln!("Starting native OpenCode servers...");
+pub(crate) trait DoorbellSource {
+    fn try_recv(&mut self) -> Result<crate::doorbell::DoorbellEvent, std::sync::mpsc::TryRecvError>;
+    fn path(&self) -> &std::path::Path;
+}
+
+impl DoorbellSource for crate::doorbell::Doorbell {
+    fn try_recv(&mut self) -> Result<crate::doorbell::DoorbellEvent, std::sync::mpsc::TryRecvError> {
+        crate::doorbell::Doorbell::try_recv(self)
     }
-        // `?` returns early on an error. The guards below still run their Drop code.
-        let ((natives, router), _terminal_guard) = launch_then_enter(
-        || {
-            let natives = pane::launch_native_rooms(&specs, &environments)?;
-            let router = pane::start_native_router(&specs, &natives)?;
-            Ok((natives, router))
-        },
-        TerminalGuard::enter,
-    )?;
-    let mut natives = natives.into_iter();
-    let mut router: Option<NativeRouter> = router;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let (rooms, _, _) = content_areas(terminal.size()?.into());
-    let areas = pane_areas(rooms, room_count);
-    let mut panes = Vec::with_capacity(room_count);
-    // Anchors `INTRO_READINESS_CEILING`: each room's own spawn instant, not
-    // a shared one, so a slow room later in this loop isn't penalized for
-    // rooms spawned before it.
-    let mut spawned_at = Vec::with_capacity(room_count);
-    let mut last_output = vec![None::<Instant>; room_count];
-    // Windows serializes Headroom bootstrap: the next Headroom room's spawn
-    // waits for the prior one to reach its ready boundary, so two wrappers
-    // never start their proxies at once. Non-Headroom rooms and every room
-    // on non-Windows spawn immediately, exactly as before.
-    let mut prior_headroom: Option<usize> = None;
-    for (index, (spec, area)) in specs.into_iter().zip(areas).enumerate() {
-        let headroom = pane::spec_uses_headroom(&spec);
-        if headroom_lane_holds(cfg!(windows), headroom, prior_headroom.is_some()) {
-            if let Some(prior) = prior_headroom {
-                wait_for_headroom_ready(&mut panes[prior], &mut last_output[prior])?;
+
+    fn path(&self) -> &std::path::Path {
+        crate::doorbell::Doorbell::path(self)
+    }
+}
+
+/// The terminal events the loop polls for. Tests supply a scripted source; the
+/// real run reads from crossterm.
+pub(crate) trait EventSource {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
+    fn read(&mut self) -> io::Result<Event>;
+}
+
+pub(crate) struct CrosstermEvents;
+
+impl EventSource for CrosstermEvents {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        event::poll(timeout)
+    }
+
+    fn read(&mut self) -> io::Result<Event> {
+        event::read()
+    }
+}
+
+/// The notices this run has to show. Bounded so a long-lived run cannot grow
+/// them without limit: at most [`MAX_NOTICES`] entries are kept, the oldest
+/// is dropped and counted, consecutive identical texts collapse into one
+/// entry with a repeat count, and a failure is never dropped to make room for
+/// a routine status. The severity travels with the notice from the code that
+/// produced it; nothing here guesses it from the wording.
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct Notices {
+    entries: Vec<Notice>,
+    dropped: usize,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+struct Notice {
+    text: String,
+    severity: NoticeSeverity,
+    repeats: usize,
+}
+
+const MAX_NOTICES: usize = 16;
+
+impl Notices {
+    /// Adds one notice, collapsing a repeat of the previous one and making
+    /// room without ever displacing a failure for a routine status.
+    pub(crate) fn push(&mut self, text: String, severity: NoticeSeverity) {
+        if let Some(last) = self.entries.last_mut() {
+            if last.text == text && last.severity == severity {
+                last.repeats += 1;
+                return;
             }
         }
-                // The owned server starts here, before the event loop, because the
-        // loop cannot wait for it; a room that cannot start its server fails
-        // startup instead of falling back to paste or a private server.
-                        panes.push(Pane::spawn_with_native(
-            spec,
-            pane_size(area),
-            doorbell.guest_environment(index)?,
-            natives.next().flatten(),
-        )?);
-        spawned_at.push(Instant::now());
-        if headroom {
-            prior_headroom = Some(index);
+        if self.entries.len() >= MAX_NOTICES {
+            match self
+                .entries
+                .iter()
+                .position(|entry| entry.severity != NoticeSeverity::Failure)
+            {
+                Some(victim) => {
+                    self.entries.remove(victim);
+                    self.dropped += 1;
+                }
+                None if severity != NoticeSeverity::Failure => {
+                    self.dropped += 1;
+                    return;
+                }
+                None => {
+                    self.entries.remove(0);
+                    self.dropped += 1;
+                }
+            }
+        }
+        self.entries.push(Notice {
+            text,
+            severity,
+            repeats: 1,
+        });
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.dropped = 0;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn line(entry: &Notice) -> String {
+        if entry.repeats > 1 {
+            format!("{} (x{})", entry.text, entry.repeats)
+        } else {
+            entry.text.clone()
         }
     }
+
+    /// Every notice with failures first, for the full list and the popup.
+    /// Within each group the order stays oldest first.
+    pub(crate) fn ordered_lines(&self) -> Vec<String> {
+        let failures = self
+            .entries
+            .iter()
+            .filter(|entry| entry.severity == NoticeSeverity::Failure)
+            .map(Self::line);
+        let infos = self
+            .entries
+            .iter()
+            .filter(|entry| entry.severity != NoticeSeverity::Failure)
+            .map(Self::line);
+        failures.chain(infos).collect()
+    }
+
+    /// The one-row status line. One notice on its own is exactly its own
+    /// text; with more than one, the newest failure leads behind a count so
+    /// an earlier routine status can never hide it, clipped with an ellipsis
+    /// to the width it has. When the width cannot fit enough of the message
+    /// to act on, the line points at the mailroom instead of a bare count.
+    fn status_line(&self, width: u16) -> Option<String> {
+        let first = self.entries.first()?;
+        if self.entries.len() == 1 && first.repeats == 1 {
+            return Some(first.text.clone());
+        }
+        let failures = self
+            .entries
+            .iter()
+            .filter(|entry| entry.severity == NoticeSeverity::Failure)
+            .count();
+        let (head, latest) = if failures > 0 {
+            let label = if failures == 1 { "failure" } else { "failures" };
+            let newest = self
+                .entries
+                .iter()
+                .rev()
+                .find(|entry| entry.severity == NoticeSeverity::Failure)?;
+            (format!("{failures} {label}: "), newest)
+        } else {
+            (
+                format!("{} notices: ", self.entries.len()),
+                self.entries.last()?,
+            )
+        };
+        let room = (width as usize).saturating_sub(head.chars().count());
+        // A clipped fragment shorter than this cannot name a room and a
+        // reason, so name the mailroom instead of showing a bare count.
+        const USEFUL_CHARS: usize = 12;
+        if room < USEFUL_CHARS {
+            const POINTER: &str = "see mailroom";
+            let budget = (width as usize).saturating_sub(head.chars().count());
+            if budget == 0 {
+                return Some(clipped(&head, width as usize));
+            }
+            return Some(format!("{head}{}", clipped(POINTER, budget)));
+        }
+        Some(format!("{head}{}", clipped(&Self::line(latest), room)))
+    }
+}
+
+/// Renders the mailroom popup into a buffer: the notice history first with
+/// failures before routine statuses, then the envelopes. The widget scrolls,
+/// so every line stays reachable no matter how many envelopes precede it.
+fn render_mail_popup(
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    mailroom: &Mailroom,
+    notice: &Notices,
+    scroll: u16,
+) {
+    use ratatui::widgets::Widget;
+    Widget::render(Clear, area, buf);
+    // The full list lives here: the one row can only ever show the newest
+    // failure, so every notice stays reachable by scrolling. Failures sort
+    // first, ahead of queued envelopes.
+    Widget::render(
+        Paragraph::new(mail_popup_text(mailroom, notice))
+            .block(Block::bordered().title(" Mailroom "))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
+        buf,
+    );
+}
+
+/// The mailroom popup body: the notice history first with failures
+/// before routine statuses, then the envelope history. Notices lead so a
+/// failure is visible even with a full mailroom; the widget scrolls, so
+/// every line stays reachable.
+fn mail_popup_text(mailroom: &Mailroom, notice: &Notices) -> String {
+    let mut text = String::new();
+    if !notice.is_empty() {
+        text.push_str("Notices (failures first; Up/Down or wheel to scroll)\n");
+        for line in notice.ordered_lines() {
+            text.push_str("  ");
+            text.push_str(&line);
+            text.push('\n');
+        }
+        if notice.dropped > 0 {
+            text.push_str(&format!("  ({} older notices dropped)\n", notice.dropped));
+        }
+        text.push('\n');
+    }
+    text.push_str(&mailroom.summary());
+    text
+}
+
+/// `text` cut to `budget` characters, with an ellipsis in the last one.
+fn clipped(text: &str, budget: usize) -> String {
+    if budget == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= budget {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(budget - 1).collect();
+    out.push('…');
+    out
+}
+
+/// Adds one notice to the ones this iteration has produced. Nothing inside
+/// an iteration replaces an earlier notice: a later status line is appended,
+/// so a failure reported first is still there when the UI reads the result.
+fn append_notice(notice: &mut Notices, text: String, severity: NoticeSeverity) {
+    notice.push(text, severity);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_rooms_iteration<D, B>(
+    doorbell: &mut D,
+    mut terminal: Option<&mut Terminal<B>>,
+    panes: &mut [Pane],
+    router: &mut Option<NativeRouter>,
+    mailroom: &mut Mailroom,
+    delivery_gates: &mut [DeliveryGate],
+    last_output: &mut [Option<Instant>],
+    spawned_at: &mut [Instant],
+    room_pulses: &mut [Option<PulseSample>],
+    room_details: &mut [RoomDetail],
+    pending: &mut VecDeque<(u64, usize)>,
+    submit_pending: &mut VecDeque<(Instant, usize, bool)>,
+    fuse: &mut DeliveryFuse,
+    delivery_paused: &mut bool,
+    notice: &mut Notices,
+    input_ready_out: &mut Vec<bool>,
+    codex: &mut [Option<pane::CodexMint>],
+    pane_sizes: &[portable_pty::PtySize],
+    environments: &[pane::GuestEnvironment],
+    token_pricing: &[TokenPricing],
+    fuse_size: usize,
+    room_count: usize,
+    now: Instant,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    D: DoorbellSource,
+    B: Backend,
+{
+    if crate::shutdown::requested() {
+        return Ok(());
+    }
+    complete_mints(
+        &mut LivePanes,
+        codex,
+        panes,
+        router.as_mut(),
+        delivery_gates,
+        spawned_at,
+        last_output,
+        room_pulses,
+        pane_sizes,
+        environments,
+        notice,
+        now,
+    )?;
+    if let Some(router) = router.as_mut() {
+        let notices = tick_native(
+            router,
+            panes,
+            now,
+            mailroom,
+            *delivery_paused,
+            fuse.is_tripped(),
+        );
+        // Every notice this pass drained reaches the UI, in order: none is
+        // dropped just because another one arrived with it.
+        for (text, severity) in notices {
+            append_notice(notice, text, severity);
+        }
+    }
+    for (index, pane) in panes.iter_mut().enumerate() {
+        if pane.drain_output()? {
+            last_output[index] = Some(now);
+        }
+    }
+    let input_ready: Vec<_> = panes
+        .iter()
+        .enumerate()
+        .map(|(index, pane)| {
+            let output_is_quiet = last_output[index].is_some_and(|last| {
+                now.duration_since(last) >= quiet_threshold(pane.headroom_active())
+            });
+            pane.automation_input_ready(output_is_quiet)
+        })
+        .collect();
+    *input_ready_out = input_ready.clone();
+    resend_whisper_submits(submit_pending, panes, &input_ready, now);
+    for index in 0..room_count {
+        delivery_gates[index].observe(input_ready[index]);
+        let waited = now.duration_since(spawned_at[index]);
+        if delivery_gates[index].can_send_intro(
+            input_ready[index],
+            waited,
+            intro_ceiling(panes[index].headroom_active()),
+        ) {
+            let roster = welcome_roster(panes, room_pulses, now);
+            match panes[index].send_whisper(
+                "The Crowded Room",
+                &house_rules(index + 1, &roster, fuse_size),
+            ) {
+                Ok(()) => {
+                    delivery_gates[index].intro_sent();
+                    panes[index].begin_session_capture();
+                }
+                Err(error) => {
+                    append_notice(
+                        notice,
+                        format!(
+                            "Could not teach {} the house rules: {error}",
+                            panes[index].title()
+                        ),
+                        NoticeSeverity::Failure,
+                    );
+                }
+            }
+        }
+    }
+    if !*delivery_paused {
+        let (injected, failed) = inject_ready_pending(
+            pending,
+            PendingSubmit {
+                queue: submit_pending,
+                now,
+            },
+            mailroom,
+            panes,
+            delivery_gates,
+            &input_ready,
+            fuse,
+        );
+        if fuse.is_tripped() {
+            *delivery_paused = true;
+            append_notice(
+                notice,
+                format!(
+                    "Delivery fuse tripped after {injected} queued injections; {} remain",
+                    pending.len()
+                ),
+                NoticeSeverity::Failure,
+            );
+        } else if injected > 0 || failed > 0 {
+            append_notice(
+                notice,
+                format!("Queued delivery: {injected} injected, {failed} failed"),
+                if failed > 0 {
+                    NoticeSeverity::Failure
+                } else {
+                    NoticeSeverity::Info
+                },
+            );
+        }
+    }
+    while let Ok(event) = doorbell.try_recv() {
+        let envelope = match event {
+            DoorbellEvent::Roster(request) => {
+                request.reply(
+                    panes
+                        .iter()
+                        .enumerate()
+                        .map(|(index, pane)| {
+                            let resolved = roster_state(
+                                pane.is_online(),
+                                delivery_gates[index],
+                                input_ready[index],
+                                room_pulses[index].clone(),
+                                now,
+                            );
+                            RosterRoom {
+                                room: index + 1,
+                                name: pane.name().to_owned(),
+                                guest: pane.guest(),
+                                vendor: pane.vendor().to_owned(),
+                                transport: pane.transport().to_owned(),
+                                state: resolved.state,
+                                state_source: resolved.source,
+                                allow_control: pane.allows_control(),
+                                model: effective_model(
+                                    pane.current_model().as_deref(),
+                                    room_pulses[index].as_ref(),
+                                    now,
+                                ),
+                                effort: pane.current_effort(),
+                                cost: pane::usage_cost(
+                                    &pane.guest(),
+                                    pane.cwd(),
+                                    pane.title(),
+                                    token_pricing,
+                                )
+                                .map(|cost| format!("${cost:.6}"))
+                                .unwrap_or_else(|| "unknown".to_owned()),
+                                headroom: pane.headroom_active(),
+                                pulse_age_ms: room_pulses[index].as_ref().map(|sample| {
+                                    now.saturating_duration_since(sample.received_at)
+                                        .as_millis()
+                                        as u64
+                                }),
+                                capabilities: pane.capabilities(),
+                                scheduling: pane.scheduling(),
+                            }
+                        })
+                        .collect(),
+                );
+                continue;
+            }
+            DoorbellEvent::Pulse(pulse) => {
+                if pulse.detail.as_ref().is_none_or(|events| events.is_empty()) {
+                    delivery_gates[pulse.from].observe_pulse(pulse.state, input_ready[pulse.from]);
+                }
+                apply_pulse_to_room(
+                    room_pulses,
+                    room_details,
+                    pulse.from,
+                    pulse.state,
+                    pulse.model,
+                    pulse.detail,
+                );
+                continue;
+            }
+            DoorbellEvent::Control(control) => {
+                let source = panes[control.from].title().to_owned();
+                let target = panes[control.to].title().to_owned();
+                let label = control.action.label();
+                if !panes[control.to].allows_control() {
+                    control.reply_failed(format!("{target} does not allow peer control"));
+                    append_notice(
+                        notice,
+                        format!("{source} control rejected by {target}"),
+                        NoticeSeverity::Failure,
+                    );
+                    continue;
+                }
+                let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
+                    let size = match terminal.as_mut() {
+                        Some(term) => {
+                            term.autoresize()?;
+                            let (rooms, _, _) = content_areas(term.size()?.into());
+                            pane_size(pane_areas(rooms, room_count)[control.to])
+                        }
+                        None => pane_sizes[control.to],
+                    };
+                    let codex_native = panes[control.to].codex_native();
+                    let claude_native = panes[control.to].claude_native();
+                    let prompt = if codex_native {
+                        house_rules(
+                            control.to + 1,
+                            &welcome_roster(panes, room_pulses, now),
+                            fuse_size,
+                        )
+                    } else {
+                        String::new()
+                    };
+                    match &control.action {
+                        ControlAction::ClearContext if claude_native => relaunch_claude_room(
+                            pane::ClaudeRelaunch::Clear,
+                            control.to,
+                            size,
+                            panes,
+                            router.as_mut(),
+                            delivery_gates,
+                            last_output,
+                            spawned_at,
+                            room_pulses,
+                            environments,
+                            now,
+                        )
+                        .map(|()| false),
+                        ControlAction::Resume if claude_native => relaunch_claude_room(
+                            pane::ClaudeRelaunch::Resume,
+                            control.to,
+                            size,
+                            panes,
+                            router.as_mut(),
+                            delivery_gates,
+                            last_output,
+                            spawned_at,
+                            room_pulses,
+                            environments,
+                            now,
+                        )
+                        .map(|()| true),
+                        ControlAction::ClearContext if codex_native => relaunch_codex_room(
+                            pane::CodexRelaunch::Clear,
+                            control.to,
+                            size,
+                            &prompt,
+                            panes,
+                            router.as_mut(),
+                            codex,
+                            delivery_gates,
+                            last_output,
+                            spawned_at,
+                            room_pulses,
+                            environments,
+                            now,
+                        )
+                        .map(|()| false),
+                        ControlAction::Resume if codex_native => relaunch_codex_room(
+                            pane::CodexRelaunch::Resume,
+                            control.to,
+                            size,
+                            &prompt,
+                            panes,
+                            router.as_mut(),
+                            codex,
+                            delivery_gates,
+                            last_output,
+                            spawned_at,
+                            room_pulses,
+                            environments,
+                            now,
+                        )
+                        .map(|()| true),
+                        ControlAction::ClearContext => {
+                            panes[control.to].clear_context(size).map(|_| false)
+                        }
+                        ControlAction::Resume => panes[control.to].resume_context(size),
+                        ControlAction::Configure { model, effort } => panes[control.to]
+                            .configure(model.as_deref(), effort.as_ref().map(|e| e.label()), size)
+                            .map(|_| false),
+                    }
+                })();
+                match result {
+                    Ok(resumed) => {
+                        delivery_gates[control.to] = gate_after_control(panes[control.to].needs_intro(), resumed);
+                        last_output[control.to] = None;
+                        spawned_at[control.to] = Instant::now();
+                        room_pulses[control.to] = match &control.action {
+                            // A native room's process is new even when its
+                            // conversation is the same one.
+                            ControlAction::Resume if !panes[control.to].is_native() => None,
+                            _ => Some(PulseSample::now(PulseState::Starting, None)),
+                        };
+                        control.reply_applied();
+                        append_notice(
+                            notice,
+                            format!("{source} told {target} to {label}"),
+                            NoticeSeverity::Info,
+                        );
+                    }
+                    Err(error) => {
+                        control.reply_failed(error.to_string());
+                        append_notice(
+                            notice,
+                            format!("{source} could not {label} on {target}: {error}"),
+                            NoticeSeverity::Failure,
+                        );
+                    }
+                }
+                continue;
+            }
+            DoorbellEvent::SessionReport(report) => {
+                report_native_session(panes, router.as_mut(), report, notice);
+                continue;
+            }
+            DoorbellEvent::Message(envelope) => envelope,
+        };
+        route_doorbell_message(
+            envelope,
+            panes,
+            router.as_mut(),
+            mailroom,
+            delivery_gates,
+            &input_ready,
+            pending,
+            submit_pending,
+            fuse,
+            delivery_paused,
+            notice,
+            now,
+        );
+    }
+    Ok(())
+}
+
+
+
+/// The production event loop: pumps mints, output, the outbox and the doorbell,
+/// draws, then reads and handles terminal events until Ctrl+Q or a shutdown
+/// request. The event source and terminal are injected so a test can run this
+/// same loop with scripted events and a fake terminal.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_loop<B, E, D>(
+    terminal: &mut Terminal<B>,
+    events: &mut E,
+    doorbell: &mut D,
+    mut panes: &mut [Pane],
+    router: &mut Option<NativeRouter>,
+    mut codex: &mut [Option<pane::CodexMint>],
+    environments: &[pane::GuestEnvironment],
+    mut spawned_at: &mut [Instant],
+    mut last_output: &mut [Option<Instant>],
+    pane_sizes: &mut Vec<portable_pty::PtySize>,
+    token_pricing: &[TokenPricing],
+    mut fuse_size: usize,
+    mut notice: &mut Notices,
+    resumed: &[bool],
+    room_count: usize,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    B: Backend,
+    E: EventSource,
+    D: DoorbellSource,
+{
     let mut delivery_gates = panes
         .iter()
         .enumerate()
@@ -1599,7 +3157,16 @@ fn run_rooms(
         .collect::<Vec<_>>();
     let mut focused = 0;
     let mut input_mode = InputMode::Normal;
-        let mut notice: Option<String> = startup_notice;
+    // How far the mailroom popup is scrolled. Reset whenever it opens; the
+    // notice history itself is kept on open and cleared on dismiss, so the
+    // failures the status row points at are still there to scroll to.
+    let mut mail_scroll: u16 = 0;
+    // A Codex room is bound to the session the launch phase gave it before any
+    // mail is sent. A room that was not started stays native and unbound with
+    // its reason, so its mail is held instead of being pasted.
+    if let Some(router) = router.as_mut() {
+        pane::bind_codex_rooms(router, &mut panes, &codex)?;
+    }
     let mut mailroom = Mailroom::new(100);
     let mut fuse = DeliveryFuse::new(fuse_size);
     let mut delivery_paused = false;
@@ -1628,7 +3195,10 @@ fn run_rooms(
     if let Some(router) = router.as_mut() {
         let now = Instant::now();
         for index in 0..room_count {
-            if router.is_native(index) {
+            // A native Codex room already received its intro from the exec
+            // turn that created its session, and a room that was not started
+            // has nowhere to receive one.
+            if router.is_native(index) && codex[index].is_none() {
                 let roster = welcome_roster(&panes, &room_pulses, now);
                 if let Err(error) = router.send(
                     &mut mailroom,
@@ -1637,10 +3207,13 @@ fn run_rooms(
                     &house_rules(index + 1, &roster, fuse_size),
                     None,
                 ) {
-                    notice = Some(format!(
-                        "Could not teach {} the house rules: {error}",
-                        panes[index].title()
-                    ));
+                    notice.push(
+                        format!(
+                            "Could not teach {} the house rules: {error}",
+                            panes[index].title()
+                        ),
+                        NoticeSeverity::Failure,
+                    );
                 }
             }
         }
@@ -1651,291 +3224,32 @@ fn run_rooms(
             break;
         }
         let now = Instant::now();
-        if let Some(router) = router.as_mut() {
-            if let Some(text) = router
-                .tick(now, &mut mailroom, delivery_paused, fuse.is_tripped())
-                .pop()
-            {
-                notice = Some(text);
-            }
-        }
-        for (index, pane) in panes.iter_mut().enumerate() {
-            if pane.drain_output()? {
-                last_output[index] = Some(now);
-            }
-        }
-        let input_ready: Vec<_> = panes
-            .iter()
-            .enumerate()
-            .map(|(index, pane)| {
-                let output_is_quiet = last_output[index].is_some_and(|last| {
-                    now.duration_since(last) >= quiet_threshold(pane.headroom_active())
-                });
-                pane.automation_input_ready(output_is_quiet)
-            })
-            .collect();
-        resend_whisper_submits(&mut submit_pending, &mut panes, &input_ready, now);
-        for index in 0..room_count {
-            delivery_gates[index].observe(input_ready[index]);
-            let waited = now.duration_since(spawned_at[index]);
-            if delivery_gates[index].can_send_intro(
-                input_ready[index],
-                waited,
-                intro_ceiling(panes[index].headroom_active()),
-            ) {
-                let roster = welcome_roster(&panes, &room_pulses, now);
-                match panes[index].send_whisper(
-                    "The Crowded Room",
-                    &house_rules(index + 1, &roster, fuse_size),
-                ) {
-                    Ok(()) => {
-                        delivery_gates[index].intro_sent();
-                        panes[index].begin_session_capture();
-                    }
-                    Err(error) => {
-                        // Leave the gate at `AwaitingIntro` so the next loop
-                        // iteration retries; a failed write must not claim a
-                        // successful intro or start session capture.
-                        notice = Some(format!(
-                            "Could not teach {} the house rules: {error}",
-                            panes[index].title()
-                        ));
-                    }
-                }
-            }
-        }
-        if !delivery_paused {
-            let (injected, failed) = inject_ready_pending(
-                &mut pending,
-                PendingSubmit {
-                    queue: &mut submit_pending,
-                    now,
-                },
-                &mut mailroom,
-                &mut panes,
-                &mut delivery_gates,
-                &input_ready,
-                &mut fuse,
-            );
-            if fuse.is_tripped() {
-                delivery_paused = true;
-                notice = Some(format!(
-                    "Delivery fuse tripped after {injected} queued injections; {} remain",
-                    pending.len()
-                ));
-            } else if injected > 0 || failed > 0 {
-                notice = Some(format!(
-                    "Queued delivery: {injected} injected, {failed} failed"
-                ));
-            }
-        }
-        while let Ok(event) = doorbell.try_recv() {
-            let envelope = match event {
-                DoorbellEvent::Roster(request) => {
-                    request.reply(
-                        panes
-                            .iter()
-                            .enumerate()
-                            .map(|(index, pane)| {
-                                let resolved = roster_state(
-                                    pane.is_online(),
-                                    delivery_gates[index],
-                                    input_ready[index],
-                                    room_pulses[index].clone(),
-                                    now,
-                                );
-                                RosterRoom {
-                                    room: index + 1,
-                                    name: pane.name().to_owned(),
-                                    guest: pane.guest(),
-                                    vendor: pane.vendor().to_owned(),
-                                    transport: pane.transport().to_owned(),
-                                    state: resolved.state,
-                                    state_source: resolved.source,
-                                    allow_control: pane.allows_control(),
-                                    model: effective_model(
-                                        pane.current_model().as_deref(),
-                                        room_pulses[index].as_ref(),
-                                        now,
-                                    ),
-                                    effort: pane.current_effort(),
-                                    cost: pane::usage_cost(
-                                        &pane.guest(),
-                                        pane.cwd(),
-                                        pane.title(),
-                                        &token_pricing,
-                                    )
-                                    .map(|cost| format!("${cost:.6}"))
-                                    .unwrap_or_else(|| "unknown".to_owned()),
-                                    headroom: pane.headroom_active(),
-                                    pulse_age_ms: room_pulses[index].as_ref().map(|sample| {
-                                        now.saturating_duration_since(sample.received_at)
-                                            .as_millis()
-                                            as u64
-                                    }),
-                                    capabilities: pane.capabilities(),
-                                    scheduling: pane.scheduling(),
-                                }
-                            })
-                            .collect(),
-                    );
-                    continue;
-                }
-                DoorbellEvent::Pulse(pulse) => {
-                    if pulse.detail.as_ref().is_none_or(|events| events.is_empty()) {
-                        delivery_gates[pulse.from]
-                            .observe_pulse(pulse.state, input_ready[pulse.from]);
-                    }
-                    apply_pulse_to_room(
-                        &mut room_pulses,
-                        &mut room_details,
-                        pulse.from,
-                        pulse.state,
-                        pulse.model,
-                        pulse.detail,
-                    );
-                    continue;
-                }
-                DoorbellEvent::Control(control) => {
-                    let source = panes[control.from].title().to_owned();
-                    let target = panes[control.to].title().to_owned();
-                    let label = control.action.label();
-                    if !panes[control.to].allows_control() {
-                        control.reply_failed(format!("{target} does not allow peer control"));
-                        notice = Some(format!("{source} control rejected by {target}"));
-                        continue;
-                    }
-
-                    // Reports whether the room came back holding a prior
-                    // conversation, which only a resume can do and only when it
-                    // was actually honoured.
-                    let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
-                        terminal.autoresize()?;
-                        let (rooms, _, _) = content_areas(terminal.size()?.into());
-                        let size = pane_size(pane_areas(rooms, room_count)[control.to]);
-                        match &control.action {
-                            ControlAction::ClearContext => {
-                                panes[control.to].clear_context(size).map(|_| false)
-                            }
-                            ControlAction::Resume => panes[control.to].resume_context(size),
-                            ControlAction::Configure { model, effort } => panes[control.to]
-                                .configure(
-                                    model.as_deref(),
-                                    effort.as_ref().map(|e| e.label()),
-                                    size,
-                                )
-                                .map(|_| false),
-                        }
-                    })();
-                    match result {
-                        Ok(resumed) => {
-                            delivery_gates[control.to] =
-                                gate_after_control(panes[control.to].needs_intro(), resumed);
-                            last_output[control.to] = None;
-                            spawned_at[control.to] = Instant::now();
-                            room_pulses[control.to] = match &control.action {
-                                ControlAction::Resume => None,
-                                _ => Some(PulseSample::now(PulseState::Starting, None)),
-                            };
-                            control.reply_applied();
-                            notice = Some(format!("{source} told {target} to {label}"));
-                        }
-                        Err(error) => {
-                            control.reply_failed(error.to_string());
-                            notice =
-                                Some(format!("{source} could not {label} on {target}: {error}"));
-                        }
-                    }
-                    continue;
-                }
-                DoorbellEvent::Message(envelope) => envelope,
-            };
-                        let source = panes[envelope.from].title().to_owned();
-            let target = panes[envelope.to].title().to_owned();
-                        let body = message_with_hat(
-                envelope.task.as_deref(),
-                envelope.role.as_deref(),
-                &envelope.body,
-            );
-            // A native room never receives terminal paste: its mail is saved to
-            // the outbox first, and the sender is told how far it got.
-            if panes[envelope.to].is_native() {
-                let to = envelope.to;
-                let result = match router.as_mut() {
-                    Some(router) => router.send(
-                        &mut mailroom,
-                        &source,
-                        to,
-                        &body,
-                        Some(doorbell_reply(envelope)),
-                    ),
-                    None => {
-                        envelope.reply_failed("native delivery is unavailable");
-                        Err("native delivery is unavailable".to_owned())
-                    }
-                };
-                notice = Some(match result {
-                    Ok(()) => {
-                        fuse.record();
-                        if fuse.is_tripped() {
-                            delivery_paused = true;
-                            format!("{source} → {target} saved; delivery fuse tripped at {}", fuse.limit)
-                        } else {
-                            format!("{source} → {target} saved for native delivery")
-                        }
-                    }
-                    Err(error) => format!("{source} → {target} not saved: {error}"),
-                });
-                continue;
-            }
-            if delivery_paused || !delivery_gates[envelope.to].can_deliver(input_ready[envelope.to])
-            {
-                if pending.len() >= 100 {
-                    envelope.reply_failed("delivery queue is full");
-                    continue;
-                }
-                let reason = if delivery_gates[envelope.to].is_starting() {
-                    "room starting"
-                } else if !input_ready[envelope.to] {
-                    "room busy"
-                } else if fuse.is_tripped() {
-                    "fuse tripped"
-                } else {
-                    "delivery paused"
-                };
-                let id = mailroom.queue(source, target, body, reason);
-                pending.push_back((id, envelope.to));
-                envelope.reply_queued(id);
-                notice = Some(format!("Envelope #{id:04} queued: {reason}"));
-            } else {
-                let (id, result) = mailroom.deliver(source, &mut panes[envelope.to], body);
-                match result {
-                    Ok(()) => {
-                        envelope.reply_injected(id);
-                        delivery_gates[envelope.to].message_sent();
-                        submit_pending.push_back((now, envelope.to, false));
-                        fuse.record();
-                        if fuse.is_tripped() {
-                            delivery_paused = true;
-                            notice = Some(format!(
-                                "Envelope #{id:04} injected; delivery fuse tripped at {}",
-                                fuse.limit
-                            ));
-                        } else {
-                            notice = Some(format!(
-                                "Doorbell envelope #{id:04} injected • fuse {}/{}",
-                                fuse.remaining(),
-                                fuse.limit
-                            ));
-                        }
-                    }
-                    Err(error) => {
-                        envelope.reply_failed(error.to_string());
-                        notice = Some(format!("Envelope #{id:04} failed: {error}"));
-                    }
-                }
-            }
-        }
+        let mut input_ready = vec![false; room_count];
+        run_rooms_iteration(
+            doorbell,
+            Some(&mut *terminal),
+            panes,
+            router,
+            &mut mailroom,
+            &mut delivery_gates,
+            last_output,
+            spawned_at,
+            &mut room_pulses,
+            &mut room_details,
+            &mut pending,
+            &mut submit_pending,
+            &mut fuse,
+            &mut delivery_paused,
+            notice,
+            &mut input_ready,
+            codex,
+            pane_sizes,
+            environments,
+            token_pricing,
+            fuse_size,
+            room_count,
+            now,
+        )?;
 
         // Drain any completed background results without blocking.
         while let Ok((index, (refreshed, cost))) = cost_rx.try_recv() {
@@ -1964,14 +3278,14 @@ fn run_rooms(
             let guest = panes[index].guest().to_owned();
             let cwd = panes[index].cwd().to_path_buf();
             let title = panes[index].title().to_owned();
-            let pricing = token_pricing.clone();
+            let pricing = token_pricing.to_vec();
             schedule_cost_collection(
                 CostIdentity {
                     index,
                     guest: guest.clone(),
                     cwd: cwd.clone(),
                     title: title.clone(),
-                    pricing: pricing.clone(),
+                    pricing: pricing.to_vec(),
                 },
                 CostScheduleCtx {
                     now,
@@ -2016,7 +3330,7 @@ fn run_rooms(
             }
         }
 
-        for pane in &mut panes {
+        for pane in panes.iter_mut() {
             pane.apply_scroll();
         }
         terminal.draw(|frame| {
@@ -2080,7 +3394,7 @@ fn run_rooms(
             );
 
             let status_text = match &input_mode {
-                InputMode::Normal => notice.clone().unwrap_or_else(|| {
+                InputMode::Normal => notice.status_line(status.width).unwrap_or_else(|| {
                     if fuse.is_tripped() {
                         format!(
                             " FUSE TRIPPED: {}/{} delivered • {} queued • F3: reset & resume ",
@@ -2142,7 +3456,7 @@ fn run_rooms(
                 }
 
             };
-            let status_style = match (&input_mode, notice.is_some()) {
+            let status_style = match (&input_mode, !notice.is_empty()) {
                 (InputMode::Composing(_), _) => Style::default().fg(Color::Yellow),
                 (InputMode::MailLog, _) => Style::default().fg(Color::Cyan),
                 (InputMode::Config(_), _) => Style::default().fg(Color::Yellow),
@@ -2153,13 +3467,7 @@ fn run_rooms(
 
             if matches!(&input_mode, InputMode::MailLog) {
                 let popup = mail_popup_area(frame.area());
-                frame.render_widget(Clear, popup);
-                frame.render_widget(
-                    Paragraph::new(mailroom.summary())
-                        .block(Block::bordered().title(" Mailroom "))
-                        .wrap(Wrap { trim: false }),
-                    popup,
-                );
+                render_mail_popup(popup, frame.buffer_mut(), &mailroom, &notice, mail_scroll);
             }
 
             if let InputMode::Config(state) = &input_mode {
@@ -2251,18 +3559,23 @@ fn run_rooms(
             }
 
 
-        })?;
-        for pane in &mut panes {
+        }).map_err(|error| io::Error::other(error.to_string()))?;
+        for pane in panes.iter_mut() {
             pane.restore_scroll();
         }
 
-        for pane in &mut panes {
+        for pane in panes.iter_mut() {
             pane.poll_exit()?;
+        }
+        // A child reaped here must not leave its room marked live for the next
+        // pass, or for a doorbell handled later in this one.
+        if let Some(router) = router.as_mut() {
+            refresh_codex_liveness(&panes, router);
         }
 
         let next_event = match stashed_events.pop_front() {
             Some(event) => Some(event),
-            None if event::poll(Duration::from_millis(16))? => Some(event::read()?),
+            None if events.poll(Duration::from_millis(16))? => Some(events.read()?),
             None => None,
         };
         // A wheel report crossterm failed to keep whole arrives as keys. Act on
@@ -2299,13 +3612,7 @@ fn run_rooms(
                             InputMode::Composing(_) | InputMode::Config(_)
                         ) =>
                 {
-                    input_mode = match input_mode {
-                        InputMode::MailLog => InputMode::Normal,
-                        InputMode::Normal => InputMode::MailLog,
-                        InputMode::Config(_) => unreachable!(),
-                        InputMode::Composing(_) => unreachable!(),
-                    };
-                    notice = None;
+                    toggle_mail_log(&mut input_mode, &mut mail_scroll, &mut notice);
                 }
                 Event::Key(key)
                     if key.code == KeyCode::F(1)
@@ -2322,7 +3629,7 @@ fn run_rooms(
                         ))),
                         InputMode::Composing(_) => unreachable!(),
                     };
-                    notice = None;
+                    notice.clear();
                 }
                 Event::Key(key)
                     if key.code == KeyCode::F(3)
@@ -2337,13 +3644,19 @@ fn run_rooms(
                             fuse.reset();
                         }
                         delivery_paused = false;
-                        notice = Some(format!(
-                            "Automatic delivery resumed; {} queued",
-                            pending.len()
-                        ));
+                        notice.push(
+                            format!(
+                                "Automatic delivery resumed; {} queued",
+                                pending.len()
+                            ),
+                            NoticeSeverity::Info,
+                        );
                     } else {
                         delivery_paused = true;
-                        notice = Some("Automatic delivery paused".to_owned());
+                        notice.push(
+                            "Automatic delivery paused".to_owned(),
+                            NoticeSeverity::Info,
+                        );
                     }
                 }
                 Event::Key(key)
@@ -2356,24 +3669,16 @@ fn run_rooms(
                         .as_mut()
                         .filter(|router| router.is_native(focused))
                     {
-                        notice = Some(
-                            match router.send(
-                                &mut mailroom,
-                                "The Crowded Room",
-                                focused,
-                                &house_rules(focused + 1, &roster, fuse_size),
-                                None,
-                            ) {
-                                Ok(()) => format!(
-                                    "{} reintroduced to the room",
-                                    panes[focused].title()
-                                ),
-                                Err(error) => format!(
-                                    "Could not reintroduce {}: {error}",
-                                    panes[focused].title()
-                                ),
-                            },
+                        let message = house_rules(focused + 1, &roster, fuse_size);
+                        let title = panes[focused].title().to_owned();
+                        let (text, severity) = reintroduce_native_room(
+                            &title,
+                            router,
+                            &mut mailroom,
+                            focused,
+                            &message,
                         );
+                        notice.push(text, severity);
                     } else {
                     match panes[focused].send_whisper(
                         "The Crowded Room",
@@ -2382,44 +3687,47 @@ fn run_rooms(
                         Ok(()) => {
                             delivery_gates[focused].intro_sent();
                             panes[focused].begin_session_capture();
-                            notice = Some(format!(
-                                "{} reintroduced to the room",
-                                panes[focused].title()
-                            ));
+                            notice.push(
+                                format!(
+                                    "{} reintroduced to the room",
+                                    panes[focused].title()
+                                ),
+                                NoticeSeverity::Info,
+                            );
                         }
                         Err(error) => {
-                                                        notice = Some(format!(
-                                "Could not reintroduce {}: {error}",
-                                panes[focused].title()
-                            ));
+                                                        notice.push(
+                                format!(
+                                    "Could not reintroduce {}: {error}",
+                                    panes[focused].title()
+                                ),
+                                NoticeSeverity::Failure,
+                            );
                         }
                     }
                     }
                 }
-                Event::Key(key) if force_restart_requested(key, panes[focused].is_online()) => {
-                    terminal.autoresize()?;
-                    let (rooms, _, _) = content_areas(terminal.size()?.into());
-                    let area = pane_areas(rooms, room_count)[focused];
-                    match panes[focused].restart(pane_size(area)) {
-                        Ok(()) => {
-                            delivery_gates[focused] =
-                                DeliveryGate::new(panes[focused].needs_intro());
-                            last_output[focused] = None;
-                            spawned_at[focused] = Instant::now();
-                            room_pulses[focused] =
-                                Some(PulseSample::now(PulseState::Starting, None));
-                            notice = Some(format!("{} restarted", panes[focused].title()));
-                        }
-                        Err(error) => {
-                            notice = Some(format!(
-                                "Could not restart {}: {error}",
-                                panes[focused].title()
-                            ));
-                        }
-                    }
-                }
-
-                Event::Key(key) => match &mut input_mode {
+                Event::Key(key) if run_rooms_key_event(
+                    &Event::Key(key),
+                    &mut loop_state(
+                        focused,
+                        fuse_size,
+                        &mut |index| {
+                            terminal.autoresize().map_err(|error| io::Error::other(error.to_string()))?;
+                            let (rooms, _, _) = content_areas(terminal.size().map_err(|error| io::Error::other(error.to_string()))?.into());
+                            Ok(pane_size(pane_areas(rooms, room_count)[index]))
+                        },
+                        &mut panes,
+                        router.as_mut(),
+                        &mut codex,
+                        &mut delivery_gates,
+                        &mut last_output,
+                        &mut spawned_at,
+                        &mut room_pulses,
+                        &environments,
+                        &mut notice,
+                    ),
+                )? => match &mut input_mode {
                     InputMode::Composing(message) => {
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                             match key.code {
@@ -2436,18 +3744,23 @@ fn run_rooms(
                                             .as_mut()
                                             .filter(|router| router.is_native(target))
                                         {
-                                            notice = Some(
-                                                match router.send(
-                                                    &mut mailroom,
-                                                    &source,
-                                                    target,
-                                                    &message,
-                                                    None,
-                                                ) {
-                                                    Ok(()) => "Saved for native delivery".to_owned(),
-                                                    Err(error) => format!("Not saved: {error}"),
-                                                },
-                                            );
+                                            let (text, severity) = match router.send(
+                                                &mut mailroom,
+                                                &source,
+                                                target,
+                                                &message,
+                                                None,
+                                            ) {
+                                                Ok(()) => (
+                                                    "Saved for native delivery".to_owned(),
+                                                    NoticeSeverity::Info,
+                                                ),
+                                                Err(error) => (
+                                                    format!("Not saved: {error}"),
+                                                    NoticeSeverity::Failure,
+                                                ),
+                                            };
+                                            notice.push(text, severity);
                                         } else if delivery_paused
                                             || !delivery_gates[target]
                                                 .can_deliver(input_ready[target])
@@ -2460,23 +3773,31 @@ fn run_rooms(
                                                 "room not ready",
                                             );
                                             pending.push_back((id, target));
-                                            notice = Some(format!("Envelope #{id:04} queued"));
+                                            notice.push(
+                                                format!("Envelope #{id:04} queued"),
+                                                NoticeSeverity::Info,
+                                            );
                                         } else {
                                             let (id, result) = mailroom.deliver(
                                                 source,
                                                 &mut panes[target],
                                                 message,
                                             );
-                                            notice = Some(match result {
+                                            let (text, severity) = match result {
                                                 Ok(()) => {
                                                     delivery_gates[target].message_sent();
                                                     submit_pending.push_back((now, target, false));
-                                                    format!("Envelope #{id:04} injected")
+                                                    (
+                                                        format!("Envelope #{id:04} injected"),
+                                                        NoticeSeverity::Info,
+                                                    )
                                                 }
-                                                Err(error) => {
-                                                    format!("Envelope #{id:04} failed: {error}")
-                                                }
-                                            });
+                                                Err(error) => (
+                                                    format!("Envelope #{id:04} failed: {error}"),
+                                                    NoticeSeverity::Failure,
+                                                ),
+                                            };
+                                            notice.push(text, severity);
                                         }
                                     }
                                 }
@@ -2503,16 +3824,16 @@ fn run_rooms(
                                                                                     match compose_target(&panes, focused) {
                                 Ok(_) => {
                                     input_mode = InputMode::Composing(String::new());
-                                    notice = None;
+                                    notice.clear();
                                 }
-                                Err(reason) => notice = Some(reason),
+                                Err(reason) => notice.push(reason, NoticeSeverity::Info),
                             }
                         } else if key.code == KeyCode::Tab
                             && key.modifiers == KeyModifiers::NONE
                             && key.kind == KeyEventKind::Press
                         {
                             focused = (focused + 1) % panes.len();
-                            notice = None;
+                            notice.clear();
                         } else if key.code == KeyCode::PageUp && key.kind == KeyEventKind::Press {
                             if panes[focused].is_alternate_screen() {
                                 let _ = panes[focused].forward_page_up();
@@ -2528,19 +3849,35 @@ fn run_rooms(
                                 panes[focused].scroll_down(rows);
                             }
                         } else if panes[focused].is_online() {
-                            if let Some(message) = forward_key(&mut panes[focused], key) {
-                                notice = Some(message);
+                            if let Some((message, severity)) = forward_key(&mut panes[focused], key)
+                            {
+                                notice.push(message, severity);
                             }
                         } else {
-                            notice = Some(format!(
-                                "{} is offline; press Ctrl+R to revive it",
-                                panes[focused].title()
-                            ));
+                            notice.push(
+                                format!(
+                                    "{} is offline; press Ctrl+R to revive it",
+                                    panes[focused].title()
+                                ),
+                                NoticeSeverity::Info,
+                            );
                         }
                     }
                     InputMode::MailLog => {
                         if key.code == KeyCode::Esc && key.kind == KeyEventKind::Press {
-                            input_mode = InputMode::Normal;
+                            toggle_mail_log(&mut input_mode, &mut mail_scroll, &mut notice);
+                        } else if key.code == KeyCode::Up && key.kind == KeyEventKind::Press {
+                            mail_scroll = mail_scroll.saturating_sub(1);
+                        } else if key.code == KeyCode::Down && key.kind == KeyEventKind::Press
+                        {
+                            mail_scroll = mail_scroll.saturating_add(1);
+                        } else if key.code == KeyCode::PageUp && key.kind == KeyEventKind::Press
+                        {
+                            mail_scroll = mail_scroll.saturating_sub(10);
+                        } else if key.code == KeyCode::PageDown
+                            && key.kind == KeyEventKind::Press
+                        {
+                            mail_scroll = mail_scroll.saturating_add(10);
                         }
                     }
                     InputMode::Config(state) => {
@@ -2548,7 +3885,7 @@ fn run_rooms(
                             match key.code {
                                 KeyCode::Esc if key.kind == KeyEventKind::Press => {
                                     input_mode = InputMode::Normal;
-                                    notice = None;
+                                    notice.clear();
                                 }
                                 KeyCode::Enter if key.kind == KeyEventKind::Press => {
                                     let saved = save_config_state(
@@ -2594,18 +3931,29 @@ fn run_rooms(
                     }
                 },
                 Event::Resize(_, _) => {
-                    terminal.autoresize()?;
-                    let (rooms, _, _) = content_areas(terminal.size()?.into());
+                    terminal.autoresize().map_err(|error| io::Error::other(error.to_string()))?;
+                    let (rooms, _, _) = content_areas(terminal.size().map_err(|error| io::Error::other(error.to_string()))?.into());
                     let areas = pane_areas(rooms, room_count);
-                    for (pane, area) in panes.iter_mut().zip(areas.iter()) {
-                        pane.resize(pane_size(*area))?;
+                    *pane_sizes = areas.iter().map(|area| pane_size(*area)).collect();
+                    for (pane, size) in panes.iter_mut().zip(pane_sizes.iter()) {
+                        pane.resize(*size)?;
                     }
                 }
                 // Wheel routing depends on whether the focused pane is in
                 // alternate-screen mode: primary screen scrolls parent
                 // scrollback, alternate screen forwards as PageUp/PageDown.
                 Event::Mouse(mouse) => {
-                    if matches!(&input_mode, InputMode::Normal) {
+                    if matches!(&input_mode, InputMode::MailLog) {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                mail_scroll = mail_scroll.saturating_sub(3);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                mail_scroll = mail_scroll.saturating_add(3);
+                            }
+                            _ => {}
+                        }
+                    } else if matches!(&input_mode, InputMode::Normal) {
                         if panes[focused].is_alternate_screen() {
                             match mouse.kind {
                                 MouseEventKind::ScrollUp => {
@@ -2636,12 +3984,137 @@ fn run_rooms(
 
     // Explicit cleanup makes the normal exit path clear; both guards remain
     // as fallbacks for errors and early returns.
-    for pane in &mut panes {
+    for pane in panes.iter_mut() {
         pane.cleanup();
     }
-    terminal.show_cursor()?;
+    terminal.show_cursor().map_err(|error| io::Error::other(error.to_string()))?;
     Ok(())
 }
+
+
+fn run_rooms(
+    mut specs: Vec<RoomSpec>,
+    resumed: Vec<bool>,
+        fuse_size: usize,
+    token_pricing: Vec<TokenPricing>,
+    startup_notice: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let room_count = specs.len();
+    debug_assert_eq!(resumed.len(), room_count);
+    // Each room receives only its own capability token.
+    let mut doorbell = Doorbell::start(room_count)?;
+    // Owned OpenCode servers start before the terminal is taken over, in
+    // parallel, so a slow start never freezes the event loop; a room that
+    // cannot start fails the launch instead of falling back to paste.
+    let environments = (0..room_count)
+        .map(|index| doorbell.guest_environment(index))
+        .collect::<Result<Vec<_>, _>>()?;
+    if specs.iter().any(|spec| spec.native_delivery) {
+        eprintln!("Starting native rooms...");
+    }
+    // A native Codex room's session is created before its terminal starts, so
+    // its binding is known instead of discovered. That is one model turn per
+    // such room, run in parallel and bounded.
+    let codex_prompts: Vec<Option<String>> = {
+        let roster = welcome_roster_specs(&specs);
+        specs
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                pane::codex_native_spec(spec).then(|| house_rules(index + 1, &roster, fuse_size))
+            })
+            .collect()
+    };
+    if codex_prompts.iter().any(Option::is_some) {
+        eprintln!("Creating native Codex sessions (one model turn per room)...");
+    }
+    let mut codex = pane::start_codex_mints(&mut specs, &environments, &codex_prompts);
+    let mut mint_notices: Vec<String> = codex
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mint)| match mint {
+            Some(pane::CodexMint::Failed(reason)) => Some(format!(
+                "{}: {reason}; the room was not started",
+                specs[index].title
+            )),
+            _ => None,
+        })
+        .collect();
+    for message in &mint_notices {
+        eprintln!("{message}");
+    }
+    // A native Claude room's session id is Crowded's to choose, so it is fixed
+    // and saved before the terminal starts: no model turn is involved.
+    let (mut claude_starts, mut claude_notices) = pane::start_claude_sessions(&mut specs);
+    for message in &claude_notices {
+        eprintln!("{message}");
+    }
+        // `?` returns early on an error. The guards below still run their Drop code.
+        let ((natives, router), _terminal_guard) = launch_then_enter(
+        || {
+            let natives = pane::launch_native_rooms(&specs, &environments)?;
+            let router = pane::start_native_router(&specs, &natives)?;
+            Ok((natives, router))
+        },
+        TerminalGuard::enter,
+    )?;
+    let mut router: Option<NativeRouter> = router;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let (rooms, _, _) = content_areas(terminal.size()?.into());
+    let areas = pane_areas(rooms, room_count);
+    let mut last_output = vec![None::<Instant>; room_count];
+    let mut pane_sizes: Vec<_> = areas.iter().map(|area| pane_size(*area)).collect();
+    let mut notice = Notices::default();
+    if let Some(text) = startup_notice {
+        notice.push(text, NoticeSeverity::Info);
+    }
+    // Every Claude session and binding exists before any terminal starts.
+    if let Some(router) = router.as_mut() {
+        claude_notices.extend(pane::bind_claude_rooms(
+            router,
+            &specs,
+            &mut claude_starts,
+        )?);
+    }
+    let (mut panes, mut spawned_at) = start_rooms(
+        &mut LivePanes,
+        specs,
+        &pane_sizes,
+        &environments,
+        natives,
+        &codex,
+        &claude_starts,
+        &mut last_output,
+        cfg!(windows),
+        HEADROOM_READY_TIMEOUT,
+        &mut notice,
+    )?;
+    for message in mint_notices.drain(..) {
+        notice.push(message, NoticeSeverity::Failure);
+    }
+    for message in claude_notices.drain(..) {
+        notice.push(message, NoticeSeverity::Failure);
+    }
+    run_loop(
+        &mut terminal,
+        &mut CrosstermEvents,
+        &mut doorbell,
+        &mut panes,
+        &mut router,
+        &mut codex,
+        &environments,
+        &mut spawned_at,
+        &mut last_output,
+        &mut pane_sizes,
+        &token_pricing,
+        fuse_size,
+        &mut notice,
+        &resumed,
+        room_count,
+    )
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -2676,6 +4149,2256 @@ mod tests {
         assert_eq!(production.matches("router.send(").count(), 4);
         // The terminal writers that remain are the two for ordinary rooms.
         assert_eq!(production.matches(".send_whisper(").count(), 2);
+        // The native delivery helper has no terminal writer of its own, so an
+        // error there cannot turn into a paste.
+        let helper = &production[production.find("fn send_native_mail(").unwrap()..];
+        let helper = &helper[..helper.find("\n}\n").unwrap()];
+        assert!(!helper.contains(".send_whisper("));
+        assert!(!helper.contains(".write_bytes("));
+    }
+
+    /// The session-report path never touches a terminal either: it only
+    /// swaps router bindings and tells the outbox to hold or adopt mail.
+    #[test]
+    fn session_reporting_reaches_no_terminal_writer() {
+        let source = include_str!("app.rs");
+        let production = &source[..source.find("#[cfg(test)]").unwrap()];
+        for name in ["fn report_native_session(", "fn apply_session_report("] {
+            let helper = &production[production.find(name).unwrap()..];
+            let helper = &helper[..helper.find("\n}\n").unwrap()];
+            assert!(!helper.contains(".send_whisper("), "{name} must not paste");
+            assert!(!helper.contains(".write_bytes("), "{name} must not paste");
+            assert!(!helper.contains("println!"), "{name} stays out of stdout");
+        }
+    }
+
+    /// F4 on a native OpenCode room runs exactly the startup intro delivery:
+    /// the same house-rules text travels through the router, OpenCode accepts
+    /// it, and each prompt asks for a turn. A second press with an unchanged
+    /// roster resends the identical text, like the key handler does.
+    #[cfg(unix)]
+    #[test]
+    fn f4_reintroduction_reaches_a_native_room_exactly_like_the_startup_intro() {
+        use crate::native_launch::{self, tests::fake_room};
+        use crate::native_route::{Backend, NativeRouter, RoomEntry};
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let fake = fake_room(root.path(), "a", "v2.2.5");
+        let room = native_launch::start(native_launch::NativeLaunch::direct(
+            fake.program.as_os_str(),
+            cwd.path(),
+            "1.1".to_owned(),
+            1,
+            &[],
+        ))
+        .unwrap();
+        let entry = RoomEntry {
+            index: 0,
+            title: "Room A".to_owned(),
+            binding: room.binding().clone(),
+            backend: Backend::OpenCode(room.server()),
+        };
+        let path = root.path().join("state").join("native-outbox.json");
+        let mut router = NativeRouter::start(path, vec![entry]).unwrap();
+        let mut mailroom = Mailroom::new(50);
+
+        let intro = house_rules(1, "Room A (model m, effort unsupported)", 0);
+        for _ in 0..2 {
+            let (notice, severity) =
+                reintroduce_native_room("Room A", &mut router, &mut mailroom, 0, &intro);
+            assert_eq!(notice, "Room A reintroduced to the room");
+            assert_eq!(severity, NoticeSeverity::Info);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            router.tick(Instant::now(), &mut mailroom, false, false);
+            let view = mailroom.summary();
+            if view.matches("ACCEPTED by OpenCode").count() == 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "never accepted:\n{view}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let received = fake.state.received.lock().unwrap().clone();
+        let expected = crate::pane::whisper_note("The Crowded Room", &intro);
+        assert_eq!(
+            received,
+            vec![
+                (received[0].0.clone(), expected.clone()),
+                (received[1].0.clone(), expected),
+            ]
+        );
+        assert_ne!(received[0].0, received[1].0);
+        assert_eq!(*fake.state.resumes.lock().unwrap(), [true, true]);
+    }
+
+    #[cfg(all(test, unix))]
+    fn report_test_stub(root: &std::path::Path, name: &str, log: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join(name);
+        // As an interactive pane (no arguments) the stub records everything
+        // written to the terminal, so a test can prove no report path ever
+        // writes to a room. As `codex queue` it answers like the CLI.
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = queue ]; then\n  printf '%s\\n' \"$@\" >> '{}'\n  thread=\"\"\n  prev=\"\"\n  for a in \"$@\"; do\n    if [ \"$prev\" = \"--thread\" ]; then thread=\"$a\"; fi\n    prev=\"$a\"\n  done\n  printf 'Queued message sub_1 for thread %s.\\n' \"$thread\"\nelse\n  exec cat > '{}'\nfi\n",
+                root.join(format!("{name}.args")).display(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(all(test, unix))]
+    fn report_test_spec(
+        program: &std::path::Path,
+        cwd: &std::path::Path,
+        title: &str,
+        native: bool,
+    ) -> RoomSpec {
+        RoomSpec {
+            name: "test".to_owned(),
+            vendor: "test".to_owned(),
+            title: title.to_owned(),
+            program: program.as_os_str().to_owned(),
+            args: Vec::new(),
+            transport: crate::config::Transport::Raw,
+            cwd: Some(cwd.to_path_buf()),
+            variables: Vec::new(),
+            allow_control: true,
+            use_headroom: false,
+            scheduling: None,
+            headroom_args: Vec::new(),
+            native_delivery: native,
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn report_test_pane(
+        spec: RoomSpec,
+        native: Option<crate::native_launch::NativeRoom>,
+        codex: Option<&pane::CodexMint>,
+    ) -> Pane {
+        spawn_room(
+            &mut LivePanes,
+            spec,
+            PtySize {
+                rows: 6,
+                cols: 60,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            pane::GuestEnvironment::new([]),
+            native,
+            codex,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[cfg(all(test, unix))]
+    fn apply_test_report(
+        panes: &mut [Pane],
+        router: Option<&mut NativeRouter>,
+        from: usize,
+        session: Option<&str>,
+        pending: bool,
+    ) -> String {
+        let (reply, _dropped) = std::sync::mpsc::sync_channel(1);
+        let mut notice = Notices::default();
+        report_native_session(
+            panes,
+            router,
+            crate::doorbell::DoorbellSessionReport {
+                from,
+                session: session.map(str::to_owned),
+                pending,
+                reply,
+            },
+            &mut notice,
+        );
+        notice.ordered_lines().join("; ")
+    }
+
+    #[cfg(all(test, unix))]
+    fn pump_router(router: &mut NativeRouter, mailroom: &mut Mailroom, ms: u64) {
+        let end = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < end {
+            router.tick(Instant::now(), mailroom, false, false);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn report_test_opencode_room(
+        root: &std::path::Path,
+        cwd: &std::path::Path,
+        session: &str,
+    ) -> (
+        Vec<Pane>,
+        Option<NativeRouter>,
+        crate::native_launch::tests::FakeRoom,
+    ) {
+        use crate::native_launch::{self, tests::fake_room};
+        let program = report_test_stub(root, "opencode", &root.join("calls"));
+        // The fake is named for the session the tests rebind onto: its
+        // echo answers every prompt with ses_b.
+        let fake = fake_room(root, "b", "v2.2.5");
+        // Consume the launch generation a real startup would have taken, so
+        // the report allocates the next one like production does.
+        let _launch_generation =
+            crate::native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+                .next()
+                .unwrap();
+        let native = native_launch::start(native_launch::NativeLaunch::direct(
+            fake.program.as_os_str(),
+            cwd,
+            "1.1".to_owned(),
+            1,
+            &[],
+        ))
+        .unwrap();
+        let specs = vec![report_test_spec(&program, cwd, "Opencode · 1", true)];
+        let server = native.server();
+        // The room starts bound to the given session. Tests that need mail to
+        // stay unsent use an id the fake server never echoes; tests that
+        // deliver use the fake's own session.
+        let entry = crate::native_route::RoomEntry {
+            index: 0,
+            title: "Opencode · 1".to_owned(),
+            binding: crate::native_outbox::Binding {
+                room: native.binding().room.clone(),
+                session: session.to_owned(),
+                endpoint: native.binding().endpoint.clone(),
+                generation: 1,
+            },
+            backend: crate::native_route::Backend::OpenCode(server),
+        };
+        let path = root.join("state").join("native-outbox.json");
+        let router = NativeRouter::start(path, vec![entry]).unwrap();
+        let panes = vec![report_test_pane(
+            specs.into_iter().next().unwrap(),
+            Some(native),
+            None,
+        )];
+        (panes, Some(router), fake)
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_pending_report_holds_new_mail_without_sending_or_pasting() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut panes, mut router, fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses-old-1");
+        let mut mailroom = Mailroom::new(50);
+        let notice = apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        assert!(notice.contains("session pending after clear"), "{notice}");
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "held", None)
+            .unwrap();
+        pump_router(router.as_mut().unwrap(), &mut mailroom, 300);
+        let view = mailroom.summary();
+        assert!(view.contains("HELD: session pending after clear"), "{view}");
+        assert!(
+            fake.state.received.lock().unwrap().is_empty(),
+            "nothing is sent while pending"
+        );
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn an_immediate_report_after_pending_delivers_once_paused() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut panes, mut router, fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses-old-1");
+        let mut mailroom = Mailroom::new(50);
+        // Pending, mail, then the new session id with no scheduling pass in
+        // between: the hold is already on the mail when the rebind adopts it.
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "held", None)
+            .unwrap();
+        apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+        // Paused: nothing moves, but nothing is lost either.
+        let end = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < end {
+            router.as_mut().unwrap().tick(Instant::now(), &mut mailroom, true, false);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(fake.state.received.lock().unwrap().is_empty());
+        pump_router(router.as_mut().unwrap(), &mut mailroom, 500);
+        let received = fake.state.received.lock().unwrap().clone();
+        assert_eq!(received.len(), 1, "exactly one delivery: {received:?}");
+        assert_eq!(received[0].1, "[whisper from Room X] held");
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn an_immediate_report_after_pending_delivers_once_fused() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut panes, mut router, fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses-old-1");
+        let mut mailroom = Mailroom::new(50);
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "held", None)
+            .unwrap();
+        apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+        let end = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < end {
+            router.as_mut().unwrap().tick(Instant::now(), &mut mailroom, false, true);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(fake.state.received.lock().unwrap().is_empty());
+        pump_router(router.as_mut().unwrap(), &mut mailroom, 500);
+        let received = fake.state.received.lock().unwrap().clone();
+        assert_eq!(received.len(), 1, "exactly one delivery: {received:?}");
+        assert_eq!(received[0].1, "[whisper from Room X] held");
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn rapid_consecutive_reports_rebind_once_and_deliver_once() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut panes, mut router, fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses-old-1");
+        let mut mailroom = Mailroom::new(50);
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
+            .unwrap();
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "new", None)
+            .unwrap();
+        let first = apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+        assert!(first.contains("now follows reported session ses_b"), "{first}");
+        let second = apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+        assert!(second.contains("already on ses_b"), "{second}");
+        let binding = router.as_ref().unwrap().binding_for(0).unwrap();
+        assert_eq!(binding.generation, 2, "one rebind, one generation bump");
+        // Wait for the delivery itself instead of a fixed budget, then give a
+        // duplicate a moment to appear before asserting exactly once.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            router
+                .as_mut()
+                .unwrap()
+                .tick(Instant::now(), &mut mailroom, false, false);
+            if !fake.state.received.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the report mail was never delivered:\n{}",
+                mailroom.summary()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // A second delivery, if one were coming, would leave on a schedule
+        // inside this window.
+        std::thread::sleep(Duration::from_millis(400));
+        router
+            .as_mut()
+            .unwrap()
+            .tick(Instant::now(), &mut mailroom, false, false);
+        let received = fake.state.received.lock().unwrap().clone();
+        assert_eq!(received.len(), 1, "exactly one delivery: {received:?}");
+        assert_eq!(received[0].1, "[whisper from Room X] new");
+        let view = mailroom.summary();
+        assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn the_same_session_id_while_pending_releases_mail_without_a_new_generation() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut panes, mut router, _fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses_b");
+        let mut mailroom = Mailroom::new(50);
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "held", None)
+            .unwrap();
+        pump_router(router.as_mut().unwrap(), &mut mailroom, 300);
+        assert!(mailroom.summary().contains("HELD: session pending after clear"));
+        let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+        assert!(notice.contains("pending cleared"), "{notice}");
+        pump_router(router.as_mut().unwrap(), &mut mailroom, 300);
+        let view = mailroom.summary();
+        assert!(view.contains("ACCEPTED by OpenCode"), "{view}");
+        assert_eq!(
+            router.as_ref().unwrap().binding_for(0).unwrap().generation,
+            1,
+            "the same id never bumps the generation"
+        );
+    }
+
+    /// Mail saved before the pending signal belongs to the session that
+    /// ended: an immediate report for that same session must find nothing to
+    /// release, because no scheduling pass ran between the two commands.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn mail_saved_before_the_pending_signal_is_never_released_by_a_same_id_report() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut panes, mut router, fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses_b");
+        let mut mailroom = Mailroom::new(50);
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
+            .unwrap();
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+        pump_router(router.as_mut().unwrap(), &mut mailroom, 400);
+        let received = fake.state.received.lock().unwrap().clone();
+        assert!(
+            received.is_empty(),
+            "mail saved before the pending signal is never delivered: {received:?}"
+        );
+        let view = mailroom.summary();
+        assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
+    }
+
+    /// Two pending signals in a row still leave earlier mail held: the
+    /// boundary is the first command, so a later report of the same session
+    /// has nothing to release either.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn mail_saved_before_two_pending_reports_stays_held_when_the_room_returns() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut panes, mut router, fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses_b");
+        let mut mailroom = Mailroom::new(50);
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
+            .unwrap();
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+        pump_router(router.as_mut().unwrap(), &mut mailroom, 400);
+        let received = fake.state.received.lock().unwrap().clone();
+        assert!(
+            received.is_empty(),
+            "mail saved before the pending signal is never delivered: {received:?}"
+        );
+        let view = mailroom.summary();
+        assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
+    }
+
+    /// A pending signal followed by a different session keeps earlier mail
+    /// held while the room moves on: the old session's mail is never resent
+    /// to the new one.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn mail_saved_before_a_pending_signal_stays_held_when_a_new_session_arrives() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut panes, mut router, fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses-old-1");
+        let mut mailroom = Mailroom::new(50);
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
+            .unwrap();
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+        assert!(notice.contains("now follows reported session ses_b"), "{notice}");
+        pump_router(router.as_mut().unwrap(), &mut mailroom, 400);
+        let received = fake.state.received.lock().unwrap().clone();
+        assert!(
+            received.is_empty(),
+            "mail saved before the pending signal is never delivered: {received:?}"
+        );
+        let view = mailroom.summary();
+        assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
+    }
+
+    /// The pending report through the production handler while the outbox
+    /// save fails: the old mail stays held, is never sent and is never
+    /// marked accepted, even when the same session reports back at once.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_failed_pending_save_keeps_old_mail_held_through_the_handler() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut panes, mut router, fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses_b");
+        let mut mailroom = Mailroom::new(50);
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
+            .unwrap();
+        // Drain the enqueue with delivery paused: seeing it queued proves the
+        // save landed, and no schedule can have sent the mail yet.
+        let settled = Instant::now() + Duration::from_secs(5);
+        loop {
+            router
+                .as_mut()
+                .unwrap()
+                .tick(Instant::now(), &mut mailroom, true, false);
+            if mailroom.summary().contains("QUEUED") {
+                break;
+            }
+            assert!(Instant::now() < settled, "the enqueue never settled");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The state directory becomes a file, so every later save fails.
+        let state_dir = root.path().join("state");
+        std::fs::remove_dir_all(&state_dir).unwrap();
+        std::fs::write(&state_dir, b"not a directory").unwrap();
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+        pump_router(router.as_mut().unwrap(), &mut mailroom, 400);
+        let received = fake.state.received.lock().unwrap().clone();
+        assert!(
+            received.is_empty(),
+            "old mail must never be sent while the hold is unsaved: {received:?}"
+        );
+        let view = mailroom.summary();
+        assert!(view.contains("HELD"), "{view}");
+        assert!(!view.contains("ACCEPTED"), "{view}");
+    }
+
+    /// Ticks until the outbox has answered every command sent so far, which
+    /// is when nothing is still saving, collecting notices on the way.
+    #[cfg(all(test, unix))]
+    fn drain_answered(router: &mut Option<NativeRouter>, mailroom: &mut Mailroom) -> Vec<String> {
+        let mut notices = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            notices.extend(
+                router
+                    .as_mut()
+                    .unwrap()
+                    .tick(Instant::now(), mailroom, true, false)
+                    .into_iter()
+                    .map(|(text, _)| text),
+            );
+            if !mailroom.summary().contains("SAVING") {
+                return notices;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the outbox never answered:\n{}",
+                mailroom.summary()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Two hold failures waiting for the next production iteration: one from
+    /// the pending hold write, one from adopting the held mail once the disk
+    /// is gone. The fake server stays alive for reports that rebind.
+    #[cfg(all(test, unix))]
+    fn rig_with_two_hold_failures(
+        root: &std::path::Path,
+        cwd: &std::path::Path,
+    ) -> (ReportDispatch, crate::native_launch::tests::FakeRoom) {
+        let (mut panes, mut router, fake) = report_test_opencode_room(root, cwd, "ses_b");
+        let mut mailroom = Mailroom::new(50);
+        let state_dir = root.join("state");
+        let state_path = state_dir.join("native-outbox.json");
+
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
+            .unwrap();
+        // The pending report cannot write its hold...
+        crate::native_outbox::fail_pending_hold_at(&state_path);
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        // ...and the mail saved after it is held for the next session. Wait
+        // for that save on disk before breaking anything, so there really is
+        // held mail for the second failure to hit.
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "new", None)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let saved = std::fs::read_to_string(&state_path).unwrap_or_default();
+            // The enqueue writes twice: once saved, then released onto the
+            // pending hold. Wait for the second, or there is no held mail
+            // for the adoption to fail on.
+            if saved.contains("] new") && saved.contains("session pending after clear") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the new mail was never saved");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Now the disk goes away, so adopting that held mail fails too.
+        std::fs::remove_dir_all(&state_dir).unwrap();
+        std::fs::write(&state_dir, b"not a directory").unwrap();
+        apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+        // Give the outbox time to answer everything, so the one iteration
+        // below has to carry both failures at once.
+        std::thread::sleep(Duration::from_millis(1000));
+        (ReportDispatch::new(panes, router), fake)
+    }
+
+    /// Two hold failures drained in one production iteration are both
+    /// surfaced, in order: none is dropped because another arrived with it.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn two_hold_failures_in_one_iteration_are_both_surfaced() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut rig, _fake) = rig_with_two_hold_failures(root.path(), cwd.path());
+        let notice = rig.dispatch();
+        assert_eq!(
+            notice.matches("could not be held").count(),
+            2,
+            "both hold failures reach the UI in one iteration: {notice}"
+        );
+        assert!(
+            notice.contains("the pending hold could not be written"),
+            "the earlier failure is not dropped: {notice}"
+        );
+    }
+
+    /// A same-session report processed after the failures adds its own line
+    /// instead of replacing them.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn two_hold_failures_survive_a_same_session_report_in_one_iteration() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut rig, _fake) = rig_with_two_hold_failures(root.path(), cwd.path());
+        rig.push_report(0, Some("ses_b"), false);
+        let notice = rig.dispatch();
+        assert_eq!(
+            notice.matches("could not be held").count(),
+            2,
+            "the report must not replace the failures: {notice}"
+        );
+        assert!(notice.contains("is already on ses_b"), "{notice}");
+    }
+
+    /// A rebind report processed after the failures keeps them too.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn two_hold_failures_survive_a_rebind_report_in_one_iteration() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut rig, _fake) = rig_with_two_hold_failures(root.path(), cwd.path());
+        rig.push_report(0, Some("ses-reported-9"), false);
+        let notice = rig.dispatch();
+        assert_eq!(
+            notice.matches("could not be held").count(),
+            2,
+            "the rebind must not replace the failures: {notice}"
+        );
+        assert!(
+            notice.contains("now follows reported session ses-reported-9"),
+            "{notice}"
+        );
+    }
+
+    /// A delivery status line processed after the failures keeps them too.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn two_hold_failures_survive_a_delivery_status_in_one_iteration() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut rig, _fake) = rig_with_two_hold_failures(root.path(), cwd.path());
+        // A message to the room itself: the delivery path writes its own
+        // status line after the failures.
+        rig.push_message(0, 0, "status line");
+        let notice = rig.dispatch();
+        assert_eq!(
+            notice.matches("could not be held").count(),
+            2,
+            "the status must not replace the failures: {notice}"
+        );
+        assert!(
+            notice.contains("saved for native delivery"),
+            "a delivery status line is there too: {notice}"
+        );
+        assert!(
+            notice.split("; ").count() >= 3,
+            "failures and status are all present: {notice}"
+        );
+    }
+
+    /// A failure notice survives an unknown-room report in the same
+    /// iteration, and the report is still surfaced.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_failure_notice_survives_an_unknown_room_report_in_one_iteration() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut rig, _fake) = rig_with_two_hold_failures(root.path(), cwd.path());
+        rig.push_report(9, Some("ses-x"), false);
+        let notice = rig.dispatch();
+        assert_eq!(
+            notice.matches("could not be held").count(),
+            2,
+            "the unknown room must not replace the failures: {notice}"
+        );
+        assert!(notice.contains("unknown room"), "{notice}");
+    }
+
+    /// One notice on its own is surfaced unchanged: no separator, nothing
+    /// added, exactly the line the event produced.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_single_notice_is_surfaced_unchanged() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (panes, router, _fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses_b");
+        let mut rig = ReportDispatch::new(panes, router);
+        rig.push_report(0, Some("ses_b"), false);
+        let notice = rig.dispatch();
+        assert_eq!(
+            notice, "Opencode · 1 is already on ses_b",
+            "a lone notice is exactly as produced"
+        );
+    }
+
+    /// Renders the production status line the way the UI does: the actual
+    /// Paragraph, into an 80-column, one-row buffer.
+    fn rendered_status(notices: &Notices) -> String {
+        rendered_status_at(notices, 80)
+    }
+
+    /// Same as [`rendered_status`], at the given width.
+    fn rendered_status_at(notices: &Notices, width: u16) -> String {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::Widget;
+        let area = ratatui::layout::Rect::new(0, 0, width, 1);
+        let text = notices
+            .status_line(area.width)
+            .expect("a notice to show");
+        let mut buffer = Buffer::empty(area);
+        Widget::render(Paragraph::new(text), area, &mut buffer);
+        (0..area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn two_hold_failures_render_a_count_and_a_failure_at_eighty_columns() {
+        let mut notices = Notices::default();
+        notices.push(
+            "native delivery: Opencode · 1 could not be held: the pending hold could not be written"
+                .to_owned(),
+            NoticeSeverity::Failure,
+        );
+        notices.push(
+            "native delivery: Opencode · 1 could not be held: Not a directory (os error 20)"
+                .to_owned(),
+            NoticeSeverity::Failure,
+        );
+        let rendered = rendered_status(&notices);
+        assert!(rendered.starts_with("2 failures: "), "{rendered}");
+        assert!(rendered.contains("could not be held"), "{rendered}");
+    }
+
+    #[test]
+    fn a_long_routine_notice_does_not_hide_a_new_failure() {
+        let mut notices = Notices::default();
+        notices.push(
+            format!(
+                "Opencode · 1 is already on ses_b — {}",
+                "x".repeat(260)
+            ),
+            NoticeSeverity::Info,
+        );
+        notices.push(
+            "native delivery: Opencode · 1 could not be held: no space left on the device"
+                .to_owned(),
+            NoticeSeverity::Failure,
+        );
+        let rendered = rendered_status(&notices);
+        assert!(rendered.starts_with("1 failure: "), "{rendered}");
+        assert!(rendered.contains("could not be held"), "{rendered}");
+        assert!(
+            !rendered.starts_with("Opencode · 1 is already"),
+            "the prior routine status must not lead: {rendered}"
+        );
+    }
+
+    #[test]
+    fn one_plain_notice_renders_exactly_as_before() {
+        let text = "Opencode · 1 is already on ses_b";
+        let mut notices = Notices::default();
+        notices.push(text.to_owned(), NoticeSeverity::Info);
+        assert_eq!(notices.status_line(80).as_deref(), Some(text));
+        let rendered = rendered_status(&notices);
+        assert!(rendered.starts_with(text), "{rendered}");
+        assert!(!rendered.contains("failure"), "{rendered}");
+        assert!(!rendered.contains("notices"), "{rendered}");
+    }
+
+    #[test]
+    fn one_hundred_reports_stay_bounded_and_show_the_newest_status() {
+        let mut notices = Notices::default();
+        let mut newest = String::new();
+        for index in 0..100 {
+            newest = format!("Opencode · 1 is already on ses_b ({index})");
+            notices.push(newest.clone(), NoticeSeverity::Info);
+        }
+        assert!(
+            notices.entries.len() <= MAX_NOTICES,
+            "the list stays bounded: {}",
+            notices.entries.len()
+        );
+        assert_eq!(
+            notices.dropped,
+            100 - MAX_NOTICES,
+            "the oldest are counted, not forgotten"
+        );
+        let rendered = rendered_status(&notices);
+        assert!(
+            rendered.contains(&newest),
+            "the newest status is visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_routine_status_never_displaces_a_failure_when_the_list_is_full() {
+        let mut notices = Notices::default();
+        for index in 0..MAX_NOTICES {
+            notices.push(
+                format!(
+                    "native delivery: room {index} could not be held: no space left"
+                ),
+                NoticeSeverity::Failure,
+            );
+        }
+        notices.push(
+            "Opencode · 1 is already on ses_b".to_owned(),
+            NoticeSeverity::Info,
+        );
+        assert_eq!(
+            notices
+                .entries
+                .iter()
+                .filter(|entry| entry.severity == NoticeSeverity::Failure)
+                .count(),
+            MAX_NOTICES,
+            "every slot still holds a failure"
+        );
+        assert_eq!(notices.dropped, 1, "the routine status was the one dropped");
+        let rendered = rendered_status(&notices);
+        assert!(
+            rendered.starts_with(&format!("{MAX_NOTICES} failures: ")),
+            "{rendered}"
+        );
+    }
+
+    /// The one-row status line stays actionable at every width: a count and
+    /// the newest failure at 80 and 40 columns, and at 20 columns a count
+    /// plus an explicit mailroom pointer instead of a bare count.
+    #[test]
+    fn status_line_stays_actionable_at_eighty_forty_and_twenty_columns() {
+        let mut notices = Notices::default();
+        notices.push(
+            "Opencode · 1 is already on ses_b".to_owned(),
+            NoticeSeverity::Info,
+        );
+        notices.push(
+            "native delivery: Opencode · 2 could not be held: no space left on the device"
+                .to_owned(),
+            NoticeSeverity::Failure,
+        );
+        let wide = rendered_status_at(&notices, 80);
+        assert!(wide.starts_with("1 failure: "), "{wide}");
+        assert!(wide.contains("could not be held"), "{wide}");
+        let mid = rendered_status_at(&notices, 40);
+        assert!(mid.starts_with("1 failure: "), "{mid}");
+        assert!(mid.contains("native delivery"), "{mid}");
+        let narrow = rendered_status_at(&notices, 20);
+        assert!(narrow.starts_with("1 failure: "), "{narrow}");
+        assert!(
+            narrow.contains("see mail") || narrow.contains("could not be held"),
+            "at 20 columns the row names a reason or points at the mailroom: {narrow}"
+        );
+        assert!(
+            !narrow.trim_end_matches('…').ends_with(':'),
+            "never just a bare count: {narrow}"
+        );
+    }
+
+    /// Renders the production mailroom popup the way the UI does, through
+    /// the same render helper the event loop calls, into the real 80x24
+    /// layout.
+    fn rendered_popup(
+        mailroom: &Mailroom,
+        notices: &Notices,
+        scroll: u16,
+    ) -> Vec<String> {
+        use ratatui::buffer::Buffer;
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let popup = mail_popup_area(area);
+        let mut buffer = Buffer::empty(area);
+        render_mail_popup(popup, &mut buffer, mailroom, notices, scroll);
+        (popup.y..popup.y + popup.height)
+            .map(|y| {
+                (popup.x..popup.x + popup.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// With 20 queued envelopes present, every failure is reachable: the
+    /// popup lists failures first and scrolls, so no failure hides behind
+    /// the envelopes.
+    #[test]
+    fn mailroom_popup_lists_failures_first_and_scrolls_past_envelopes() {
+        let mut mailroom = Mailroom::new(100);
+        for _ in 0..20 {
+            mailroom.queue("Room A".to_owned(), "Room B".to_owned(), "hi".to_owned(), "room busy");
+        }
+        let mut notices = Notices::default();
+        notices.push("Doorbell envelope #0001 injected".to_owned(), NoticeSeverity::Info);
+        for index in 0..3 {
+            notices.push(
+                format!("native delivery: Room {index} could not be held: disk {index} full"),
+                NoticeSeverity::Failure,
+            );
+        }
+        let text = mail_popup_text(&mailroom, &notices);
+        let first_failure = text.find("could not be held").expect("a failure in the text");
+        let first_info = text.find("Doorbell envelope").expect("the info in the text");
+        assert!(
+            first_failure < first_info,
+            "failures sort before routine statuses"
+        );
+        let top: String = rendered_popup(&mailroom, &notices, 0).join("\n");
+        assert!(
+            top.contains("could not be held"),
+            "a failure is visible without scrolling: {top}"
+        );
+        for index in 0..3 {
+            let needle = format!("disk {index} full");
+            let mut seen = false;
+            for scroll in (0..60).step_by(5) {
+                let view: String = rendered_popup(&mailroom, &notices, scroll).join("\n");
+                if view.contains(&needle) {
+                    seen = true;
+                    break;
+                }
+            }
+            assert!(seen, "failure {index} is reachable by scrolling");
+        }
+    }
+
+    /// F2 opens the Mailroom without discarding anything: the failures the
+    /// status row pointed at are still in the history and visible in the
+    /// production popup render after the real toggle transition.
+    #[test]
+    fn opening_the_mailroom_keeps_failures_visible_in_the_popup() {
+        let mut mailroom = Mailroom::new(100);
+        for _ in 0..20 {
+            mailroom.queue("Room A".to_owned(), "Room B".to_owned(), "hi".to_owned(), "room busy");
+        }
+        let mut notices = Notices::default();
+        notices.push(
+            "native delivery: Room 0 could not be held: disk full".to_owned(),
+            NoticeSeverity::Failure,
+        );
+        notices.push(
+            "native delivery: Room 1 could not be held: disk full".to_owned(),
+            NoticeSeverity::Failure,
+        );
+        notices.push("Doorbell envelope #0001 injected".to_owned(), NoticeSeverity::Info);
+        let mut mode = InputMode::Normal;
+        let mut scroll = 7;
+        toggle_mail_log(&mut mode, &mut scroll, &mut notices);
+        assert!(matches!(mode, InputMode::MailLog));
+        assert_eq!(scroll, 0, "opening resets the scroll");
+        assert_eq!(notices.entries.len(), 3, "opening keeps the history");
+        let view: String = rendered_popup(&mailroom, &notices, scroll).join("\n");
+        assert!(
+            view.contains("Room 0 could not be held") && view.contains("Room 1 could not be held"),
+            "both failures are visible after the F2 press: {view}"
+        );
+    }
+
+    /// Leaving the Mailroom by the same toggle dismisses the history: the
+    /// status row is empty afterwards, like the other view changes that
+    /// clear (Tab, whisper, settings).
+    #[test]
+    fn closing_the_mailroom_dismisses_the_history() {
+        let mut notices = Notices::default();
+        notices.push(
+            "native delivery: Room 0 could not be held: disk full".to_owned(),
+            NoticeSeverity::Failure,
+        );
+        let mut mode = InputMode::MailLog;
+        let mut scroll = 4;
+        toggle_mail_log(&mut mode, &mut scroll, &mut notices);
+        assert!(matches!(mode, InputMode::Normal));
+        assert!(notices.entries.is_empty(), "dismissing clears the history");
+        assert_eq!(notices.status_line(80), None);
+    }
+
+    /// A repeated routine status renders how many times it arrived, in the
+    /// status row and in the popup history.
+    #[test]
+    fn repeated_routine_status_renders_its_repeat_count() {
+        let text = "Opencode · 1 is already on ses_b";
+        let mut notices = Notices::default();
+        for _ in 0..3 {
+            notices.push(text.to_owned(), NoticeSeverity::Info);
+        }
+        assert_eq!(notices.entries.len(), 1);
+        assert_eq!(
+            notices.status_line(80).as_deref(),
+            Some("1 notices: Opencode · 1 is already on ses_b (x3)")
+        );
+        assert!(
+            notices.ordered_lines().iter().any(|line| line.ends_with("(x3)")),
+            "the popup keeps the count"
+        );
+    }
+
+    /// A repeated failure renders how many times it arrived.
+    #[test]
+    fn repeated_failure_renders_its_repeat_count() {
+        let text = "native delivery: Room 0 could not be held: disk full";
+        let mut notices = Notices::default();
+        for _ in 0..3 {
+            notices.push(text.to_owned(), NoticeSeverity::Failure);
+        }
+        assert_eq!(
+            notices.status_line(80).as_deref(),
+            Some("1 failure: native delivery: Room 0 could not be held: disk full (x3)")
+        );
+    }
+
+    /// A successful queued delivery is a routine status: `0 failed` never
+    /// counts as a failure, so 16 zero-failed statuses cannot displace a
+    /// real failure. Everything here runs through the production iteration.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn zero_failed_queued_delivery_is_info_and_never_displaces_a_failure() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let log = root.path().join("writes");
+        let stub = report_test_stub(root.path(), "room", &log);
+        let offline = report_test_pane(
+            report_test_spec(&stub, cwd.path(), "Room A", false),
+            None,
+            Some(&pane::CodexMint::Failed("gone".to_owned())),
+        );
+        let online = report_test_pane(
+            report_test_spec(&stub, cwd.path(), "Room B", false),
+            None,
+            None,
+        );
+        let mut rig = ReportDispatch::new(vec![offline, online], None);
+        let old = || Instant::now() - Duration::from_secs(60);
+        rig.last_output = vec![Some(old()), Some(old())];
+        // Sixteen distinct delivery failures through the production route.
+        for index in 0..16 {
+            rig.push_message(1, 0, &format!("poke {index}"));
+            rig.dispatch_keep();
+        }
+        assert_eq!(rig.notice.entries.len(), 16, "sixteen failures are kept");
+        assert!(
+            rig.notice
+                .entries
+                .iter()
+                .all(|entry| entry.severity == NoticeSeverity::Failure),
+            "every seeded notice is a failure"
+        );
+        assert_eq!(rig.notice.dropped, 0);
+        // One queued status while paused, then one zero-failed delivery
+        // status once the room injects it.
+        rig.paused = true;
+        rig.push_message(0, 1, "hello");
+        rig.dispatch_keep();
+        rig.paused = false;
+        rig.last_output = vec![Some(old()), Some(old())];
+        rig.dispatch_keep();
+        assert_eq!(rig.notice.entries.len(), 16, "still bounded");
+        assert!(
+            rig.notice
+                .entries
+                .iter()
+                .all(|entry| entry.severity == NoticeSeverity::Failure),
+            "no routine status displaced a failure"
+        );
+        assert_eq!(rig.notice.dropped, 2, "both routine statuses were dropped");
+        assert!(
+            !rig
+                .notice
+                .entries
+                .iter()
+                .any(|entry| entry.text.contains("Queued delivery")),
+            "a zero-failed status was recorded as routine, not as a failure"
+        );
+    }
+
+    /// A queued delivery with a real failure is a failure.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn failed_queued_delivery_is_a_failure() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let log = root.path().join("writes");
+        let stub = report_test_stub(root.path(), "room", &log);
+        let offline = report_test_pane(
+            report_test_spec(&stub, cwd.path(), "Room A", false),
+            None,
+            Some(&pane::CodexMint::Failed("gone".to_owned())),
+        );
+        let mut rig = ReportDispatch::new(vec![offline], None);
+        rig.last_output = vec![Some(Instant::now() - Duration::from_secs(60))];
+        rig.paused = true;
+        rig.push_message(0, 0, "hello");
+        rig.dispatch_keep();
+        assert!(
+            rig.notice
+                .entries
+                .iter()
+                .any(|entry| entry.severity == NoticeSeverity::Info
+                    && entry.text.contains("queued")),
+            "the queued status is routine"
+        );
+        rig.paused = false;
+        rig.last_output = vec![Some(Instant::now() - Duration::from_secs(60))];
+        rig.dispatch_keep();
+        let last = rig.notice.entries.last().expect("a delivery status");
+        assert!(last.text.contains("1 failed"), "{last:?}");
+        assert_eq!(last.severity, NoticeSeverity::Failure);
+    }
+
+    /// The capitalized intro failure is a failure, not a routine status.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn capitalised_teach_failure_is_a_failure() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let log = root.path().join("writes");
+        let stub = report_test_stub(root.path(), "room", &log);
+        let offline = report_test_pane(
+            report_test_spec(&stub, cwd.path(), "Room A", false),
+            None,
+            Some(&pane::CodexMint::Failed("gone".to_owned())),
+        );
+        let mut rig = ReportDispatch::new(vec![offline], None);
+        rig.gates[0] = DeliveryGate::new(true);
+        rig.spawned_at[0] = Instant::now() - Duration::from_secs(3600);
+        rig.dispatch_keep();
+        let only = rig.notice.entries.last().expect("an intro notice");
+        assert!(only.text.starts_with("Could not teach"), "{only:?}");
+        assert_eq!(only.severity, NoticeSeverity::Failure);
+    }
+
+    /// Hold failures are failures; same-session and rebind statuses are
+    /// routine; an unknown-room report is a failure. All through the
+    /// production iteration.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn session_notices_carry_producer_severity() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut rig, _fake) = rig_with_two_hold_failures(root.path(), cwd.path());
+        rig.dispatch_keep();
+        let holds: Vec<_> = rig
+            .notice
+            .entries
+            .iter()
+            .filter(|entry| entry.text.contains("could not be held"))
+            .collect();
+        assert_eq!(holds.len(), 2, "both hold failures reach the UI");
+        assert!(
+            holds
+                .iter()
+                .all(|entry| entry.severity == NoticeSeverity::Failure),
+            "hold failures are failures"
+        );
+        rig.push_report(0, Some("ses_b"), false);
+        rig.dispatch_keep();
+        assert!(
+            rig.notice
+                .entries
+                .iter()
+                .any(|entry| entry.severity == NoticeSeverity::Info
+                    && entry.text.contains("ses_b")),
+            "a same-session status is routine"
+        );
+        rig.push_report(9, Some("ses-x"), false);
+        rig.dispatch_keep();
+        let last = rig.notice.entries.last().expect("an unknown-room notice");
+        assert!(last.text.contains("unknown room"), "{last:?}");
+        assert_eq!(last.severity, NoticeSeverity::Failure);
+    }
+
+    /// Native doorbell outcomes carry their severity: accepted mail is
+    /// routine, a refused send is a failure.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn deliver_native_paths_carry_their_severity() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let log = root.path().join("writes");
+        let stub = report_test_stub(root.path(), "room", &log);
+        // No router: the send is refused.
+        let mut panes = vec![report_test_pane(
+            report_test_spec(&stub, cwd.path(), "Room A", false),
+            None,
+            Some(&pane::CodexMint::Failed("gone".to_owned())),
+        )];
+        let mut mailroom = Mailroom::new(50);
+        let mut fuse = DeliveryFuse::new(100);
+        let mut paused = false;
+        let mut notice = Notices::default();
+        deliver_native_doorbell(
+            &mut panes,
+            None,
+            &mut mailroom,
+            "Room X",
+            "Room A",
+            0,
+            "hi",
+            None,
+            &mut fuse,
+            &mut paused,
+            &mut notice,
+        );
+        let refused = notice.entries.last().expect("a refusal notice");
+        assert!(refused.text.contains("not saved"), "{refused:?}");
+        assert_eq!(refused.severity, NoticeSeverity::Failure);
+        // A live router accepts the same mail.
+        let (mut panes, mut router, _fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses_b");
+        let target = panes[0].title().to_owned();
+        let mut notice = Notices::default();
+        deliver_native_doorbell(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            &target,
+            0,
+            "hi",
+            None,
+            &mut fuse,
+            &mut paused,
+            &mut notice,
+        );
+        let saved = notice.entries.last().expect("a saved notice");
+        assert!(saved.text.contains("saved for native delivery"), "{saved:?}");
+        assert_eq!(saved.severity, NoticeSeverity::Info);
+    }
+
+    /// A reintroduction that the router refuses is a failure (the accepted
+    /// arm is covered by the F4 test asserting `Info`).
+    #[cfg(all(test, unix))]
+    #[test]
+    fn refused_reintroduction_is_a_failure() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (_panes, mut router, _fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses_b");
+        let mut mailroom = Mailroom::new(50);
+        let (text, severity) =
+            reintroduce_native_room("Ghost", router.as_mut().unwrap(), &mut mailroom, 7, "hi");
+        assert!(text.contains("does not use native delivery"), "{text}");
+        assert_eq!(severity, NoticeSeverity::Failure);
+    }
+
+    /// Peer control outcomes carry their severity: an applied control is
+    /// routine, a rejected one is a failure.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn control_outcomes_carry_their_severity() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+
+        use crate::doorbell::{DoorbellControl, DoorbellEvent};
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let log = root.path().join("writes");
+        // Named `codex` so the room has a control adapter and can resume.
+        let stub = report_test_stub(root.path(), "codex", &log);
+        let first = report_test_pane(
+            report_test_spec(&stub, cwd.path(), "Room A", false),
+            None,
+            None,
+        );
+        let second = report_test_pane(
+            report_test_spec(&stub, cwd.path(), "Room B", false),
+            None,
+            None,
+        );
+        let mut rig = ReportDispatch::new(vec![first, second], None);
+        let old = || Instant::now() - Duration::from_secs(60);
+        rig.last_output = vec![Some(old()), Some(old())];
+        let push_control = |rig: &mut ReportDispatch| {
+            let (reply, _dropped) = std::sync::mpsc::sync_channel(1);
+            rig.doorbell.events.push_back(DoorbellEvent::Control(DoorbellControl {
+                from: 0,
+                to: 1,
+                action: crate::doorbell::ControlAction::Resume,
+                reply,
+            }));
+        };
+        push_control(&mut rig);
+        rig.dispatch_keep();
+        let told = rig.notice.entries.last().expect("a control notice");
+        assert!(told.text.contains("told"), "{told:?}");
+        assert_eq!(told.severity, NoticeSeverity::Info);
+        rig.panes[1].set_allow_control(false);
+        push_control(&mut rig);
+        rig.dispatch_keep();
+        let rejected = rig.notice.entries.last().expect("a rejection notice");
+        assert!(rejected.text.contains("rejected"), "{rejected:?}");
+        assert_eq!(rejected.severity, NoticeSeverity::Failure);
+    }
+
+    /// Fuse notices are failures; an ordinary injected envelope is routine.
+    /// The room runs a `sleep` stub: it stays online and takes writes, but
+    /// never produces output, so readiness never flips mid-test.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn fuse_notices_are_failures_and_injected_is_routine() {
+        use std::os::unix::fs::PermissionsExt;
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let sleep = root.path().join("room");
+        std::fs::write(&sleep, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&sleep, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let online = report_test_pane(
+            report_test_spec(&sleep, cwd.path(), "Room B", false),
+            None,
+            None,
+        );
+        let mut rig = ReportDispatch::new(vec![online], None);
+        let old = || Instant::now() - Duration::from_secs(60);
+        rig.last_output = vec![Some(old())];
+        rig.push_message(0, 0, "first");
+        rig.dispatch_keep();
+        let injected = rig.notice.entries.last().expect("an injected notice");
+        assert!(injected.text.contains("injected"), "{injected:?}");
+        assert_eq!(injected.severity, NoticeSeverity::Info);
+        // One injection trips a fuse of one; the trip notice is a failure.
+        rig.fuse = DeliveryFuse::new(1);
+        rig.paused = true;
+        rig.push_message(0, 0, "second");
+        rig.push_message(0, 0, "third");
+        rig.dispatch_keep();
+        rig.paused = false;
+        rig.last_output = vec![Some(old())];
+        rig.gates[0] = DeliveryGate::new(false);
+        // The pty echoes the first delivery back on its own schedule; wait
+        // until the writer is idle and two passes leave the clock untouched,
+        // so no late echo can flip readiness during the inject pass below.
+        rig.paused = true;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut quiet_rounds = 0u32;
+        while quiet_rounds < 2 {
+            assert!(Instant::now() < deadline, "the pty echo never settled");
+            rig.last_output = vec![Some(old())];
+            let before = rig.last_output[0];
+            rig.dispatch_keep();
+            if !rig.panes[0].has_unwritten_input() && rig.last_output[0] == before {
+                quiet_rounds += 1;
+            } else {
+                quiet_rounds = 0;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        rig.paused = false;
+        rig.gates[0] = DeliveryGate::new(false);
+        rig.dispatch_keep();
+        let trip = rig.notice.entries.last().expect("a fuse notice");
+        assert!(trip.text.contains("fuse tripped"), "{trip:?}");
+        assert_eq!(trip.severity, NoticeSeverity::Failure);
+    }
+
+    /// A mint that failed to start the room is a failure.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn failed_mint_is_a_failure() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let log = root.path().join("writes");
+        let stub = report_test_stub(root.path(), "room", &log);
+        let online = report_test_pane(
+            report_test_spec(&stub, cwd.path(), "Room B", false),
+            None,
+            None,
+        );
+        let mut rig = ReportDispatch::new(vec![online], None);
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        rig.codex[0] = Some(pane::CodexMint::Pending(rx));
+        rig.dispatch_keep();
+        let mint = rig
+            .notice
+            .entries
+            .iter()
+            .find(|entry| entry.text.contains("was not started"))
+            .expect("a mint notice");
+        assert_eq!(mint.severity, NoticeSeverity::Failure);
+    }
+
+    /// A rejected key is a failure, chosen where the text is produced.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn forward_key_rejection_is_a_failure() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let log = root.path().join("writes");
+        let stub = report_test_stub(root.path(), "room", &log);
+        let mut pane = report_test_pane(
+            report_test_spec(&stub, cwd.path(), "Room A", false),
+            None,
+            Some(&pane::CodexMint::Failed("gone".to_owned())),
+        );
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let (text, severity) = forward_key(&mut pane, key).expect("a rejection");
+        assert!(text.contains("rejected input"), "{text}");
+        assert_eq!(severity, NoticeSeverity::Failure);
+    }
+
+    /// A pending-hold write failure belongs to the pending command: it shows
+    /// up as a notice naming the room, and the mail queued around it keeps
+    /// its own result instead of inheriting that failure.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_pending_save_failure_is_reported_as_its_own_failure() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut panes, mut router, fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses_b");
+        let mut mailroom = Mailroom::new(50);
+        let state_path = root.path().join("state").join("native-outbox.json");
+
+        // Old mail, the pending report, then new mail with no pass in
+        // between: the outbox answers the three commands in that order.
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
+            .unwrap();
+        crate::native_outbox::fail_pending_hold_at(&state_path);
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "new", None)
+            .unwrap();
+
+        let notices = drain_answered(&mut router, &mut mailroom);
+        let view = mailroom.summary();
+        assert!(
+            !view.contains("FAILED"),
+            "both messages keep their own result: {view}"
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("could not be held")
+                    && notice.contains("Opencode · 1")),
+            "the pending failure is a notice naming the room: {notices:?}"
+        );
+
+        // The new message was really saved, so clearing the mark delivers it,
+        // while the mail from before the mark stays held.
+        apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+        pump_router(router.as_mut().unwrap(), &mut mailroom, 500);
+        let received = fake.state.received.lock().unwrap().clone();
+        assert_eq!(
+            received.len(),
+            1,
+            "only the new message is sent: {received:?}"
+        );
+        assert!(received[0].1.contains("new"), "{received:?}");
+        let view = mailroom.summary();
+        assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
+    }
+
+    /// Two pending reports with one failing write: the failure is reported
+    /// once, the second report succeeds, and the room still accepts mail.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn two_pending_reports_with_one_failing_are_each_accounted_for() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut panes, mut router, _fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses_b");
+        let mut mailroom = Mailroom::new(50);
+        let state_path = root.path().join("state").join("native-outbox.json");
+
+        // Old mail gives the first report a hold to write.
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
+            .unwrap();
+        crate::native_outbox::fail_pending_hold_at(&state_path);
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        apply_test_report(&mut panes, router.as_mut(), 0, None, true);
+        // Its own result proves the two reports above were both answered.
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "later", None)
+            .unwrap();
+
+        let notices = drain_answered(&mut router, &mut mailroom);
+        let view = mailroom.summary();
+        assert!(
+            !view.contains("FAILED"),
+            "the second report and the later mail keep their own result: {view}"
+        );
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.contains("could not be held"))
+                .count(),
+            1,
+            "exactly one pending failure is reported: {notices:?}"
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("Opencode · 1")),
+            "the failure names the room: {notices:?}"
+        );
+        assert!(
+            send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "after", None)
+                .is_ok(),
+            "a reported failure must not stop the room from accepting mail"
+        );
+    }
+
+    /// Waits until a terminal's log stops changing: every write the pane
+    /// accepted has reached its child by then, so a settled log is complete.
+    #[cfg(all(test, unix))]
+    fn settled_log(path: &std::path::Path) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut previous = std::fs::read(path).unwrap_or_default();
+        let mut settled_at = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(50));
+            let current = std::fs::read(path).unwrap_or_default();
+            if current != previous {
+                previous = current;
+                settled_at = Instant::now();
+            } else if !previous.is_empty() && settled_at.elapsed() >= Duration::from_millis(400) {
+                return previous;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the terminal log never settled: {previous:?}"
+            );
+        }
+    }
+
+    /// The real event-loop pass, driven from a test. Reports enter as the
+    /// doorbell events production receives, so the `SessionReport` arm itself
+    /// runs for every case a test pushes.
+    #[cfg(all(test, unix))]
+    struct ReportDispatch {
+        doorbell: ReportEvents,
+        panes: Vec<Pane>,
+        router: Option<NativeRouter>,
+        mailroom: Mailroom,
+        gates: Vec<DeliveryGate>,
+        last_output: Vec<Option<Instant>>,
+        spawned_at: Vec<Instant>,
+        pulses: Vec<Option<PulseSample>>,
+        details: Vec<RoomDetail>,
+        pending: std::collections::VecDeque<(u64, usize)>,
+        submits: std::collections::VecDeque<(Instant, usize, bool)>,
+        fuse: DeliveryFuse,
+        paused: bool,
+        notice: Notices,
+        input_ready_out: Vec<bool>,
+        codex: Vec<Option<pane::CodexMint>>,
+        sizes: Vec<PtySize>,
+        environments: Vec<pane::GuestEnvironment>,
+    }
+
+    /// Queues doorbell events for [`ReportDispatch`] to drain exactly like
+    /// the production loop drains them.
+    #[cfg(all(test, unix))]
+    struct ReportEvents {
+        events: std::collections::VecDeque<DoorbellEvent>,
+    }
+
+    #[cfg(all(test, unix))]
+    impl DoorbellSource for ReportEvents {
+        fn try_recv(&mut self) -> Result<DoorbellEvent, std::sync::mpsc::TryRecvError> {
+            self.events
+                .pop_front()
+                .ok_or(std::sync::mpsc::TryRecvError::Empty)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            std::path::Path::new("test-doorbell.sock")
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    impl ReportDispatch {
+        fn new(panes: Vec<Pane>, router: Option<NativeRouter>) -> Self {
+            let now = Instant::now();
+            let rooms = panes.len();
+            Self {
+                doorbell: ReportEvents {
+                    events: std::collections::VecDeque::new(),
+                },
+                gates: (0..rooms)
+                    .map(|_| DeliveryGate::new(false))
+                    .collect(),
+                last_output: vec![None; rooms],
+                spawned_at: vec![now; rooms],
+                pulses: vec![None; rooms],
+                details: (0..rooms).map(|_| RoomDetail::default()).collect(),
+                pending: std::collections::VecDeque::new(),
+                submits: std::collections::VecDeque::new(),
+                fuse: DeliveryFuse::new(0),
+                paused: false,
+                notice: Notices::default(),
+                input_ready_out: Vec::new(),
+                codex: (0..rooms).map(|_| None).collect(),
+                sizes: (0..rooms)
+                    .map(|_| PtySize {
+                        rows: 6,
+                        cols: 60,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .collect(),
+                environments: (0..rooms)
+                    .map(|_| pane::GuestEnvironment::new([]))
+                    .collect(),
+                mailroom: Mailroom::new(50),
+                panes,
+                router,
+            }
+        }
+
+        /// Queues one session report exactly as the doorbell hands it over.
+        fn push_report(&mut self, from: usize, session: Option<&str>, pending: bool) {
+            let (reply, _dropped) = std::sync::mpsc::sync_channel(1);
+            self.doorbell
+                .events
+                .push_back(DoorbellEvent::SessionReport(
+                    crate::doorbell::DoorbellSessionReport {
+                        from,
+                        session: session.map(str::to_owned),
+                        pending,
+                        reply,
+                    },
+                ));
+        }
+
+        /// Queues one doorbell message exactly as the doorbell hands it over.
+        fn push_message(&mut self, from: usize, to: usize, body: &str) {
+            let (mut envelope, _answers) = crate::doorbell::DoorbellEnvelope::for_test();
+            envelope.from = from;
+            envelope.to = to;
+            envelope.body = body.to_owned();
+            self.doorbell.events.push_back(DoorbellEvent::Message(envelope));
+        }
+
+        /// Runs one event-loop pass and returns the notice the dispatch left.
+        fn dispatch(&mut self) -> String {
+            let rooms = self.panes.len();
+            let now = Instant::now();
+            run_rooms_iteration(
+                &mut self.doorbell,
+                None::<&mut Terminal<CrosstermBackend<io::Stdout>>>,
+                &mut self.panes,
+                &mut self.router,
+                &mut self.mailroom,
+                &mut self.gates,
+                &mut self.last_output,
+                &mut self.spawned_at,
+                &mut self.pulses,
+                &mut self.details,
+                &mut self.pending,
+                &mut self.submits,
+                &mut self.fuse,
+                &mut self.paused,
+                &mut self.notice,
+                &mut self.input_ready_out,
+                &mut self.codex,
+                &self.sizes,
+                &self.environments,
+                &[],
+                100,
+                rooms,
+                now,
+            )
+            .unwrap();
+            std::mem::take(&mut self.notice).ordered_lines().join("; ")
+        }
+
+        /// Runs one event-loop pass like [`ReportDispatch::dispatch`], but
+        /// keeps the notices so a test can check each one's severity.
+        fn dispatch_keep(&mut self) {
+            let rooms = self.panes.len();
+            let now = Instant::now();
+            run_rooms_iteration(
+                &mut self.doorbell,
+                None::<&mut Terminal<CrosstermBackend<io::Stdout>>>,
+                &mut self.panes,
+                &mut self.router,
+                &mut self.mailroom,
+                &mut self.gates,
+                &mut self.last_output,
+                &mut self.spawned_at,
+                &mut self.pulses,
+                &mut self.details,
+                &mut self.pending,
+                &mut self.submits,
+                &mut self.fuse,
+                &mut self.paused,
+                &mut self.notice,
+                &mut self.input_ready_out,
+                &mut self.codex,
+                &self.sizes,
+                &self.environments,
+                &[],
+                100,
+                rooms,
+                now,
+            )
+            .unwrap();
+        }
+    }
+
+    /// A Claude room's own report is the only other source of its session: a
+    /// valid id rebinds under a new generation and is saved as reported; a
+    /// non-UUID is ignored.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_claude_session_report_rebinds_and_a_non_uuid_is_ignored() {
+        const FIRST: &str = "6a1d2f74-1f52-4e0f-9d61-0a1b2c3d4e5f";
+        const SECOND: &str = "7b2e3a85-2a63-4f10-8e72-1b2c3d4e5f60";
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let program = report_test_stub(root.path(), "claude", &root.path().join("calls"));
+        let spec = report_test_spec(&program, cwd.path(), "Claude · 1", true);
+        let size = PtySize {
+            rows: 6,
+            cols: 60,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let mut panes = vec![
+            spawn_room(
+                &mut LivePanes,
+                spec,
+                size,
+                pane::GuestEnvironment::new([]),
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+        ];
+        let mut router = NativeRouter::start(root.path().join("outbox.json"), Vec::new()).unwrap();
+        pane::bind_claude_room(&mut router, &mut panes, 0, FIRST).unwrap();
+        let old = router.binding_for(0).unwrap();
+        let mut rig = ReportDispatch::new(panes, Some(router));
+
+        let shown = {
+            rig.push_report(0, Some("not-a-uuid"), false);
+            rig.dispatch()
+        };
+        assert!(shown.contains("not a Claude session id"), "{shown}");
+        assert_eq!(
+            rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
+            FIRST
+        );
+
+        rig.push_report(0, Some(SECOND), false);
+        rig.dispatch();
+        let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        assert_eq!(binding.session, SECOND);
+        assert!(binding.generation > old.generation);
+        assert_eq!(
+            crate::pane::session_state::lookup_reported("claude", cwd.path(), "Claude · 1")
+                .as_deref(),
+            Some(SECOND)
+        );
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn session_reports_never_touch_a_terminal() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        // Room 0 is a bound native OpenCode room; room 1 is an ordinary
+        // Claude room with a live terminal of its own. Both record every byte
+        // written to them, so any terminal write is caught.
+        let native_log = root.path().join("native.pty");
+        let raw_log = root.path().join("raw.pty");
+        let native_program = report_test_stub(root.path(), "opencode", &native_log);
+        let raw_program = report_test_stub(root.path(), "claude", &raw_log);
+        let fake = {
+            use crate::native_launch::tests::fake_room;
+            fake_room(root.path(), "server", "v2.2.5")
+        };
+        let mut specs = vec![
+            report_test_spec(&native_program, cwd.path(), "Opencode · 1", true),
+            report_test_spec(&raw_program, cwd.path(), "Claude · 2", false),
+        ];
+        let native = {
+            use crate::native_launch;
+            let _ = &fake;
+            native_launch::start(native_launch::NativeLaunch::direct(
+                fake.program.as_os_str(),
+                cwd.path(),
+                "1.1".to_owned(),
+                1,
+                &[],
+            ))
+            .unwrap()
+        };
+        let server = native.server();
+        let binding = crate::native_outbox::Binding {
+            room: native.binding().room.clone(),
+            session: "ses-old-1".to_owned(),
+            endpoint: native.binding().endpoint.clone(),
+            generation: 1,
+        };
+        let router = Some(
+            NativeRouter::start(
+                root.path().join("state").join("native-outbox.json"),
+                vec![crate::native_route::RoomEntry {
+                    index: 0,
+                    title: "Opencode · 1".to_owned(),
+                    binding,
+                    backend: crate::native_route::Backend::OpenCode(server),
+                }],
+            )
+            .unwrap(),
+        );
+        let panes = vec![
+            report_test_pane(specs.remove(0), Some(native), None),
+            report_test_pane(specs.remove(0), None, None),
+        ];
+        // Pending, same id, a rebind, an unknown room and a wrong vendor,
+        // each arriving as the doorbell event production dispatches, so the
+        // real SessionReport arm runs for every case below.
+        let mut rig = ReportDispatch::new(panes, router);
+        rig.push_report(0, None, true);
+        let notice = rig.dispatch();
+        assert!(notice.contains("session pending after clear"), "{notice}");
+        rig.push_report(0, Some("ses-old-1"), false);
+        let notice = rig.dispatch();
+        assert!(notice.contains("pending cleared"), "{notice}");
+        rig.push_report(0, Some("ses-reported-9"), false);
+        let notice = rig.dispatch();
+        assert!(
+            notice.contains("now follows reported session ses-reported-9"),
+            "{notice}"
+        );
+        rig.push_report(9, Some("ses-x"), false);
+        let notice = rig.dispatch();
+        assert!(notice.contains("unknown room"), "{notice}");
+        rig.push_report(1, Some("ses-x"), false);
+        let notice = rig.dispatch();
+        assert!(
+            notice.contains("is not a native OpenCode, Codex or Claude room"),
+            "{notice}"
+        );
+        // A room's PTY hands bytes to its child only on a line boundary, so
+        // flush both queues with a marker of the test's own and wait for the
+        // logs to settle: every byte a report wrote has reached the child by
+        // then, and each log must hold nothing but that marker.
+        for pane in rig.panes.iter_mut() {
+            for key in [KeyCode::Char('Z'), KeyCode::Char('Q'), KeyCode::Char('\n')] {
+                pane.write_key(KeyEvent::new(key, KeyModifiers::NONE))
+                    .unwrap();
+            }
+        }
+        // Wait out anything still queued for the terminals.
+        let end = Instant::now() + Duration::from_secs(5);
+        while rig.panes.iter().any(|pane| pane.has_unwritten_input()) {
+            assert!(Instant::now() < end, "writes never drained");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for (name, log) in [("native", &native_log), ("raw", &raw_log)] {
+            let bytes = settled_log(log);
+            assert_eq!(
+                bytes,
+                b"ZQ\n".to_vec(),
+                "session reports must never write to a terminal ({name} got {bytes:?})"
+            );
+        }
+        // And the rebind it did perform landed on the right room.
+        assert_eq!(
+            rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
+            "ses-reported-9"
+        );
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_report_rebinds_only_the_reporting_room() {
+        use crate::native_launch::{self, tests::fake_room};
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        // Consume the launch generation a real startup would have taken.
+        let _launch_generation =
+            crate::native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+                .next()
+                .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        // Rooms 0 and 2 keep ordinary bindings; room 1 starts on a stale id.
+        let fake_a = fake_room(root.path(), "a", "v2.2.5");
+        let native_a = native_launch::start(native_launch::NativeLaunch::direct(
+            fake_a.program.as_os_str(),
+            cwd.path(),
+            "1.1".to_owned(),
+            1,
+            &[],
+        ))
+        .unwrap();
+        let fake_b = fake_room(root.path(), "b", "v2.2.5");
+        let native_b = native_launch::start(native_launch::NativeLaunch::direct(
+            fake_b.program.as_os_str(),
+            cwd.path(),
+            "2.1".to_owned(),
+            1,
+            &[],
+        ))
+        .unwrap();
+        let program_a = report_test_stub(root.path(), "opencode", &root.path().join("a.calls"));
+        let program_b = report_test_stub(root.path(), "opencode", &root.path().join("b.calls"));
+        let program_c = report_test_stub(root.path(), "codex", &root.path().join("c.args"));
+        let mut specs = vec![
+            report_test_spec(&program_a, cwd.path(), "Opencode · 1", true),
+            report_test_spec(&program_b, cwd.path(), "Opencode · 2", true),
+            report_test_spec(&program_c, cwd.path(), "Codex · 3", true),
+        ];
+        let server_a = native_a.server();
+        let server_b = native_b.server();
+        let mut router = Some(
+            NativeRouter::start(
+                root.path().join("state").join("native-outbox.json"),
+                vec![
+                    crate::native_route::RoomEntry {
+                        index: 0,
+                        title: "Opencode · 1".to_owned(),
+                        binding: native_a.binding().clone(),
+                        backend: crate::native_route::Backend::OpenCode(server_a),
+                    },
+                    crate::native_route::RoomEntry {
+                        index: 1,
+                        title: "Opencode · 2".to_owned(),
+                        binding: crate::native_outbox::Binding {
+                            room: native_b.binding().room.clone(),
+                            session: "ses-old-2".to_owned(),
+                            endpoint: native_b.binding().endpoint.clone(),
+                            generation: 1,
+                        },
+                        backend: crate::native_route::Backend::OpenCode(server_b),
+                    },
+                ],
+            )
+            .unwrap(),
+        );
+        let codex_room = {
+            let stub = |thread: &str| {
+                use std::os::unix::fs::PermissionsExt;
+                let path = root.path().join(format!("codex-{thread}"));
+                std::fs::write(
+                    &path,
+                    format!(
+                        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nprintf 'Queued message sub_1 for thread %s.\\n' '{thread}'\n",
+                        root.path().join("codex.args").display()
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+                path
+            };
+            let program = stub("thread-a");
+            crate::codex_native::room(
+                program.as_os_str().to_owned(),
+                cwd.path(),
+                "thread-a".to_owned(),
+                Vec::new(),
+            )
+        };
+        let mut panes = vec![
+            report_test_pane(specs.remove(0), Some(native_a), None),
+            report_test_pane(specs.remove(0), Some(native_b), None),
+            report_test_pane(
+                specs.remove(0),
+                None,
+                Some(&pane::CodexMint::Ready(
+                    "11111111-1111-4111-8111-111111111111".to_owned(),
+                )),
+            ),
+        ];
+        router
+            .as_mut()
+            .unwrap()
+            .bind_codex(vec![crate::native_route::CodexEntry {
+                index: 2,
+                title: "Codex · 3".to_owned(),
+                room: Some(std::sync::Arc::new(codex_room)),
+                generation: 1,
+                reason: None,
+            }])
+            .unwrap();
+        let notice = apply_test_report(&mut panes, router.as_mut(), 1, Some("ses_b"), false);
+        assert!(notice.contains("now follows reported session ses_b"), "{notice}");
+        // The reporting room rebound with a new generation; the others are
+        // untouched in binding, generation and adapter.
+        let room0 = router.as_ref().unwrap().binding_for(0).unwrap();
+        assert_eq!(room0.session, "ses_a");
+        assert_eq!(room0.generation, 1);
+        let room1 = router.as_ref().unwrap().binding_for(1).unwrap();
+        assert_eq!(room1.session, "ses_b");
+        assert_eq!(room1.generation, 2);
+        assert_eq!(
+            router.as_ref().unwrap().binding_for(2).unwrap().session,
+            "thread-a"
+        );
+        let mut mailroom = Mailroom::new(50);
+        for index in 0..3 {
+            send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", index, "hi", None)
+                .unwrap();
+        }
+        let end = Instant::now() + Duration::from_secs(20);
+        loop {
+            router.as_mut().unwrap().tick(Instant::now(), &mut mailroom, false, false);
+            if mailroom.summary().matches("ACCEPTED").count() == 3 {
+                break;
+            }
+            assert!(Instant::now() < end, "rooms did not stay deliverable");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_report_for_an_unknown_room_changes_nothing() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut panes, mut router, _fake) = report_test_opencode_room(root.path(), cwd.path(), "ses_b");
+        let notice = apply_test_report(&mut panes, router.as_mut(), 9, Some("ses-x"), false);
+        assert!(notice.contains("unknown room"), "{notice}");
+        assert!(router.as_ref().unwrap().binding_for(0).is_some());
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_reported_id_rebinds_the_opencode_room_and_delivers_to_it() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut panes, mut router, fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses-old-1");
+        let mut mailroom = Mailroom::new(50);
+        let old = router.as_ref().unwrap().binding_for(0).unwrap();
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
+            .unwrap();
+        let end = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < end {
+            router.as_mut().unwrap().tick(Instant::now(), &mut mailroom, true, false);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+        assert!(notice.contains("now follows reported session ses_b"), "{notice}");
+        let binding = router.as_ref().unwrap().binding_for(0).unwrap();
+        assert_eq!(binding.session, "ses_b");
+        assert_eq!(binding.generation, 2);
+        assert_eq!(
+            binding.endpoint, old.endpoint,
+            "the rebind stays on the same owned server"
+        );
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "new", None)
+            .unwrap();
+        pump_router(router.as_mut().unwrap(), &mut mailroom, 500);
+        let received = fake.state.received.lock().unwrap().clone();
+        assert_eq!(received.len(), 1, "only post-report mail reaches the server");
+        assert!(received[0].1.contains("new"), "{received:?}");
+        let view = mailroom.summary();
+        assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
+        assert!(view.contains("ACCEPTED by OpenCode"), "{view}");
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_codex_report_rebinds_persists_and_delivers_to_the_new_thread() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        // The interactive pane and the queue CLI are two processes running
+        // one stub: each gets its own file, so the pane's own redirection
+        // can never truncate what the queue CLI wrote.
+        let queue_args = root.path().join("codex.args");
+        let program = report_test_stub(root.path(), "codex", &root.path().join("codex.log"));
+        // Consume the launch generation a real startup would have taken.
+        let _launch_generation =
+            crate::native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+                .next()
+                .unwrap();
+        let specs = vec![report_test_spec(&program, cwd.path(), "Codex · 1", true)];
+        let mut router =
+            pane::start_native_router(&specs, &[None]).expect("native rooms start a router");
+        let mint = pane::CodexMint::Ready("11111111-1111-4111-8111-111111111111".to_owned());
+        let mut panes = vec![report_test_pane(
+            specs.into_iter().next().unwrap(),
+            None,
+            Some(&mint),
+        )];
+        router
+            .as_mut()
+            .unwrap()
+            .bind_codex(vec![crate::native_route::CodexEntry {
+                index: 0,
+                title: "Codex · 1".to_owned(),
+                room: Some(std::sync::Arc::new(panes[0].codex_room_for(
+                    "11111111-1111-4111-8111-111111111111".to_owned(),
+                ))),
+                generation: 1,
+                reason: None,
+            }])
+            .unwrap();
+        let mut mailroom = Mailroom::new(50);
+        let thread = "33333333-3333-4333-8333-333333333333";
+        let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some(thread), false);
+        assert!(notice.contains("now follows reported session"), "{notice}");
+        assert_eq!(
+            crate::pane::session_state::lookup_reported("codex", cwd.path(), "Codex · 1").as_deref(),
+            Some(thread),
+            "the reported thread survives a restart"
+        );
+        let binding = router.as_ref().unwrap().binding_for(0).unwrap();
+        assert_eq!(binding.session, thread);
+        assert_eq!(binding.generation, 2);
+        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "hi codex", None)
+            .unwrap();
+        // Acceptance and the queue CLI's own argument log come from
+        // different processes, so wait for both instead of assuming one
+        // implies the other.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            router.as_mut().unwrap().tick(Instant::now(), &mut mailroom, false, false);
+            let view = mailroom.summary();
+            let logged = std::fs::read_to_string(&queue_args).unwrap_or_default();
+            if view.contains("ACCEPTED by Codex") && logged.contains(thread) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never delivered to the reported thread:\n{view}\nlogged: {logged}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_report_for_a_room_without_native_delivery_changes_nothing() {
+        use crate::native_launch::{self, tests::fake_room};
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let native_program = report_test_stub(root.path(), "opencode", &root.path().join("native.calls"));
+        let raw_program = report_test_stub(root.path(), "claude", &root.path().join("raw.calls"));
+        let fake = fake_room(root.path(), "server", "v2.2.5");
+        let mut specs = vec![
+            report_test_spec(&native_program, cwd.path(), "Opencode · 1", true),
+            report_test_spec(&raw_program, cwd.path(), "Claude · 2", false),
+        ];
+        let mut natives = vec![
+            native_launch::start(native_launch::NativeLaunch::direct(
+                fake.program.as_os_str(),
+                cwd.path(),
+                "1.1".to_owned(),
+                1,
+                &[],
+            ))
+            .ok(),
+            None,
+        ];
+        let mut router = pane::start_native_router(&specs, &natives).unwrap();
+        let mut panes = vec![
+            report_test_pane(specs.remove(0), natives.remove(0), None),
+            report_test_pane(specs.remove(0), natives.remove(0), None),
+        ];
+        let notice = apply_test_report(&mut panes, router.as_mut(), 1, Some("ses-x"), false);
+        assert!(notice.contains("not a native OpenCode, Codex or Claude room"), "{notice}");
+        assert!(router.as_ref().unwrap().binding_for(1).is_none());
+    }
+
+    #[cfg(all(test, unix))]
+    #[test]
+    fn an_unsavable_codex_report_holds_the_room_and_keeps_the_corrupt_file() {
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let path = crate::pane::session_state::state_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let program = report_test_stub(root.path(), "codex", &root.path().join("calls"));
+        let specs = vec![report_test_spec(&program, cwd.path(), "Codex · 1", true)];
+        let mut router = pane::start_native_router(&specs, &[None]).expect("router starts");
+        let mint = pane::CodexMint::Ready("11111111-1111-4111-8111-111111111111".to_owned());
+        let mut panes = vec![report_test_pane(specs.into_iter().next().unwrap(), None, Some(&mint))];
+        router
+            .as_mut()
+            .unwrap()
+            .bind_codex(vec![crate::native_route::CodexEntry {
+                index: 0,
+                title: "Codex · 1".to_owned(),
+                room: Some(std::sync::Arc::new(panes[0].codex_room_for(
+                    "11111111-1111-4111-8111-111111111111".to_owned(),
+                ))),
+                generation: 1,
+                reason: None,
+            }])
+            .unwrap();
+        let thread = "33333333-3333-4333-8333-333333333333";
+        let mut mailroom = Mailroom::new(50);
+        let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some(thread), false);
+        assert!(notice.contains(thread), "{notice}");
+        assert!(notice.contains("could not be saved"), "{notice}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");
+        let error = send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "held",
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains(thread), "the hold reason names the id: {error}");
     }
 
     #[test]
@@ -2691,7 +6414,7 @@ mod tests {
         let wait = run_with.find("wait_for_reaps()").expect("reaping is awaited");
         assert!(install < run && run < wait);
         // The loop leaves as soon as it is asked to, before doing anything else.
-        let body = &production[production.find("fn run_rooms(").unwrap()..];
+        let body = &production[production.find("fn run_loop").unwrap()..];
         let loop_start = body.find("    loop {\n").expect("event loop");
         let after = &body[loop_start + "    loop {\n".len()..];
         assert!(
@@ -2741,6 +6464,46 @@ mod tests {
         assert_eq!(body.matches("TerminalGuard::enter").count(), 1);
         assert!(!body.contains("TerminalGuard::enter()"));
         assert!(body.contains("launch_native_rooms"));
+    }
+
+    /// The loop needs a real terminal, so its call site is checked here while
+    /// the restart itself is driven through the seam by the named pane tests.
+    #[test]
+    fn run_rooms_dispatches_restart_keys_through_the_seam() {
+        let source = include_str!("app.rs");
+        let production = &source[..source.find("#[cfg(test)]").unwrap()];
+        let body = &production[production.find("fn run_loop").unwrap()..];
+        let body = &body[..body.find("\n}\n\n\nfn run_rooms").unwrap()];
+        assert_eq!(
+            body.matches("run_rooms_key_event(").count(),
+            1,
+            "the loop calls the key step exactly once"
+        );
+        assert_eq!(
+            body.matches("loop_state(").count(),
+            1,
+            "the loop builds the step state in one place"
+        );
+        let call = body.find("run_rooms_key_event(").unwrap();
+        assert!(
+            body[..call].contains("Event::Key(key)"),
+            "the step is called from the key arm"
+        );
+        let step = &production[production.find("fn run_rooms_key_event(").unwrap()..];
+        let step = &step[..step.find("\n}\n").unwrap()];
+        assert_eq!(
+            step.matches("= restart_key(").count(),
+            1,
+            "the step owns the single restart_key call"
+        );
+        assert!(
+            step.contains("force_restart_requested"),
+            "the step owns the restart guard"
+        );
+        assert!(
+            !body.contains("force_restart_requested") && !body.contains("restart_key("),
+            "the loop leaves the restart decision to the step"
+        );
     }
 
     /// The only direct writes to a pane's terminal that the app may contain.
@@ -4114,4 +7877,167 @@ mod tests {
             "should reschedule after interval and pending cleared"
         );
     }
+
+    #[cfg(unix)]
+    mod loop_behaviour {
+        use super::*;
+        use crate::config::RoomSpec;
+        use crate::native_route::NativeRouter;
+        use crate::pane::{GuestEnvironment, Pane};
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use portable_pty::PtySize;
+        use ratatui::{Terminal, backend::TestBackend};
+        use std::{
+            collections::VecDeque,
+            io,
+            path::{Path, PathBuf},
+            time::{Duration, Instant},
+        };
+
+        #[allow(dead_code)]
+        enum ScriptedStep {
+            Event(Event),
+            Idle,
+        }
+
+        struct ScriptedEvents {
+            steps: VecDeque<ScriptedStep>,
+        }
+
+        impl ScriptedEvents {
+            fn new(events: Vec<Event>) -> Self {
+                Self {
+                    steps: events.into_iter().map(ScriptedStep::Event).collect(),
+                }
+            }
+
+            #[allow(dead_code)]
+            fn steps(steps: Vec<ScriptedStep>) -> Self {
+                Self { steps: steps.into() }
+            }
+        }
+
+        impl EventSource for ScriptedEvents {
+            fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
+                loop {
+                    match self.steps.front() {
+                        Some(ScriptedStep::Event(_)) => return Ok(true),
+                        Some(ScriptedStep::Idle) => {
+                            self.steps.pop_front();
+                            return Ok(false);
+                        }
+                        None => return Ok(false),
+                    }
+                }
+            }
+
+            fn read(&mut self) -> io::Result<Event> {
+                match self.steps.pop_front() {
+                    Some(ScriptedStep::Event(event)) => Ok(event),
+                    _ => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no scripted event")),
+                }
+            }
+        }
+
+        struct SilentDoorbell {
+            path: PathBuf,
+        }
+
+        impl SilentDoorbell {
+            fn new(path: PathBuf) -> Self {
+                Self { path }
+            }
+        }
+
+        impl DoorbellSource for SilentDoorbell {
+            fn try_recv(
+                &mut self,
+            ) -> Result<crate::doorbell::DoorbellEvent, std::sync::mpsc::TryRecvError> {
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            }
+
+            fn path(&self) -> &Path {
+                &self.path
+            }
+        }
+
+        fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+            Event::Key(KeyEvent::new(code, modifiers))
+        }
+
+        fn shell_spec(program: &Path, cwd: &Path, title: &str) -> RoomSpec {
+            RoomSpec {
+                name: "sh".to_owned(),
+                vendor: "shell".to_owned(),
+                title: title.to_owned(),
+                program: program.as_os_str().to_owned(),
+                args: Vec::new(),
+                transport: crate::config::Transport::Shell,
+                cwd: Some(cwd.to_path_buf()),
+                variables: Vec::new(),
+                allow_control: false,
+                use_headroom: false,
+                scheduling: None,
+                headroom_args: Vec::new(),
+                native_delivery: false,
+            }
+        }
+
+        fn pty_size() -> PtySize {
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            }
+        }
+
+        #[test]
+        fn the_production_loop_runs_to_completion_on_ctrl_q_and_cleans_up() {
+            let cwd = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let program = if cfg!(windows) {
+                PathBuf::from("cmd.exe")
+            } else {
+                PathBuf::from("/bin/sh")
+            };
+            let spec = shell_spec(&program, cwd.path(), "Room A");
+            let pane = Pane::spawn(spec, pty_size(), GuestEnvironment::new([])).unwrap();
+            let mut panes = vec![pane];
+            let mut router: Option<NativeRouter> = None;
+            let mut codex = vec![None];
+            let environments = vec![GuestEnvironment::new([])];
+            let now = Instant::now();
+            let mut spawned_at = vec![now];
+            let mut last_output = vec![None];
+            let mut pane_sizes = vec![pty_size()];
+            let mut notice = Notices::default();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut events = ScriptedEvents::new(vec![key(KeyCode::Char('q'), KeyModifiers::CONTROL)]);
+            let mut doorbell = SilentDoorbell::new(root.path().join("doorbell.sock"));
+
+            run_loop(
+                &mut terminal,
+                &mut events,
+                &mut doorbell,
+                &mut panes,
+                &mut router,
+                &mut codex,
+                &environments,
+                &mut spawned_at,
+                &mut last_output,
+                &mut pane_sizes,
+                &[],
+                100,
+                &mut notice,
+                &[false],
+                1,
+            )
+            .unwrap();
+
+            // The loop returned only after running cleanup on the scripted exit.
+            assert!(!panes[0].is_online(), "pane must be cleaned up on exit");
+        }
+    }
+
 }

@@ -219,7 +219,35 @@ fn listener_loop(
                             }
                         }
                     }
-                    Ok(WireRequest::Roster(request)) => {
+                    Ok(WireRequest::SessionReport(request)) => {
+                if seen.contains(&request.id) {
+                    Some(WireResponse::accepted("duplicate", None))
+                } else {
+                    match validate_session_report(&request, &tokens) {
+                        Ok(from) => {
+                            let (reply, reply_rx) = mpsc::sync_channel(1);
+                            let event = DoorbellEvent::SessionReport(DoorbellSessionReport {
+                                from,
+                                session: request.session,
+                                pending: request.pending,
+                                reply,
+                            });
+                            match events.try_send(event) {
+                                Ok(()) => {
+                                    remember_id(request.id, &mut seen, &mut seen_order);
+                                    reply_rx.recv_timeout(Duration::from_secs(2)).ok()
+                                }
+                                Err(TrySendError::Full(_)) => {
+                                    Some(WireResponse::rejected("Doorbell queue is full"))
+                                }
+                                Err(TrySendError::Disconnected(_)) => break,
+                            }
+                        }
+                        Err(error) => Some(WireResponse::rejected(error)),
+                    }
+                }
+            }
+            Ok(WireRequest::Roster(request)) => {
                         match validate_roster(&request, &tokens, &mut recent_by_room) {
                             Ok(_) => {
                                 let (reply, reply_rx) = mpsc::sync_channel(1);
@@ -634,6 +662,52 @@ mod tests {
             validate_pulse(&request, &["left".to_owned(), "right".to_owned()]),
             Ok(0)
         );
+    }
+
+    /// A forged `room` field in the wire payload cannot redirect a session
+    /// report: unknown fields are ignored and the token alone names the room.
+    /// A regression that prefers a body room would rebind room 1 here.
+    #[test]
+    fn a_forged_room_field_cannot_redirect_a_session_report() {
+        let doorbell = Doorbell::start(2).unwrap();
+        let path = doorbell.path().to_owned();
+        let token = doorbell.tokens[0].clone();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(path).unwrap();
+            // No typed struct carries a room field; raw JSON reaches the
+            // server arm exactly as a hostile hook would send it.
+            let forged = serde_json::json!({
+                "kind": "session_report",
+                "token": token,
+                "id": "report-forge",
+                "session": "ses-forged",
+                "room": 1,
+            });
+            serde_json::to_writer(&mut stream, &forged).unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match doorbell.try_recv() {
+                Ok(DoorbellEvent::SessionReport(report)) => {
+                    assert_eq!(report.from, 0, "the token names the room, not the body");
+                    assert_eq!(report.session.as_deref(), Some("ses-forged"));
+                    assert!(!report.pending);
+                    report.reply_recorded("recorded");
+                    break;
+                }
+                Ok(_) => panic!("unexpected Doorbell event"),
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("report did not arrive: {error}"),
+            }
+        }
+        let response = client.join().unwrap();
+        assert!(response.ok);
+        assert_eq!(response.status, "recorded");
     }
 
     #[test]
