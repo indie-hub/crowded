@@ -2018,6 +2018,12 @@ impl Pane {
         usize::from(self.parser.screen().size().0)
     }
 
+    /// The number of visible columns in this pane's viewport.
+    #[cfg(test)]
+    pub(crate) fn visible_width(&self) -> usize {
+        usize::from(self.parser.screen().size().1)
+    }
+
     /// Scroll the retained view toward the top of the buffer. `set_scrollback`
     /// clamps to the actual retained history, so this can never overshoot.
     pub(crate) fn scroll_up(&mut self, rows: usize) {
@@ -4107,6 +4113,10 @@ mod tests {
                 .pop_front()
                 .ok_or(std::sync::mpsc::TryRecvError::Empty)
         }
+
+        fn path(&self) -> &std::path::Path {
+            std::path::Path::new("test-doorbell.sock")
+        }
     }
 
     /// One native Codex room driven by the real per-pass event-loop body, with
@@ -4276,7 +4286,7 @@ mod tests {
             let now = Instant::now();
             crate::app::run_rooms_iteration(
                 &mut self.doorbell,
-                None,
+                None::<&mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>>,
                 &mut self.panes,
                 &mut self.router,
                 &mut self.mailroom,
@@ -8634,4 +8644,586 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             assert!(log.contains(want), "{log}");
         }
     }
+
+    #[cfg(unix)]
+    mod production_loop {
+        use super::*;
+        use crate::app::{DoorbellSource, EventSource, Notices};
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        
+        use ratatui::{Terminal, backend::TestBackend};
+        use std::{
+            collections::VecDeque,
+            fs,
+            io,
+            path::{Path, PathBuf},
+            time::{Duration, Instant},
+        };
+
+        enum ScriptedStep {
+            Event(Event),
+            Idle,
+        }
+
+        struct ScriptedEvents {
+            steps: VecDeque<ScriptedStep>,
+        }
+
+        impl ScriptedEvents {
+            fn new(events: Vec<Event>) -> Self {
+                Self {
+                    steps: events.into_iter().map(ScriptedStep::Event).collect(),
+                }
+            }
+
+            #[allow(dead_code)]
+            fn steps(steps: Vec<ScriptedStep>) -> Self {
+                Self { steps: steps.into() }
+            }
+        }
+
+        impl EventSource for ScriptedEvents {
+            fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
+                loop {
+                    match self.steps.front() {
+                        Some(ScriptedStep::Event(_)) => return Ok(true),
+                        Some(ScriptedStep::Idle) => {
+                            self.steps.pop_front();
+                            return Ok(false);
+                        }
+                        None => return Ok(false),
+                    }
+                }
+            }
+
+            fn read(&mut self) -> io::Result<Event> {
+                match self.steps.pop_front() {
+                    Some(ScriptedStep::Event(event)) => Ok(event),
+                    _ => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no scripted event")),
+                }
+            }
+        }
+
+        struct SilentDoorbell {
+            path: PathBuf,
+        }
+
+        impl SilentDoorbell {
+            fn new(path: PathBuf) -> Self {
+                Self { path }
+            }
+        }
+
+        impl DoorbellSource for SilentDoorbell {
+            fn try_recv(
+                &mut self,
+            ) -> Result<crate::doorbell::DoorbellEvent, std::sync::mpsc::TryRecvError> {
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            }
+
+            fn path(&self) -> &Path {
+                &self.path
+            }
+        }
+
+        fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+            Event::Key(KeyEvent::new(code, modifiers))
+        }
+
+        fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(Instant::now() < deadline, "{what} never happened");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        #[test]
+        fn the_production_loop_forwards_an_ordinary_key_only_to_the_focused_pane() {
+            let cwd = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let (pane0, captured0) = pane_with_capture(4, 20);
+            let (pane1, captured1) = pane_with_capture(4, 20);
+            let mut panes = vec![pane0, pane1];
+            let mut router = None;
+            let mut codex = vec![None, None];
+            let environments = vec![GuestEnvironment::new([]), GuestEnvironment::new([])];
+            let now = Instant::now();
+            let mut spawned_at = vec![now, now];
+            let mut last_output = vec![None, None];
+            let mut pane_sizes = vec![small_size(), small_size()];
+            let mut notice = Notices::default();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            // Tab moves focus from 0 to 1; 'a' must reach only pane 1.
+            let mut events = ScriptedEvents::new(vec![
+                key(KeyCode::Tab, KeyModifiers::NONE),
+                key(KeyCode::Char('a'), KeyModifiers::NONE),
+                key(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            ]);
+            let mut doorbell = SilentDoorbell::new(root.path().join("doorbell.sock"));
+
+            crate::app::run_loop(
+                &mut terminal,
+                &mut events,
+                &mut doorbell,
+                &mut panes,
+                &mut router,
+                &mut codex,
+                &environments,
+                &mut spawned_at,
+                &mut last_output,
+                &mut pane_sizes,
+                &[],
+                100,
+                &mut notice,
+                &[false, false],
+                2,
+            )
+            .unwrap();
+
+            wait_for_captured(&captured1, b"a");
+            assert!(
+                captured0.lock().unwrap().is_empty(),
+                "the unfocused pane must receive nothing: {:?}",
+                captured0.lock().unwrap()
+            );
+            let _ = cwd;
+        }
+
+        #[test]
+        fn the_production_loop_forwards_online_ctrl_r_as_0x12_to_the_focused_pane() {
+            let root = tempfile::tempdir().unwrap();
+            let (pane0, captured0) = pane_with_capture(4, 20);
+            let (mut pane1, captured1) = pane_with_capture(4, 20);
+            pane1.spec.program = "codex".into();
+            pane1.spec.native_delivery = true;
+            assert!(pane1.is_online(), "the focused codex pane must be online");
+            let mut panes = vec![pane0, pane1];
+            let mut router = None;
+            let mut codex = vec![None, None];
+            let environments = vec![GuestEnvironment::new([]), GuestEnvironment::new([])];
+            let now = Instant::now();
+            let mut spawned_at = vec![now, now];
+            let mut last_output = vec![None, None];
+            let mut pane_sizes = vec![small_size(), small_size()];
+            let mut notice = Notices::default();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut events = ScriptedEvents::new(vec![
+                key(KeyCode::Tab, KeyModifiers::NONE),
+                key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                key(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            ]);
+            let mut doorbell = SilentDoorbell::new(root.path().join("doorbell.sock"));
+
+            crate::app::run_loop(
+                &mut terminal,
+                &mut events,
+                &mut doorbell,
+                &mut panes,
+                &mut router,
+                &mut codex,
+                &environments,
+                &mut spawned_at,
+                &mut last_output,
+                &mut pane_sizes,
+                &[],
+                100,
+                &mut notice,
+                &[false, false],
+                2,
+            )
+            .unwrap();
+
+            wait_for_captured(&captured1, b"\x12");
+            assert!(
+                captured0.lock().unwrap().is_empty(),
+                "the unfocused pane must receive nothing: {:?}",
+                captured0.lock().unwrap()
+            );
+            assert!(
+                notice.ordered_lines().is_empty(),
+                "an online Ctrl+R must not restart or emit notices: {:?}",
+                notice.ordered_lines()
+            );
+        }
+
+        #[test]
+        fn the_production_loop_relaunches_only_the_focused_claude_room_on_f5() {
+            let _state = session_state::StateRootGuard::isolated();
+            let cwd = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let stub_root0 = tempfile::tempdir().unwrap();
+            let stub_root1 = tempfile::tempdir().unwrap();
+            let log0 = stub_root0.path().join("claude.log");
+            let log1 = stub_root1.path().join("claude.log");
+            let stub0 = codex_stub_for_pane(
+                stub_root0.path(),
+                "claude",
+                &format!("printf 'exec\\n' >> '{}'\nexec sleep 30", log0.display()),
+            );
+            let stub1 = codex_stub_for_pane(
+                stub_root1.path(),
+                "claude",
+                &format!("printf 'exec\\n' >> '{}'\nexec sleep 30", log1.display()),
+            );
+            session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+            session_state::upsert_minted("claude", cwd.path(), "Claude · 2", MINTED_B).unwrap();
+            let mut panes = vec![
+                Pane::spawn_unavailable(
+                    claude_native_spec_for(&stub0, cwd.path(), "Claude · 1"),
+                    small_size(),
+                    GuestEnvironment::new([]),
+                    "offline",
+                )
+                .unwrap(),
+                Pane::spawn_unavailable(
+                    claude_native_spec_for(&stub1, cwd.path(), "Claude · 2"),
+                    small_size(),
+                    GuestEnvironment::new([]),
+                    "offline",
+                )
+                .unwrap(),
+            ];
+            let mut router = Some(
+                crate::native_route::NativeRouter::start(
+                    root.path().join("native-outbox.json"),
+                    Vec::new(),
+                )
+                .unwrap(),
+            );
+            {
+                let router = router.as_mut().unwrap();
+                bind_claude_room(router, &mut panes, 0, MINTED_A).unwrap();
+                bind_claude_room(router, &mut panes, 1, MINTED_B).unwrap();
+            }
+            let gen0 = router.as_ref().unwrap().binding_for(0).unwrap().generation;
+            let gen1 = router.as_ref().unwrap().binding_for(1).unwrap().generation;
+            let mut codex = vec![None, None];
+            let environments = vec![GuestEnvironment::new([]), GuestEnvironment::new([])];
+            let now = Instant::now();
+            let mut spawned_at = vec![now, now];
+            let mut last_output = vec![None, None];
+            let mut pane_sizes = vec![small_size(), small_size()];
+            let mut notice = Notices::default();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            // Tab to focus room 1, F5 restarts focused room only, then quit.
+            let mut events = ScriptedEvents::steps(vec![
+                ScriptedStep::Event(key(KeyCode::Tab, KeyModifiers::NONE)),
+                ScriptedStep::Event(key(KeyCode::F(5), KeyModifiers::NONE)),
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Event(key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            ]);
+            let mut doorbell = SilentDoorbell::new(root.path().join("doorbell.sock"));
+
+            crate::app::run_loop(
+                &mut terminal,
+                &mut events,
+                &mut doorbell,
+                &mut panes,
+                &mut router,
+                &mut codex,
+                &environments,
+                &mut spawned_at,
+                &mut last_output,
+                &mut pane_sizes,
+                &[],
+                100,
+                &mut notice,
+                &[true, true],
+                2,
+            )
+            .unwrap();
+
+            let shown = notice.ordered_lines().join("; ");
+            assert!(shown.contains("Claude · 2 restarted"), "{shown}");
+            assert!(!shown.contains("Claude · 1 restarted"), "{shown}");
+            assert_eq!(router.as_ref().unwrap().binding_for(0).unwrap().generation, gen0);
+            assert!(router.as_ref().unwrap().binding_for(1).unwrap().generation > gen1);
+            let args1: Vec<String> = panes[1]
+                .room_spec()
+                .args
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                args1.windows(2).any(|pair| {
+                    (pair[0] == "--session-id" || pair[0] == "--resume")
+                        && pair[1] == router.as_ref().unwrap().binding_for(1).unwrap().session
+                }),
+                "room 1 must relaunch on its bound session: {args1:?}"
+            );
+            let args0: Vec<String> = panes[0]
+                .room_spec()
+                .args
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !args0.iter().any(|arg| arg == "exec"),
+                "room 0 must stay untouched: {args0:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(&log0).unwrap_or_default(),
+                "",
+                "room 0 must not be launched"
+            );
+        }
+
+        #[test]
+        fn the_production_loop_relaunches_only_the_focused_offline_codex_room_on_ctrl_r() {
+            let _state = session_state::StateRootGuard::isolated();
+            let cwd = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let stub_root0 = tempfile::tempdir().unwrap();
+            let stub_root1 = tempfile::tempdir().unwrap();
+            let log0 = stub_root0.path().join("codex.calls");
+            let log1 = stub_root1.path().join("codex.calls");
+            let stub0 = gated_codex_stub(
+                stub_root0.path(),
+                &log0,
+                &stub_root0.path().join("gate"),
+                MINTED_B,
+            );
+            let stub1 = gated_codex_stub(
+                stub_root1.path(),
+                &log1,
+                &stub_root1.path().join("gate"),
+                MINTED_C,
+            );
+            // Room A has a trusted stored session so a restart would resume it;
+            // room B has none, so the focused restart must mint a new one.
+            session_state::upsert_minted("codex", cwd.path(), "Room A", MINTED_A).unwrap();
+            let mut panes = vec![
+                Pane::spawn_unavailable(
+                    codex_mint_spec(&stub0, cwd.path(), "Room A", MINTED_B),
+                    small_size(),
+                    GuestEnvironment::new([]),
+                    "offline",
+                )
+                .unwrap(),
+                Pane::spawn_unavailable(
+                    codex_mint_spec(&stub1, cwd.path(), "Room B", MINTED_C),
+                    small_size(),
+                    GuestEnvironment::new([]),
+                    "offline",
+                )
+                .unwrap(),
+            ];
+            let mut router = Some(
+                crate::native_route::NativeRouter::start(
+                    root.path().join("native-outbox.json"),
+                    Vec::new(),
+                )
+                .unwrap(),
+            );
+            let gen0 = crate::native_launch::GenerationAllocator::new(session_state::state_directory())
+                .next()
+                .unwrap();
+            let gen1 = gen0 + 1;
+            {
+                use crate::native_route::CodexEntry;
+                router.as_mut().unwrap().bind_codex(vec![
+                    CodexEntry {
+                        index: 0,
+                        title: "Room A".into(),
+                        room: Some(IterationHarness::healthy_room(&stub0, cwd.path(), MINTED_A)),
+                        generation: gen0,
+                        reason: None,
+                    },
+                    CodexEntry {
+                        index: 1,
+                        title: "Room B".into(),
+                        room: Some(IterationHarness::healthy_room(&stub1, cwd.path(), MINTED_B)),
+                        generation: gen1,
+                        reason: None,
+                    },
+                ]).unwrap();
+            }
+            let mut codex = vec![None, None];
+            let environments = vec![GuestEnvironment::new([]), GuestEnvironment::new([])];
+            let now = Instant::now();
+            let mut spawned_at = vec![now, now];
+            let mut last_output = vec![None, None];
+            let mut pane_sizes = vec![small_size(), small_size()];
+            let mut notice = Notices::default();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut events = ScriptedEvents::steps(vec![
+                ScriptedStep::Event(key(KeyCode::Tab, KeyModifiers::NONE)),
+                ScriptedStep::Event(key(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+                ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle,
+                ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle,
+                ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle,
+                ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle,
+                ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle,
+                ScriptedStep::Event(key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            ]);
+            let mut doorbell = SilentDoorbell::new(root.path().join("doorbell.sock"));
+
+            crate::app::run_loop(
+                &mut terminal,
+                &mut events,
+                &mut doorbell,
+                &mut panes,
+                &mut router,
+                &mut codex,
+                &environments,
+                &mut spawned_at,
+                &mut last_output,
+                &mut pane_sizes,
+                &[],
+                100,
+                &mut notice,
+                &[true, true],
+                2,
+            )
+            .unwrap();
+
+            let launched = |path: &Path| {
+                fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| line.starts_with("exec"))
+                    .count()
+            };
+            wait_until("room 1 relaunched", || launched(&log1) >= 1);
+            assert_eq!(launched(&log1), 1, "room 1 must relaunch exactly once");
+            assert_eq!(launched(&log0), 0, "room 0 must stay untouched");
+            let shown = notice.ordered_lines().join("; ");
+            assert!(shown.contains("Room B restarted"), "{shown}");
+            assert!(!shown.contains("Room A restarted"), "{shown}");
+            assert_eq!(router.as_ref().unwrap().binding_for(0).unwrap().generation, gen0);
+            let prompt = fs::read_to_string(&log1).unwrap_or_default();
+            assert!(
+                prompt.contains("Automatic delivery pauses after 100 successful messages"),
+                "the loop must pass its fuse size to the relaunch: {prompt}"
+            );
+            assert!(pane_sizes[1].rows > 0 && pane_sizes[1].cols > 0, "focused pane sized by the loop: {:?}", pane_sizes[1]);
+        }
+        /// The loop must size the focused pane it restarts, not pane 0. With
+        /// three rooms the bottom pane spans the full width, so a size taken
+        /// from pane 0 is visibly wrong.
+        #[test]
+        fn the_production_loop_sizes_the_focused_pane_not_pane_0_on_restart() {
+            let _state = session_state::StateRootGuard::isolated();
+            let cwd = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let stub_root0 = tempfile::tempdir().unwrap();
+            let stub_root1 = tempfile::tempdir().unwrap();
+            let stub_root2 = tempfile::tempdir().unwrap();
+            let stub0 = codex_stub_for_pane(
+                stub_root0.path(),
+                "claude",
+                "exec sleep 30",
+            );
+            let stub1 = codex_stub_for_pane(
+                stub_root1.path(),
+                "claude",
+                "exec sleep 30",
+            );
+            let stub2 = codex_stub_for_pane(
+                stub_root2.path(),
+                "claude",
+                "exec sleep 30",
+            );
+            session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+            session_state::upsert_minted("claude", cwd.path(), "Claude · 2", MINTED_B).unwrap();
+            session_state::upsert_minted("claude", cwd.path(), "Claude · 3", MINTED_C).unwrap();
+            let mut panes = vec![
+                Pane::spawn_unavailable(
+                    claude_native_spec_for(&stub0, cwd.path(), "Claude · 1"),
+                    small_size(),
+                    GuestEnvironment::new([]),
+                    "offline",
+                )
+                .unwrap(),
+                Pane::spawn_unavailable(
+                    claude_native_spec_for(&stub1, cwd.path(), "Claude · 2"),
+                    small_size(),
+                    GuestEnvironment::new([]),
+                    "offline",
+                )
+                .unwrap(),
+                Pane::spawn_unavailable(
+                    claude_native_spec_for(&stub2, cwd.path(), "Claude · 3"),
+                    small_size(),
+                    GuestEnvironment::new([]),
+                    "offline",
+                )
+                .unwrap(),
+            ];
+            let mut router = Some(
+                crate::native_route::NativeRouter::start(
+                    root.path().join("native-outbox.json"),
+                    Vec::new(),
+                )
+                .unwrap(),
+            );
+            {
+                let router = router.as_mut().unwrap();
+                bind_claude_room(router, &mut panes, 0, MINTED_A).unwrap();
+                bind_claude_room(router, &mut panes, 1, MINTED_B).unwrap();
+                bind_claude_room(router, &mut panes, 2, MINTED_C).unwrap();
+            }
+            let mut codex = vec![None, None, None];
+            let environments = vec![
+                GuestEnvironment::new([]),
+                GuestEnvironment::new([]),
+                GuestEnvironment::new([]),
+            ];
+            let now = Instant::now();
+            let mut spawned_at = vec![now, now, now];
+            let mut last_output = vec![None, None, None];
+            let mut pane_sizes = vec![small_size(), small_size(), small_size()];
+            let mut notice = Notices::default();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut events = ScriptedEvents::steps(vec![
+                ScriptedStep::Event(key(KeyCode::Tab, KeyModifiers::NONE)),
+                ScriptedStep::Event(key(KeyCode::Tab, KeyModifiers::NONE)),
+                ScriptedStep::Event(key(KeyCode::F(5), KeyModifiers::NONE)),
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Event(key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            ]);
+            let mut doorbell = SilentDoorbell::new(root.path().join("doorbell.sock"));
+
+            crate::app::run_loop(
+                &mut terminal,
+                &mut events,
+                &mut doorbell,
+                &mut panes,
+                &mut router,
+                &mut codex,
+                &environments,
+                &mut spawned_at,
+                &mut last_output,
+                &mut pane_sizes,
+                &[],
+                100,
+                &mut notice,
+                &[true, true, true],
+                3,
+            )
+            .unwrap();
+
+            let shown = notice.ordered_lines().join("; ");
+            assert!(shown.contains("Claude · 3 restarted"), "{shown}");
+            // The bottom room spans the full rooms area; it must not inherit the
+            // narrower top-left pane's width when restarted.
+            assert!(
+                panes[2].visible_width() > panes[0].visible_width(),
+                "focused pane must keep its own width, not pane 0's: pane0={} pane2={}",
+                panes[0].visible_width(),
+                panes[2].visible_width()
+            );
+        }
+
+    }
+
 }

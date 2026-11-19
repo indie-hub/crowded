@@ -16,7 +16,7 @@ use crossterm::{
 use portable_pty::PtySize;
 use ratatui::{
     Terminal,
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::{Line, Text},
@@ -2520,11 +2520,35 @@ fn run_with(
 
 pub(crate) trait DoorbellSource {
     fn try_recv(&mut self) -> Result<crate::doorbell::DoorbellEvent, std::sync::mpsc::TryRecvError>;
+    fn path(&self) -> &std::path::Path;
 }
 
 impl DoorbellSource for crate::doorbell::Doorbell {
     fn try_recv(&mut self) -> Result<crate::doorbell::DoorbellEvent, std::sync::mpsc::TryRecvError> {
         crate::doorbell::Doorbell::try_recv(self)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        crate::doorbell::Doorbell::path(self)
+    }
+}
+
+/// The terminal events the loop polls for. Tests supply a scripted source; the
+/// real run reads from crossterm.
+pub(crate) trait EventSource {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
+    fn read(&mut self) -> io::Result<Event>;
+}
+
+pub(crate) struct CrosstermEvents;
+
+impl EventSource for CrosstermEvents {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        event::poll(timeout)
+    }
+
+    fn read(&mut self) -> io::Result<Event> {
+        event::read()
     }
 }
 
@@ -2732,9 +2756,9 @@ fn append_notice(notice: &mut Notices, text: String, severity: NoticeSeverity) {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_rooms_iteration<D: DoorbellSource>(
+pub(crate) fn run_rooms_iteration<D, B>(
     doorbell: &mut D,
-    mut terminal: Option<&mut Terminal<CrosstermBackend<io::Stdout>>>,
+    mut terminal: Option<&mut Terminal<B>>,
     panes: &mut [Pane],
     router: &mut Option<NativeRouter>,
     mailroom: &mut Mailroom,
@@ -2756,7 +2780,11 @@ pub(crate) fn run_rooms_iteration<D: DoorbellSource>(
     fuse_size: usize,
     room_count: usize,
     now: Instant,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    D: DoorbellSource,
+    B: Backend,
+{
     if crate::shutdown::requested() {
         return Ok(());
     }
@@ -3094,103 +3122,34 @@ pub(crate) fn run_rooms_iteration<D: DoorbellSource>(
 }
 
 
-fn run_rooms(
-    mut specs: Vec<RoomSpec>,
-    resumed: Vec<bool>,
-        mut fuse_size: usize,
-    token_pricing: Vec<TokenPricing>,
-    startup_notice: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let room_count = specs.len();
-    debug_assert_eq!(resumed.len(), room_count);
-    // Each room receives only its own capability token.
-    let mut doorbell = Doorbell::start(room_count)?;
-    // Owned OpenCode servers start before the terminal is taken over, in
-    // parallel, so a slow start never freezes the event loop; a room that
-    // cannot start fails the launch instead of falling back to paste.
-    let environments = (0..room_count)
-        .map(|index| doorbell.guest_environment(index))
-        .collect::<Result<Vec<_>, _>>()?;
-    if specs.iter().any(|spec| spec.native_delivery) {
-        eprintln!("Starting native rooms...");
-    }
-    // A native Codex room's session is created before its terminal starts, so
-    // its binding is known instead of discovered. That is one model turn per
-    // such room, run in parallel and bounded.
-    let codex_prompts: Vec<Option<String>> = {
-        let roster = welcome_roster_specs(&specs);
-        specs
-            .iter()
-            .enumerate()
-            .map(|(index, spec)| {
-                pane::codex_native_spec(spec).then(|| house_rules(index + 1, &roster, fuse_size))
-            })
-            .collect()
-    };
-    if codex_prompts.iter().any(Option::is_some) {
-        eprintln!("Creating native Codex sessions (one model turn per room)...");
-    }
-    let mut codex = pane::start_codex_mints(&mut specs, &environments, &codex_prompts);
-    let mut mint_notices: Vec<String> = codex
-        .iter()
-        .enumerate()
-        .filter_map(|(index, mint)| match mint {
-            Some(pane::CodexMint::Failed(reason)) => Some(format!(
-                "{}: {reason}; the room was not started",
-                specs[index].title
-            )),
-            _ => None,
-        })
-        .collect();
-    for message in &mint_notices {
-        eprintln!("{message}");
-    }
-    // A native Claude room's session id is Crowded's to choose, so it is fixed
-    // and saved before the terminal starts: no model turn is involved.
-    let (mut claude_starts, mut claude_notices) = pane::start_claude_sessions(&mut specs);
-    for message in &claude_notices {
-        eprintln!("{message}");
-    }
-        // `?` returns early on an error. The guards below still run their Drop code.
-        let ((natives, router), _terminal_guard) = launch_then_enter(
-        || {
-            let natives = pane::launch_native_rooms(&specs, &environments)?;
-            let router = pane::start_native_router(&specs, &natives)?;
-            Ok((natives, router))
-        },
-        TerminalGuard::enter,
-    )?;
-    let mut router: Option<NativeRouter> = router;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let (rooms, _, _) = content_areas(terminal.size()?.into());
-    let areas = pane_areas(rooms, room_count);
-    let mut last_output = vec![None::<Instant>; room_count];
-    let mut pane_sizes: Vec<_> = areas.iter().map(|area| pane_size(*area)).collect();
-    let mut notice = Notices::default();
-    if let Some(text) = startup_notice {
-        notice.push(text, NoticeSeverity::Info);
-    }
-    // Every Claude session and binding exists before any terminal starts.
-    if let Some(router) = router.as_mut() {
-        claude_notices.extend(pane::bind_claude_rooms(
-            router,
-            &specs,
-            &mut claude_starts,
-        )?);
-    }
-    let (mut panes, mut spawned_at) = start_rooms(
-        &mut LivePanes,
-        specs,
-        &pane_sizes,
-        &environments,
-        natives,
-        &codex,
-        &claude_starts,
-        &mut last_output,
-        cfg!(windows),
-        HEADROOM_READY_TIMEOUT,
-        &mut notice,
-    )?;
+
+/// The production event loop: pumps mints, output, the outbox and the doorbell,
+/// draws, then reads and handles terminal events until Ctrl+Q or a shutdown
+/// request. The event source and terminal are injected so a test can run this
+/// same loop with scripted events and a fake terminal.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_loop<B, E, D>(
+    terminal: &mut Terminal<B>,
+    events: &mut E,
+    doorbell: &mut D,
+    mut panes: &mut [Pane],
+    router: &mut Option<NativeRouter>,
+    mut codex: &mut [Option<pane::CodexMint>],
+    environments: &[pane::GuestEnvironment],
+    mut spawned_at: &mut [Instant],
+    mut last_output: &mut [Option<Instant>],
+    pane_sizes: &mut Vec<portable_pty::PtySize>,
+    token_pricing: &[TokenPricing],
+    mut fuse_size: usize,
+    mut notice: &mut Notices,
+    resumed: &[bool],
+    room_count: usize,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    B: Backend,
+    E: EventSource,
+    D: DoorbellSource,
+{
     let mut delivery_gates = panes
         .iter()
         .enumerate()
@@ -3202,12 +3161,6 @@ fn run_rooms(
     // notice history itself is kept on open and cleared on dismiss, so the
     // failures the status row points at are still there to scroll to.
     let mut mail_scroll: u16 = 0;
-    for message in mint_notices.drain(..) {
-        notice.push(message, NoticeSeverity::Failure);
-    }
-    for message in claude_notices.drain(..) {
-        notice.push(message, NoticeSeverity::Failure);
-    }
     // A Codex room is bound to the session the launch phase gave it before any
     // mail is sent. A room that was not started stays native and unbound with
     // its reason, so its mail is held instead of being pasted.
@@ -3273,26 +3226,26 @@ fn run_rooms(
         let now = Instant::now();
         let mut input_ready = vec![false; room_count];
         run_rooms_iteration(
-            &mut doorbell,
-            Some(&mut terminal),
-            &mut panes,
-            &mut router,
+            doorbell,
+            Some(&mut *terminal),
+            panes,
+            router,
             &mut mailroom,
             &mut delivery_gates,
-            &mut last_output,
-            &mut spawned_at,
+            last_output,
+            spawned_at,
             &mut room_pulses,
             &mut room_details,
             &mut pending,
             &mut submit_pending,
             &mut fuse,
             &mut delivery_paused,
-            &mut notice,
+            notice,
             &mut input_ready,
-            &mut codex,
-            &pane_sizes,
-            &environments,
-            &token_pricing,
+            codex,
+            pane_sizes,
+            environments,
+            token_pricing,
             fuse_size,
             room_count,
             now,
@@ -3325,14 +3278,14 @@ fn run_rooms(
             let guest = panes[index].guest().to_owned();
             let cwd = panes[index].cwd().to_path_buf();
             let title = panes[index].title().to_owned();
-            let pricing = token_pricing.clone();
+            let pricing = token_pricing.to_vec();
             schedule_cost_collection(
                 CostIdentity {
                     index,
                     guest: guest.clone(),
                     cwd: cwd.clone(),
                     title: title.clone(),
-                    pricing: pricing.clone(),
+                    pricing: pricing.to_vec(),
                 },
                 CostScheduleCtx {
                     now,
@@ -3377,7 +3330,7 @@ fn run_rooms(
             }
         }
 
-        for pane in &mut panes {
+        for pane in panes.iter_mut() {
             pane.apply_scroll();
         }
         terminal.draw(|frame| {
@@ -3606,12 +3559,12 @@ fn run_rooms(
             }
 
 
-        })?;
-        for pane in &mut panes {
+        }).map_err(|error| io::Error::other(error.to_string()))?;
+        for pane in panes.iter_mut() {
             pane.restore_scroll();
         }
 
-        for pane in &mut panes {
+        for pane in panes.iter_mut() {
             pane.poll_exit()?;
         }
         // A child reaped here must not leave its room marked live for the next
@@ -3622,7 +3575,7 @@ fn run_rooms(
 
         let next_event = match stashed_events.pop_front() {
             Some(event) => Some(event),
-            None if event::poll(Duration::from_millis(16))? => Some(event::read()?),
+            None if events.poll(Duration::from_millis(16))? => Some(events.read()?),
             None => None,
         };
         // A wheel report crossterm failed to keep whole arrives as keys. Act on
@@ -3760,8 +3713,8 @@ fn run_rooms(
                         focused,
                         fuse_size,
                         &mut |index| {
-                            terminal.autoresize()?;
-                            let (rooms, _, _) = content_areas(terminal.size()?.into());
+                            terminal.autoresize().map_err(|error| io::Error::other(error.to_string()))?;
+                            let (rooms, _, _) = content_areas(terminal.size().map_err(|error| io::Error::other(error.to_string()))?.into());
                             Ok(pane_size(pane_areas(rooms, room_count)[index]))
                         },
                         &mut panes,
@@ -3978,10 +3931,10 @@ fn run_rooms(
                     }
                 },
                 Event::Resize(_, _) => {
-                    terminal.autoresize()?;
-                    let (rooms, _, _) = content_areas(terminal.size()?.into());
+                    terminal.autoresize().map_err(|error| io::Error::other(error.to_string()))?;
+                    let (rooms, _, _) = content_areas(terminal.size().map_err(|error| io::Error::other(error.to_string()))?.into());
                     let areas = pane_areas(rooms, room_count);
-                    pane_sizes = areas.iter().map(|area| pane_size(*area)).collect();
+                    *pane_sizes = areas.iter().map(|area| pane_size(*area)).collect();
                     for (pane, size) in panes.iter_mut().zip(pane_sizes.iter()) {
                         pane.resize(*size)?;
                     }
@@ -4031,12 +3984,137 @@ fn run_rooms(
 
     // Explicit cleanup makes the normal exit path clear; both guards remain
     // as fallbacks for errors and early returns.
-    for pane in &mut panes {
+    for pane in panes.iter_mut() {
         pane.cleanup();
     }
-    terminal.show_cursor()?;
+    terminal.show_cursor().map_err(|error| io::Error::other(error.to_string()))?;
     Ok(())
 }
+
+
+fn run_rooms(
+    mut specs: Vec<RoomSpec>,
+    resumed: Vec<bool>,
+        fuse_size: usize,
+    token_pricing: Vec<TokenPricing>,
+    startup_notice: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let room_count = specs.len();
+    debug_assert_eq!(resumed.len(), room_count);
+    // Each room receives only its own capability token.
+    let mut doorbell = Doorbell::start(room_count)?;
+    // Owned OpenCode servers start before the terminal is taken over, in
+    // parallel, so a slow start never freezes the event loop; a room that
+    // cannot start fails the launch instead of falling back to paste.
+    let environments = (0..room_count)
+        .map(|index| doorbell.guest_environment(index))
+        .collect::<Result<Vec<_>, _>>()?;
+    if specs.iter().any(|spec| spec.native_delivery) {
+        eprintln!("Starting native rooms...");
+    }
+    // A native Codex room's session is created before its terminal starts, so
+    // its binding is known instead of discovered. That is one model turn per
+    // such room, run in parallel and bounded.
+    let codex_prompts: Vec<Option<String>> = {
+        let roster = welcome_roster_specs(&specs);
+        specs
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| {
+                pane::codex_native_spec(spec).then(|| house_rules(index + 1, &roster, fuse_size))
+            })
+            .collect()
+    };
+    if codex_prompts.iter().any(Option::is_some) {
+        eprintln!("Creating native Codex sessions (one model turn per room)...");
+    }
+    let mut codex = pane::start_codex_mints(&mut specs, &environments, &codex_prompts);
+    let mut mint_notices: Vec<String> = codex
+        .iter()
+        .enumerate()
+        .filter_map(|(index, mint)| match mint {
+            Some(pane::CodexMint::Failed(reason)) => Some(format!(
+                "{}: {reason}; the room was not started",
+                specs[index].title
+            )),
+            _ => None,
+        })
+        .collect();
+    for message in &mint_notices {
+        eprintln!("{message}");
+    }
+    // A native Claude room's session id is Crowded's to choose, so it is fixed
+    // and saved before the terminal starts: no model turn is involved.
+    let (mut claude_starts, mut claude_notices) = pane::start_claude_sessions(&mut specs);
+    for message in &claude_notices {
+        eprintln!("{message}");
+    }
+        // `?` returns early on an error. The guards below still run their Drop code.
+        let ((natives, router), _terminal_guard) = launch_then_enter(
+        || {
+            let natives = pane::launch_native_rooms(&specs, &environments)?;
+            let router = pane::start_native_router(&specs, &natives)?;
+            Ok((natives, router))
+        },
+        TerminalGuard::enter,
+    )?;
+    let mut router: Option<NativeRouter> = router;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let (rooms, _, _) = content_areas(terminal.size()?.into());
+    let areas = pane_areas(rooms, room_count);
+    let mut last_output = vec![None::<Instant>; room_count];
+    let mut pane_sizes: Vec<_> = areas.iter().map(|area| pane_size(*area)).collect();
+    let mut notice = Notices::default();
+    if let Some(text) = startup_notice {
+        notice.push(text, NoticeSeverity::Info);
+    }
+    // Every Claude session and binding exists before any terminal starts.
+    if let Some(router) = router.as_mut() {
+        claude_notices.extend(pane::bind_claude_rooms(
+            router,
+            &specs,
+            &mut claude_starts,
+        )?);
+    }
+    let (mut panes, mut spawned_at) = start_rooms(
+        &mut LivePanes,
+        specs,
+        &pane_sizes,
+        &environments,
+        natives,
+        &codex,
+        &claude_starts,
+        &mut last_output,
+        cfg!(windows),
+        HEADROOM_READY_TIMEOUT,
+        &mut notice,
+    )?;
+    for message in mint_notices.drain(..) {
+        notice.push(message, NoticeSeverity::Failure);
+    }
+    for message in claude_notices.drain(..) {
+        notice.push(message, NoticeSeverity::Failure);
+    }
+    run_loop(
+        &mut terminal,
+        &mut CrosstermEvents,
+        &mut doorbell,
+        &mut panes,
+        &mut router,
+        &mut codex,
+        &environments,
+        &mut spawned_at,
+        &mut last_output,
+        &mut pane_sizes,
+        &token_pricing,
+        fuse_size,
+        &mut notice,
+        &resumed,
+        room_count,
+    )
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -5674,6 +5752,10 @@ mod tests {
                 .pop_front()
                 .ok_or(std::sync::mpsc::TryRecvError::Empty)
         }
+
+        fn path(&self) -> &std::path::Path {
+            std::path::Path::new("test-doorbell.sock")
+        }
     }
 
     #[cfg(all(test, unix))]
@@ -5746,7 +5828,7 @@ mod tests {
             let now = Instant::now();
             run_rooms_iteration(
                 &mut self.doorbell,
-                None,
+                None::<&mut Terminal<CrosstermBackend<io::Stdout>>>,
                 &mut self.panes,
                 &mut self.router,
                 &mut self.mailroom,
@@ -5780,7 +5862,7 @@ mod tests {
             let now = Instant::now();
             run_rooms_iteration(
                 &mut self.doorbell,
-                None,
+                None::<&mut Terminal<CrosstermBackend<io::Stdout>>>,
                 &mut self.panes,
                 &mut self.router,
                 &mut self.mailroom,
@@ -6332,7 +6414,7 @@ mod tests {
         let wait = run_with.find("wait_for_reaps()").expect("reaping is awaited");
         assert!(install < run && run < wait);
         // The loop leaves as soon as it is asked to, before doing anything else.
-        let body = &production[production.find("fn run_rooms(").unwrap()..];
+        let body = &production[production.find("fn run_loop").unwrap()..];
         let loop_start = body.find("    loop {\n").expect("event loop");
         let after = &body[loop_start + "    loop {\n".len()..];
         assert!(
@@ -6390,8 +6472,8 @@ mod tests {
     fn run_rooms_dispatches_restart_keys_through_the_seam() {
         let source = include_str!("app.rs");
         let production = &source[..source.find("#[cfg(test)]").unwrap()];
-        let body = &production[production.find("fn run_rooms(").unwrap()..];
-        let body = &body[..body.find("\n}\n").unwrap()];
+        let body = &production[production.find("fn run_loop").unwrap()..];
+        let body = &body[..body.find("\n}\n\n\nfn run_rooms").unwrap()];
         assert_eq!(
             body.matches("run_rooms_key_event(").count(),
             1,
@@ -7795,4 +7877,167 @@ mod tests {
             "should reschedule after interval and pending cleared"
         );
     }
+
+    #[cfg(unix)]
+    mod loop_behaviour {
+        use super::*;
+        use crate::config::RoomSpec;
+        use crate::native_route::NativeRouter;
+        use crate::pane::{GuestEnvironment, Pane};
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        use portable_pty::PtySize;
+        use ratatui::{Terminal, backend::TestBackend};
+        use std::{
+            collections::VecDeque,
+            io,
+            path::{Path, PathBuf},
+            time::{Duration, Instant},
+        };
+
+        #[allow(dead_code)]
+        enum ScriptedStep {
+            Event(Event),
+            Idle,
+        }
+
+        struct ScriptedEvents {
+            steps: VecDeque<ScriptedStep>,
+        }
+
+        impl ScriptedEvents {
+            fn new(events: Vec<Event>) -> Self {
+                Self {
+                    steps: events.into_iter().map(ScriptedStep::Event).collect(),
+                }
+            }
+
+            #[allow(dead_code)]
+            fn steps(steps: Vec<ScriptedStep>) -> Self {
+                Self { steps: steps.into() }
+            }
+        }
+
+        impl EventSource for ScriptedEvents {
+            fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
+                loop {
+                    match self.steps.front() {
+                        Some(ScriptedStep::Event(_)) => return Ok(true),
+                        Some(ScriptedStep::Idle) => {
+                            self.steps.pop_front();
+                            return Ok(false);
+                        }
+                        None => return Ok(false),
+                    }
+                }
+            }
+
+            fn read(&mut self) -> io::Result<Event> {
+                match self.steps.pop_front() {
+                    Some(ScriptedStep::Event(event)) => Ok(event),
+                    _ => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no scripted event")),
+                }
+            }
+        }
+
+        struct SilentDoorbell {
+            path: PathBuf,
+        }
+
+        impl SilentDoorbell {
+            fn new(path: PathBuf) -> Self {
+                Self { path }
+            }
+        }
+
+        impl DoorbellSource for SilentDoorbell {
+            fn try_recv(
+                &mut self,
+            ) -> Result<crate::doorbell::DoorbellEvent, std::sync::mpsc::TryRecvError> {
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            }
+
+            fn path(&self) -> &Path {
+                &self.path
+            }
+        }
+
+        fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+            Event::Key(KeyEvent::new(code, modifiers))
+        }
+
+        fn shell_spec(program: &Path, cwd: &Path, title: &str) -> RoomSpec {
+            RoomSpec {
+                name: "sh".to_owned(),
+                vendor: "shell".to_owned(),
+                title: title.to_owned(),
+                program: program.as_os_str().to_owned(),
+                args: Vec::new(),
+                transport: crate::config::Transport::Shell,
+                cwd: Some(cwd.to_path_buf()),
+                variables: Vec::new(),
+                allow_control: false,
+                use_headroom: false,
+                scheduling: None,
+                headroom_args: Vec::new(),
+                native_delivery: false,
+            }
+        }
+
+        fn pty_size() -> PtySize {
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            }
+        }
+
+        #[test]
+        fn the_production_loop_runs_to_completion_on_ctrl_q_and_cleans_up() {
+            let cwd = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let program = if cfg!(windows) {
+                PathBuf::from("cmd.exe")
+            } else {
+                PathBuf::from("/bin/sh")
+            };
+            let spec = shell_spec(&program, cwd.path(), "Room A");
+            let pane = Pane::spawn(spec, pty_size(), GuestEnvironment::new([])).unwrap();
+            let mut panes = vec![pane];
+            let mut router: Option<NativeRouter> = None;
+            let mut codex = vec![None];
+            let environments = vec![GuestEnvironment::new([])];
+            let now = Instant::now();
+            let mut spawned_at = vec![now];
+            let mut last_output = vec![None];
+            let mut pane_sizes = vec![pty_size()];
+            let mut notice = Notices::default();
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut events = ScriptedEvents::new(vec![key(KeyCode::Char('q'), KeyModifiers::CONTROL)]);
+            let mut doorbell = SilentDoorbell::new(root.path().join("doorbell.sock"));
+
+            run_loop(
+                &mut terminal,
+                &mut events,
+                &mut doorbell,
+                &mut panes,
+                &mut router,
+                &mut codex,
+                &environments,
+                &mut spawned_at,
+                &mut last_output,
+                &mut pane_sizes,
+                &[],
+                100,
+                &mut notice,
+                &[false],
+                1,
+            )
+            .unwrap();
+
+            // The loop returned only after running cleanup on the scripted exit.
+            assert!(!panes[0].is_online(), "pane must be cleaned up on exit");
+        }
+    }
+
 }
