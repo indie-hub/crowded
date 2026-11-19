@@ -582,8 +582,10 @@ mod tests {
 
     fn stub(root: &Path, name: &str, body: &str) -> PathBuf {
         let path = root.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let tmp = root.join(format!(".{name}.tmp"));
+        fs::write(&tmp, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(&tmp, &path).unwrap();
         path
     }
 
