@@ -1008,7 +1008,7 @@ pub(crate) fn bind_claude_room_at(
     let title = panes[index].title().to_owned();
     router
         .claude_inbox(index)?
-        .attach(panes[index].cwd(), session, generation)?;
+        .attach(panes[index].cwd(), index + 1, session, generation)?;
     panes[index].record_session(session);
     router.bind_claude(vec![crate::native_route::ClaudeEntry {
         index,
@@ -1048,7 +1048,7 @@ pub(crate) fn bind_claude_rooms(
                 let cwd = working_directory(specs[index].cwd.as_deref())?;
                 let prepared = router
                     .claude_inbox(index)
-                    .and_then(|inbox| inbox.attach(&cwd, session, generation));
+                    .and_then(|inbox| inbox.attach(&cwd, index + 1, session, generation));
                 if let Err(error) = prepared {
                     let reason = format!("{}: {error}", specs[index].title);
                     notices.push(format!("{reason}; the room was not started"));
@@ -8631,6 +8631,7 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             .arg(cwd.path())
             .arg(&first)
             .arg(&marker)
+            .env("CROWDED_ROOM", "1")
             .stdout(Stdio::null())
             .spawn()
             .expect("node runs the driver");
@@ -8842,6 +8843,213 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         child2.kill().ok();
         let _ = child1.wait();
         let _ = child2.wait();
+    }
+
+    /// A stale session file for another room must not be used: in a room-2
+    /// environment, deliver.mjs must refuse a connection file whose room does
+    /// not match and must never reach/register with room 1.
+    #[cfg(unix)]
+    #[test]
+    fn deliver_refuses_a_session_file_owned_by_another_room() {
+        use std::process::{Command, Stdio};
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("SKIP: node is not on PATH, cannot run the embedded mod");
+            return;
+        }
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (specs, mut starts, session1) = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        let mut router = crate::native_route::NativeRouter::start(
+            session_state::state_directory().join("native-outbox.json"),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(bind_claude_rooms(&mut router, &specs, &mut starts).unwrap().is_empty());
+
+        let mod_path = std::env::current_dir()
+            .unwrap()
+            .join("src/claude_mod/hooks/deliver.mjs");
+        let driver = root.path().join("drive-mod.mjs");
+        fs::write(
+            &driver,
+            r#"import { appendFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
+const [modPath, cwd, session, marker] = process.argv.slice(2);
+const { register } = await import(pathToFileURL(modPath).href);
+const log = (t) => appendFileSync(marker, `${t}\n`);
+const $ = {
+  fs: { exists: async (p) => readFile(p).then(() => true, () => false), read: (p) => readFile(p, "utf8") },
+  session: { id: async () => session },
+  http: { fetch: async (url, init) => fetch(url, init).then(async (r) => ({ ok: r.ok, status: r.status, text: await r.text() })) },
+  clock: { every: (ms, cb) => setInterval(() => { void cb(); }, ms) },
+  ui: { status: (t) => log(`STATUS ${t}`) },
+  prompt: { submit: async (input) => { log(`SUBMITTED ${input.text}`); return {}; } },
+};
+let handler = null;
+register((event, fn) => { handler = fn; });
+await handler($, { cwd, isInteractive: true }, async (e) => e);
+"#,
+        )
+        .unwrap();
+
+        // Legitimate room 1 mod connected to its own session file.
+        let marker1 = root.path().join("room1.log");
+        let mut child1 = Command::new("node")
+            .arg(&driver)
+            .arg(&mod_path)
+            .arg(cwd.path())
+            .arg(&session1)
+            .arg(&marker1)
+            .env("CROWDED_ROOM", "1")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("node runs room 1 mod");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if fs::read_to_string(&marker1)
+                .unwrap_or_default()
+                .contains("STATUS Crowded inbox connected")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "room 1 mod never connected");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Rogue room-2 environment given room 1's session id: must refuse the
+        // mismatched session file and never reach/register with room 1.
+        let marker2 = root.path().join("room2.log");
+        let mut child2 = Command::new("node")
+            .arg(&driver)
+            .arg(&mod_path)
+            .arg(cwd.path())
+            .arg(&session1)
+            .arg(&marker2)
+            .env("CROWDED_ROOM", "2")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("node runs rogue mod");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let log = fs::read_to_string(&marker2).unwrap_or_default();
+            if log.contains("STATUS Crowded inbox not connected") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "rogue mod never refused: {log}");
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(300));
+        let rogue = fs::read_to_string(&marker2).unwrap_or_default();
+        assert!(
+            !rogue.contains("STATUS Crowded inbox connected"),
+            "rogue mod must not connect: {rogue}"
+        );
+        assert!(!rogue.contains("SUBMITTED"), "rogue mod must not submit: {rogue}");
+
+        // Room 1 still receives its own mail through its own connection.
+        let mut mailroom = Mailroom::new(50);
+        router
+            .send(&mut mailroom, "Sender", 0, "only-room-1", None)
+            .unwrap();
+        pump_router(&mut router, &mut mailroom, |shown| {
+            shown.contains("ACCEPTED by Claude (submitted; not proof it was acted on)")
+        });
+        let log1 = fs::read_to_string(&marker1).unwrap();
+        assert!(log1.contains("SUBMITTED [whisper from Sender] only-room-1"), "{log1}");
+
+        child1.kill().ok();
+        child2.kill().ok();
+        let _ = child1.wait();
+        let _ = child2.wait();
+    }
+
+    /// With a connection file present, deliver.mjs must fail closed (no
+    /// registration) when CROWDED_ROOM is missing or non-numeric.
+    #[cfg(unix)]
+    #[test]
+    fn deliver_fails_closed_without_a_valid_crowded_room() {
+        use std::process::{Command, Stdio};
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("SKIP: node is not on PATH, cannot run the embedded mod");
+            return;
+        }
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (specs, mut starts, session1) = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
+        let mut router = crate::native_route::NativeRouter::start(
+            session_state::state_directory().join("native-outbox.json"),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(bind_claude_rooms(&mut router, &specs, &mut starts).unwrap().is_empty());
+
+        let mod_path = std::env::current_dir()
+            .unwrap()
+            .join("src/claude_mod/hooks/deliver.mjs");
+        let driver = root.path().join("drive-mod.mjs");
+        fs::write(
+            &driver,
+            r#"import { appendFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
+const [modPath, cwd, session, marker] = process.argv.slice(2);
+const { register } = await import(pathToFileURL(modPath).href);
+const log = (t) => appendFileSync(marker, `${t}\n`);
+const $ = {
+  fs: { exists: async (p) => readFile(p).then(() => true, () => false), read: (p) => readFile(p, "utf8") },
+  session: { id: async () => session },
+  http: { fetch: async (url, init) => fetch(url, init).then(async (r) => ({ ok: r.ok, status: r.status, text: await r.text() })) },
+  clock: { every: (ms, cb) => setInterval(() => { void cb(); }, ms) },
+  ui: { status: (t) => log(`STATUS ${t}`) },
+  prompt: { submit: async (input) => { log(`SUBMITTED ${input.text}`); return {}; } },
+};
+let handler = null;
+register((event, fn) => { handler = fn; });
+await handler($, { cwd, isInteractive: true }, async (e) => e);
+"#,
+        )
+        .unwrap();
+
+        for (name, env_value) in [("missing", None), ("non-numeric", Some("abc"))] {
+            let marker = root.path().join(format!("{name}.log"));
+            let mut cmd = Command::new("node");
+            cmd.arg(&driver)
+                .arg(&mod_path)
+                .arg(cwd.path())
+                .arg(&session1)
+                .arg(&marker)
+                .stdout(Stdio::null());
+            match env_value {
+                None => {
+                    cmd.env_remove("CROWDED_ROOM");
+                }
+                Some(value) => {
+                    cmd.env("CROWDED_ROOM", value);
+                }
+            }
+            let mut child = cmd.spawn().expect("node runs mod");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let log = fs::read_to_string(&marker).unwrap_or_default();
+                if log.contains("STATUS Crowded inbox not connected") {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "{name}: never refused: {log}");
+                thread::sleep(Duration::from_millis(20));
+            }
+            thread::sleep(Duration::from_millis(200));
+            let log = fs::read_to_string(&marker).unwrap_or_default();
+            assert!(
+                !log.contains("STATUS Crowded inbox connected"),
+                "{name}: must not connect: {log}"
+            );
+            child.kill().ok();
+            let _ = child.wait();
+        }
+        let _ = router; // keep inbox alive
     }
 
     #[cfg(unix)]

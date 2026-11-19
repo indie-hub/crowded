@@ -1901,7 +1901,7 @@ pub(crate) fn relaunch_claude_room(
             .map_err(|error| launch_failure(&title, index + 1, error))?;
         let entry_session = if let Some(session) = &session {
             inbox
-                .attach(&cwd, session, generation)
+                .attach(&cwd, index + 1, session, generation)
                 .map_err(|error| launch_failure(&title, index + 1, error))?;
             panes[index].record_session(session);
             session.clone()

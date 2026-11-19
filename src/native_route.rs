@@ -559,7 +559,7 @@ impl NativeRouter {
         generation: u64,
     ) -> io::Result<()> {
         let inbox = self.claude_inbox(index)?;
-        inbox.adopt_reported_session(cwd, session, generation)?;
+        inbox.adopt_reported_session(cwd, index + 1, session, generation)?;
         self.rebind_room(RoomEntry {
             index,
             title,
@@ -2641,7 +2641,7 @@ mod tests {
         router
             .claude_inbox(0)
             .unwrap()
-            .attach(cwd, CLAUDE_A, 1)
+            .attach(cwd, 1, CLAUDE_A, 1)
             .unwrap();
         router
             .bind_claude(vec![ClaudeEntry {

@@ -72,25 +72,31 @@ export function register(on) {
     if (!e.isInteractive) return next(e);
     const cwd = e.cwd;
     try {
+      const room = process.env.CROWDED_ROOM;
+      if (typeof room !== "string" || !/^[0-9]+$/.test(room)) {
+        $.ui.status("Crowded inbox not connected");
+        return next(e);
+      }
       const sessionId = await $.session.id();
       let file = `${cwd}/.crowded/claude-inbox/${sessionId}.json`;
       if (!(await $.fs.exists(file))) {
-        const room = process.env.CROWDED_ROOM;
-        if (typeof room !== "string" || !/^[0-9]+$/.test(room)) {
-          $.ui.status("Crowded inbox not connected");
-          return next(e);
-        }
-        const bootstrap = `${cwd}/.crowded/claude-inbox/_bootstrap.${room}.json`;
-        if (!(await $.fs.exists(bootstrap))) {
-          $.ui.status("Crowded inbox not connected");
-          return next(e);
-        }
-        file = bootstrap;
+        file = `${cwd}/.crowded/claude-inbox/_bootstrap.${room}.json`;
+      }
+      if (!(await $.fs.exists(file))) {
+        $.ui.status("Crowded inbox not connected");
+        return next(e);
       }
       const parsed = JSON.parse(await $.fs.read(file));
       const token = parsed && parsed.token;
       const origin = parsed && validUrl(parsed.url);
-      if (typeof token !== "string" || !/^[a-f0-9]{64}$/.test(token) || !origin) {
+      const fileRoom = parsed && parsed.room;
+      if (
+        typeof token !== "string" ||
+        !/^[a-f0-9]{64}$/.test(token) ||
+        !origin ||
+        (typeof fileRoom !== "number" && typeof fileRoom !== "string") ||
+        String(fileRoom) !== room
+      ) {
         $.ui.status("Crowded inbox not connected");
         return next(e);
       }
