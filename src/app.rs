@@ -1904,24 +1904,22 @@ pub(crate) fn relaunch_claude_room(
                 .attach(&cwd, session, generation)
                 .map_err(|error| launch_failure(&title, index + 1, error))?;
             panes[index].record_session(session);
-            Some(session.clone())
+            session.clone()
         } else {
             inbox
                 .prepare(&cwd, index + 1, generation)
                 .map_err(|error| launch_failure(&title, index + 1, error))?;
-            None
+            // Internal placeholder only: never passed to Claude or persisted as
+            // a Claude session; replaced when the hook reports the real session.
+            format!("unreported-{}-{generation}", index + 1)
         };
         router
             .bind_claude(vec![crate::native_route::ClaudeEntry {
                 index,
                 title: title.clone(),
-                session: entry_session,
+                session: Some(entry_session),
                 generation,
-                reason: if session.is_none() {
-                    Some("waiting for the room's session report".to_owned())
-                } else {
-                    None
-                },
+                reason: None,
             }])
             .map_err(|error| launch_failure(&title, index + 1, error))?;
     }

@@ -1089,12 +1089,15 @@ pub(crate) fn bind_claude_rooms(
                     });
                     continue;
                 }
+                // Bound for delivery through the per-room bootstrap inbox before
+                // the hook reports the real Claude session; the placeholder is
+                // internal and never passed to Claude or persisted as a session.
                 entries.push(crate::native_route::ClaudeEntry {
                     index,
                     title: specs[index].title.clone(),
-                    session: None,
+                    session: Some(format!("unreported-{room}-{generation}")),
                     generation,
-                    reason: Some("waiting for the room's session report".to_owned()),
+                    reason: None,
                 });
             }
         }
@@ -3606,8 +3609,58 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(file.path()).unwrap()).unwrap();
         assert_eq!(config["model"], "room/model");
         assert_eq!(config["mcp"]["crowded"]["enabled"], false);
-        assert!(config.get("plugin").is_none() || config["plugin"].as_array().is_some_and(|a| a.iter().all(|v| v.as_str().is_some_and(|s| s.contains("headroom")))));
-        assert!(config.get("providers").is_none());
+        let mcp = config["mcp"].as_object().unwrap();
+        assert!(mcp.keys().all(|key| key == "crowded" || key == "headroom"), "{config}");
+
+        let headroom_plugins = config
+            .get("plugin")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|entries| {
+                !entries.is_empty()
+                    && entries.iter().all(|value| {
+                        value
+                            .as_str()
+                            .is_some_and(|name| name.contains("headroom") && name != "ambient-plugin")
+                    })
+            });
+        assert!(
+            config.get("plugin").is_none() || headroom_plugins,
+            "ambient plugins must be excluded; only headroom auto-injected plugins are tolerated: {config}"
+        );
+
+        let headroom_providers = |value: &serde_json::Value| {
+            value
+                .as_object()
+                .is_some_and(|providers| !providers.is_empty() && providers.keys().all(|key| key == "headroom"))
+        };
+        let headroom_provider = config.get("provider").is_some_and(headroom_providers);
+        let headroom_providers_plural = config.get("providers").is_some_and(headroom_providers);
+        assert!(
+            config.get("provider").is_none() || headroom_provider,
+            "ambient providers must be excluded; only headroom auto-injected provider is tolerated: {config}"
+        );
+        assert!(
+            config.get("providers").is_none() || headroom_providers_plural,
+            "ambient providers must be excluded; only headroom auto-injected providers are tolerated: {config}"
+        );
+
+        let keys = config.as_object().unwrap();
+        for key in keys.keys() {
+            assert!(
+                matches!(key.as_str(), "model" | "mcp" | "plugin" | "provider" | "providers"),
+                "unexpected top-level key {key}: {config}"
+            );
+        }
+        assert!(keys.contains_key("model") && keys.contains_key("mcp"));
+        if headroom_plugins {
+            assert!(keys.contains_key("plugin"));
+        }
+        if headroom_provider {
+            assert!(keys.contains_key("provider"));
+        }
+        if headroom_providers_plural {
+            assert!(keys.contains_key("providers"));
+        }
     }
 
     #[test]
@@ -4769,7 +4822,16 @@ mod tests {
         .unwrap();
         assert!(bind_claude_rooms(&mut router, &specs, &mut sessions).unwrap().is_empty());
         assert!(crate::claude_inbox::bootstrap_file(cwd.path(), 1).unwrap().exists());
-        assert!(router.binding_for(0).is_none(), "session is learned from the hook");
+        let binding = router.binding_for(0).expect("fresh room is deliverable via bootstrap");
+        assert!(
+            binding.session.starts_with("unreported-"),
+            "fresh room must not be bound to a guessed Claude session: {}",
+            binding.session
+        );
+        assert!(
+            session_state::lookup_reported("claude", cwd.path(), "Claude · 1").is_none(),
+            "no Claude session is known until reported"
+        );
 
         session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
         let mut again = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
@@ -8614,6 +8676,172 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         ] {
             assert!(log.contains(want), "{log}");
         }
+    }
+
+    /// Two fresh Claude rooms in one cwd deliver end-to-end through their own
+    /// per-room bootstrap connections with no cross-delivery; reporting room 1's
+    /// session promotes only room 1's bootstrap to its session file.
+    #[cfg(unix)]
+    #[test]
+    fn two_fresh_claude_rooms_deliver_end_to_end_in_one_cwd() {
+        use std::process::{Command, Stdio};
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("SKIP: node is not on PATH, cannot run the embedded mod");
+            return;
+        }
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+        let mut specs = vec![
+            claude_native_spec_for(&stub, cwd.path(), "Claude · 1"),
+            claude_native_spec_for(&stub, cwd.path(), "Claude · 2"),
+        ];
+        let (mut starts, notices) = start_claude_sessions(&mut specs);
+        assert!(notices.is_empty(), "{notices:?}");
+        let mut router = crate::native_route::NativeRouter::start(
+            session_state::state_directory().join("native-outbox.json"),
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            bind_claude_rooms(&mut router, &specs, &mut starts)
+                .unwrap()
+                .is_empty()
+        );
+
+        let boot1 = crate::claude_inbox::bootstrap_file(cwd.path(), 1).unwrap();
+        let boot2 = crate::claude_inbox::bootstrap_file(cwd.path(), 2).unwrap();
+        let c1: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&boot1).unwrap()).unwrap();
+        let c2: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&boot2).unwrap()).unwrap();
+        assert_ne!(c1["token"], c2["token"], "rooms must have unique bootstrap identities");
+        assert_ne!(boot1, boot2);
+        assert!(!cwd.path().join(".crowded/claude-inbox/_bootstrap.json").exists());
+
+        let mod_path = std::env::current_dir()
+            .unwrap()
+            .join("src/claude_mod/hooks/deliver.mjs");
+        let driver = root.path().join("drive-mod.mjs");
+        fs::write(
+            &driver,
+            r#"import { appendFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
+const [modPath, cwd, session, marker] = process.argv.slice(2);
+const { register } = await import(pathToFileURL(modPath).href);
+const log = (t) => appendFileSync(marker, `${t}\n`);
+const $ = {
+  fs: { exists: async (p) => readFile(p).then(() => true, () => false), read: (p) => readFile(p, "utf8") },
+  session: { id: async () => session },
+  http: { fetch: async (url, init) => fetch(url, init).then(async (r) => ({ ok: r.ok, status: r.status, text: await r.text() })) },
+  clock: { every: (ms, cb) => setInterval(() => { void cb(); }, ms) },
+  ui: { status: (t) => log(`STATUS ${t}`) },
+  prompt: { submit: async (input) => { log(`SUBMITTED ${input.text}`); return {}; } },
+};
+let handler = null;
+register((event, fn) => { handler = fn; });
+await handler($, { cwd, isInteractive: true }, async (e) => e);
+"#,
+        )
+        .unwrap();
+        let marker1 = root.path().join("room1.log");
+        let marker2 = root.path().join("room2.log");
+        // Session ids whose connection files do not exist force deliver.mjs to
+        // resolve each room's per-room bootstrap via CROWDED_ROOM.
+        let mut child1 = Command::new("node")
+            .arg(&driver)
+            .arg(&mod_path)
+            .arg(cwd.path())
+            .arg("pending-session-room-1")
+            .arg(&marker1)
+            .env("CROWDED_ROOM", "1")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("node runs room 1 mod");
+        let mut child2 = Command::new("node")
+            .arg(&driver)
+            .arg(&mod_path)
+            .arg(cwd.path())
+            .arg("pending-session-room-2")
+            .arg(&marker2)
+            .env("CROWDED_ROOM", "2")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("node runs room 2 mod");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let a = fs::read_to_string(&marker1)
+                .unwrap_or_default()
+                .contains("STATUS Crowded inbox connected");
+            let b = fs::read_to_string(&marker2)
+                .unwrap_or_default()
+                .contains("STATUS Crowded inbox connected");
+            if a && b {
+                break;
+            }
+            assert!(Instant::now() < deadline, "mods never connected: a={a} b={b}");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut mailroom = Mailroom::new(50);
+        router
+            .send(&mut mailroom, "Sender", 0, "to-room-1", None)
+            .unwrap();
+        pump_router(&mut router, &mut mailroom, |shown| {
+            shown.matches("ACCEPTED by Claude (submitted;").count() == 1
+        });
+        router
+            .send(&mut mailroom, "Sender", 1, "to-room-2", None)
+            .unwrap();
+        pump_router(&mut router, &mut mailroom, |shown| {
+            shown.matches("ACCEPTED by Claude (submitted;").count() == 2
+        });
+        let log1 = fs::read_to_string(&marker1).unwrap();
+        let log2 = fs::read_to_string(&marker2).unwrap();
+        assert!(log1.contains("SUBMITTED [whisper from Sender] to-room-1"), "{log1}");
+        assert!(!log1.contains("to-room-2"), "room 1 must not receive room 2 mail: {log1}");
+        assert!(log2.contains("SUBMITTED [whisper from Sender] to-room-2"), "{log2}");
+        assert!(!log2.contains("to-room-1"), "room 2 must not receive room 1 mail: {log2}");
+
+        // Report room 1's session: its bootstrap becomes its session file; room 2
+        // keeps its own bootstrap and endpoint unchanged.
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        let generation = next_generation().unwrap();
+        router
+            .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), MINTED_A, generation)
+            .unwrap();
+        assert!(!boot1.exists(), "room 1 bootstrap must be removed on report");
+        assert!(
+            crate::claude_inbox::connection_file(cwd.path(), MINTED_A)
+                .unwrap()
+                .exists(),
+            "room 1 session connection file must exist"
+        );
+        assert!(boot2.exists(), "room 2 bootstrap must remain untouched");
+        let c2_after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&boot2).unwrap()).unwrap();
+        assert_eq!(c2, c2_after, "room 2 endpoint must be unchanged");
+
+        router
+            .send(&mut mailroom, "Sender", 0, "to-room-1-after-report", None)
+            .unwrap();
+        pump_router(&mut router, &mut mailroom, |shown| {
+            shown.matches("ACCEPTED by Claude (submitted;").count() == 3
+        });
+        let log1 = fs::read_to_string(&marker1).unwrap();
+        let log2 = fs::read_to_string(&marker2).unwrap();
+        assert!(
+            log1.contains("SUBMITTED [whisper from Sender] to-room-1-after-report"),
+            "{log1}"
+        );
+        assert!(!log2.contains("to-room-1-after-report"), "room 2 must not receive room 1 mail: {log2}");
+
+        child1.kill().ok();
+        child2.kill().ok();
+        let _ = child1.wait();
+        let _ = child2.wait();
     }
 
     #[cfg(unix)]
