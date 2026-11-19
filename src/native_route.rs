@@ -2731,7 +2731,8 @@ mod tests {
 
         // A reported session keeps the running mod's receiver: its process did
         // not restart, so it goes on polling, and only new-generation mail is
-        // offered to it. The launch's connection file stays.
+        // offered to it. The connection file is promoted to the reported session
+        // and the previous session file is removed.
         router
             .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), CLAUDE_B, 2)
             .unwrap();
@@ -2741,10 +2742,16 @@ mod tests {
             "a report rebind keeps the receiver"
         );
         assert!(
-            crate::claude_inbox::connection_file(cwd.path(), CLAUDE_A)
+            !crate::claude_inbox::connection_file(cwd.path(), CLAUDE_A)
                 .unwrap()
                 .exists(),
-            "the running process keeps its connection file"
+            "the previous session file must be removed on report"
+        );
+        assert!(
+            crate::claude_inbox::connection_file(cwd.path(), CLAUDE_B)
+                .unwrap()
+                .exists(),
+            "the reported session file must exist"
         );
         let (stop, kept_mod) = polling(old_mod.resumed());
         let log = Log::default();

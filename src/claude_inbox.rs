@@ -178,7 +178,11 @@ impl ClaudeInbox {
         create_private_directory(parent)?;
         self.write_connection(&path)?;
         if let Ok(mut file) = self.file.lock() {
-            *file = Some(path);
+            if let Some(previous) = file.replace(path.clone())
+                && previous != path
+            {
+                let _ = fs::remove_file(previous);
+            }
         }
         if let Ok(mut bootstrap) = self.bootstrap.lock()
             && let Some(path) = bootstrap.take()
@@ -1049,6 +1053,32 @@ mod tests {
             legitimate.join().unwrap(),
             200,
             "a legitimate request must still be answered"
+        );
+    }
+
+    /// A second session report replaces the previous session's connection file;
+    /// the old one must not remain readable in the cwd.
+    #[test]
+    fn adopt_reported_session_removes_the_previous_session_file() {
+        let inbox = inbox(Duration::from_millis(200));
+        let cwd = tempfile::tempdir().unwrap();
+        let first = "11111111-1111-4111-8111-111111111111";
+        let second = "22222222-2222-4222-8222-222222222222";
+        inbox.prepare(cwd.path(), 1, 1).unwrap();
+        let bootstrap = bootstrap_file(cwd.path(), 1).unwrap();
+        assert!(bootstrap.exists(), "bootstrap must exist before first report");
+
+        inbox.adopt_reported_session(cwd.path(), first, 2).unwrap();
+        let first_file = connection_file(cwd.path(), first).unwrap();
+        assert!(first_file.exists(), "first session file must exist");
+        assert!(!bootstrap.exists(), "bootstrap must be removed on report");
+
+        inbox.adopt_reported_session(cwd.path(), second, 3).unwrap();
+        let second_file = connection_file(cwd.path(), second).unwrap();
+        assert!(second_file.exists(), "second session file must exist");
+        assert!(
+            !first_file.exists(),
+            "previous session file must be removed on second report"
         );
     }
 }
