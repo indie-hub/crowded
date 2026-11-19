@@ -6,6 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.46.0] - 2026-11-19
+
 ### Added
 - Native Claude rooms have a lifecycle ahead of delivery: Crowded chooses the session id with `claude --session-id`, saves the binding before the terminal starts, restarts with `claude --resume`, clears through the durable marker into a new id, and rebinds when the room's own SessionStart hook reports a new one.
 - Native Claude rooms take mail: Crowded extracts its embedded delivery mod into `<cwd>/.crowded/claude-mod/` and launches `claude` with `--plugin-dir` for it on every start, restart, clear and resume. A submitted prompt shows `ACCEPTED by Claude (submitted; not proof it was acted on)`; a refused one stays held, and a collected-but-unreceipted one stays uncertain and is never resent. The mod is inert outside Crowded, and the connection file under `.crowded/claude-inbox/` is removed when its launch is replaced and on exit. Needs a Claude Code that loads `--plugin-dir` plugins (validated on 2.1.322); brand-new-user prompts, Windows and a real TUI `/clear` in a Crowded pane are not verified.
