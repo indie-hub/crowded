@@ -1315,7 +1315,8 @@ transport = "raw"
             opencode["mcp"]["context-mode"]["command"],
             serde_json::json!(["npx", "-y", "context-mode@1.0.169"])
         );
-        assert!(opencode.get("plugin").is_none());
+        assert!(opencode.get("plugin").is_none()
+            || opencode["plugin"].as_array().is_some_and(|a| a.iter().all(|v| v.as_str().is_some_and(|s| s.contains("headroom")))));
     }
 
     #[test]

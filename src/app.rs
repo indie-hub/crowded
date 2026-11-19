@@ -1862,12 +1862,12 @@ pub(crate) fn relaunch_codex_room(
     }
 }
 
-/// Relaunches one native Claude room in place. The session id is known before
-/// the terminal starts, so the room is bound at once and its mail is held there.
+/// Relaunches one native Claude room in place. A reported session is resumed;
+/// otherwise the room starts fresh and learns its session from the hook.
 #[allow(clippy::too_many_arguments)]
 /// A failure in the relaunch sequence is reported with the way out; nothing
-/// is rolled back, so the room may be left recorded on a session that did not
-/// start.
+/// is rolled back, so the room may be left recorded or bound on a session that
+/// did not start.
 fn launch_failure(title: &str, room: usize, cause: impl std::fmt::Display) -> Box<dyn std::error::Error> {
     io::Error::other(format!(
         "{title}: {cause}; the room may be recorded or bound on a session that did not start; use control {room} clear to start a new one"
@@ -1889,16 +1889,40 @@ pub(crate) fn relaunch_claude_room(
     now: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let title = panes[index].title().to_owned();
-    // Simple order: choose the id, take the generation, write, bind, start.
-    // Nothing is rolled back; a failure at or after the write is reported with
-    // the way out and the room may stay recorded on a session that never ran.
     let generation = pane::next_generation()
         .map_err(|error| launch_failure(&title, index + 1, error))?;
     let (spec, session) = panes[index]
         .relaunch_claude(action, index + 1)
         .map_err(|error| launch_failure(&title, index + 1, error))?;
     if let Some(router) = router.as_deref_mut() {
-        pane::bind_claude_room_at(router, panes, index, &session, generation)
+        let cwd = panes[index].cwd().to_path_buf();
+        let inbox = router
+            .claude_inbox(index)
+            .map_err(|error| launch_failure(&title, index + 1, error))?;
+        let entry_session = if let Some(session) = &session {
+            inbox
+                .attach(&cwd, session, generation)
+                .map_err(|error| launch_failure(&title, index + 1, error))?;
+            panes[index].record_session(session);
+            Some(session.clone())
+        } else {
+            inbox
+                .prepare(&cwd, generation)
+                .map_err(|error| launch_failure(&title, index + 1, error))?;
+            None
+        };
+        router
+            .bind_claude(vec![crate::native_route::ClaudeEntry {
+                index,
+                title: title.clone(),
+                session: entry_session,
+                generation,
+                reason: if session.is_none() {
+                    Some("waiting for the room's session report".to_owned())
+                } else {
+                    None
+                },
+            }])
             .map_err(|error| launch_failure(&title, index + 1, error))?;
     }
     panes[index].cleanup();

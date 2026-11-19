@@ -73,10 +73,14 @@ export function register(on) {
     const cwd = e.cwd;
     try {
       const sessionId = await $.session.id();
-      const file = `${cwd}/.crowded/claude-inbox/${sessionId}.json`;
+      let file = `${cwd}/.crowded/claude-inbox/${sessionId}.json`;
       if (!(await $.fs.exists(file))) {
-        $.ui.status("Crowded inbox not connected");
-        return next(e);
+        const bootstrap = `${cwd}/.crowded/claude-inbox/_bootstrap.json`;
+        if (!(await $.fs.exists(bootstrap))) {
+          $.ui.status("Crowded inbox not connected");
+          return next(e);
+        }
+        file = bootstrap;
       }
       const parsed = JSON.parse(await $.fs.read(file));
       const token = parsed && parsed.token;

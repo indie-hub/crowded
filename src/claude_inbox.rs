@@ -134,12 +134,32 @@ impl ClaudeInbox {
             .parent()
             .ok_or_else(|| io::Error::other("the Claude inbox file has no directory"))?;
         create_private_directory(parent)?;
-        let contents = format!("{{\"url\":\"{}\",\"token\":\"{}\"}}", self.url, self.token);
-        write_private(&path, &contents)?;
+        self.write_connection(&path)?;
         if let Ok(mut file) = self.file.lock() {
             *file = Some(path);
         }
         Ok(())
+    }
+
+    /// Prepares the inbox for a fresh launch whose session will be learned from
+    /// the room's hook. Writes a bootstrap connection file the mod can find.
+    pub(crate) fn prepare(&self, cwd: &Path, generation: u64) -> io::Result<()> {
+        self.relaunch(generation);
+        let path = bootstrap_file(cwd)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("the Claude inbox file has no directory"))?;
+        create_private_directory(parent)?;
+        self.write_connection(&path)?;
+        if let Ok(mut file) = self.file.lock() {
+            *file = Some(path);
+        }
+        Ok(())
+    }
+
+    fn write_connection(&self, path: &Path) -> io::Result<()> {
+        let contents = format!("{{\"url\":\"{}\",\"token\":\"{}\"}}", self.url, self.token);
+        write_private(path, &contents)
     }
 
     /// Moves the room to a session its own hook reported. The mod's process
@@ -243,6 +263,14 @@ pub(crate) fn connection_file(cwd: &Path, session: &str) -> io::Result<PathBuf> 
         .join(".crowded")
         .join("claude-inbox")
         .join(format!("{session}.json")))
+}
+
+/// The bootstrap connection file used before the room's session is known.
+pub(crate) fn bootstrap_file(cwd: &Path) -> io::Result<PathBuf> {
+    Ok(cwd
+        .join(".crowded")
+        .join("claude-inbox")
+        .join("_bootstrap.json"))
 }
 
 pub(crate) fn write_private(path: &Path, contents: &str) -> io::Result<()> {

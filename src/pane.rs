@@ -804,26 +804,8 @@ pub(crate) fn claude_native_spec(spec: &RoomSpec) -> bool {
     spec.native_delivery && matches!(controls::cli_vendor(spec), Ok(controls::CliVendor::Claude))
 }
 
-/// A session id Crowded chooses for a Claude room. Only Crowded or the room's
-/// own report may name a session, so the id is generated here.
-fn new_claude_session_id() -> io::Result<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    Ok(format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    ))
-}
-
-/// A native Claude room's session is Crowded's to choose, so a user-supplied
-/// resume form is refused instead of silently replaced.
+/// A native Claude room's session is learned from the room's hook, so a
+/// user-supplied resume form is refused instead of silently replaced.
 fn refuse_claude_session_args(spec: &RoomSpec) -> io::Result<()> {
     const OWNED: [&str; 6] = [
         "--resume",
@@ -845,24 +827,16 @@ fn refuse_claude_session_args(spec: &RoomSpec) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         format!(
-            "{}: a native Claude room's session is chosen by Crowded; remove --resume, --continue, --session-id and --fork-session from its arguments",
+            "{}: a native Claude room's session is learned from the room; remove --resume, --continue, --session-id and --fork-session from its arguments",
             spec.title
         ),
     ))
 }
 
-/// The session Crowded minted or the room's own hook reported for this room.
+/// The session the room's own hook reported for this room. Crowded must not
+/// guess sessions.
 fn stored_claude_session(cwd: &Path, title: &str) -> Option<String> {
-    session_state::lookup_minted("claude", cwd, title)
-        .or_else(|| session_state::lookup_reported("claude", cwd, title))
-        .filter(|id| codex_native::valid_uuid(id))
-}
-
-fn set_claude_new_session(spec: &mut RoomSpec, session_id: &str) -> io::Result<()> {
-    controls::clear_resume_args(spec)?;
-    spec.args.push("--session-id".into());
-    spec.args.push(session_id.into());
-    Ok(())
+    session_state::lookup_reported("claude", cwd, title).filter(|id| codex_native::valid_uuid(id))
 }
 
 /// The mod Crowded embeds for its Claude rooms: the manifest, the hook
@@ -960,15 +934,17 @@ fn equip_claude_mod(spec: &mut RoomSpec, cwd: &Path) -> io::Result<()> {
 /// What a native Claude room's launch decided before its terminal starts.
 #[derive(Clone, Debug)]
 pub(crate) enum ClaudeStart {
-    /// The session the room starts with; already saved and bound.
-    Ready(String),
+    /// Resume a session the room's hook reported earlier.
+    Resume(String),
+    /// Start fresh and learn the session from the room's hook.
+    Fresh,
     /// The room must not start, with the reason to show.
     Failed(String),
 }
 
-/// Chooses each native Claude room's session before its terminal starts: the
-/// stored one to resume, otherwise a fresh id Crowded saves first. Returns one
-/// explicit decision per room, so a failure can never look like a plain start.
+/// Chooses each native Claude room's session before its terminal starts: resume
+/// a session the room's hook reported, otherwise start fresh and learn it from
+/// the hook.
 pub(crate) fn start_claude_sessions(
     specs: &mut [RoomSpec],
 ) -> (Vec<Option<ClaudeStart>>, Vec<String>) {
@@ -978,23 +954,21 @@ pub(crate) fn start_claude_sessions(
         if !claude_native_spec(spec) {
             continue;
         }
-        let prepared: io::Result<String> = (|| {
+        let prepared: io::Result<ClaudeStart> = (|| {
             refuse_claude_session_args(spec)?;
             let cwd = working_directory(spec.cwd.as_deref())?;
-            if let Some(stored) = stored_claude_session(&cwd, &spec.title) {
+            controls::clear_resume_args(spec)?;
+            let start = if let Some(stored) = stored_claude_session(&cwd, &spec.title) {
                 controls::set_resume_session(spec, &stored)?;
-                equip_claude_mod(spec, &cwd)?;
-                return Ok(stored);
-            }
-            let session = new_claude_session_id()?;
-            // Saved before the terminal starts, so a crash cannot lose the id.
-            session_state::upsert_minted("claude", &cwd, &spec.title, &session)?;
-            set_claude_new_session(spec, &session)?;
+                ClaudeStart::Resume(stored)
+            } else {
+                ClaudeStart::Fresh
+            };
             equip_claude_mod(spec, &cwd)?;
-            Ok(session)
+            Ok(start)
         })();
         match prepared {
-            Ok(session) => starts[index] = Some(ClaudeStart::Ready(session)),
+            Ok(start) => starts[index] = Some(start),
             Err(error) => {
                 let reason = format!("{}: {error}", spec.title);
                 notices.push(format!("{reason}; the room was not started"));
@@ -1023,6 +997,7 @@ pub(crate) fn next_generation() -> io::Result<u64> {
     GenerationAllocator::new(session_state::state_directory()).next()
 }
 
+#[cfg(test)]
 pub(crate) fn bind_claude_room_at(
     router: &mut crate::native_route::NativeRouter,
     panes: &mut [Pane],
@@ -1044,10 +1019,9 @@ pub(crate) fn bind_claude_room_at(
     }])
 }
 
-/// Binds every native Claude room before its terminal starts: a ready room to
-/// its session and inbox under a fresh generation, a failed one to its reason
-/// so its mail is held instead of pasted. A room whose inbox file cannot be
-/// written does not start; its reason is returned as a notice.
+/// Binds every native Claude room before its terminal starts. A room resuming a
+/// reported session is bound to it; a fresh room starts unbound and learns its
+/// session from the hook.
 pub(crate) fn bind_claude_rooms(
     router: &mut crate::native_route::NativeRouter,
     specs: &[RoomSpec],
@@ -1060,36 +1034,69 @@ pub(crate) fn bind_claude_rooms(
             continue;
         };
         let generation = GenerationAllocator::new(session_state::state_directory()).next()?;
-        let (session, reason) = match current {
-            ClaudeStart::Ready(session) => (Some(session.clone()), None),
-            ClaudeStart::Failed(reason) => (None, Some(reason.clone())),
-        };
-        if let Some(session) = &session {
-            let cwd = working_directory(specs[index].cwd.as_deref())?;
-            let prepared = router
-                .claude_inbox(index)
-                .and_then(|inbox| inbox.attach(&cwd, session, generation));
-            if let Err(error) = prepared {
-                let reason = format!("{}: {error}", specs[index].title);
-                notices.push(format!("{reason}; the room was not started"));
-                *current = ClaudeStart::Failed(reason.clone());
+        match current {
+            ClaudeStart::Failed(reason) => {
                 entries.push(crate::native_route::ClaudeEntry {
                     index,
                     title: specs[index].title.clone(),
                     session: None,
                     generation,
-                    reason: Some(reason),
+                    reason: Some(reason.clone()),
                 });
-                continue;
+            }
+            ClaudeStart::Resume(session) => {
+                let cwd = working_directory(specs[index].cwd.as_deref())?;
+                let prepared = router
+                    .claude_inbox(index)
+                    .and_then(|inbox| inbox.attach(&cwd, session, generation));
+                if let Err(error) = prepared {
+                    let reason = format!("{}: {error}", specs[index].title);
+                    notices.push(format!("{reason}; the room was not started"));
+                    *current = ClaudeStart::Failed(reason.clone());
+                    entries.push(crate::native_route::ClaudeEntry {
+                        index,
+                        title: specs[index].title.clone(),
+                        session: None,
+                        generation,
+                        reason: Some(reason),
+                    });
+                    continue;
+                }
+                entries.push(crate::native_route::ClaudeEntry {
+                    index,
+                    title: specs[index].title.clone(),
+                    session: Some(session.clone()),
+                    generation,
+                    reason: None,
+                });
+            }
+            ClaudeStart::Fresh => {
+                let cwd = working_directory(specs[index].cwd.as_deref())?;
+                let prepared = router
+                    .claude_inbox(index)
+                    .and_then(|inbox| inbox.prepare(&cwd, generation));
+                if let Err(error) = prepared {
+                    let reason = format!("{}: {error}", specs[index].title);
+                    notices.push(format!("{reason}; the room was not started"));
+                    *current = ClaudeStart::Failed(reason.clone());
+                    entries.push(crate::native_route::ClaudeEntry {
+                        index,
+                        title: specs[index].title.clone(),
+                        session: None,
+                        generation,
+                        reason: Some(reason),
+                    });
+                    continue;
+                }
+                entries.push(crate::native_route::ClaudeEntry {
+                    index,
+                    title: specs[index].title.clone(),
+                    session: None,
+                    generation,
+                    reason: Some("waiting for the room's session report".to_owned()),
+                });
             }
         }
-        entries.push(crate::native_route::ClaudeEntry {
-            index,
-            title: specs[index].title.clone(),
-            session,
-            generation,
-            reason,
-        });
     }
     router.bind_claude(entries)?;
     Ok(notices)
@@ -2110,19 +2117,17 @@ impl Pane {
         claude_native_spec(&self.spec)
     }
 
-    /// Prepares this native Claude room's next launch: the stored session to
-    /// resume, or a fresh id for a clear or a first start. An explicit resume
-    /// with no stored session fails without writing anything.
+    /// Prepares this native Claude room's next launch. A reported session is
+    /// resumed; otherwise the room starts fresh and learns its session from the
+    /// hook. An explicit resume with no reported session fails.
     pub(crate) fn relaunch_claude(
         &self,
         action: ClaudeRelaunch,
         room: usize,
-    ) -> io::Result<(RoomSpec, String)> {
+    ) -> io::Result<(RoomSpec, Option<String>)> {
         let mut spec = self.spec.clone();
         let session = match action {
             ClaudeRelaunch::Clear => {
-                // Durable intent first, exactly as a Codex clear: a later
-                // resume must not restore the session this replaces.
                 session_state::clear_room("claude", &self.cwd, &self.spec.title)?;
                 None
             }
@@ -2136,14 +2141,10 @@ impl Pane {
             }
             ClaudeRelaunch::Restart => stored_claude_session(&self.cwd, &self.spec.title),
         };
-        let Some(session) = session else {
-            let session = new_claude_session_id()?;
-            session_state::upsert_minted("claude", &self.cwd, &self.spec.title, &session)?;
-            set_claude_new_session(&mut spec, &session)?;
-            equip_claude_mod(&mut spec, &self.cwd)?;
-            return Ok((spec, session));
-        };
-        controls::set_resume_session(&mut spec, &session)?;
+        controls::clear_resume_args(&mut spec)?;
+        if let Some(session) = &session {
+            controls::set_resume_session(&mut spec, session)?;
+        }
         equip_claude_mod(&mut spec, &self.cwd)?;
         Ok((spec, session))
     }
@@ -3602,9 +3603,10 @@ mod tests {
         let file = opencode_wrapped_config(&mut launch, true).unwrap().unwrap();
         let config: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(file.path()).unwrap()).unwrap();
-        assert_eq!(config.as_object().unwrap().len(), 2);
         assert_eq!(config["model"], "room/model");
         assert_eq!(config["mcp"]["crowded"]["enabled"], false);
+        assert!(config.get("plugin").is_none() || config["plugin"].as_array().is_some_and(|a| a.iter().all(|v| v.as_str().is_some_and(|s| s.contains("headroom")))));
+        assert!(config.get("providers").is_none());
     }
 
     #[test]
@@ -4721,118 +4723,61 @@ mod tests {
         spec
     }
 
-    /// The startup phase chooses the room's session, saves it before the
-    /// terminal starts, and the router holds that room's mail.
+    /// A minted Claude session is never resumed: Crowded must not guess
+    /// sessions, so a room with no reported session starts fresh.
     #[cfg(unix)]
     #[test]
-    fn a_native_claude_start_chooses_saves_and_holds() {
+    fn a_native_claude_room_never_resumes_a_minted_session() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
+
+        let (starts, notices) = start_claude_sessions(&mut specs);
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(matches!(&starts[0], Some(ClaudeStart::Fresh)), "{:?}", starts[0]);
+        assert!(!specs[0].args.iter().any(|a| a == "--resume"), "{:?}", specs[0].args);
+        assert!(!specs[0].args.iter().any(|a| a == "--session-id"), "{:?}", specs[0].args);
+    }
+
+    /// A fresh Claude room starts without guessing a session and learns it
+    /// from the hook.
+    #[cfg(unix)]
+    #[test]
+    fn a_native_claude_start_starts_fresh_and_waits_for_report() {
         let _state = session_state::StateRootGuard::isolated();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
         let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
 
-        let (sessions, notices) = start_claude_sessions(&mut specs);
+        let (mut sessions, notices) = start_claude_sessions(&mut specs);
         assert!(notices.is_empty(), "{notices:?}");
-        let Some(ClaudeStart::Ready(session)) = sessions[0].clone() else {
-            panic!("a session is chosen: {:?}", sessions[0]);
-        };
-        assert_eq!(
-            session_state::lookup_minted("claude", cwd.path(), "Claude · 1").as_deref(),
-            Some(session.as_str()),
-            "the id is saved before the terminal starts"
-        );
-        assert_eq!(
-            args_after(&specs[0].args, "--session-id").first(),
-            Some(&OsString::from(&session))
-        );
+        assert!(matches!(&sessions[0], Some(ClaudeStart::Fresh)), "{:?}", sessions[0]);
+        assert!(session_state::lookup_minted("claude", cwd.path(), "Claude · 1").is_none());
+        assert!(session_state::lookup_reported("claude", cwd.path(), "Claude · 1").is_none());
+        assert!(!specs[0].args.iter().any(|a| a == "--session-id"), "{:?}", specs[0].args);
+        assert!(!specs[0].args.iter().any(|a| a == "--resume"), "{:?}", specs[0].args);
 
-        let mut panes = vec![
-            crate::app::spawn_room(
-                &mut crate::app::LivePanes,
-                specs.remove(0),
-                small_size(),
-                GuestEnvironment::new([]),
-                None,
-                None,
-                None,
-            )
-            .unwrap(),
-        ];
         let mut router = crate::native_route::NativeRouter::start(
             session_state::state_directory().join("native-outbox.json"),
             Vec::new(),
         )
         .unwrap();
-        bind_claude_room(&mut router, &mut panes, 0, &session).unwrap();
-        assert_eq!(router.binding_for(0).unwrap().session, session);
-        let mut mailroom = Mailroom::new(10);
-        let (replied, reply) = std::sync::mpsc::sync_channel(1);
-        router
-            .send(
-                &mut mailroom,
-                "Sender",
-                0,
-                "hi",
-                Some(Box::new(move |_, reply| {
-                    let _ = replied.send(reply);
-                })),
-            )
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let outcome = loop {
-            router.tick(Instant::now(), &mut mailroom, false, false);
-            if let Ok(outcome) = reply.try_recv() {
-                break outcome;
-            }
-            assert!(Instant::now() < deadline, "the hold was never answered");
-            thread::sleep(Duration::from_millis(20));
-        };
-        assert_eq!(
-            outcome,
-            crate::native_route::NativeReply::Held("no Claude mod connected".to_owned()),
-            "a Claude room never accepts or queues mail"
-        );
-        let shown = mailroom.summary();
-        assert!(shown.contains("HELD: no Claude mod connected"), "{shown}");
-        // The hold is durable: the saved outbox still carries the message.
-        drop(router);
-        let mut restarted = crate::native_route::NativeRouter::start(
-            session_state::state_directory().join("native-outbox.json"),
-            Vec::new(),
-        )
-        .unwrap();
-        let mut mailroom = Mailroom::new(10);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            restarted.tick(Instant::now(), &mut mailroom, true, false);
-            let shown = mailroom.summary();
-            if shown.contains("hi") {
-                assert!(shown.contains("HELD"), "{shown}");
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the held mail did not survive a router restart: {shown}"
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
+        assert!(bind_claude_rooms(&mut router, &specs, &mut sessions).unwrap().is_empty());
+        assert!(crate::claude_inbox::bootstrap_file(cwd.path()).unwrap().exists());
+        assert!(router.binding_for(0).is_none(), "session is learned from the hook");
 
-        // A later start of the same room resumes the stored id, not a new one.
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
         let mut again = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
         let (again_starts, _) = start_claude_sessions(&mut again);
-        assert!(
-            matches!(&again_starts[0], Some(ClaudeStart::Ready(id)) if id == &session),
-            "{again_starts:?}"
-        );
-        assert_eq!(
-            args_after(&again[0].args, "--resume").first(),
-            Some(&OsString::from(&session))
-        );
+        assert!(matches!(&again_starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A), "{again_starts:?}");
+        assert_eq!(args_after(&again[0].args, "--resume").first(), Some(&OsString::from(MINTED_A)));
     }
 
-    /// Every message to a Claude room is held, not just the first: the hold
-    /// must not queue later mail for delivery.
+    /// Every message to a bound Claude room is held, not just the first.
     #[cfg(unix)]
     #[test]
     fn every_message_to_a_claude_room_is_held() {
@@ -4840,8 +4785,10 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
         let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let (starts, _) = start_claude_sessions(std::slice::from_mut(&mut spec));
+        assert!(matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A), "{:?}", starts[0]);
         let mut panes = vec![
             crate::app::spawn_room(
                 &mut crate::app::LivePanes,
@@ -4859,11 +4806,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        let session = match &starts[0] {
-            Some(ClaudeStart::Ready(id)) => id.clone(),
-            other => panic!("{other:?}"),
-        };
-        bind_claude_room(&mut router, &mut panes, 0, &session).unwrap();
+        bind_claude_room(&mut router, &mut panes, 0, MINTED_A).unwrap();
 
         let mut mailroom = Mailroom::new(10);
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -4935,7 +4878,7 @@ mod tests {
                 log.display()
             ),
         );
-        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
         let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let mut rig = IterationHarness::new(root.path());
         rig.panes[0] =
@@ -5021,7 +4964,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
-        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
         let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let mut rig = IterationHarness::new(root.path());
         rig.panes[0] =
@@ -5054,7 +4997,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
-        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
         let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let mut rig = IterationHarness::new(root.path());
         rig.panes[0] =
@@ -5096,7 +5039,7 @@ mod tests {
                 log.display()
             ),
         );
-        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
         let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let mut rig = IterationHarness::new(root.path());
         rig.panes[0] =
@@ -5118,7 +5061,7 @@ mod tests {
         assert_eq!(rig.panes[0].room_spec().args, args_before);
         assert!(!log.exists(), "no process was spawned");
         assert_eq!(
-            session_state::lookup_minted("claude", cwd.path(), "Claude · 1").as_deref(),
+            session_state::lookup_reported("claude", cwd.path(), "Claude · 1").as_deref(),
             Some(MINTED_A),
             "the old id is untouched"
         );
@@ -5147,7 +5090,7 @@ mod tests {
             "{starts:?}"
         );
         let shown = notices.join("; ");
-        assert!(shown.contains("session is chosen by Crowded"), "{shown}");
+        assert!(shown.contains("session is learned from the room"), "{shown}");
         assert_eq!(
             session_state::lookup("claude", cwd.path(), "Claude · 1"),
             None
@@ -5171,49 +5114,29 @@ mod tests {
                 log.display()
             ),
         );
-        for rejected in [false, true] {
-            let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
-            if rejected {
-                spec.args = vec!["--resume".into(), MINTED_A.into()];
-            } else {
-                // A leftover temp file makes the session save fail.
-                fs::create_dir_all(session_state::state_directory()).unwrap();
-                fs::write(
-                    session_state::state_directory()
-                        .join(format!("session-state.{}.tmp", std::process::id())),
-                    b"blocked",
-                )
-                .unwrap();
-            }
-            let (starts, notices) = start_claude_sessions(std::slice::from_mut(&mut spec));
-            assert!(
-                matches!(&starts[0], Some(ClaudeStart::Failed(_))),
-                "rejected={rejected}: {starts:?}"
-            );
-            let mut factory = RecordingPanes::default();
-            let mut last_output = vec![None];
-            crate::app::start_rooms(
-                &mut factory,
-                vec![spec],
-                &[small_size()],
-                &[GuestEnvironment::new([])],
-                vec![None],
-                &[None],
-                &starts,
-                &mut last_output,
-                false,
-                Duration::from_millis(5),
-                &mut crate::app::Notices::default(),
-            )
-            .unwrap();
-            assert_eq!(factory.kinds(), ["unavailable"], "rejected={rejected}");
-            assert!(!notices.is_empty());
-            assert!(!log.exists(), "rejected={rejected}: a process was spawned");
-            let _ = fs::remove_file(
-                session_state::state_directory()
-                    .join(format!("session-state.{}.tmp", std::process::id())),
-            );
-        }
+        let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
+        spec.args = vec!["--resume".into(), MINTED_A.into()];
+        let (starts, notices) = start_claude_sessions(std::slice::from_mut(&mut spec));
+        assert!(matches!(&starts[0], Some(ClaudeStart::Failed(_))), "{starts:?}");
+        let mut factory = RecordingPanes::default();
+        let mut last_output = vec![None];
+        crate::app::start_rooms(
+            &mut factory,
+            vec![spec],
+            &[small_size()],
+            &[GuestEnvironment::new([])],
+            vec![None],
+            &[None],
+            &starts,
+            &mut last_output,
+            false,
+            Duration::from_millis(5),
+            &mut crate::app::Notices::default(),
+        )
+        .unwrap();
+        assert_eq!(factory.kinds(), ["unavailable"]);
+        assert!(!notices.is_empty());
+        assert!(!log.exists(), "a process was spawned");
     }
 
     /// The event loop's own restart arm turns a real F5 key into the relaunch.
@@ -5224,7 +5147,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
-        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
         let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let mut rig = IterationHarness::new(root.path());
         rig.panes[0] =
@@ -5259,9 +5182,8 @@ mod tests {
         );
     }
 
-    /// Restart resumes the stored id, resume without one fails visibly, and a
-    /// clear writes the durable marker first and starts a new id. Mail saved
-    /// before a relaunch stays held.
+    /// Restart resumes the reported session, resume without one fails
+    /// visibly, and a clear starts fresh without guessing a session.
     #[cfg(unix)]
     #[test]
     fn a_native_claude_room_restarts_resumes_and_clears() {
@@ -5273,11 +5195,11 @@ mod tests {
             root.path(),
             "claude",
             &format!(
-                "printf '%s\\n' \"$@\" >> '{}'\nexec sleep 30",
+                "printf 'LAUNCH\\n' >> '{0}'\nprintf '%s\\n' \"$@\" >> '{0}'\nexec sleep 30",
                 log.display()
             ),
         );
-        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
         let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
 
         let mut rig = IterationHarness::new(root.path());
@@ -5314,7 +5236,7 @@ mod tests {
         assert_eq!(
             args_after(&rig.panes[0].room_spec().args, "--resume").first(),
             Some(&OsString::from(MINTED_A)),
-            "a restart resumes the stored id"
+            "a restart resumes the reported session"
         );
         let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
         assert!(binding.generation > old.generation);
@@ -5328,13 +5250,11 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         rig.paused = false;
-        // Every Claude message is held until the mod exists, so the guarantee
-        // here is that it was never delivered, while the generation moved.
         rig.pump_until("old mail held", |view| {
             view.contains("saved before the relaunch") && view.contains("HELD:")
         });
 
-        // Resume with no stored session names the way out and mints nothing.
+        // Resume with no reported session names the way out.
         session_state::clear_room("claude", cwd.path(), "Claude · 1").unwrap();
         rig.push_control(crate::doorbell::ControlAction::Resume);
         rig.iterate();
@@ -5345,56 +5265,36 @@ mod tests {
         );
         assert!(shown.contains("control 1 clear"), "{shown}");
 
-        // A clear whose marker cannot be saved starts nothing.
-        fs::create_dir_all(session_state::state_directory()).unwrap();
-        fs::write(
-            session_state::state_directory()
-                .join(format!("session-state.{}.tmp", std::process::id())),
-            b"blocked",
-        )
-        .unwrap();
+        // A clear starts fresh without guessing a session.
+        let before = fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| *l == "LAUNCH")
+            .count();
         rig.push_control(crate::doorbell::ControlAction::ClearContext);
         rig.iterate();
-        let shown = rig.notice.ordered_lines().join("; ");
+        assert!(session_state::lookup_reported("claude", cwd.path(), "Claude · 1").is_none());
         assert!(
-            shown.contains("the cleared marker could not be saved"),
-            "{shown}"
+            !rig.panes[0]
+                .room_spec()
+                .args
+                .iter()
+                .any(|a| a == "--session-id" || a == "--resume"),
+            "{:?}",
+            rig.panes[0].room_spec().args
         );
-        assert_eq!(
-            session_state::lookup_minted("claude", cwd.path(), "Claude · 1"),
-            None,
-            "a failed clear saves no session"
-        );
-        fs::remove_file(
-            session_state::state_directory()
-                .join(format!("session-state.{}.tmp", std::process::id())),
-        )
-        .unwrap();
-
-        // A clear writes the marker and starts a session of its own.
-        rig.push_control(crate::doorbell::ControlAction::ClearContext);
-        rig.iterate();
-        let fresh = session_state::lookup_minted("claude", cwd.path(), "Claude · 1")
-            .expect("a clear saves the new id");
-        // One start per relaunch, and the failed clear started none.
-        let launches = || {
-            fs::read_to_string(&log)
-                .unwrap_or_default()
-                .lines()
-                .filter(|line| *line == "--resume" || *line == "--session-id")
-                .count()
-        };
         let deadline = Instant::now() + Duration::from_secs(10);
-        while launches() < 2 {
+        while fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| *l == "LAUNCH")
+            .count()
+            <= before
+        {
+            rig.iterate();
             assert!(Instant::now() < deadline, "the clear never launched");
             thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(launches(), 2, "one start per relaunch");
-        assert_ne!(fresh, MINTED_A);
-        assert_eq!(
-            args_after(&rig.panes[0].room_spec().args, "--session-id").first(),
-            Some(&OsString::from(&fresh))
-        );
     }
 
     /// The Ctrl+R and F5 key events reach the real dispatch: an offline native
@@ -5525,7 +5425,7 @@ mod tests {
                 log.display()
             ),
         );
-        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
         let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let mut rig = IterationHarness::new(root.path());
         rig.panes[0] =
@@ -5549,10 +5449,7 @@ mod tests {
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect();
         assert!(
-            args.windows(2).any(|pair| {
-                (pair[0] == "--session-id" || pair[0] == "--resume")
-                    && pair[1] == binding.session
-            }),
+            args.windows(2).any(|pair| pair[0] == "--resume" && pair[1] == binding.session),
             "{args:?}"
         );
         let launched = || {
@@ -5646,8 +5543,8 @@ mod tests {
             "claude",
             &format!("printf 'exec\\n' >> '{}'\nexec sleep 30", log1.display()),
         );
-        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
-        session_state::upsert_minted("claude", cwd.path(), "Claude · 2", MINTED_B).unwrap();
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 2", MINTED_B).unwrap();
         let mut rig = IterationHarness::new(root.path());
         rig.panes = vec![
             Pane::spawn_unavailable(
@@ -8222,8 +8119,8 @@ mod tests {
         );
     }
 
-    /// A Claude launch writes the inbox connection file before the terminal
-    /// starts, and its child never inherits the nested-session marker.
+    /// A Claude launch writes the bootstrap inbox connection file before the
+    /// terminal starts, and its child never inherits the nested-session marker.
     #[cfg(unix)]
     #[test]
     fn a_claude_launch_writes_its_inbox_file_and_a_clean_environment() {
@@ -8287,12 +8184,10 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
         let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
         let (mut starts, _) = start_claude_sessions(&mut specs);
-        let first = match &starts[0] {
-            Some(ClaudeStart::Ready(session)) => session.clone(),
-            other => panic!("{other:?}"),
-        };
+        assert!(matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A), "{:?}", starts[0]);
         let mut router = crate::native_route::NativeRouter::start(
             session_state::state_directory().join("native-outbox.json"),
             Vec::new(),
@@ -8312,7 +8207,7 @@ mod tests {
             )
             .unwrap(),
         ];
-        let old = crate::claude_inbox::mod_of(cwd.path(), &first);
+        let old = crate::claude_inbox::mod_of(cwd.path(), MINTED_A);
         let registered = crate::claude_inbox::FakeMod::register(&old.url, &old.token);
 
         const SECOND: &str = "3f8f8f8f-3333-4333-8333-333333333333";
@@ -8327,7 +8222,7 @@ mod tests {
 
         assert_eq!(registered.next_status(), 401, "the old receiver is refused");
         assert!(
-            !crate::claude_inbox::connection_file(cwd.path(), &first)
+            !crate::claude_inbox::connection_file(cwd.path(), MINTED_A)
                 .unwrap()
                 .exists(),
             "the cleared launch's connection file is removed"
@@ -8358,8 +8253,6 @@ mod tests {
             reply.recv_timeout(Duration::from_secs(5)).unwrap(),
             crate::native_route::NativeReply::Held("no Claude mod connected".to_owned())
         );
-        // The relaunched process's own mod takes the room: its receiver is a
-        // fresh registration and is never refused as an existing one.
         let relaunched = crate::claude_inbox::mod_of(cwd.path(), SECOND);
         let fresh = crate::claude_inbox::FakeMod::register(&relaunched.url, &relaunched.token);
         assert!(!fresh.receiver.is_empty());
@@ -8372,11 +8265,12 @@ mod tests {
         title: &str,
     ) -> (Vec<RoomSpec>, Vec<Option<ClaudeStart>>, String) {
         let stub = codex_stub_for_pane(root, "claude", "exec sleep 30");
+        session_state::upsert_reported("claude", cwd, title, MINTED_A).unwrap();
         let mut specs = vec![claude_native_spec_for(&stub, cwd, title)];
         let (starts, notices) = start_claude_sessions(&mut specs);
         assert!(notices.is_empty(), "{notices:?}");
         let session = match &starts[0] {
-            Some(ClaudeStart::Ready(session)) => session.clone(),
+            Some(ClaudeStart::Resume(session)) => session.clone(),
             other => panic!("{other:?}"),
         };
         (specs, starts, session)
@@ -8393,7 +8287,7 @@ mod tests {
         assert_eq!(
             specs[0].args,
             vec![
-                OsString::from("--session-id"),
+                OsString::from("--resume"),
                 OsString::from(&session),
                 OsString::from("--plugin-dir"),
                 dir.as_os_str().into(),
@@ -8470,13 +8364,16 @@ mod tests {
         let _state = session_state::StateRootGuard::isolated();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        fn plugin_dir_args(flag: &str, session: &str, dir: &Path) -> Vec<OsString> {
+        fn resume_args(session: &str, dir: &Path) -> Vec<OsString> {
             vec![
-                OsString::from(flag),
+                OsString::from("--resume"),
                 OsString::from(session),
                 OsString::from("--plugin-dir"),
                 dir.as_os_str().into(),
             ]
+        }
+        fn fresh_args(dir: &Path) -> Vec<OsString> {
+            vec![OsString::from("--plugin-dir"), dir.as_os_str().into()]
         }
         let (mut specs, _, stored) = claude_started_spec(root.path(), cwd.path(), "Claude · 1");
         let dir = cwd.path().join(".crowded").join("claude-mod");
@@ -8488,14 +8385,14 @@ mod tests {
         )
         .unwrap();
         let (spec, session) = pane.relaunch_claude(ClaudeRelaunch::Resume, 1).unwrap();
-        assert_eq!(session, stored);
-        assert_eq!(spec.args, plugin_dir_args("--resume", &stored, &dir));
+        assert_eq!(session.as_deref(), Some(stored.as_str()));
+        assert_eq!(spec.args, resume_args(&stored, &dir));
         let (spec, session) = pane.relaunch_claude(ClaudeRelaunch::Restart, 1).unwrap();
-        assert_eq!(session, stored);
-        assert_eq!(spec.args, plugin_dir_args("--resume", &stored, &dir));
-        let (spec, cleared) = pane.relaunch_claude(ClaudeRelaunch::Clear, 1).unwrap();
-        assert_ne!(cleared, stored);
-        assert_eq!(spec.args, plugin_dir_args("--session-id", &cleared, &dir));
+        assert_eq!(session.as_deref(), Some(stored.as_str()));
+        assert_eq!(spec.args, resume_args(&stored, &dir));
+        let (spec, session) = pane.relaunch_claude(ClaudeRelaunch::Clear, 1).unwrap();
+        assert_eq!(session, None);
+        assert_eq!(spec.args, fresh_args(&dir));
         // A title with no stored session still fails instead of starting.
         let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
         let fresh = Pane::spawn_unavailable(
@@ -8524,7 +8421,7 @@ mod tests {
         let mut specs = vec![spec];
         let (starts, notices) = start_claude_sessions(&mut specs);
         assert!(notices.is_empty(), "{notices:?}");
-        assert!(matches!(&starts[0], Some(ClaudeStart::Ready(_))));
+        assert!(matches!(&starts[0], Some(ClaudeStart::Fresh)));
         let mut plugin_dirs = 0;
         for arg in &specs[0].args {
             plugin_dirs += usize::from(arg == "--plugin-dir");
@@ -8866,8 +8763,8 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
                 "claude",
                 &format!("printf 'exec\\n' >> '{}'\nexec sleep 30", log1.display()),
             );
-            session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
-            session_state::upsert_minted("claude", cwd.path(), "Claude · 2", MINTED_B).unwrap();
+            session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+            session_state::upsert_reported("claude", cwd.path(), "Claude · 2", MINTED_B).unwrap();
             let mut panes = vec![
                 Pane::spawn_unavailable(
                     claude_native_spec_for(&stub0, cwd.path(), "Claude · 1"),
@@ -9129,9 +9026,9 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
                 "claude",
                 "exec sleep 30",
             );
-            session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
-            session_state::upsert_minted("claude", cwd.path(), "Claude · 2", MINTED_B).unwrap();
-            session_state::upsert_minted("claude", cwd.path(), "Claude · 3", MINTED_C).unwrap();
+            session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+            session_state::upsert_reported("claude", cwd.path(), "Claude · 2", MINTED_B).unwrap();
+            session_state::upsert_reported("claude", cwd.path(), "Claude · 3", MINTED_C).unwrap();
             let mut panes = vec![
                 Pane::spawn_unavailable(
                     claude_native_spec_for(&stub0, cwd.path(), "Claude · 1"),
