@@ -2026,6 +2026,45 @@ pub(crate) fn restart_key(
     )
 }
 
+/// The restart arm of the event loop: the only place a key event becomes a
+/// launch. The loop calls this once per restart key; tests drive the same path
+/// with a real KeyEvent and no terminal.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_rooms_restart_key(
+    key: KeyEvent,
+    size: portable_pty::PtySize,
+    focused: usize,
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    codex: &mut [Option<pane::CodexMint>],
+    delivery_gates: &mut [DeliveryGate],
+    last_output: &mut [Option<Instant>],
+    spawned_at: &mut [Instant],
+    room_pulses: &mut [Option<PulseSample>],
+    environments: &[pane::GuestEnvironment],
+    fuse_size: usize,
+    now: Instant,
+    notice: &mut Notices,
+) {
+    if let Some((text, severity)) = restart_key(
+        key,
+        size,
+        focused,
+        panes,
+        router,
+        codex,
+        delivery_gates,
+        last_output,
+        spawned_at,
+        room_pulses,
+        environments,
+        fuse_size,
+        now,
+    ) {
+        notice.push(text, severity);
+    }
+}
+
 /// Sends doorbell mail to a native room through the router. This is the only
 /// native delivery path: a room never falls back to terminal paste, not even
 /// when the router cannot take the message.
@@ -3672,7 +3711,7 @@ fn run_rooms(
                     terminal.autoresize()?;
                     let (rooms, _, _) = content_areas(terminal.size()?.into());
                     let area = pane_areas(rooms, room_count)[focused];
-                    if let Some((text, severity)) = restart_key(
+                    run_rooms_restart_key(
                         key,
                         pane_size(area),
                         focused,
@@ -3686,9 +3725,8 @@ fn run_rooms(
                         &environments,
                         fuse_size,
                         Instant::now(),
-                    ) {
-                        notice.push(text, severity);
-                    }
+                        &mut notice,
+                    );
                 }
 
                 Event::Key(key) => match &mut input_mode {
@@ -6299,6 +6337,33 @@ mod tests {
         assert_eq!(body.matches("TerminalGuard::enter").count(), 1);
         assert!(!body.contains("TerminalGuard::enter()"));
         assert!(body.contains("launch_native_rooms"));
+    }
+
+    /// The loop needs a real terminal, so its call site is checked here while
+    /// the restart itself is driven through the seam by the named pane tests.
+    #[test]
+    fn run_rooms_dispatches_restart_keys_through_the_seam() {
+        let source = include_str!("app.rs");
+        let production = &source[..source.find("#[cfg(test)]").unwrap()];
+        let body = &production[production.find("fn run_rooms(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert_eq!(
+            body.matches("run_rooms_restart_key(").count(),
+            1,
+            "the loop calls the restart seam exactly once"
+        );
+        let arm = body
+            .find("Event::Key(key) if force_restart_requested")
+            .expect("the restart key arm is present");
+        let call = body.find("run_rooms_restart_key(").unwrap();
+        assert!(call > arm, "the seam is called from the restart key arm");
+        let seam = &production[production.find("fn run_rooms_restart_key(").unwrap()..];
+        let seam = &seam[..seam.find("\n}\n").unwrap()];
+        assert_eq!(
+            seam.matches("= restart_key(").count(),
+            1,
+            "the seam owns the single restart_key call"
+        );
     }
 
     /// The only direct writes to a pane's terminal that the app may contain.

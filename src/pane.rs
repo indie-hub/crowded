@@ -5476,6 +5476,175 @@ mod tests {
         assert!(!log_text.lines().any(|line| line == "exec"), "{log_text}");
     }
 
+    /// F5 drives the loop's restart seam for an offline native Claude room:
+    /// the room comes back on its native path with a new generation and one exec.
+    #[cfg(unix)]
+    #[test]
+    fn f5_drives_the_loop_restart_seam_for_a_native_claude_room() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("claude.exec");
+        let stub = codex_stub_for_pane(
+            root.path(),
+            "claude",
+            &format!(
+                "printf 'exec\\n' >> '{}'\nprintf '%s\\n' \"$@\" >> '{}'\nexec sleep 30",
+                log.display(),
+                log.display()
+            ),
+        );
+        session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        let spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
+        let mut rig = IterationHarness::new(root.path());
+        rig.panes[0] =
+            Pane::spawn_unavailable(spec, small_size(), GuestEnvironment::new([]), "offline")
+                .unwrap();
+        bind_claude_room(rig.router.as_mut().unwrap(), &mut rig.panes, 0, MINTED_A).unwrap();
+        let old = rig.router.as_ref().unwrap().binding_for(0).unwrap().generation;
+
+        let f5 = KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE);
+        crate::app::run_rooms_restart_key(
+            f5,
+            small_size(),
+            0,
+            &mut rig.panes,
+            rig.router.as_mut(),
+            &mut rig.codex,
+            &mut rig.gates,
+            &mut rig.last_output,
+            &mut rig.spawned_at,
+            &mut rig.pulses,
+            &rig.environments,
+            100,
+            Instant::now(),
+            &mut rig.notice,
+        );
+
+        let shown = rig.notice.ordered_lines().join("; ");
+        assert!(shown.ends_with("restarted"), "{shown}");
+        let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        assert!(binding.generation > old, "the native generation must advance");
+        let args: Vec<String> = rig.panes[0]
+            .room_spec()
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2).any(|pair| {
+                (pair[0] == "--session-id" || pair[0] == "--resume")
+                    && pair[1] == binding.session
+            }),
+            "{args:?}"
+        );
+        let launched = || {
+            fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| *line == "exec")
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while launched() < 1 {
+            assert!(Instant::now() < deadline, "the fake claude was never relaunched");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(launched(), 1, "one exec per relaunch");
+    }
+
+    /// Ctrl+R on an offline native Codex room reaches the same loop seam and
+    /// resumes its stored session under a new generation, with no second exec.
+    #[cfg(unix)]
+    #[test]
+    fn offline_ctrl_r_drives_the_loop_restart_seam_for_a_native_codex_room() {
+        let _state = session_state::StateRootGuard::isolated();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("codex.calls");
+        let stub = gated_codex_stub(root.path(), &log, &root.path().join("gate"), MINTED_B);
+        session_state::upsert_minted("codex", cwd.path(), "Room A", MINTED_A).unwrap();
+        let mut rig = IterationHarness::new(root.path());
+        rig.codex_pane_offline(&stub, cwd.path(), "Room A", MINTED_B);
+        let old = crate::native_launch::GenerationAllocator::new(session_state::state_directory())
+            .next()
+            .unwrap();
+        rig.bind(
+            Some(IterationHarness::healthy_room(&stub, cwd.path(), MINTED_B)),
+            old,
+            None,
+        );
+
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        crate::app::run_rooms_restart_key(
+            ctrl_r,
+            small_size(),
+            0,
+            &mut rig.panes,
+            rig.router.as_mut(),
+            &mut rig.codex,
+            &mut rig.gates,
+            &mut rig.last_output,
+            &mut rig.spawned_at,
+            &mut rig.pulses,
+            &rig.environments,
+            100,
+            Instant::now(),
+            &mut rig.notice,
+        );
+
+        let shown = rig.notice.ordered_lines().join("; ");
+        assert!(shown.ends_with("restarted"), "{shown}");
+        let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        assert_eq!(binding.session, MINTED_A);
+        assert!(binding.generation > old);
+        let resumed = || {
+            fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.starts_with("resume"))
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while resumed() < 1 {
+            assert!(Instant::now() < deadline, "the fake codex never resumed");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(resumed(), 1, "one resume per relaunch, no second exec");
+        let log_text = fs::read_to_string(&log).unwrap_or_default();
+        assert!(!log_text.lines().any(|line| line.starts_with("exec")));
+    }
+
+    /// The seam leaves an online Ctrl+R alone and the literal 0x12 byte still
+    /// reaches the child, so reverse search keeps working (INV-5).
+    #[cfg(unix)]
+    #[test]
+    fn an_online_ctrl_r_is_not_a_restart_and_forwards_0x12() {
+        let (mut pane, captured) = pane_with_capture(4, 20);
+        assert!(pane.is_online());
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let mut notice = crate::app::Notices::default();
+        crate::app::run_rooms_restart_key(
+            ctrl_r,
+            small_size(),
+            0,
+            std::slice::from_mut(&mut pane),
+            None,
+            &mut [None],
+            &mut [crate::app::DeliveryGate::new(false)],
+            &mut [None],
+            &mut [Instant::now()],
+            &mut [None],
+            &[GuestEnvironment::new([])],
+            100,
+            Instant::now(),
+            &mut notice,
+        );
+        assert!(notice.ordered_lines().is_empty());
+        assert!(crate::app::forward_key(&mut pane, ctrl_r).is_none());
+        wait_for_captured(&captured, &[0x12]);
+    }
+
     /// A clear whose durable marker cannot be saved must not start a mint or
     /// change the room: the previous session stays the one a resume would use.
     #[cfg(unix)]
