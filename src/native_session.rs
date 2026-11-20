@@ -43,6 +43,29 @@ pub(crate) fn same_launch_placeholder(held: &Binding, current: &Binding) -> bool
         && is_unreported_placeholder(held)
 }
 
+/// What a session report does to the launch generation: [`ReportedGeneration`]
+/// keeps the caller's allocation and error handling.
+pub(crate) enum ReportedGeneration {
+    /// The launch keeps its generation: the report turns the launch's
+    /// unreported placeholder into the real session, so mail saved against
+    /// the placeholder still belongs to this launch.
+    Keep(u64),
+    /// A session switch or relaunch takes a new generation, which holds older
+    /// mail as stale. The caller allocates it.
+    Allocate,
+}
+
+/// Decides the generation for a session report without allocating anything:
+/// a launch placeholder keeps its generation on its first report.
+pub(crate) fn generation_for_report(current: Option<&Binding>) -> ReportedGeneration {
+    match current {
+        Some(binding) if is_unreported_placeholder(binding) => {
+            ReportedGeneration::Keep(binding.generation)
+        }
+        _ => ReportedGeneration::Allocate,
+    }
+}
+
 /// Whether a queued message is held only because its launch is gone: it can
 /// never be adopted onto another binding.
 pub(crate) fn is_stale_hold(message: &Message) -> bool {

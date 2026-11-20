@@ -2260,15 +2260,15 @@ fn apply_session_report(
     // real session: the launch keeps its generation, so mail saved against the
     // placeholder still belongs to this launch. Any later report is a session
     // switch and takes a new generation, which holds older mail as stale.
-    let generation = match current.as_ref() {
-        Some(binding) if crate::native_outbox::is_unreported_placeholder(binding) => {
-            binding.generation
+    let generation = match crate::native_session::generation_for_report(current.as_ref()) {
+        crate::native_session::ReportedGeneration::Keep(generation) => generation,
+        crate::native_session::ReportedGeneration::Allocate => {
+            crate::native_launch::GenerationAllocator::new(
+                crate::pane::session_state::state_directory(),
+            )
+            .next()
+            .map_err(|error| format!("{title} could not take a launch generation: {error}"))?
         }
-        _ => crate::native_launch::GenerationAllocator::new(
-            crate::pane::session_state::state_directory(),
-        )
-        .next()
-        .map_err(|error| format!("{title} could not take a launch generation: {error}"))?,
     };
     let destination = (from + 1).to_string();
     if panes[from].codex_native() {
