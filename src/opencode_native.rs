@@ -543,6 +543,25 @@ impl Server {
         Ok(result)
     }
 
+    /// Starts a new session on this owned server for a cleared room: the
+    /// server, endpoint and ownership evidence stay, only the session and its
+    /// generation change. The session is created first, so a failed request
+    /// leaves the previous binding untouched.
+    #[allow(dead_code)]
+    pub(crate) fn new_session(&mut self, room: String, generation: u64) -> io::Result<Binding> {
+        let session = self.client.create_session()?;
+        let mut owned = self
+            .binding
+            .lock()
+            .map_err(|_| io::Error::other("server binding state is poisoned"))?;
+        let launch = owned
+            .as_mut()
+            .ok_or_else(|| io::Error::other("server is not bound"))?;
+        let binding = launch.adopt_report(room, generation, session.clone())?;
+        self.session = session;
+        Ok(binding)
+    }
+
     pub fn claim_async(
         mut self,
         room: String,
@@ -1085,6 +1104,55 @@ mod tests {
         });
         client.verify_pid(42).unwrap();
         assert_eq!(client.create_session().unwrap(), "ses_explicit");
+    }
+
+    #[test]
+    fn a_new_session_replaces_the_binding_and_keeps_the_server() {
+        let client = fake(2, |i, headers, _| {
+            assert!(headers.starts_with("POST /api/session "));
+            match i {
+                0 => Some(response(200, &json!({"data": {"id": "ses_fresh"}}))),
+                _ => Some(response(500, &json!({}))),
+            }
+        });
+        let mut launch = LaunchBinding::new("1".into(), 3, 42).unwrap();
+        let old = launch
+            .bind(OwnershipEvidence {
+                child_pid: 42,
+                reported_pid: 42,
+                endpoint: client.address,
+                session: "ses_old".into(),
+                generation: 3,
+            })
+            .unwrap()
+            .clone();
+        let mut server = Server {
+            child: None,
+            client: Arc::clone(&client),
+            session: "ses_old".into(),
+            url: format!("http://{}", client.address),
+            binding: Mutex::new(Some(launch)),
+            server_pid: Some(42),
+        };
+        let fresh = server.new_session("1".into(), 9).unwrap();
+        assert_eq!(fresh.session, "ses_fresh");
+        assert_eq!(fresh.endpoint, old.endpoint);
+        assert_eq!(fresh.generation, 9);
+        assert_eq!(server.session, "ses_fresh");
+        {
+            let owned = server.binding.lock().unwrap();
+            let launch = owned.as_ref().unwrap();
+            assert!(!launch.accepts(&old));
+            assert!(launch.accepts(&fresh));
+        }
+        // A failed creation leaves the binding and the session in place.
+        assert!(server.new_session("1".into(), 10).is_err());
+        assert_eq!(server.session, "ses_fresh");
+        let owned = server.binding.lock().unwrap();
+        let launch = owned.as_ref().unwrap();
+        assert!(launch.accepts(&fresh));
+        assert!(!launch.accepts(&old));
+        assert_eq!(launch.bound().unwrap().generation, 9);
     }
 
     #[test]
