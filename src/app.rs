@@ -4165,8 +4165,13 @@ fn run_rooms(
     )
 }
 
+/// Test-only rig shared with the native delivery lifecycle harness: only the
+/// pieces the harness drives are visible outside [`tests`].
+#[cfg(all(test, unix))]
+pub(crate) use tests::{ReportDispatch, report_test_pane, report_test_spec, report_test_stub};
+
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
 
     #[test]

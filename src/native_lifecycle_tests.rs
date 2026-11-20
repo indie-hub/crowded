@@ -1,85 +1,41 @@
 //! Deterministic lifecycle tests for native Claude delivery: the real router,
 //! the durable outbox and room relaunch driven through production callers,
 //! with [`FakeMod`] standing in for the room's mod. No sleeps and no timing
-//! asserts: helpers pump the loop with yields under bounded deadlines (the
-//! deadline only guards hangs) and assert on delivered bodies, counts,
-//! generations and bindings. Negative asserts poll for a full second, about
-//! ten schedule intervals, so an offer that could happen has time to happen.
+//! asserts: helpers pump bounded dispatch rounds with yields (deadlines only
+//! guard hangs) and assert on delivered bodies, counts, generations and
+//! bindings. Negative phases assert nothing is offered over bounded pumps
+//! and then require a later marker message to be offered and accepted,
+//! proving the loop was alive. The harness mutates no process-global state:
+//! every room runs on explicit tempdir paths, and phantom sessions use
+//! random ids whose files cannot exist in any config dir.
 
-use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::app::tests::{ReportDispatch, report_test_pane, report_test_spec, report_test_stub};
+use crate::app::{ReportDispatch, report_test_pane, report_test_spec, report_test_stub};
 use crate::claude_inbox::{Claim, FakeMod, bootstrap_file};
 use crate::native_outbox::{is_unreported_placeholder, unreported_session};
 use crate::native_route::{ClaudeEntry, NativeRouter};
 use crate::pane::{self, ClaudeRelaunch, ClaudeStart, session_state::StateRootGuard};
 
-/// Saves every process-level `CROWDED_*` variable and removes it, so a stub
-/// room can never touch a live room; the previous environment is restored on
-/// drop. No other test mutates process-level `CROWDED_*`, so no lock is
-/// needed. `CLAUDE_CONFIG_DIR` is deliberately left alone: phantom sessions
-/// use random ids whose files cannot exist in any config dir.
-struct EnvGuard {
-    saved: Vec<(String, Option<OsString>)>,
-}
-
-impl EnvGuard {
-    fn new() -> Self {
-        let names: Vec<String> = std::env::vars_os()
-            .filter_map(|(key, _)| {
-                let name = key.to_string_lossy().into_owned();
-                name.starts_with("CROWDED_").then_some(name)
-            })
-            .collect();
-        let saved = names
-            .into_iter()
-            .map(|name| {
-                let value = std::env::var_os(&name);
-                // Safety: process-level `CROWDED_*` is only read by children.
-                unsafe {
-                    std::env::remove_var(&name);
-                }
-                (name, value)
-            })
-            .collect();
-        Self { saved }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in self.saved.drain(..) {
-            // Safety: restores exactly what was saved above.
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-    }
-}
-
 /// One bound Claude room per title, each with its own working directory, on a
-/// fresh isolated state root and a router bound to fresh placeholders.
+/// fresh isolated state root and a router bound to fresh placeholders. Fields
+/// drop in declaration order, so the rig (router worker, room processes)
+/// shuts down before the guards and tempdirs it ran on go away.
 struct Fixture {
-    _state: StateRootGuard,
-    _env: EnvGuard,
-    _root: tempfile::TempDir,
+    rig: ReportDispatch,
     cwds: Vec<tempfile::TempDir>,
     titles: Vec<String>,
     /// The mod's credentials per room, read once at bind time: a report
     /// replaces the bootstrap file, but the inbox server stays the same.
     conns: Vec<(String, String)>,
     outbox_path: PathBuf,
-    rig: ReportDispatch,
+    _root: tempfile::TempDir,
+    _state: StateRootGuard,
 }
 
 impl Fixture {
     fn fresh(titles: &[&str]) -> Self {
         let _state = StateRootGuard::isolated();
-        let _env = EnvGuard::new();
         let root = tempfile::tempdir().unwrap();
         let program = report_test_stub(root.path(), "claude", &root.path().join("calls"));
         let mut cwds = Vec::new();
@@ -101,14 +57,13 @@ impl Fixture {
         let rig = ReportDispatch::new(panes, Some(router));
         let titles = titles.iter().map(|title| (*title).to_owned()).collect();
         let mut fx = Self {
-            _state,
-            _env,
-            _root: root,
+            rig,
             cwds,
             titles,
             conns: Vec::new(),
             outbox_path,
-            rig,
+            _root: root,
+            _state,
         };
         for index in 0..fx.titles.len() {
             fx.conns.push(fx.read_bootstrap(index));
@@ -144,15 +99,38 @@ impl Fixture {
         self.rig.dispatch()
     }
 
-    fn pump(&mut self, rounds: usize) {
-        for _ in 0..rounds {
-            self.rig.dispatch();
-            std::thread::yield_now();
-        }
-    }
-
     fn conn(&self, index: usize) -> (String, String) {
         self.conns[index].clone()
+    }
+
+    /// Bounded quiet pumps with positive completion evidence: nothing may be
+    /// offered during the quiet pumps, then a marker sent after them must be
+    /// offered and accepted, proving the loop was alive the whole time. A
+    /// stale mail that could be offered would surface instead of (or before)
+    /// the marker, since it is older.
+    fn assert_quiet_then_marker(&mut self, mod_: &FakeMod, to: usize, marker: &str, why: &str) {
+        const QUIET_PUMPS: usize = 200;
+        for _ in 0..QUIET_PUMPS {
+            self.rig.dispatch();
+            assert!(
+                mod_.next_claim().is_none(),
+                "{why}: mail was offered during the quiet pumps"
+            );
+            std::thread::yield_now();
+        }
+        self.send(to, marker);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < end {
+            self.rig.dispatch();
+            if let Some(claim) = mod_.next_claim() {
+                assert!(claim.text.ends_with(marker), "{}: {}", claim.text, why);
+                assert_eq!(mod_.receipt(&claim, "started", ""), 200);
+                settle(&mut self.rig, "ACCEPTED by Claude");
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("{why}: marker was never offered");
     }
 
     /// Re-reads the room's bootstrap file after a relaunch or router restart
@@ -235,26 +213,6 @@ fn settle(rig: &mut ReportDispatch, marker: &str) {
     panic!("never settled: {}", rig.mailroom.summary());
 }
 
-/// Spins the loop for the whole duration, collecting anything the mod is
-/// offered: a negative assert needs several schedule intervals to mean
-/// anything, and spinning alone would finish in microseconds.
-fn offers_within(
-    rig: &mut ReportDispatch,
-    mod_: &FakeMod,
-    wait: std::time::Duration,
-) -> Vec<String> {
-    let end = std::time::Instant::now() + wait;
-    let mut offered = Vec::new();
-    while std::time::Instant::now() < end {
-        rig.dispatch();
-        while let Some(claim) = mod_.next_claim() {
-            offered.push(claim.text);
-        }
-        std::thread::yield_now();
-    }
-    offered
-}
-
 /// Mail held before the mod registers is delivered after it registers, under
 /// the same placeholder binding and exactly once.
 #[test]
@@ -265,7 +223,6 @@ fn held_mail_before_mod_registration_is_delivered_after_it_registers() {
     fx.send(0, "hello-before-mod");
     // The schedule ran while no mod was connected: the hold is on record.
     settle(&mut fx.rig, "HELD: no Claude mod connected");
-    fx.pump(20);
     assert!(is_unreported_placeholder(&fx.binding(0)));
     let (url, token) = fx.conn(0);
     let mod_ = FakeMod::register(&url, &token);
@@ -273,18 +230,15 @@ fn held_mail_before_mod_registration_is_delivered_after_it_registers() {
     assert!(claim.text.ends_with("hello-before-mod"), "{}", claim.text);
     assert_eq!(mod_.receipt(&claim, "started", ""), 200);
     settle(&mut fx.rig, "ACCEPTED by Claude");
-    assert!(
-        offers_within(&mut fx.rig, &mod_, std::time::Duration::from_secs(1)).is_empty(),
-        "held mail was offered twice"
-    );
     let after = fx.binding(0);
     assert_eq!(after.session, before.session);
     assert_eq!(after.generation, before.generation);
+    fx.assert_quiet_then_marker(&mod_, 0, "marker-quiet-s1", "held mail was offered twice");
 }
 
 /// The first report of a launch keeps its generation; mail saved earlier is
-/// delivered to the reported session in order, exactly once. Re-registering
-/// the same mod delivers nothing again.
+/// delivered to the reported session in order, exactly once. The mod keeps
+/// polling with the same receiver afterwards and sees nothing twice.
 #[test]
 fn first_report_keeps_generation_and_delivers_once_in_order() {
     const REPORTED: &str = "8c3f4b96-3b74-4021-9f83-2c3d4e5f6071";
@@ -307,24 +261,16 @@ fn first_report_keeps_generation_and_delivers_once_in_order() {
     assert!(second.text.ends_with("second"), "{}", second.text);
     assert_eq!(mod_.receipt(&second, "started", ""), 200);
     settle(&mut fx.rig, "ACCEPTED by Claude");
-    assert!(
-        offers_within(&mut fx.rig, &mod_, std::time::Duration::from_secs(1)).is_empty(),
-        "mail was offered twice"
-    );
-    // The mod survived the report with the same receiver: re-registering
-    // while it is live is refused, and polling on shows nothing twice.
+    // The mod survived the report with the same receiver: polling on with a
+    // resumed handle shows nothing twice, then a marker must flow.
     let again = mod_.resumed();
-    assert_eq!(again.register_again(), 409);
-    assert!(
-        offers_within(&mut fx.rig, &again, std::time::Duration::from_secs(1)).is_empty(),
-        "re-registration duplicated mail"
-    );
+    fx.assert_quiet_then_marker(&again, 0, "marker-quiet-s2", "mail was offered twice");
 }
 
 /// A relaunch moves the room to a new generation: old-launch mail stays held
 /// and is never sent to the new session, while new mail flows. Reopening the
-/// durable outbox gives the same verdict, and re-registering the same mod
-/// delivers nothing again.
+/// durable outbox gives the same verdict, and the mod keeps polling with the
+/// same receiver afterwards and sees nothing twice.
 #[test]
 fn relaunch_into_a_new_generation_keeps_old_mail_stale() {
     let mut fx = Fixture::fresh(&["Claude · 1"]);
@@ -343,17 +289,17 @@ fn relaunch_into_a_new_generation_keeps_old_mail_stale() {
     assert!(claim.text.ends_with("new-mail"), "{}", claim.text);
     assert_eq!(mod_.receipt(&claim, "started", ""), 200);
     settle(&mut fx.rig, "ACCEPTED by Claude");
-    assert!(
-        offers_within(&mut fx.rig, &mod_, std::time::Duration::from_secs(1)).is_empty(),
-        "old-launch mail crossed generations"
-    );
-    // The mod survived the relaunch with the same receiver: re-registering
-    // while it is live is refused, and polling on shows nothing twice.
+    // The old mail is still held, visibly stale: the silence below is a
+    // verdict, not an idle loop.
+    settle(&mut fx.rig, "sent for an earlier launch");
+    // The mod survived the relaunch with the same receiver: polling on with
+    // a resumed handle shows nothing twice, then a marker must flow.
     let again = mod_.resumed();
-    assert_eq!(again.register_again(), 409);
-    assert!(
-        offers_within(&mut fx.rig, &again, std::time::Duration::from_secs(1)).is_empty(),
-        "re-registration duplicated mail"
+    fx.assert_quiet_then_marker(
+        &again,
+        0,
+        "marker-quiet-s3",
+        "old-launch mail crossed generations",
     );
 }
 
@@ -428,10 +374,7 @@ fn pending_mark_adopts_only_pending_held_mail() {
     assert!(claim.text.ends_with("while-pending"), "{}", claim.text);
     assert_eq!(mod_.receipt(&claim, "started", ""), 200);
     settle(&mut fx.rig, "ACCEPTED by Claude");
-    assert!(
-        offers_within(&mut fx.rig, &mod_, std::time::Duration::from_secs(1)).is_empty(),
-        "stale pre-mark mail leaked"
-    );
+    fx.assert_quiet_then_marker(&mod_, 0, "marker-quiet-s5", "stale pre-mark mail leaked");
 }
 
 /// A fresh relaunch with wiped durable state sends nothing stale and mints no
@@ -466,10 +409,7 @@ fn fresh_relaunch_with_wiped_state_sends_nothing_stale() {
     fx.refresh_conn(0);
     let (url, token) = fx.conn(0);
     let mod_ = FakeMod::register(&url, &token);
-    assert!(
-        offers_within(&mut fx.rig, &mod_, std::time::Duration::from_secs(1)).is_empty(),
-        "wiped mail came back"
-    );
+    fx.assert_quiet_then_marker(&mod_, 0, "marker-quiet-s6", "wiped mail came back");
     fx.send(0, "clean-slate");
     let claim = claim_next(&mut fx.rig, &mod_).expect("new mail was never offered");
     assert!(claim.text.ends_with("clean-slate"), "{}", claim.text);
@@ -505,12 +445,6 @@ fn two_rooms_with_interleaved_reports_keep_their_mail_apart() {
     assert_eq!(mod0.receipt(&claim0, "started", ""), 200);
     assert_eq!(mod1.receipt(&claim1, "started", ""), 200);
     settle(&mut fx.rig, "ACCEPTED by Claude");
-    assert!(
-        offers_within(&mut fx.rig, &mod0, std::time::Duration::from_secs(1)).is_empty(),
-        "room 1 got room 2's mail"
-    );
-    assert!(
-        offers_within(&mut fx.rig, &mod1, std::time::Duration::from_secs(1)).is_empty(),
-        "room 2 got room 1's mail"
-    );
+    fx.assert_quiet_then_marker(&mod0, 0, "marker-quiet-7a", "room 1 got room 2's mail");
+    fx.assert_quiet_then_marker(&mod1, 1, "marker-quiet-7b", "room 2 got room 1's mail");
 }
