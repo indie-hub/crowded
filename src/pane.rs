@@ -9409,15 +9409,13 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
 
         impl EventSource for ScriptedEvents {
             fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
-                loop {
-                    match self.steps.front() {
-                        Some(ScriptedStep::Event(_)) => return Ok(true),
-                        Some(ScriptedStep::Idle) => {
-                            self.steps.pop_front();
-                            return Ok(false);
-                        }
-                        None => return Ok(false),
+                match self.steps.front() {
+                    Some(ScriptedStep::Event(_)) => Ok(true),
+                    Some(ScriptedStep::Idle) => {
+                        self.steps.pop_front();
+                        Ok(false)
                     }
+                    None => Ok(false),
                 }
             }
 
