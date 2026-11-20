@@ -305,7 +305,15 @@ keeps sessions at `<config>/projects/<cwd-encoded>/<id>.jsonl`, where
 replaced by `-` (`/Users/bruno/.meridian` becomes `-Users-bruno--meridian`).
 If that file is absent, or the cwd encodes differently (a very long path Claude
 may truncate, for instance), the room starts fresh and the hook reports the new
-session. No id is guessed and no stale id is retried.
+session. No id is guessed and no stale id is retried. A reported id whose file
+cannot be found is kept, not erased: that launch skips `--resume` and the next
+report replaces the id, so a check that can only fail safe never loses what the
+room reported. The directory that is checked is `CLAUDE_CONFIG_DIR` (or `HOME`)
+from the room's launch environment; Crowded reads the room's variables, but
+`crowded.toml` has no per-room environment key, so set `CLAUDE_CONFIG_DIR` in
+the environment Crowded itself runs in. A launcher wrapper that exports
+`CLAUDE_CONFIG_DIR` inside the child only is invisible to the check: the stored
+id is kept and the launch starts fresh, which is the fail-safe result.
 
 Before its session is known, a fresh room's mod reads the per-room bootstrap
 connection file `<cwd>/.crowded/claude-inbox/_bootstrap.<room>.json` (named by

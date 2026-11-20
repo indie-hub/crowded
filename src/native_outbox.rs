@@ -304,14 +304,19 @@ mod tests {
     }
 
     /// Mail saved before a Claude mod connects is held, not lost: once the mod
-    /// registers it moves to the room's current binding and is offered exactly
-    /// once, even when the room reported a new session meanwhile.
+    /// registers it is offered exactly once, while the room still has the
+    /// launch's own unreported placeholder binding.
     #[test]
     fn startup_mail_held_for_a_missing_mod_is_delivered_once_it_registers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outbox.json");
         let mut outbox = Outbox::open(&path, 4, 4, 1).unwrap();
-        let startup = binding("a", 1);
+        let startup = Binding {
+            room: "a".to_owned(),
+            session: unreported_session("a", 1),
+            endpoint: "claude".to_owned(),
+            generation: 1,
+        };
         let startup_bindings = HashMap::from([("a".to_owned(), startup.clone())]);
         let calls = Arc::new(AtomicUsize::new(0));
         let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -336,15 +341,12 @@ mod tests {
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // The mod registers and the room reports its session: the intro moves
-        // onto that binding and is offered once.
+        // The mod registers in the same launch: the intro is offered once.
         ready.store(true, Ordering::SeqCst);
-        let reported = pending_binding("a", 2);
-        let reported_bindings = HashMap::from([("a".to_owned(), reported.clone())]);
         outbox
-            .schedule(&reported_bindings, false, false, &[], Arc::clone(&adapter))
+            .schedule(&startup_bindings, false, false, &[], Arc::clone(&adapter))
             .unwrap();
-        wait(&mut outbox, &reported_bindings);
+        wait(&mut outbox, &startup_bindings);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         let delivered = outbox
             .state
@@ -353,13 +355,126 @@ mod tests {
             .find(|message| message.id == id)
             .expect("the intro is kept as history");
         assert_eq!(delivered.status, Status::Accepted);
-        assert_eq!(delivered.binding, reported);
+        assert_eq!(delivered.binding, startup_bindings["a"]);
 
         // Accepted mail is never offered again.
         outbox
-            .schedule(&reported_bindings, false, false, &[], adapter)
+            .schedule(&startup_bindings, false, false, &[], adapter)
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Mail held for one session or launch is never delivered to another: a
+    /// relaunch on session B must not receive session A's held mail.
+    #[test]
+    fn held_mail_for_an_older_session_is_never_delivered_to_a_new_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let mut outbox = Outbox::open(&path, 4, 4, 1).unwrap();
+        let old = binding("a", 1);
+        let old_bindings = HashMap::from([("a".to_owned(), old.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let id = outbox
+            .enqueue("source".into(), old.clone(), "old mail".into())
+            .unwrap()
+            .id;
+        outbox
+            .schedule(&old_bindings, false, false, &[], fake(&calls, held))
+            .unwrap();
+        wait(&mut outbox, &old_bindings);
+        assert_eq!(hold_of(&mut outbox, &id), Some(CLAUDE_HOLD.to_owned()));
+
+        // The room relaunches on another session; its mod is live.
+        let next = pending_binding("a", 2);
+        let next_bindings = HashMap::from([("a".to_owned(), next)]);
+        let delivered = Arc::new(AtomicUsize::new(0));
+        outbox
+            .schedule(&next_bindings, false, false, &[], fake(&delivered, accepted))
+            .unwrap();
+        assert_eq!(delivered.load(Ordering::SeqCst), 0, "old mail reached the new session");
+        assert_eq!(hold_of(&mut outbox, &id), Some(STALE_HOLD.to_owned()));
+        assert_eq!(
+            outbox
+                .state
+                .messages
+                .iter()
+                .find(|message| message.id == id)
+                .unwrap()
+                .binding,
+            old
+        );
+    }
+
+    /// An adapter that records the order it was asked to send in, and can be
+    /// unreachable for exactly the first readiness check.
+    struct OrderedFake {
+        checks: AtomicUsize,
+        order: std::sync::Mutex<Vec<String>>,
+    }
+    impl Adapter for OrderedFake {
+        fn send(&self, message: Message) -> AdapterResult {
+            self.order.lock().unwrap().push(message.text);
+            accepted()
+        }
+        fn ready(&self, _: &str) -> bool {
+            self.checks.fetch_add(1, Ordering::SeqCst) > 0
+        }
+    }
+
+    /// While an older message is held the room is blocked: a newer message is
+    /// never sent before it, even across a readiness change inside one pass.
+    #[test]
+    fn an_older_held_message_is_never_overtaken_by_newer_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let mut outbox = Outbox::open(&path, 4, 4, 1).unwrap();
+        let b = binding("a", 1);
+        let bindings = HashMap::from([("a".to_owned(), b.clone())]);
+        let held_calls = Arc::new(AtomicUsize::new(0));
+        outbox
+            .enqueue("source".into(), b.clone(), "older".into())
+            .unwrap();
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&held_calls, held))
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        outbox
+            .enqueue("source".into(), b.clone(), "newer".into())
+            .unwrap();
+        let adapter = Arc::new(OrderedFake {
+            checks: AtomicUsize::new(0),
+            order: std::sync::Mutex::new(Vec::new()),
+        });
+        let as_adapter: Arc<dyn Adapter> = Arc::clone(&adapter) as Arc<dyn Adapter>;
+
+        // The room cannot receive on the first look: nothing may go out, and
+        // in particular the newer message must not overtake the older hold.
+        outbox
+            .schedule(&bindings, false, false, &[], Arc::clone(&as_adapter))
+            .unwrap();
+        assert!(
+            outbox
+                .state
+                .messages
+                .iter()
+                .all(|message| message.status != Status::Sending),
+            "newer mail was sent while the older message was held"
+        );
+
+        // The room can receive: the older message goes first, then the newer.
+        outbox
+            .schedule(&bindings, false, false, &[], Arc::clone(&as_adapter))
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        outbox
+            .schedule(&bindings, false, false, &[], as_adapter)
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(*adapter.order.lock().unwrap(), vec!["older".to_owned(), "newer".to_owned()]);
+    }
+
+    fn held() -> AdapterResult {
+        AdapterResult::Dropped(CLAUDE_HOLD.to_owned())
     }
 
     fn dropped() -> AdapterResult {
@@ -1020,6 +1135,22 @@ fn is_stale_hold(message: &Message) -> bool {
     matches!(&message.status, Status::Queued { hold: Some(reason) } if reason == STALE_HOLD)
 }
 
+/// The session name a Claude room is bound to before its own hook reports the
+/// real session. It names one launch, never a session, and is never persisted.
+pub(crate) fn unreported_session(room: &str, generation: u64) -> String {
+    format!("unreported-{room}-{generation}")
+}
+
+/// Whether a held message still belongs to the room's current launch: it was
+/// bound to that launch's unreported placeholder, for the same generation.
+/// Mail bound to a real session or an older generation belongs to another
+/// launch and is never retargeted.
+fn same_launch_placeholder(held: &Binding, current: &Binding) -> bool {
+    held.room == current.room
+        && held.generation == current.generation
+        && held.session == unreported_session(&held.room, held.generation)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum Status {
     Queued { hold: Option<String> },
@@ -1605,6 +1736,18 @@ impl Outbox {
         self.update(next, id)
     }
 
+    /// Holds a message under `reason` without sending it.
+    fn set_hold(&mut self, id: &str, reason: &str) -> io::Result<()> {
+        let mut next = self.state.clone();
+        let Some(item) = next.messages.iter_mut().find(|message| message.id == id) else {
+            return Ok(());
+        };
+        item.status = Status::Queued {
+            hold: Some(reason.to_owned()),
+        };
+        self.update(next, id)
+    }
+
     fn trim_history(&self, state: &mut State) {
         let mut terminal = state
             .messages
@@ -1732,26 +1875,50 @@ impl Outbox {
             return Ok(());
         }
         let mut blocked = HashSet::new();
+        // Rooms the adapter reported unable to receive, decided once per pass.
+        // Their later mail is held, never sent ahead of an older hold, and
+        // still gets an answer instead of waiting without one.
+        let mut unready = HashSet::new();
         for mut message in self.state.messages.clone() {
             let room = &message.destination;
+            if unready.contains(room) {
+                if matches!(&message.status, Status::Queued { hold: None })
+                    && bindings.get(room) == Some(&message.binding)
+                {
+                    self.set_hold(&message.id, CLAUDE_HOLD)?;
+                }
+                continue;
+            }
             if blocked.contains(room) {
                 continue;
             }
             if matches!(&message.status, Status::Queued { hold: Some(reason) } if reason == CLAUDE_HOLD)
             {
                 // The room's mod was not connected when this mail was saved.
-                // Once it is, move the mail onto the room's current binding and
-                // offer it again: the room did not relaunch, only its session
-                // became known. Mail that was never offered cannot be a second
-                // delivery.
-                let Some(binding) = bindings.get(room) else {
+                // It may be offered again only to the launch it belongs to:
+                // the room's current binding, or the unreported placeholder of
+                // this same generation that its real session replaces. Mail
+                // bound to an older session or generation is never retargeted;
+                // it belongs to a launch that is gone.
+                let Some(current) = bindings.get(room) else {
                     continue;
                 };
+                if &message.binding != current {
+                    if !same_launch_placeholder(&message.binding, current) {
+                        self.set_hold(&message.id, STALE_HOLD)?;
+                        continue;
+                    }
+                    self.adopt_missing_mod(&message.id, current)?;
+                }
+                // While the mod cannot receive, the room stays blocked for the
+                // rest of this pass: a newer message must never overtake this
+                // older held one.
                 if !adapter.ready(room) {
+                    blocked.insert(room.clone());
+                    unready.insert(room.clone());
                     continue;
                 }
-                self.adopt_missing_mod(&message.id, binding)?;
-                message.binding = binding.clone();
+                message.binding = current.clone();
                 message.status = Status::Queued { hold: None };
             }
             match &message.status {
