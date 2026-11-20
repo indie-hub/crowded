@@ -457,8 +457,11 @@ the room); existence is not re-checked against the server.
 
 No path in this feature writes to a PTY or retries an accepted message:
 pending, failed, uncertain, stale and unbound mail never becomes a paste.
-A report from a Claude room rebinds it under a new generation, like the other
-native rooms.
+A report from a Claude room rebinds it like the other native rooms. The first
+report of a fresh launch turns that launch's unreported placeholder into the
+real session and keeps the launch's generation, so mail saved against the
+placeholder still belongs to that launch; a later report is a session switch
+and takes a new generation, which holds older mail as stale.
 
 ## Run rooms
 

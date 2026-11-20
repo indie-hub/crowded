@@ -477,6 +477,35 @@ mod tests {
         AdapterResult::Dropped(CLAUDE_HOLD.to_owned())
     }
 
+    /// Mail behind an uncertain message is never sent past it and never left
+    /// looking merely queued: it carries a visible hold reason.
+    #[test]
+    fn newer_mail_behind_an_uncertain_message_shows_a_hold_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let mut outbox = Outbox::open(&path, 4, 4, 2).unwrap();
+        let b = binding("a", 1);
+        let bindings = HashMap::from([("a".to_owned(), b.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        outbox.enqueue("s".into(), b.clone(), "first".into()).unwrap();
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&calls, || AdapterResult::Uncertain))
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
+        outbox.enqueue("s".into(), b, "second".into()).unwrap();
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&calls, accepted))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            outbox.state.messages[1].status,
+            Status::Queued {
+                hold: Some(UNCERTAIN_HOLD.to_owned())
+            }
+        );
+    }
+
     fn dropped() -> AdapterResult {
         AdapterResult::Dropped("stopped".into())
     }
@@ -926,14 +955,16 @@ mod tests {
         assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
         let hash = outbox.state.messages[0].hash.clone();
 
-        // The second message waits behind the uncertain one.
+        // The second message waits behind the uncertain one and says why.
         outbox
             .schedule(&bindings, false, false, &[], fake(&calls, accepted))
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             outbox.state.messages[1].status,
-            Status::Queued { hold: None }
+            Status::Queued {
+                hold: Some(UNCERTAIN_HOLD.to_owned())
+            }
         );
 
         // Wrong evidence settles nothing.
@@ -1052,7 +1083,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // An adapter that panics leaves the message uncertain, and an uncertain
-        // message holds back the mail behind it.
+        // message holds back the mail behind it with a visible reason.
         outbox
             .enqueue("s".into(), current.clone(), "second".into())
             .unwrap();
@@ -1069,7 +1100,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             outbox.state.messages[2].status,
-            Status::Queued { hold: None }
+            Status::Queued {
+                hold: Some(UNCERTAIN_HOLD.to_owned())
+            }
         );
     }
 
@@ -1109,6 +1142,10 @@ pub(crate) const STALE_HOLD: &str = "sent for an earlier launch of this room; no
 
 /// The hold reason a Claude room's mail carries until the room-side mod exists.
 pub(crate) const CLAUDE_HOLD: &str = "no Claude mod connected";
+/// The hold on mail behind a message that may already have arrived. Nothing is
+/// sent past an uncertain message until it is settled.
+pub(crate) const UNCERTAIN_HOLD: &str =
+    "an earlier message to this room is uncertain; nothing new is sent";
 /// Mail held for an earlier launch never counts toward the live capacity, so
 /// this separate bound keeps it from growing without limit. Nothing is evicted;
 /// reaching it refuses new mail with a clear error.
@@ -1135,10 +1172,21 @@ fn is_stale_hold(message: &Message) -> bool {
     matches!(&message.status, Status::Queued { hold: Some(reason) } if reason == STALE_HOLD)
 }
 
+/// Holds retried once the room can receive again: the room could not take the
+/// mail, and the mail never reached it.
+fn is_retryable_hold(reason: &str) -> bool {
+    reason == CLAUDE_HOLD || reason == UNCERTAIN_HOLD
+}
+
 /// The session name a Claude room is bound to before its own hook reports the
 /// real session. It names one launch, never a session, and is never persisted.
 pub(crate) fn unreported_session(room: &str, generation: u64) -> String {
     format!("unreported-{room}-{generation}")
+}
+
+/// Whether a binding is the unreported placeholder of its own launch.
+pub(crate) fn is_unreported_placeholder(binding: &Binding) -> bool {
+    binding.session == unreported_session(&binding.room, binding.generation)
 }
 
 /// Whether a held message still belongs to the room's current launch: it was
@@ -1148,7 +1196,7 @@ pub(crate) fn unreported_session(room: &str, generation: u64) -> String {
 fn same_launch_placeholder(held: &Binding, current: &Binding) -> bool {
     held.room == current.room
         && held.generation == current.generation
-        && held.session == unreported_session(&held.room, held.generation)
+        && is_unreported_placeholder(held)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1879,8 +1927,18 @@ impl Outbox {
         // Their later mail is held, never sent ahead of an older hold, and
         // still gets an answer instead of waiting without one.
         let mut unready = HashSet::new();
+        // Rooms where an uncertain message keeps newer mail from going out.
+        let mut stuck = HashSet::new();
         for mut message in self.state.messages.clone() {
             let room = &message.destination;
+            if stuck.contains(room) {
+                if matches!(&message.status, Status::Queued { hold: None })
+                    && bindings.get(room) == Some(&message.binding)
+                {
+                    self.set_hold(&message.id, UNCERTAIN_HOLD)?;
+                }
+                continue;
+            }
             if unready.contains(room) {
                 if matches!(&message.status, Status::Queued { hold: None })
                     && bindings.get(room) == Some(&message.binding)
@@ -1892,7 +1950,7 @@ impl Outbox {
             if blocked.contains(room) {
                 continue;
             }
-            if matches!(&message.status, Status::Queued { hold: Some(reason) } if reason == CLAUDE_HOLD)
+            if matches!(&message.status, Status::Queued { hold: Some(reason) } if is_retryable_hold(reason))
             {
                 // The room's mod was not connected when this mail was saved.
                 // It may be offered again only to the launch it belongs to:
@@ -1924,18 +1982,21 @@ impl Outbox {
             match &message.status {
                                 Status::Queued { hold: None } => {
                     if bindings.get(room) != Some(&message.binding) {
-                        // Mail for another launch is held with a visible reason
-                        // and never sent; it neither counts as live work nor
-                        // stands in front of newer mail.
-                        let mut next = self.state.clone();
-                        if let Some(item) = next.messages.iter_mut().find(|m| m.id == message.id)
-                        {
-                            item.status = Status::Queued {
-                                hold: Some(STALE_HOLD.to_owned()),
-                            };
+                        // Mail from this launch's own placeholder may move to
+                        // the session the placeholder became. Mail for another
+                        // launch is held with a visible reason and never sent;
+                        // it neither counts as live work nor stands in front of
+                        // newer mail.
+                        let Some(current) = bindings.get(room) else {
+                            self.set_hold(&message.id, STALE_HOLD)?;
+                            continue;
+                        };
+                        if !same_launch_placeholder(&message.binding, current) {
+                            self.set_hold(&message.id, STALE_HOLD)?;
+                            continue;
                         }
-                        self.update(next, &message.id)?;
-                        continue;
+                        self.adopt_missing_mod(&message.id, current)?;
+                        message.binding = current.clone();
                     }
                     if self.pending.contains(room) {
                         // The room reported itself between sessions after this
@@ -1990,7 +2051,13 @@ impl Outbox {
                 }
                                 // Held mail of an earlier launch does not stand in front of newer mail.
                 Status::Queued { hold: Some(reason) } if reason == STALE_HOLD => {}
-                Status::Queued { .. } | Status::Sending | Status::Uncertain => {
+                // Nothing is sent past a message that may already have arrived:
+                // its newer mail is held with a visible reason, not left queued.
+                Status::Uncertain => {
+                    blocked.insert(room.clone());
+                    stuck.insert(room.clone());
+                }
+                Status::Queued { .. } | Status::Sending => {
                     blocked.insert(room.clone());
                 }
                 _ => {}
@@ -2009,9 +2076,18 @@ impl Outbox {
             if item.status != Status::Sending || item.binding != completion.binding {
                 continue;
             }
-            if bindings.get(&item.destination) != Some(&completion.binding) {
+            let current = bindings.get(&item.destination);
+            let same_launch = current.is_some_and(|current| {
+                current == &completion.binding || same_launch_placeholder(&completion.binding, current)
+            });
+            if !same_launch {
                 item.status = Status::Uncertain;
             } else {
+                // A completion from this launch's placeholder still describes
+                // this launch: its first report only renamed the session.
+                if let Some(current) = current {
+                    item.binding = current.clone();
+                }
                 item.status = match completion.result {
                     AdapterResult::Accepted(receipt) => {
                         item.receipt = receipt;

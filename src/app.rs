@@ -2248,11 +2248,20 @@ fn apply_session_report(
             "ignored: the reported session is not a Claude session id"
         ));
     }
-    let generation = crate::native_launch::GenerationAllocator::new(
-        crate::pane::session_state::state_directory(),
-    )
-    .next()
-    .map_err(|error| format!("{title} could not take a launch generation: {error}"))?;
+    // The first report of a launch turns its unreported placeholder into the
+    // real session: the launch keeps its generation, so mail saved against the
+    // placeholder still belongs to this launch. Any later report is a session
+    // switch and takes a new generation, which holds older mail as stale.
+    let generation = match current.as_ref() {
+        Some(binding) if crate::native_outbox::is_unreported_placeholder(binding) => {
+            binding.generation
+        }
+        _ => crate::native_launch::GenerationAllocator::new(
+            crate::pane::session_state::state_directory(),
+        )
+        .next()
+        .map_err(|error| format!("{title} could not take a launch generation: {error}"))?,
+    };
     let destination = (from + 1).to_string();
     if panes[from].codex_native() {
         if let Err(error) = crate::pane::session_state::upsert_reported(
@@ -5967,6 +5976,80 @@ mod tests {
                 .as_deref(),
             Some(SECOND)
         );
+    }
+
+    /// A session report that arrives before the mod registers keeps the
+    /// launch's generation: the startup intro saved against the unreported
+    /// placeholder is then delivered to the reported session, exactly once.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_startup_intro_reaches_the_session_reported_before_the_mod_registers() {
+        const REPORTED: &str = "8c3f4b96-3b74-4021-9f83-2c3d4e5f6071";
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let program = report_test_stub(root.path(), "claude", &root.path().join("calls"));
+        let spec = report_test_spec(&program, cwd.path(), "Claude · 1", true);
+        let panes = vec![report_test_pane(spec.clone(), None, None)];
+        let mut router = NativeRouter::start(root.path().join("outbox.json"), Vec::new()).unwrap();
+        // The production fresh-launch binding: a per-room bootstrap inbox and
+        // the unreported placeholder for this launch.
+        let mut starts = vec![Some(pane::ClaudeStart::Fresh)];
+        pane::bind_claude_rooms(&mut router, std::slice::from_ref(&spec), &mut starts).unwrap();
+        let launch = router.binding_for(0).unwrap();
+        assert_eq!(
+            launch.session,
+            crate::native_outbox::unreported_session("1", launch.generation)
+        );
+        let connection: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(crate::claude_inbox::bootstrap_file(cwd.path(), 1).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let (url, token) = (
+            connection["url"].as_str().unwrap().to_owned(),
+            connection["token"].as_str().unwrap().to_owned(),
+        );
+        let mut rig = ReportDispatch::new(panes, Some(router));
+
+        // The house rules are saved while the room still has its placeholder.
+        rig.router
+            .as_mut()
+            .unwrap()
+            .send(&mut rig.mailroom, "Sender", 0, "house rules", None)
+            .unwrap();
+        // The hook reports the real session before the mod connects.
+        let shown = {
+            rig.push_report(0, Some(REPORTED), false);
+            rig.dispatch()
+        };
+        assert!(shown.contains("now follows reported session"), "{shown}");
+        let reported = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        assert_eq!(reported.session, REPORTED);
+        assert_eq!(
+            reported.generation, launch.generation,
+            "the launch generation must survive its first report"
+        );
+
+        // The mod connects: the intro must travel to the reported session.
+        let mod_ = crate::claude_inbox::FakeMod::register(&url, &token);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let claim = loop {
+            rig.dispatch();
+            if let Some(claim) = mod_.next_claim() {
+                break claim;
+            }
+            assert!(Instant::now() < deadline, "the intro was never offered");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(claim.text.ends_with("house rules"), "{}", claim.text);
+        assert_eq!(mod_.receipt(&claim, "started", ""), 200);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !rig.mailroom.summary().contains("ACCEPTED by Claude") {
+            rig.dispatch();
+            assert!(Instant::now() < deadline, "{}", rig.mailroom.summary());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(mod_.next_claim().is_none(), "the intro was offered twice");
     }
 
     #[cfg(all(test, unix))]

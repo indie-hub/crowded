@@ -1741,11 +1741,15 @@ mod tests {
         *a.fake.state.mode.lock().unwrap() = FakeMode::Normal;
         router.send(&mut mailroom, "Room B", 0, "behind it", recorder(&log)).unwrap();
         pump_for(&mut router, &mut mailroom, false, false, 600);
-        // Nothing was resent, and the message behind it was not sent past it.
+        // Nothing was resent, and the message behind it was not sent past it;
+        // it says why it is waiting instead of looking merely queued.
         assert!(texts(&a).is_empty());
         let view = mailroom.summary();
         assert!(view.contains("UNCERTAIN: may have been accepted; it will not be resent"), "{view}");
-        assert!(view.contains("QUEUED"), "{view}");
+        assert!(
+            view.contains(crate::native_outbox::UNCERTAIN_HOLD),
+            "{view}"
+        );
     }
 
     #[test]
