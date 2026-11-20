@@ -284,6 +284,84 @@ mod tests {
         wait(&mut outbox, &bindings);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
+
+    /// An adapter whose room can receive only after its mod registered.
+    struct ModFake {
+        ready: Arc<std::sync::atomic::AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Adapter for ModFake {
+        fn send(&self, _: Message) -> AdapterResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.ready.load(Ordering::SeqCst) {
+                return AdapterResult::Dropped(CLAUDE_HOLD.to_owned());
+            }
+            accepted()
+        }
+        fn ready(&self, _: &str) -> bool {
+            self.ready.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Mail saved before a Claude mod connects is held, not lost: once the mod
+    /// registers it moves to the room's current binding and is offered exactly
+    /// once, even when the room reported a new session meanwhile.
+    #[test]
+    fn startup_mail_held_for_a_missing_mod_is_delivered_once_it_registers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let mut outbox = Outbox::open(&path, 4, 4, 1).unwrap();
+        let startup = binding("a", 1);
+        let startup_bindings = HashMap::from([("a".to_owned(), startup.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adapter: Arc<dyn Adapter> = Arc::new(ModFake {
+            ready: Arc::clone(&ready),
+            calls: Arc::clone(&calls),
+        });
+
+        let id = outbox
+            .enqueue("source".into(), startup, "house rules".into())
+            .unwrap()
+            .id;
+        outbox
+            .schedule(&startup_bindings, false, false, &[], Arc::clone(&adapter))
+            .unwrap();
+        wait(&mut outbox, &startup_bindings);
+        assert_eq!(hold_of(&mut outbox, &id), Some(CLAUDE_HOLD.to_owned()));
+
+        // While no mod is registered the held mail is not retried.
+        outbox
+            .schedule(&startup_bindings, false, false, &[], Arc::clone(&adapter))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The mod registers and the room reports its session: the intro moves
+        // onto that binding and is offered once.
+        ready.store(true, Ordering::SeqCst);
+        let reported = pending_binding("a", 2);
+        let reported_bindings = HashMap::from([("a".to_owned(), reported.clone())]);
+        outbox
+            .schedule(&reported_bindings, false, false, &[], Arc::clone(&adapter))
+            .unwrap();
+        wait(&mut outbox, &reported_bindings);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let delivered = outbox
+            .state
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+            .expect("the intro is kept as history");
+        assert_eq!(delivered.status, Status::Accepted);
+        assert_eq!(delivered.binding, reported);
+
+        // Accepted mail is never offered again.
+        outbox
+            .schedule(&reported_bindings, false, false, &[], adapter)
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
     fn dropped() -> AdapterResult {
         AdapterResult::Dropped("stopped".into())
     }
@@ -995,6 +1073,12 @@ pub(crate) enum AdapterResult {
 
 pub(crate) trait Adapter: Send + Sync + 'static {
     fn send(&self, message: Message) -> AdapterResult;
+
+    /// Whether the room can take mail now. A room that cannot keeps its mail
+    /// held instead of being retried on every schedule.
+    fn ready(&self, _room: &str) -> bool {
+        true
+    }
 }
 
 pub(crate) enum Command {
@@ -1509,6 +1593,18 @@ impl Outbox {
         Ok(())
     }
 
+    /// Moves mail held for a room whose mod was missing onto the room's
+    /// current binding, so the next schedule can offer it.
+    fn adopt_missing_mod(&mut self, id: &str, binding: &Binding) -> io::Result<()> {
+        let mut next = self.state.clone();
+        let Some(item) = next.messages.iter_mut().find(|message| message.id == id) else {
+            return Ok(());
+        };
+        item.binding = binding.clone();
+        item.status = Status::Queued { hold: None };
+        self.update(next, id)
+    }
+
     fn trim_history(&self, state: &mut State) {
         let mut terminal = state
             .messages
@@ -1636,10 +1732,27 @@ impl Outbox {
             return Ok(());
         }
         let mut blocked = HashSet::new();
-        for message in self.state.messages.clone() {
+        for mut message in self.state.messages.clone() {
             let room = &message.destination;
             if blocked.contains(room) {
                 continue;
+            }
+            if matches!(&message.status, Status::Queued { hold: Some(reason) } if reason == CLAUDE_HOLD)
+            {
+                // The room's mod was not connected when this mail was saved.
+                // Once it is, move the mail onto the room's current binding and
+                // offer it again: the room did not relaunch, only its session
+                // became known. Mail that was never offered cannot be a second
+                // delivery.
+                let Some(binding) = bindings.get(room) else {
+                    continue;
+                };
+                if !adapter.ready(room) {
+                    continue;
+                }
+                self.adopt_missing_mod(&message.id, binding)?;
+                message.binding = binding.clone();
+                message.status = Status::Queued { hold: None };
             }
             match &message.status {
                                 Status::Queued { hold: None } => {
@@ -1709,8 +1822,7 @@ impl Outbox {
                     });
                 }
                                 // Held mail of an earlier launch does not stand in front of newer mail.
-                Status::Queued { hold: Some(reason) }
-                    if reason == STALE_HOLD || reason == CLAUDE_HOLD => {}
+                Status::Queued { hold: Some(reason) } if reason == STALE_HOLD => {}
                 Status::Queued { .. } | Status::Sending | Status::Uncertain => {
                     blocked.insert(room.clone());
                 }

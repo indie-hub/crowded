@@ -88,6 +88,14 @@ impl Routing {
             self.opencode.send(message)
         }
     }
+
+    /// Only a Claude room's readiness is known before a send: its mod must be
+    /// registered and polling.
+    fn ready(&self, room: &str) -> bool {
+        self.claude
+            .get(room)
+            .is_none_or(|inbox| inbox.open_for_delivery())
+    }
 }
 
 impl SwitchAdapter {
@@ -125,6 +133,13 @@ impl Adapter for SwitchAdapter {
             Err(_) => return AdapterResult::Dropped("native routing is unavailable".into()),
         };
         adapter.send(message)
+    }
+
+    fn ready(&self, room: &str) -> bool {
+        match self.current.lock() {
+            Ok(current) => current.ready(room),
+            Err(_) => false,
+        }
     }
 }
 

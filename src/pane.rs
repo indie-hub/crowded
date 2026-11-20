@@ -833,15 +833,18 @@ fn refuse_claude_session_args(spec: &RoomSpec) -> io::Result<()> {
     ))
 }
 
-/// The Claude config directory: `CLAUDE_CONFIG_DIR` when set, otherwise
-/// `$HOME/.claude`. If it cannot be determined, existence checks fail safe.
-fn claude_config_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+/// The Claude config directory a room's own process sees: `CLAUDE_CONFIG_DIR`
+/// when its launch environment sets one, otherwise `$HOME/.claude`. The
+/// variables are the room's, so a room launched with its own config directory
+/// is checked against that directory and not against Crowded's. If neither can
+/// be determined, existence checks fail safe.
+fn claude_config_dir(variables: &[(OsString, OsString)]) -> Option<PathBuf> {
+    if let Some(dir) = environment_value(variables, "CLAUDE_CONFIG_DIR") {
         if !dir.is_empty() {
             return Some(PathBuf::from(dir));
         }
     }
-    std::env::var_os("HOME")
+    environment_value(variables, "HOME")
         .filter(|home| !home.is_empty())
         .map(|home| PathBuf::from(home).join(".claude"))
 }
@@ -862,11 +865,15 @@ fn claude_project_dir_name(cwd: &Path) -> String {
 /// stores sessions at `<config>/projects/<cwd-encoded>/<session-id>.jsonl`.
 /// If the layout or config dir cannot be determined, this fails safe to
 /// `false`.
-fn claude_session_file_exists(cwd: &Path, session: &str) -> bool {
+fn claude_session_file_exists(
+    cwd: &Path,
+    session: &str,
+    variables: &[(OsString, OsString)],
+) -> bool {
     if !codex_native::valid_uuid(session) {
         return false;
     }
-    let Some(config) = claude_config_dir() else {
+    let Some(config) = claude_config_dir(variables) else {
         return false;
     };
     let encoded = claude_project_dir_name(cwd);
@@ -881,18 +888,18 @@ fn claude_session_file_exists(cwd: &Path, session: &str) -> bool {
 }
 
 /// The reported Claude session that is safe to resume: only when the room's
-/// hook reported it and its exact session file exists for this cwd. A stale or
-/// unverifiable id is never resumed; it is cleared/ignored so the hook can
-/// replace it.
-fn stored_claude_session(cwd: &Path, title: &str) -> Option<String> {
+/// hook reported it and its exact session file exists for this cwd. A reported
+/// id whose file cannot be found is not resumed this launch, but it is kept:
+/// the check can only fail safe, so a miss must never erase what the room
+/// reported. The next report replaces it.
+fn stored_claude_session(
+    cwd: &Path,
+    title: &str,
+    variables: &[(OsString, OsString)],
+) -> Option<String> {
     let session = session_state::lookup_reported("claude", cwd, title)
         .filter(|id| codex_native::valid_uuid(id))?;
-    if claude_session_file_exists(cwd, &session) {
-        return Some(session);
-    }
-    // Stale reported id (file missing or unverifiable): never resume it.
-    let _ = session_state::clear_room("claude", cwd, title);
-    None
+    claude_session_file_exists(cwd, &session, variables).then_some(session)
 }
 
 /// The mod Crowded embeds for its Claude rooms: the manifest, the hook
@@ -1014,7 +1021,8 @@ pub(crate) fn start_claude_sessions(
             refuse_claude_session_args(spec)?;
             let cwd = working_directory(spec.cwd.as_deref())?;
             controls::clear_resume_args(spec)?;
-            let start = if let Some(stored) = stored_claude_session(&cwd, &spec.title) {
+            let start = if let Some(stored) = stored_claude_session(&cwd, &spec.title, &spec.variables)
+            {
                 controls::set_resume_session(spec, &stored)?;
                 ClaudeStart::Resume(stored)
             } else {
@@ -2192,14 +2200,23 @@ impl Pane {
                 None
             }
             ClaudeRelaunch::Resume => {
-                Some(stored_claude_session(&self.cwd, &self.spec.title).ok_or_else(|| {
+                Some(stored_claude_session(
+                    &self.cwd,
+                    &self.spec.title,
+                    &self.native_delivery_variables(),
+                )
+                .ok_or_else(|| {
                     io::Error::other(format!(
                         "{}: no stored Claude session to resume; use control {room} clear to start a new one",
                         self.spec.title
                     ))
                 })?)
             }
-            ClaudeRelaunch::Restart => stored_claude_session(&self.cwd, &self.spec.title),
+            ClaudeRelaunch::Restart => stored_claude_session(
+                &self.cwd,
+                &self.spec.title,
+                &self.native_delivery_variables(),
+            ),
         };
         controls::clear_resume_args(&mut spec)?;
         if let Some(session) = &session {
@@ -4932,9 +4949,10 @@ mod tests {
         assert!(matches!(&starts[0], Some(ClaudeStart::Fresh)), "{:?}", starts[0]);
         assert!(!specs[0].args.iter().any(|a| a == "--resume"), "{:?}", specs[0].args);
         assert!(!specs[0].args.iter().any(|a| a == "--session-id"), "{:?}", specs[0].args);
-        assert!(
-            session_state::lookup_reported("claude", cwd.path(), "Claude · 1").is_none(),
-            "stale reported id must not remain resumable"
+        assert_eq!(
+            session_state::lookup_reported("claude", cwd.path(), "Claude · 1"),
+            Some(MINTED_A.to_owned()),
+            "a check that cannot confirm the file must not erase the reported id"
         );
 
         // Same reported id with its exact session file present: resume it.
@@ -4958,6 +4976,34 @@ mod tests {
             !specs[0].args.iter().any(|a| a == "--session-id"),
             "{:?}",
             specs[0].args
+        );
+    }
+
+    /// The session check reads the config directory of the room's own launch
+    /// environment, not only Crowded's.
+    #[cfg(unix)]
+    #[test]
+    fn a_room_own_config_dir_is_checked_for_the_session_file() {
+        let _state = session_state::StateRootGuard::isolated();
+        let _claude_config = ClaudeConfigDirGuard::new();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+        let room_config = tempfile::tempdir().unwrap();
+
+        session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+        materialize_claude_session(room_config.path(), cwd.path(), MINTED_A);
+        let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
+        spec.variables.push((
+            OsString::from("CLAUDE_CONFIG_DIR"),
+            room_config.path().as_os_str().to_owned(),
+        ));
+        let (starts, notices) = start_claude_sessions(std::slice::from_mut(&mut spec));
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(
+            matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A),
+            "{:?}",
+            starts[0]
         );
     }
 

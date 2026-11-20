@@ -248,10 +248,7 @@ impl ClaudeInbox {
             let Some(registered) = &state.receiver else {
                 return AdapterResult::Dropped(CLAUDE_HOLD.to_owned());
             };
-            let live = (self.now)()
-                .checked_duration_since(registered.last_poll)
-                .is_none_or(|idle| idle <= RECEIVER_TIMEOUT);
-            if !live {
+            if !self.receiver_is_live(registered) {
                 return AdapterResult::Dropped(DISCONNECTED_HOLD.to_owned());
             }
             state.queue.push_back(Mail {
@@ -266,6 +263,24 @@ impl ClaudeInbox {
             Ok(Outcome::Held(reason)) => AdapterResult::Dropped(reason),
             Err(_) => self.abandon(&message.id),
         }
+    }
+
+    /// Whether a registered mod is polling, so mail held for a missing mod can
+    /// be offered again once it connects.
+    pub(crate) fn open_for_delivery(&self) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        state
+            .receiver
+            .as_ref()
+            .is_some_and(|registered| self.receiver_is_live(registered))
+    }
+
+    fn receiver_is_live(&self, registered: &Receiver) -> bool {
+        (self.now)()
+            .checked_duration_since(registered.last_poll)
+            .is_none_or(|idle| idle <= RECEIVER_TIMEOUT)
     }
 
     /// Gives up on a receipt: mail no mod collected is removed, so it is never
@@ -892,6 +907,24 @@ mod tests {
             held.join().unwrap(),
             AdapterResult::Dropped(reason) if reason == "prompt is open"
         ));
+    }
+
+    /// Held mail waits for a registered mod: readiness follows registration
+    /// and ends once the mod stops polling.
+    #[test]
+    fn a_missing_or_stalled_mod_is_not_open_for_delivery() {
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || *now.lock().unwrap())
+        };
+        let inbox = Arc::new(ClaudeInbox::open(clock, Duration::from_millis(50)).unwrap());
+        inbox.retarget(1);
+        assert!(!inbox.open_for_delivery());
+        let _mod = FakeMod::register(&inbox.url, &inbox.token);
+        assert!(inbox.open_for_delivery());
+        *now.lock().unwrap() += RECEIVER_TIMEOUT + Duration::from_millis(1);
+        assert!(!inbox.open_for_delivery());
     }
 
     /// A mod that claims a message and vanishes leaves it uncertain and it is
