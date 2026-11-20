@@ -1161,7 +1161,7 @@ pub(crate) fn bind_claude_rooms(
                 entries.push(crate::native_route::ClaudeEntry {
                     index,
                     title: specs[index].title.clone(),
-                    session: Some(crate::native_outbox::unreported_session(
+                    session: Some(crate::native_session::unreported_session(
                         &room.to_string(),
                         generation,
                     )),

@@ -13,8 +13,8 @@ use std::path::PathBuf;
 
 use crate::app::{ReportDispatch, report_test_pane, report_test_spec, report_test_stub};
 use crate::claude_inbox::{Claim, FakeMod, bootstrap_file};
-use crate::native_outbox::{is_unreported_placeholder, unreported_session};
 use crate::native_route::{ClaudeEntry, NativeRouter};
+use crate::native_session::{is_unreported_placeholder, unreported_session};
 use crate::pane::{self, ClaudeRelaunch, ClaudeStart, session_state::StateRootGuard};
 
 /// One bound Claude room per title, each with its own working directory, on a

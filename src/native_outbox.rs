@@ -17,11 +17,12 @@ use std::{
 };
 
 /// Verbatim-moved session and hold rules, owned by [`crate::native_session`].
-/// The re-export keeps every existing path working while callers migrate.
-pub(crate) use crate::native_session::{
+use crate::native_session::{
     CLAUDE_HOLD, PENDING_HOLD, STALE_HOLD, UNCERTAIN_HOLD, UNCONFIRMED_HOLD, is_retryable_hold,
-    is_stale_hold, is_unreported_placeholder, same_launch_placeholder, unreported_session,
+    is_stale_hold, same_launch_placeholder,
 };
+#[cfg(test)]
+use crate::native_session::{is_unreported_placeholder, unreported_session};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Binding {

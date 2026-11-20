@@ -17,7 +17,8 @@ use std::{
 };
 
 use crate::{
-    native_outbox::{AdapterResult, CLAUDE_HOLD, Message, STALE_HOLD},
+    native_outbox::{AdapterResult, Message},
+    native_session::{CLAUDE_HOLD, STALE_HOLD},
     pane::session_state::create_private_directory,
 };
 

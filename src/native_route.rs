@@ -1785,7 +1785,7 @@ mod tests {
             "{view}"
         );
         assert!(
-            view.contains(crate::native_outbox::UNCERTAIN_HOLD),
+            view.contains(crate::native_session::UNCERTAIN_HOLD),
             "{view}"
         );
     }
@@ -2916,7 +2916,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             answered_with(&mut router, &mut mailroom, &log),
-            NativeReply::Held(crate::native_outbox::CLAUDE_HOLD.to_owned())
+            NativeReply::Held(crate::native_session::CLAUDE_HOLD.to_owned())
         );
 
         // The mod reads the room's own connection file, registers and polls.

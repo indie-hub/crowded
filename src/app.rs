@@ -1919,7 +1919,7 @@ pub(crate) fn relaunch_claude_room(
                 .map_err(|error| launch_failure(&title, index + 1, error))?;
             // Internal placeholder only: never passed to Claude or persisted as
             // a Claude session; replaced when the hook reports the real session.
-            crate::native_outbox::unreported_session(&(index + 1).to_string(), generation)
+            crate::native_session::unreported_session(&(index + 1).to_string(), generation)
         };
         router
             .bind_claude(vec![crate::native_route::ClaudeEntry {
@@ -6225,7 +6225,7 @@ mod tests {
         let launch = router.binding_for(0).unwrap();
         assert_eq!(
             launch.session,
-            crate::native_outbox::unreported_session("1", launch.generation)
+            crate::native_session::unreported_session("1", launch.generation)
         );
         let connection: serde_json::Value = serde_json::from_slice(
             &std::fs::read(crate::claude_inbox::bootstrap_file(cwd.path(), 1).unwrap()).unwrap(),
