@@ -12,6 +12,8 @@ mod mailroom;
 mod mcp_cli;
 mod native_binding;
 mod native_launch;
+#[cfg(all(test, unix))]
+mod native_lifecycle_tests;
 mod native_outbox;
 mod native_route;
 mod opencode_native;

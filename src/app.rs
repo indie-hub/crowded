@@ -4166,7 +4166,7 @@ fn run_rooms(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -4299,7 +4299,7 @@ mod tests {
     }
 
     #[cfg(all(test, unix))]
-    fn report_test_stub(
+    pub(crate) fn report_test_stub(
         root: &std::path::Path,
         name: &str,
         log: &std::path::Path,
@@ -4323,7 +4323,7 @@ mod tests {
     }
 
     #[cfg(all(test, unix))]
-    fn report_test_spec(
+    pub(crate) fn report_test_spec(
         program: &std::path::Path,
         cwd: &std::path::Path,
         title: &str,
@@ -4347,7 +4347,7 @@ mod tests {
     }
 
     #[cfg(all(test, unix))]
-    fn report_test_pane(
+    pub(crate) fn report_test_pane(
         spec: RoomSpec,
         native: Option<crate::native_launch::NativeRoom>,
         codex: Option<&pane::CodexMint>,
@@ -5948,11 +5948,11 @@ mod tests {
     /// doorbell events production receives, so the `SessionReport` arm itself
     /// runs for every case a test pushes.
     #[cfg(all(test, unix))]
-    struct ReportDispatch {
+    pub(crate) struct ReportDispatch {
         doorbell: ReportEvents,
         panes: Vec<Pane>,
-        router: Option<NativeRouter>,
-        mailroom: Mailroom,
+        pub(crate) router: Option<NativeRouter>,
+        pub(crate) mailroom: Mailroom,
         gates: Vec<DeliveryGate>,
         last_output: Vec<Option<Instant>>,
         spawned_at: Vec<Instant>,
@@ -5991,7 +5991,7 @@ mod tests {
 
     #[cfg(all(test, unix))]
     impl ReportDispatch {
-        fn new(panes: Vec<Pane>, router: Option<NativeRouter>) -> Self {
+        pub(crate) fn new(panes: Vec<Pane>, router: Option<NativeRouter>) -> Self {
             let now = Instant::now();
             let rooms = panes.len();
             Self {
@@ -6028,7 +6028,7 @@ mod tests {
         }
 
         /// Queues one session report exactly as the doorbell hands it over.
-        fn push_report(&mut self, from: usize, session: Option<&str>, pending: bool) {
+        pub(crate) fn push_report(&mut self, from: usize, session: Option<&str>, pending: bool) {
             let (reply, _dropped) = std::sync::mpsc::sync_channel(1);
             self.doorbell.events.push_back(DoorbellEvent::SessionReport(
                 crate::doorbell::DoorbellSessionReport {
@@ -6052,7 +6052,7 @@ mod tests {
         }
 
         /// Runs one event-loop pass and returns the notice the dispatch left.
-        fn dispatch(&mut self) -> String {
+        pub(crate) fn dispatch(&mut self) -> String {
             let rooms = self.panes.len();
             let now = Instant::now();
             run_rooms_iteration(
@@ -6115,6 +6115,29 @@ mod tests {
                 now,
             )
             .unwrap();
+        }
+
+        /// Relaunches one room through the production restart path, so a
+        /// lifecycle test can move a room into a new generation.
+        pub(crate) fn relaunch_claude(
+            &mut self,
+            index: usize,
+            action: pane::ClaudeRelaunch,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let size = self.sizes[index];
+            relaunch_claude_room(
+                action,
+                index,
+                size,
+                &mut self.panes,
+                self.router.as_mut(),
+                &mut self.gates,
+                &mut self.last_output,
+                &mut self.spawned_at,
+                &mut self.pulses,
+                &self.environments,
+                Instant::now(),
+            )
         }
     }
 
