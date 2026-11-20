@@ -6578,7 +6578,7 @@ mod tests {
         let source = include_str!("app.rs");
         let production = &source[..source.find("#[cfg(test)]").unwrap()];
         let body = &production[production.find("fn run_loop").unwrap()..];
-        let body = &body[..body.find("\n}\n\n\nfn run_rooms").unwrap()];
+        let body = &body[..body.find("\nfn run_rooms").unwrap()];
         assert_eq!(
             body.matches("run_rooms_key_event(").count(),
             1,
