@@ -19,8 +19,8 @@ use std::{
 /// Verbatim-moved session and hold rules, owned by [`crate::native_session`].
 /// The re-export keeps every existing path working while callers migrate.
 pub(crate) use crate::native_session::{
-    CLAUDE_HOLD, PENDING_HOLD, STALE_HOLD, UNCERTAIN_HOLD, UNCONFIRMED_HOLD,
-    is_unreported_placeholder, same_launch_placeholder, unreported_session,
+    CLAUDE_HOLD, PENDING_HOLD, STALE_HOLD, UNCERTAIN_HOLD, UNCONFIRMED_HOLD, is_retryable_hold,
+    is_stale_hold, is_unreported_placeholder, same_launch_placeholder, unreported_session,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1637,16 +1637,6 @@ fn is_history(status: &Status) -> bool {
         status,
         Status::Accepted | Status::Acknowledged | Status::Failed { .. }
     )
-}
-
-fn is_stale_hold(message: &Message) -> bool {
-    matches!(&message.status, Status::Queued { hold: Some(reason) } if reason == STALE_HOLD)
-}
-
-/// Holds retried once the room can receive again: the room could not take the
-/// mail, and the mail never reached it.
-fn is_retryable_hold(reason: &str) -> bool {
-    reason == CLAUDE_HOLD || reason == UNCERTAIN_HOLD
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -3,7 +3,7 @@
 //! per-room state lives here; the router and outbox maps own that. Callers
 //! pass values in and get decisions back.
 
-use crate::native_outbox::Binding;
+use crate::native_outbox::{Binding, Message, Status};
 
 /// The hold reason of mail whose binding is no longer the room's current one.
 pub(crate) const STALE_HOLD: &str = "sent for an earlier launch of this room; not delivered";
@@ -41,4 +41,16 @@ pub(crate) fn same_launch_placeholder(held: &Binding, current: &Binding) -> bool
     held.room == current.room
         && held.generation == current.generation
         && is_unreported_placeholder(held)
+}
+
+/// Whether a queued message is held only because its launch is gone: it can
+/// never be adopted onto another binding.
+pub(crate) fn is_stale_hold(message: &Message) -> bool {
+    matches!(&message.status, Status::Queued { hold: Some(reason) } if reason == STALE_HOLD)
+}
+
+/// Holds retried once the room can receive again: the room could not take the
+/// mail, and the mail never reached it.
+pub(crate) fn is_retryable_hold(reason: &str) -> bool {
+    reason == CLAUDE_HOLD || reason == UNCERTAIN_HOLD
 }
