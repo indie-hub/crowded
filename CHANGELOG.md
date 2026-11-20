@@ -7,6 +7,18 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.46.1] - 2026-11-20
+
+### Fixed
+- Native Claude rooms no longer resume a session that does not exist. Crowded stopped choosing session ids with `claude --session-id`: a fresh start passes neither `--session-id` nor `--resume` and learns the real id from the room's own SessionStart hook. A reported id is resumed only when its session file exists under `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<cwd with every non-alphanumeric character replaced by ->/`; otherwise the room starts fresh and keeps the stored id.
+- The Claude delivery mod works in Claude Code 2.1.328: it reads the room with `$.env.get` instead of `process.env`, which the mod sandbox does not provide, so it no longer reports "Crowded inbox not connected" and delivers nothing.
+- Fresh Claude rooms sharing a working directory each get their own authenticated bootstrap connection (`_bootstrap.<room>.json`), which the first session report replaces with the session's file; the mod refuses a connection file that belongs to another room and does nothing without a numeric `CROWDED_ROOM`. Stale session files are removed on the next report and on exit.
+- Startup mail for a Claude room is delivered after its mod registers. Held mail stays inside its own launch: the first session report of a launch keeps the launch generation, while a relaunch or a later session switch takes a new one and leaves earlier mail held. A held message is never overtaken by newer mail, and mail behind an uncertain message shows a visible hold.
+
+### Known limits
+- A `CLAUDE_CONFIG_DIR` exported inside a launcher wrapper, rather than in Crowded's own environment, is not seen when checking for a session file; the room starts fresh.
+- A resumed Claude room is sent its welcome message again.
+
 ## [0.46.0] - 2026-11-19
 
 ### Added
