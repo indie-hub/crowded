@@ -16,6 +16,7 @@ mod native_launch;
 mod native_lifecycle_tests;
 mod native_outbox;
 mod native_route;
+mod native_session;
 mod opencode_native;
 mod opencode_outbox;
 mod pane;
