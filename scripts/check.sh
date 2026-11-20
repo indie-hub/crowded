@@ -6,5 +6,5 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 cargo fmt --check
-cargo clippy --locked --all-targets
+cargo clippy --locked --all-targets -- -D clippy::correctness
 cargo test --locked

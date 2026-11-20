@@ -35,8 +35,10 @@ jobs:
           path: fmt-diff.txt
           if-no-files-found: ignore
 
+      # Only the correctness group is denied: the style warnings stay visible
+      # until they are fixed, and a new upstream style lint cannot redden main.
       - name: cargo clippy
-        run: cargo clippy --locked --all-targets
+        run: cargo clippy --locked --all-targets -- -D clippy::correctness
 
   test:
     name: test (${{ matrix.os }})
