@@ -263,6 +263,8 @@ fn held_mail_before_mod_registration_is_delivered_after_it_registers() {
     let before = fx.binding(0);
     assert!(is_unreported_placeholder(&before));
     fx.send(0, "hello-before-mod");
+    // The schedule ran while no mod was connected: the hold is on record.
+    settle(&mut fx.rig, "HELD: no Claude mod connected");
     fx.pump(20);
     assert!(is_unreported_placeholder(&fx.binding(0)));
     let (url, token) = fx.conn(0);
@@ -290,6 +292,7 @@ fn first_report_keeps_generation_and_delivers_once_in_order() {
     let launch = fx.binding(0);
     fx.send(0, "first");
     fx.send(0, "second");
+    settle(&mut fx.rig, "HELD: no Claude mod connected");
     let shown = fx.report(0, Some(REPORTED));
     assert!(shown.contains("now follows reported session"), "{shown}");
     let reported = fx.binding(0);
@@ -327,6 +330,7 @@ fn relaunch_into_a_new_generation_keeps_old_mail_stale() {
     let mut fx = Fixture::fresh(&["Claude · 1"]);
     let launch = fx.binding(0);
     fx.send(0, "old-mail");
+    settle(&mut fx.rig, "HELD: no Claude mod connected");
     fx.rig.relaunch_claude(0, ClaudeRelaunch::Clear).unwrap();
     let relaunched = fx.binding(0);
     assert!(relaunched.generation > launch.generation);
@@ -363,6 +367,7 @@ fn phantom_session_report_before_mod_registration_stays_safe_and_never_resumes()
     let mut fx = Fixture::fresh(&["Claude · 1"]);
     let launch = fx.binding(0);
     fx.send(0, "intro");
+    settle(&mut fx.rig, "HELD: no Claude mod connected");
     let shown = fx.report(0, Some(PHANTOM));
     assert!(shown.contains("now follows reported session"), "{shown}");
     let reported = fx.binding(0);
@@ -404,11 +409,12 @@ fn pending_mark_adopts_only_pending_held_mail() {
     let first = fx.binding(0);
     // Saved before the mark, with no mod to take it: held, not lost.
     fx.send(0, "before-the-mark");
-    fx.pump(20);
+    settle(&mut fx.rig, "HELD: no Claude mod connected");
     let shown = fx.report_pending(0);
     assert!(shown.contains("session pending after clear"), "{shown}");
     // Saved while the mark is set: held for the next session.
     fx.send(0, "while-pending");
+    settle(&mut fx.rig, "HELD: session pending after clear");
     // A new session ends the old one and takes a new generation: only the
     // pending-held mail moves onto it.
     let shown = fx.report(0, Some(SECOND));
@@ -435,6 +441,7 @@ fn fresh_relaunch_with_wiped_state_sends_nothing_stale() {
     const REPORTED: &str = "bd4e5f60-4a85-4132-8e94-3d4e5f607184";
     let mut fx = Fixture::fresh(&["Claude · 1"]);
     fx.send(0, "doomed");
+    settle(&mut fx.rig, "HELD: no Claude mod connected");
     let shown = fx.report(0, Some(REPORTED));
     assert!(shown.contains("now follows reported session"), "{shown}");
     let path = fx.outbox_path.clone();
@@ -479,6 +486,7 @@ fn two_rooms_with_interleaved_reports_keep_their_mail_apart() {
     let mut fx = Fixture::fresh(&["Claude · 1", "Claude · 2"]);
     fx.send(0, "for-room-one");
     fx.send(1, "for-room-two");
+    settle(&mut fx.rig, "HELD: no Claude mod connected");
     // Interleaved: room 2 reports first.
     let shown = fx.report(1, Some(TWO));
     assert!(shown.contains("now follows reported session"), "{shown}");
