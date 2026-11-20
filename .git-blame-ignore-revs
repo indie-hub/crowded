@@ -1,0 +1,4 @@
+# Formatting-only commits. Listing them keeps git blame pointing at the
+# commit that wrote the logic rather than the one that re-wrapped it.
+# Enable with: git config blame.ignoreRevsFile .git-blame-ignore-revs
+dea86855b82c8ed1e77a6dc019c98775cbd49346
