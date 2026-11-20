@@ -55,6 +55,13 @@ jobs:
         with:
           shared-key: test
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       # RUST_TEST_THREADS stays unset: the suite relies on its default parallelism.
       - name: cargo test
         run: cargo test --locked
+
+      - name: Claude mod delivery tests
+        run: node --test src/claude_mod/deliver.test.mjs
