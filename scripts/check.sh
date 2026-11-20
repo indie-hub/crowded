@@ -5,6 +5,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+if [ -n "${RUSTUP_TOOLCHAIN:-}" ]; then
+  echo "note: ignoring RUSTUP_TOOLCHAIN so rust-toolchain.toml selects the pinned toolchain"
+  unset RUSTUP_TOOLCHAIN
+fi
+
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D clippy::correctness
 cargo test --locked
