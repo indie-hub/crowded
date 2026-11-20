@@ -6851,8 +6851,9 @@ mod tests {
     fn run_rooms_dispatches_restart_keys_through_the_seam() {
         let source = include_str!("app.rs");
         let production = &source[..source.find("#[cfg(test)]").unwrap()];
+        // Source-text slicing breaks on reformat or rename, so anchor on a full signature.
         let body = &production[production.find("fn run_loop").unwrap()..];
-        let body = &body[..body.find("\nfn run_rooms").unwrap()];
+        let body = &body[..body.find("\nfn run_rooms(").unwrap()];
         assert_eq!(
             body.matches("run_rooms_key_event(").count(),
             1,
