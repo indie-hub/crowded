@@ -51,15 +51,23 @@ fn add_user_key(root: &Path) -> Value {
     let mut document: Value =
         serde_json::from_str(&fs::read_to_string(&path).expect("hooks.json")).expect("valid JSON");
     document["MyMarker"] = json!(true);
-    fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&document).unwrap()))
-        .expect("write hooks.json");
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&document).unwrap()),
+    )
+    .expect("write hooks.json");
     document
 }
 
 #[test]
 fn resync_refuses_a_hand_edited_tui_plugin() {
     let root = synced_project();
-    let plugin = root.path().join(".opencode").join("plugins").join("crowded-tui").join("tui.js");
+    let plugin = root
+        .path()
+        .join(".opencode")
+        .join("plugins")
+        .join("crowded-tui")
+        .join("tui.js");
     let written = fs::read(&plugin).expect("the generated plugin");
     let mut edited = written.clone();
     edited.extend_from_slice(b"\n// my own note\n");
@@ -95,7 +103,9 @@ fn resync_keeps_a_user_key_in_the_hooks_file() {
     let merged: Value =
         serde_json::from_str(&fs::read_to_string(hooks_path(root.path())).unwrap()).unwrap();
     assert_eq!(merged["MyMarker"], json!(true), "the user's key survives");
-    let starts = merged["hooks"]["SessionStart"].as_array().expect("SessionStart");
+    let starts = merged["hooks"]["SessionStart"]
+        .as_array()
+        .expect("SessionStart");
     assert_eq!(
         starts.len(),
         2,
@@ -117,13 +127,23 @@ fn remove_takes_away_only_what_crowded_wrote() {
 
     let after: Value =
         serde_json::from_str(&fs::read_to_string(hooks_path(root.path())).unwrap()).unwrap();
-    assert_eq!(after["MyMarker"], json!(true), "the user's key survives removal");
+    assert_eq!(
+        after["MyMarker"],
+        json!(true),
+        "the user's key survives removal"
+    );
     assert!(
         after.get("hooks").is_none(),
         "Crowded's own hooks are gone: {after:?}"
     );
     assert!(
-        !root.path().join(".opencode").join("plugins").join("crowded-tui").join("tui.js").exists(),
+        !root
+            .path()
+            .join(".opencode")
+            .join("plugins")
+            .join("crowded-tui")
+            .join("tui.js")
+            .exists(),
         "the plugin Crowded created is removed"
     );
 }
@@ -134,7 +154,12 @@ fn a_refused_resync_changes_no_file_and_keeps_the_state() {
     let state_path = root.path().join(".crowded").join("toolbox-state.json");
     let state_before = fs::read(&state_path).expect("state after sync");
     let hooks_before = fs::read(hooks_path(root.path())).expect("codex hooks after sync");
-    let plugin = root.path().join(".opencode").join("plugins").join("crowded-tui").join("tui.js");
+    let plugin = root
+        .path()
+        .join(".opencode")
+        .join("plugins")
+        .join("crowded-tui")
+        .join("tui.js");
     let written = fs::read(&plugin).expect("the generated plugin");
     let mut edited = written.clone();
     edited.extend_from_slice(b"\n// my own note\n");
@@ -150,7 +175,10 @@ fn a_refused_resync_changes_no_file_and_keeps_the_state() {
     let out = toolbox(root.path(), "resync");
     assert!(!out.status.success(), "resync must be refused");
     assert!(String::from_utf8_lossy(&out.stderr).contains("refusing to overwrite"));
-    assert_eq!(fs::read(&state_path).expect("state survives a refusal"), state_before);
+    assert_eq!(
+        fs::read(&state_path).expect("state survives a refusal"),
+        state_before
+    );
     assert_eq!(fs::read(&plugin).unwrap(), edited, "the edit is untouched");
     assert_eq!(
         fs::read(hooks_path(root.path())).expect("orphan hooks stay"),
@@ -165,5 +193,8 @@ fn a_refused_resync_changes_no_file_and_keeps_the_state() {
         "remove after a refusal failed: {}",
         String::from_utf8_lossy(&removed.stderr)
     );
-    assert!(!hooks_path(root.path()).exists(), "Crowded's own file is removed");
+    assert!(
+        !hooks_path(root.path()).exists(),
+        "Crowded's own file is removed"
+    );
 }

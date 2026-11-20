@@ -1498,7 +1498,7 @@ impl Drop for TerminalGuard {
 pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let resolved = room_specs()?;
     let resumed = vec![false; resolved.specs.len()];
-        run_with(
+    run_with(
         resolved.specs,
         resumed,
         resolved.fuse_size,
@@ -1511,7 +1511,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// launch, but every supported guest starts with its resume-most-recent
 /// flag already applied.
 pub(crate) fn run_resumed() -> Result<(), Box<dyn std::error::Error>> {
-        resume_with(room_specs_resumed()?, run_with)
+    resume_with(room_specs_resumed()?, run_with)
 }
 
 /// The part of `crowded resume` that decides what each room does and what the
@@ -1558,7 +1558,7 @@ pub(crate) fn rooms_needing_detail(panes: &[Pane]) -> Vec<usize> {
 /// The room the Ctrl+W composer would write to, or the notice that explains
 /// why it cannot be written to.
 pub(crate) fn compose_target(panes: &[Pane], focused: usize) -> Result<usize, String> {
-        let target = (focused + 1) % panes.len();
+    let target = (focused + 1) % panes.len();
     if panes[target].is_online() {
         Ok(target)
     } else {
@@ -1781,14 +1781,18 @@ pub(crate) fn complete_mints(
             pane::CodexUpdate::Failed { index, reason } => (index, reason),
         };
         let spec = panes[index].room_spec().clone();
-        panes[index] = factory.unavailable(spec, sizes[index], environments[index].clone(), &failure)?;
+        panes[index] =
+            factory.unavailable(spec, sizes[index], environments[index].clone(), &failure)?;
         delivery_gates[index] = DeliveryGate::new(false);
         spawned_at[index] = now;
         last_output[index] = None;
         if let (Some(router), Some(mint)) = (router.as_deref_mut(), codex[index].as_ref()) {
             pane::bind_codex_room(router, panes, index, mint)?;
         }
-        let message = format!("{}: {failure}; the room was not started", panes[index].title());
+        let message = format!(
+            "{}: {failure}; the room was not started",
+            panes[index].title()
+        );
         eprintln!("{message}");
         append_notice(notice, message, NoticeSeverity::Failure);
     }
@@ -1868,7 +1872,11 @@ pub(crate) fn relaunch_codex_room(
 /// A failure in the relaunch sequence is reported with the way out; nothing
 /// is rolled back, so the room may be left recorded or bound on a session that
 /// did not start.
-fn launch_failure(title: &str, room: usize, cause: impl std::fmt::Display) -> Box<dyn std::error::Error> {
+fn launch_failure(
+    title: &str,
+    room: usize,
+    cause: impl std::fmt::Display,
+) -> Box<dyn std::error::Error> {
     io::Error::other(format!(
         "{title}: {cause}; the room may be recorded or bound on a session that did not start; use control {room} clear to start a new one"
     ))
@@ -1889,8 +1897,8 @@ pub(crate) fn relaunch_claude_room(
     now: Instant,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let title = panes[index].title().to_owned();
-    let generation = pane::next_generation()
-        .map_err(|error| launch_failure(&title, index + 1, error))?;
+    let generation =
+        pane::next_generation().map_err(|error| launch_failure(&title, index + 1, error))?;
     let (spec, session) = panes[index]
         .relaunch_claude(action, index + 1)
         .map_err(|error| launch_failure(&title, index + 1, error))?;
@@ -2306,9 +2314,9 @@ fn apply_session_report(
                 "ignored: {title} has no OpenCode binding to rebind"
             ));
         };
-        let server = router.server_for(from).ok_or_else(|| {
-            format!("{title} has no owned OpenCode server to rebind")
-        })?;
+        let server = router
+            .server_for(from)
+            .ok_or_else(|| format!("{title} has no owned OpenCode server to rebind"))?;
         router
             .rebind_room(crate::native_route::RoomEntry {
                 index: from,
@@ -2387,7 +2395,8 @@ pub(crate) fn deliver_native_doorbell(
     delivery_paused: &mut bool,
     notice: &mut Notices,
 ) {
-    let (text, severity) = match send_native_mail(panes, router, mailroom, source, to, body, reply) {
+    let (text, severity) = match send_native_mail(panes, router, mailroom, source, to, body, reply)
+    {
         Ok(()) => {
             fuse.record();
             if fuse.is_tripped() {
@@ -2538,11 +2547,11 @@ pub(crate) fn doorbell_reply(envelope: crate::doorbell::DoorbellEnvelope) -> nat
 fn run_with(
     specs: Vec<RoomSpec>,
     resumed: Vec<bool>,
-        fuse_size: usize,
+    fuse_size: usize,
     token_pricing: Vec<TokenPricing>,
     startup_notice: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-        // A hang-up or a kill from outside ends the loop below like Ctrl+Q does.
+    // A hang-up or a kill from outside ends the loop below like Ctrl+Q does.
     crate::shutdown::install();
     let result = run_rooms(specs, resumed, fuse_size, token_pricing, startup_notice);
     crate::native_launch::wait_for_reaps();
@@ -2550,12 +2559,15 @@ fn run_with(
 }
 
 pub(crate) trait DoorbellSource {
-    fn try_recv(&mut self) -> Result<crate::doorbell::DoorbellEvent, std::sync::mpsc::TryRecvError>;
+    fn try_recv(&mut self)
+    -> Result<crate::doorbell::DoorbellEvent, std::sync::mpsc::TryRecvError>;
     fn path(&self) -> &std::path::Path;
 }
 
 impl DoorbellSource for crate::doorbell::Doorbell {
-    fn try_recv(&mut self) -> Result<crate::doorbell::DoorbellEvent, std::sync::mpsc::TryRecvError> {
+    fn try_recv(
+        &mut self,
+    ) -> Result<crate::doorbell::DoorbellEvent, std::sync::mpsc::TryRecvError> {
         crate::doorbell::Doorbell::try_recv(self)
     }
 
@@ -2971,8 +2983,7 @@ where
                                 headroom: pane.headroom_active(),
                                 pulse_age_ms: room_pulses[index].as_ref().map(|sample| {
                                     now.saturating_duration_since(sample.received_at)
-                                        .as_millis()
-                                        as u64
+                                        .as_millis() as u64
                                 }),
                                 capabilities: pane.capabilities(),
                                 scheduling: pane.scheduling(),
@@ -3101,7 +3112,8 @@ where
                 })();
                 match result {
                     Ok(resumed) => {
-                        delivery_gates[control.to] = gate_after_control(panes[control.to].needs_intro(), resumed);
+                        delivery_gates[control.to] =
+                            gate_after_control(panes[control.to].needs_intro(), resumed);
                         last_output[control.to] = None;
                         spawned_at[control.to] = Instant::now();
                         room_pulses[control.to] = match &control.action {
@@ -3151,8 +3163,6 @@ where
     }
     Ok(())
 }
-
-
 
 /// The production event loop: pumps mints, output, the outbox and the doorbell,
 /// draws, then reads and handles terminal events until Ctrl+Q or a shutdown
@@ -3220,7 +3230,7 @@ where
     // Holds the event that ended a wheel burst, so draining never discards it,
     // and any key run handed back by the torn-report filter.
     let mut stashed_events: VecDeque<Event> = VecDeque::new();
-        let mut torn_report = TornMouseReport::default();
+    let mut torn_report = TornMouseReport::default();
 
     // A native room is introduced through its outbox, like all of its mail.
     if let Some(router) = router.as_mut() {
@@ -3250,7 +3260,7 @@ where
         }
     }
 
-        loop {
+    loop {
         if crate::shutdown::requested() {
             break;
         }
@@ -3332,7 +3342,7 @@ where
             );
         }
         {
-                                    for index in rooms_needing_detail(&panes) {
+            for index in rooms_needing_detail(&panes) {
                 let guest = panes[index].guest().to_owned();
                 let cwd = panes[index].cwd().to_path_buf();
                 let title = panes[index].title().to_owned();
@@ -3676,18 +3686,12 @@ where
                         }
                         delivery_paused = false;
                         notice.push(
-                            format!(
-                                "Automatic delivery resumed; {} queued",
-                                pending.len()
-                            ),
+                            format!("Automatic delivery resumed; {} queued", pending.len()),
                             NoticeSeverity::Info,
                         );
                     } else {
                         delivery_paused = true;
-                        notice.push(
-                            "Automatic delivery paused".to_owned(),
-                            NoticeSeverity::Info,
-                        );
+                        notice.push("Automatic delivery paused".to_owned(), NoticeSeverity::Info);
                     }
                 }
                 Event::Key(key)
@@ -3695,10 +3699,8 @@ where
                         && key.kind == KeyEventKind::Press
                         && matches!(&input_mode, InputMode::Normal) =>
                 {
-                                        let roster = welcome_roster(&panes, &room_pulses, now);
-                    if let Some(router) = router
-                        .as_mut()
-                        .filter(|router| router.is_native(focused))
+                    let roster = welcome_roster(&panes, &room_pulses, now);
+                    if let Some(router) = router.as_mut().filter(|router| router.is_native(focused))
                     {
                         let message = house_rules(focused + 1, &roster, fuse_size);
                         let title = panes[focused].title().to_owned();
@@ -3711,259 +3713,280 @@ where
                         );
                         notice.push(text, severity);
                     } else {
-                    match panes[focused].send_whisper(
-                        "The Crowded Room",
-                        &house_rules(focused + 1, &roster, fuse_size),
-                    ) {
-                        Ok(()) => {
-                            delivery_gates[focused].intro_sent();
-                            panes[focused].begin_session_capture();
-                            notice.push(
-                                format!(
-                                    "{} reintroduced to the room",
-                                    panes[focused].title()
-                                ),
-                                NoticeSeverity::Info,
-                            );
+                        match panes[focused].send_whisper(
+                            "The Crowded Room",
+                            &house_rules(focused + 1, &roster, fuse_size),
+                        ) {
+                            Ok(()) => {
+                                delivery_gates[focused].intro_sent();
+                                panes[focused].begin_session_capture();
+                                notice.push(
+                                    format!("{} reintroduced to the room", panes[focused].title()),
+                                    NoticeSeverity::Info,
+                                );
+                            }
+                            Err(error) => {
+                                notice.push(
+                                    format!(
+                                        "Could not reintroduce {}: {error}",
+                                        panes[focused].title()
+                                    ),
+                                    NoticeSeverity::Failure,
+                                );
+                            }
                         }
-                        Err(error) => {
-                                                        notice.push(
-                                format!(
-                                    "Could not reintroduce {}: {error}",
-                                    panes[focused].title()
-                                ),
-                                NoticeSeverity::Failure,
-                            );
-                        }
-                    }
                     }
                 }
-                Event::Key(key) if run_rooms_key_event(
-                    &Event::Key(key),
-                    &mut loop_state(
-                        focused,
-                        fuse_size,
-                        &mut |index| {
-                            terminal.autoresize().map_err(|error| io::Error::other(error.to_string()))?;
-                            let (rooms, _, _) = content_areas(terminal.size().map_err(|error| io::Error::other(error.to_string()))?.into());
-                            Ok(pane_size(pane_areas(rooms, room_count)[index]))
-                        },
-                        &mut panes,
-                        router.as_mut(),
-                        &mut codex,
-                        &mut delivery_gates,
-                        &mut last_output,
-                        &mut spawned_at,
-                        &mut room_pulses,
-                        &environments,
-                        &mut notice,
-                    ),
-                )? => match &mut input_mode {
-                    InputMode::Composing(message) => {
-                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                            match key.code {
-                                KeyCode::Esc if key.kind == KeyEventKind::Press => {
-                                    input_mode = InputMode::Normal;
-                                }
-                                KeyCode::Enter if key.kind == KeyEventKind::Press => {
-                                                                        let target = (focused + 1) % panes.len();
-                                    if panes[target].is_online() {
-                                        let message = std::mem::take(message);
-                                        let source = panes[focused].title().to_owned();
+                Event::Key(key)
+                    if run_rooms_key_event(
+                        &Event::Key(key),
+                        &mut loop_state(
+                            focused,
+                            fuse_size,
+                            &mut |index| {
+                                terminal
+                                    .autoresize()
+                                    .map_err(|error| io::Error::other(error.to_string()))?;
+                                let (rooms, _, _) = content_areas(
+                                    terminal
+                                        .size()
+                                        .map_err(|error| io::Error::other(error.to_string()))?
+                                        .into(),
+                                );
+                                Ok(pane_size(pane_areas(rooms, room_count)[index]))
+                            },
+                            &mut panes,
+                            router.as_mut(),
+                            &mut codex,
+                            &mut delivery_gates,
+                            &mut last_output,
+                            &mut spawned_at,
+                            &mut room_pulses,
+                            &environments,
+                            &mut notice,
+                        ),
+                    )? =>
+                {
+                    match &mut input_mode {
+                        InputMode::Composing(message) => {
+                            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                                match key.code {
+                                    KeyCode::Esc if key.kind == KeyEventKind::Press => {
                                         input_mode = InputMode::Normal;
-                                        if let Some(router) = router
-                                            .as_mut()
-                                            .filter(|router| router.is_native(target))
-                                        {
-                                            let (text, severity) = match router.send(
-                                                &mut mailroom,
-                                                &source,
-                                                target,
-                                                &message,
-                                                None,
-                                            ) {
-                                                Ok(()) => (
-                                                    "Saved for native delivery".to_owned(),
-                                                    NoticeSeverity::Info,
-                                                ),
-                                                Err(error) => (
-                                                    format!("Not saved: {error}"),
-                                                    NoticeSeverity::Failure,
-                                                ),
-                                            };
-                                            notice.push(text, severity);
-                                        } else if delivery_paused
-                                            || !delivery_gates[target]
-                                                .can_deliver(input_ready[target])
-                                        {
-                                            let destination = panes[target].title().to_owned();
-                                            let id = mailroom.queue(
-                                                source,
-                                                destination,
-                                                message,
-                                                "room not ready",
-                                            );
-                                            pending.push_back((id, target));
-                                            notice.push(
-                                                format!("Envelope #{id:04} queued"),
-                                                NoticeSeverity::Info,
-                                            );
-                                        } else {
-                                            let (id, result) = mailroom.deliver(
-                                                source,
-                                                &mut panes[target],
-                                                message,
-                                            );
-                                            let (text, severity) = match result {
-                                                Ok(()) => {
-                                                    delivery_gates[target].message_sent();
-                                                    submit_pending.push_back((now, target, false));
-                                                    (
-                                                        format!("Envelope #{id:04} injected"),
+                                    }
+                                    KeyCode::Enter if key.kind == KeyEventKind::Press => {
+                                        let target = (focused + 1) % panes.len();
+                                        if panes[target].is_online() {
+                                            let message = std::mem::take(message);
+                                            let source = panes[focused].title().to_owned();
+                                            input_mode = InputMode::Normal;
+                                            if let Some(router) = router
+                                                .as_mut()
+                                                .filter(|router| router.is_native(target))
+                                            {
+                                                let (text, severity) = match router.send(
+                                                    &mut mailroom,
+                                                    &source,
+                                                    target,
+                                                    &message,
+                                                    None,
+                                                ) {
+                                                    Ok(()) => (
+                                                        "Saved for native delivery".to_owned(),
                                                         NoticeSeverity::Info,
-                                                    )
-                                                }
-                                                Err(error) => (
-                                                    format!("Envelope #{id:04} failed: {error}"),
-                                                    NoticeSeverity::Failure,
-                                                ),
-                                            };
-                                            notice.push(text, severity);
+                                                    ),
+                                                    Err(error) => (
+                                                        format!("Not saved: {error}"),
+                                                        NoticeSeverity::Failure,
+                                                    ),
+                                                };
+                                                notice.push(text, severity);
+                                            } else if delivery_paused
+                                                || !delivery_gates[target]
+                                                    .can_deliver(input_ready[target])
+                                            {
+                                                let destination = panes[target].title().to_owned();
+                                                let id = mailroom.queue(
+                                                    source,
+                                                    destination,
+                                                    message,
+                                                    "room not ready",
+                                                );
+                                                pending.push_back((id, target));
+                                                notice.push(
+                                                    format!("Envelope #{id:04} queued"),
+                                                    NoticeSeverity::Info,
+                                                );
+                                            } else {
+                                                let (id, result) = mailroom.deliver(
+                                                    source,
+                                                    &mut panes[target],
+                                                    message,
+                                                );
+                                                let (text, severity) = match result {
+                                                    Ok(()) => {
+                                                        delivery_gates[target].message_sent();
+                                                        submit_pending
+                                                            .push_back((now, target, false));
+                                                        (
+                                                            format!("Envelope #{id:04} injected"),
+                                                            NoticeSeverity::Info,
+                                                        )
+                                                    }
+                                                    Err(error) => (
+                                                        format!(
+                                                            "Envelope #{id:04} failed: {error}"
+                                                        ),
+                                                        NoticeSeverity::Failure,
+                                                    ),
+                                                };
+                                                notice.push(text, severity);
+                                            }
                                         }
                                     }
-                                }
-                                KeyCode::Backspace => {
-                                    message.pop();
-                                }
-                                KeyCode::Char(c)
-                                    if matches!(
-                                        key.modifiers,
-                                        KeyModifiers::NONE | KeyModifiers::SHIFT
-                                    ) =>
-                                {
-                                    message.push(c);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    InputMode::Normal => {
-                        if key.code == KeyCode::Char('w')
-                            && key.modifiers == KeyModifiers::CONTROL
-                            && key.kind == KeyEventKind::Press
-                        {
-                                                                                    match compose_target(&panes, focused) {
-                                Ok(_) => {
-                                    input_mode = InputMode::Composing(String::new());
-                                    notice.clear();
-                                }
-                                Err(reason) => notice.push(reason, NoticeSeverity::Info),
-                            }
-                        } else if key.code == KeyCode::Tab
-                            && key.modifiers == KeyModifiers::NONE
-                            && key.kind == KeyEventKind::Press
-                        {
-                            focused = (focused + 1) % panes.len();
-                            notice.clear();
-                        } else if key.code == KeyCode::PageUp && key.kind == KeyEventKind::Press {
-                            if panes[focused].is_alternate_screen() {
-                                let _ = panes[focused].forward_page_up();
-                            } else {
-                                let rows = panes[focused].visible_height();
-                                panes[focused].scroll_up(rows);
-                            }
-                        } else if key.code == KeyCode::PageDown && key.kind == KeyEventKind::Press {
-                            if panes[focused].is_alternate_screen() {
-                                let _ = panes[focused].forward_page_down();
-                            } else {
-                                let rows = panes[focused].visible_height();
-                                panes[focused].scroll_down(rows);
-                            }
-                        } else if panes[focused].is_online() {
-                            if let Some((message, severity)) = forward_key(&mut panes[focused], key)
-                            {
-                                notice.push(message, severity);
-                            }
-                        } else {
-                            notice.push(
-                                format!(
-                                    "{} is offline; press Ctrl+R to revive it",
-                                    panes[focused].title()
-                                ),
-                                NoticeSeverity::Info,
-                            );
-                        }
-                    }
-                    InputMode::MailLog => {
-                        if key.code == KeyCode::Esc && key.kind == KeyEventKind::Press {
-                            toggle_mail_log(&mut input_mode, &mut mail_scroll, &mut notice);
-                        } else if key.code == KeyCode::Up && key.kind == KeyEventKind::Press {
-                            mail_scroll = mail_scroll.saturating_sub(1);
-                        } else if key.code == KeyCode::Down && key.kind == KeyEventKind::Press
-                        {
-                            mail_scroll = mail_scroll.saturating_add(1);
-                        } else if key.code == KeyCode::PageUp && key.kind == KeyEventKind::Press
-                        {
-                            mail_scroll = mail_scroll.saturating_sub(10);
-                        } else if key.code == KeyCode::PageDown
-                            && key.kind == KeyEventKind::Press
-                        {
-                            mail_scroll = mail_scroll.saturating_add(10);
-                        }
-                    }
-                    InputMode::Config(state) => {
-                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                            match key.code {
-                                KeyCode::Esc if key.kind == KeyEventKind::Press => {
-                                    input_mode = InputMode::Normal;
-                                    notice.clear();
-                                }
-                                KeyCode::Enter if key.kind == KeyEventKind::Press => {
-                                    let saved = save_config_state(
-                                        state,
-                                        &mut panes,
-                                        &mut fuse,
-                                        &mut fuse_size,
-                                        &mut notice,
-                                    );
-                                    if saved {
-                                        input_mode = InputMode::Normal;
+                                    KeyCode::Backspace => {
+                                        message.pop();
                                     }
+                                    KeyCode::Char(c)
+                                        if matches!(
+                                            key.modifiers,
+                                            KeyModifiers::NONE | KeyModifiers::SHIFT
+                                        ) =>
+                                    {
+                                        message.push(c);
+                                    }
+                                    _ => {}
                                 }
-                                KeyCode::Tab if key.kind == KeyEventKind::Press => {
-                                    state.selected = (state.selected + 1) % panes.len();
-                                    state.error = None;
-                                    state.resync(&panes);
+                            }
+                        }
+                        InputMode::Normal => {
+                            if key.code == KeyCode::Char('w')
+                                && key.modifiers == KeyModifiers::CONTROL
+                                && key.kind == KeyEventKind::Press
+                            {
+                                match compose_target(&panes, focused) {
+                                    Ok(_) => {
+                                        input_mode = InputMode::Composing(String::new());
+                                        notice.clear();
+                                    }
+                                    Err(reason) => notice.push(reason, NoticeSeverity::Info),
                                 }
-                                KeyCode::Up if key.kind == KeyEventKind::Press => {
-                                    state.field = state.field.prev();
-                                    state.error = None;
+                            } else if key.code == KeyCode::Tab
+                                && key.modifiers == KeyModifiers::NONE
+                                && key.kind == KeyEventKind::Press
+                            {
+                                focused = (focused + 1) % panes.len();
+                                notice.clear();
+                            } else if key.code == KeyCode::PageUp && key.kind == KeyEventKind::Press
+                            {
+                                if panes[focused].is_alternate_screen() {
+                                    let _ = panes[focused].forward_page_up();
+                                } else {
+                                    let rows = panes[focused].visible_height();
+                                    panes[focused].scroll_up(rows);
                                 }
-                                KeyCode::Down if key.kind == KeyEventKind::Press => {
-                                    state.field = state.field.next();
-                                    state.error = None;
+                            } else if key.code == KeyCode::PageDown
+                                && key.kind == KeyEventKind::Press
+                            {
+                                if panes[focused].is_alternate_screen() {
+                                    let _ = panes[focused].forward_page_down();
+                                } else {
+                                    let rows = panes[focused].visible_height();
+                                    panes[focused].scroll_down(rows);
                                 }
-                                KeyCode::Backspace => {
-                                    state.edit(|input| {
-                                        input.pop();
-                                    });
-                                }
-                                KeyCode::Char(ch)
-                                    if matches!(
-                                        key.modifiers,
-                                        KeyModifiers::NONE | KeyModifiers::SHIFT
-                                    ) =>
+                            } else if panes[focused].is_online() {
+                                if let Some((message, severity)) =
+                                    forward_key(&mut panes[focused], key)
                                 {
-                                    state.edit(|input| input.push(ch));
+                                    notice.push(message, severity);
                                 }
-                                _ => {}
+                            } else {
+                                notice.push(
+                                    format!(
+                                        "{} is offline; press Ctrl+R to revive it",
+                                        panes[focused].title()
+                                    ),
+                                    NoticeSeverity::Info,
+                                );
+                            }
+                        }
+                        InputMode::MailLog => {
+                            if key.code == KeyCode::Esc && key.kind == KeyEventKind::Press {
+                                toggle_mail_log(&mut input_mode, &mut mail_scroll, &mut notice);
+                            } else if key.code == KeyCode::Up && key.kind == KeyEventKind::Press {
+                                mail_scroll = mail_scroll.saturating_sub(1);
+                            } else if key.code == KeyCode::Down && key.kind == KeyEventKind::Press {
+                                mail_scroll = mail_scroll.saturating_add(1);
+                            } else if key.code == KeyCode::PageUp && key.kind == KeyEventKind::Press
+                            {
+                                mail_scroll = mail_scroll.saturating_sub(10);
+                            } else if key.code == KeyCode::PageDown
+                                && key.kind == KeyEventKind::Press
+                            {
+                                mail_scroll = mail_scroll.saturating_add(10);
+                            }
+                        }
+                        InputMode::Config(state) => {
+                            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                                match key.code {
+                                    KeyCode::Esc if key.kind == KeyEventKind::Press => {
+                                        input_mode = InputMode::Normal;
+                                        notice.clear();
+                                    }
+                                    KeyCode::Enter if key.kind == KeyEventKind::Press => {
+                                        let saved = save_config_state(
+                                            state,
+                                            &mut panes,
+                                            &mut fuse,
+                                            &mut fuse_size,
+                                            &mut notice,
+                                        );
+                                        if saved {
+                                            input_mode = InputMode::Normal;
+                                        }
+                                    }
+                                    KeyCode::Tab if key.kind == KeyEventKind::Press => {
+                                        state.selected = (state.selected + 1) % panes.len();
+                                        state.error = None;
+                                        state.resync(&panes);
+                                    }
+                                    KeyCode::Up if key.kind == KeyEventKind::Press => {
+                                        state.field = state.field.prev();
+                                        state.error = None;
+                                    }
+                                    KeyCode::Down if key.kind == KeyEventKind::Press => {
+                                        state.field = state.field.next();
+                                        state.error = None;
+                                    }
+                                    KeyCode::Backspace => {
+                                        state.edit(|input| {
+                                            input.pop();
+                                        });
+                                    }
+                                    KeyCode::Char(ch)
+                                        if matches!(
+                                            key.modifiers,
+                                            KeyModifiers::NONE | KeyModifiers::SHIFT
+                                        ) =>
+                                    {
+                                        state.edit(|input| input.push(ch));
+                                    }
+                                    _ => {}
+                                }
                             }
                         }
                     }
-                },
+                }
                 Event::Resize(_, _) => {
-                    terminal.autoresize().map_err(|error| io::Error::other(error.to_string()))?;
-                    let (rooms, _, _) = content_areas(terminal.size().map_err(|error| io::Error::other(error.to_string()))?.into());
+                    terminal
+                        .autoresize()
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    let (rooms, _, _) = content_areas(
+                        terminal
+                            .size()
+                            .map_err(|error| io::Error::other(error.to_string()))?
+                            .into(),
+                    );
                     let areas = pane_areas(rooms, room_count);
                     *pane_sizes = areas.iter().map(|area| pane_size(*area)).collect();
                     for (pane, size) in panes.iter_mut().zip(pane_sizes.iter()) {
@@ -4018,15 +4041,16 @@ where
     for pane in panes.iter_mut() {
         pane.cleanup();
     }
-    terminal.show_cursor().map_err(|error| io::Error::other(error.to_string()))?;
+    terminal
+        .show_cursor()
+        .map_err(|error| io::Error::other(error.to_string()))?;
     Ok(())
 }
-
 
 fn run_rooms(
     mut specs: Vec<RoomSpec>,
     resumed: Vec<bool>,
-        fuse_size: usize,
+    fuse_size: usize,
     token_pricing: Vec<TokenPricing>,
     startup_notice: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4080,8 +4104,8 @@ fn run_rooms(
     for message in &claude_notices {
         eprintln!("{message}");
     }
-        // `?` returns early on an error. The guards below still run their Drop code.
-        let ((natives, router), _terminal_guard) = launch_then_enter(
+    // `?` returns early on an error. The guards below still run their Drop code.
+    let ((natives, router), _terminal_guard) = launch_then_enter(
         || {
             let natives = pane::launch_native_rooms(&specs, &environments)?;
             let router = pane::start_native_router(&specs, &natives)?;
@@ -4101,11 +4125,7 @@ fn run_rooms(
     }
     // Every Claude session and binding exists before any terminal starts.
     if let Some(router) = router.as_mut() {
-        claude_notices.extend(pane::bind_claude_rooms(
-            router,
-            &specs,
-            &mut claude_starts,
-        )?);
+        claude_notices.extend(pane::bind_claude_rooms(router, &specs, &mut claude_starts)?);
     }
     let (mut panes, mut spawned_at) = start_rooms(
         &mut LivePanes,
@@ -4145,8 +4165,6 @@ fn run_rooms(
     )
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4160,13 +4178,27 @@ mod tests {
             doorbell_reply(envelope)(7, outcome);
             answers.read()
         };
-        assert_eq!(answer(Accepted), (true, "accepted".to_owned(), Some(7), None));
+        assert_eq!(
+            answer(Accepted),
+            (true, "accepted".to_owned(), Some(7), None)
+        );
         assert_eq!(answer(Queued), (true, "queued".to_owned(), Some(7), None));
-        assert_eq!(answer(Held("why".to_owned())), (true, "held".to_owned(), Some(7), None));
-        assert_eq!(answer(Uncertain), (true, "uncertain".to_owned(), Some(7), None));
+        assert_eq!(
+            answer(Held("why".to_owned())),
+            (true, "held".to_owned(), Some(7), None)
+        );
+        assert_eq!(
+            answer(Uncertain),
+            (true, "uncertain".to_owned(), Some(7), None)
+        );
         assert_eq!(
             answer(Failed("HTTP 401".to_owned())),
-            (false, "rejected".to_owned(), None, Some("HTTP 401".to_owned()))
+            (
+                false,
+                "rejected".to_owned(),
+                None,
+                Some("HTTP 401".to_owned())
+            )
         );
     }
 
@@ -4267,7 +4299,11 @@ mod tests {
     }
 
     #[cfg(all(test, unix))]
-    fn report_test_stub(root: &std::path::Path, name: &str, log: &std::path::Path) -> std::path::PathBuf {
+    fn report_test_stub(
+        root: &std::path::Path,
+        name: &str,
+        log: &std::path::Path,
+    ) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = root.join(name);
         // As an interactive pane (no arguments) the stub records everything
@@ -4383,10 +4419,11 @@ mod tests {
         let fake = fake_room(root, "b", "v2.2.5");
         // Consume the launch generation a real startup would have taken, so
         // the report allocates the next one like production does.
-        let _launch_generation =
-            crate::native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
-                .next()
-                .unwrap();
+        let _launch_generation = crate::native_launch::GenerationAllocator::new(
+            crate::pane::session_state::state_directory(),
+        )
+        .next()
+        .unwrap();
         let native = native_launch::start(native_launch::NativeLaunch::direct(
             fake.program.as_os_str(),
             cwd,
@@ -4432,8 +4469,16 @@ mod tests {
         let mut mailroom = Mailroom::new(50);
         let notice = apply_test_report(&mut panes, router.as_mut(), 0, None, true);
         assert!(notice.contains("session pending after clear"), "{notice}");
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "held", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "held",
+            None,
+        )
+        .unwrap();
         pump_router(router.as_mut().unwrap(), &mut mailroom, 300);
         let view = mailroom.summary();
         assert!(view.contains("HELD: session pending after clear"), "{view}");
@@ -4455,13 +4500,24 @@ mod tests {
         // Pending, mail, then the new session id with no scheduling pass in
         // between: the hold is already on the mail when the rebind adopts it.
         apply_test_report(&mut panes, router.as_mut(), 0, None, true);
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "held", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "held",
+            None,
+        )
+        .unwrap();
         apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
         // Paused: nothing moves, but nothing is lost either.
         let end = Instant::now() + Duration::from_millis(300);
         while Instant::now() < end {
-            router.as_mut().unwrap().tick(Instant::now(), &mut mailroom, true, false);
+            router
+                .as_mut()
+                .unwrap()
+                .tick(Instant::now(), &mut mailroom, true, false);
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(fake.state.received.lock().unwrap().is_empty());
@@ -4481,12 +4537,23 @@ mod tests {
             report_test_opencode_room(root.path(), cwd.path(), "ses-old-1");
         let mut mailroom = Mailroom::new(50);
         apply_test_report(&mut panes, router.as_mut(), 0, None, true);
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "held", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "held",
+            None,
+        )
+        .unwrap();
         apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
         let end = Instant::now() + Duration::from_millis(300);
         while Instant::now() < end {
-            router.as_mut().unwrap().tick(Instant::now(), &mut mailroom, false, true);
+            router
+                .as_mut()
+                .unwrap()
+                .tick(Instant::now(), &mut mailroom, false, true);
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(fake.state.received.lock().unwrap().is_empty());
@@ -4505,14 +4572,33 @@ mod tests {
         let (mut panes, mut router, fake) =
             report_test_opencode_room(root.path(), cwd.path(), "ses-old-1");
         let mut mailroom = Mailroom::new(50);
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "old",
+            None,
+        )
+        .unwrap();
         apply_test_report(&mut panes, router.as_mut(), 0, None, true);
         apply_test_report(&mut panes, router.as_mut(), 0, None, true);
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "new", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "new",
+            None,
+        )
+        .unwrap();
         let first = apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
-        assert!(first.contains("now follows reported session ses_b"), "{first}");
+        assert!(
+            first.contains("now follows reported session ses_b"),
+            "{first}"
+        );
         let second = apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
         assert!(second.contains("already on ses_b"), "{second}");
         let binding = router.as_ref().unwrap().binding_for(0).unwrap();
@@ -4559,10 +4645,22 @@ mod tests {
             report_test_opencode_room(root.path(), cwd.path(), "ses_b");
         let mut mailroom = Mailroom::new(50);
         apply_test_report(&mut panes, router.as_mut(), 0, None, true);
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "held", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "held",
+            None,
+        )
+        .unwrap();
         pump_router(router.as_mut().unwrap(), &mut mailroom, 300);
-        assert!(mailroom.summary().contains("HELD: session pending after clear"));
+        assert!(
+            mailroom
+                .summary()
+                .contains("HELD: session pending after clear")
+        );
         let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
         assert!(notice.contains("pending cleared"), "{notice}");
         pump_router(router.as_mut().unwrap(), &mut mailroom, 300);
@@ -4587,8 +4685,16 @@ mod tests {
         let (mut panes, mut router, fake) =
             report_test_opencode_room(root.path(), cwd.path(), "ses_b");
         let mut mailroom = Mailroom::new(50);
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "old",
+            None,
+        )
+        .unwrap();
         apply_test_report(&mut panes, router.as_mut(), 0, None, true);
         apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
         pump_router(router.as_mut().unwrap(), &mut mailroom, 400);
@@ -4613,8 +4719,16 @@ mod tests {
         let (mut panes, mut router, fake) =
             report_test_opencode_room(root.path(), cwd.path(), "ses_b");
         let mut mailroom = Mailroom::new(50);
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "old",
+            None,
+        )
+        .unwrap();
         apply_test_report(&mut panes, router.as_mut(), 0, None, true);
         apply_test_report(&mut panes, router.as_mut(), 0, None, true);
         apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
@@ -4640,11 +4754,22 @@ mod tests {
         let (mut panes, mut router, fake) =
             report_test_opencode_room(root.path(), cwd.path(), "ses-old-1");
         let mut mailroom = Mailroom::new(50);
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "old",
+            None,
+        )
+        .unwrap();
         apply_test_report(&mut panes, router.as_mut(), 0, None, true);
         let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
-        assert!(notice.contains("now follows reported session ses_b"), "{notice}");
+        assert!(
+            notice.contains("now follows reported session ses_b"),
+            "{notice}"
+        );
         pump_router(router.as_mut().unwrap(), &mut mailroom, 400);
         let received = fake.state.received.lock().unwrap().clone();
         assert!(
@@ -4667,8 +4792,16 @@ mod tests {
         let (mut panes, mut router, fake) =
             report_test_opencode_room(root.path(), cwd.path(), "ses_b");
         let mut mailroom = Mailroom::new(50);
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "old",
+            None,
+        )
+        .unwrap();
         // Drain the enqueue with delivery paused: seeing it queued proves the
         // save landed, and no schedule can have sent the mail yet.
         let settled = Instant::now() + Duration::from_secs(5);
@@ -4740,16 +4873,32 @@ mod tests {
         let state_dir = root.join("state");
         let state_path = state_dir.join("native-outbox.json");
 
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "old",
+            None,
+        )
+        .unwrap();
         // The pending report cannot write its hold...
         crate::native_outbox::fail_pending_hold_at(&state_path);
         apply_test_report(&mut panes, router.as_mut(), 0, None, true);
         // ...and the mail saved after it is held for the next session. Wait
         // for that save on disk before breaking anything, so there really is
         // held mail for the second failure to hit.
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "new", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "new",
+            None,
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let saved = std::fs::read_to_string(&state_path).unwrap_or_default();
@@ -4887,8 +5036,7 @@ mod tests {
         let _state = crate::pane::session_state::StateRootGuard::isolated();
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let (panes, router, _fake) =
-            report_test_opencode_room(root.path(), cwd.path(), "ses_b");
+        let (panes, router, _fake) = report_test_opencode_room(root.path(), cwd.path(), "ses_b");
         let mut rig = ReportDispatch::new(panes, router);
         rig.push_report(0, Some("ses_b"), false);
         let notice = rig.dispatch();
@@ -4909,9 +5057,7 @@ mod tests {
         use ratatui::buffer::Buffer;
         use ratatui::widgets::Widget;
         let area = ratatui::layout::Rect::new(0, 0, width, 1);
-        let text = notices
-            .status_line(area.width)
-            .expect("a notice to show");
+        let text = notices.status_line(area.width).expect("a notice to show");
         let mut buffer = Buffer::empty(area);
         Widget::render(Paragraph::new(text), area, &mut buffer);
         (0..area.width)
@@ -4941,10 +5087,7 @@ mod tests {
     fn a_long_routine_notice_does_not_hide_a_new_failure() {
         let mut notices = Notices::default();
         notices.push(
-            format!(
-                "Opencode · 1 is already on ses_b — {}",
-                "x".repeat(260)
-            ),
+            format!("Opencode · 1 is already on ses_b — {}", "x".repeat(260)),
             NoticeSeverity::Info,
         );
         notices.push(
@@ -5003,9 +5146,7 @@ mod tests {
         let mut notices = Notices::default();
         for index in 0..MAX_NOTICES {
             notices.push(
-                format!(
-                    "native delivery: room {index} could not be held: no space left"
-                ),
+                format!("native delivery: room {index} could not be held: no space left"),
                 NoticeSeverity::Failure,
             );
         }
@@ -5066,11 +5207,7 @@ mod tests {
     /// Renders the production mailroom popup the way the UI does, through
     /// the same render helper the event loop calls, into the real 80x24
     /// layout.
-    fn rendered_popup(
-        mailroom: &Mailroom,
-        notices: &Notices,
-        scroll: u16,
-    ) -> Vec<String> {
+    fn rendered_popup(mailroom: &Mailroom, notices: &Notices, scroll: u16) -> Vec<String> {
         use ratatui::buffer::Buffer;
         let area = ratatui::layout::Rect::new(0, 0, 80, 24);
         let popup = mail_popup_area(area);
@@ -5092,10 +5229,18 @@ mod tests {
     fn mailroom_popup_lists_failures_first_and_scrolls_past_envelopes() {
         let mut mailroom = Mailroom::new(100);
         for _ in 0..20 {
-            mailroom.queue("Room A".to_owned(), "Room B".to_owned(), "hi".to_owned(), "room busy");
+            mailroom.queue(
+                "Room A".to_owned(),
+                "Room B".to_owned(),
+                "hi".to_owned(),
+                "room busy",
+            );
         }
         let mut notices = Notices::default();
-        notices.push("Doorbell envelope #0001 injected".to_owned(), NoticeSeverity::Info);
+        notices.push(
+            "Doorbell envelope #0001 injected".to_owned(),
+            NoticeSeverity::Info,
+        );
         for index in 0..3 {
             notices.push(
                 format!("native delivery: Room {index} could not be held: disk {index} full"),
@@ -5103,8 +5248,12 @@ mod tests {
             );
         }
         let text = mail_popup_text(&mailroom, &notices);
-        let first_failure = text.find("could not be held").expect("a failure in the text");
-        let first_info = text.find("Doorbell envelope").expect("the info in the text");
+        let first_failure = text
+            .find("could not be held")
+            .expect("a failure in the text");
+        let first_info = text
+            .find("Doorbell envelope")
+            .expect("the info in the text");
         assert!(
             first_failure < first_info,
             "failures sort before routine statuses"
@@ -5135,7 +5284,12 @@ mod tests {
     fn opening_the_mailroom_keeps_failures_visible_in_the_popup() {
         let mut mailroom = Mailroom::new(100);
         for _ in 0..20 {
-            mailroom.queue("Room A".to_owned(), "Room B".to_owned(), "hi".to_owned(), "room busy");
+            mailroom.queue(
+                "Room A".to_owned(),
+                "Room B".to_owned(),
+                "hi".to_owned(),
+                "room busy",
+            );
         }
         let mut notices = Notices::default();
         notices.push(
@@ -5146,7 +5300,10 @@ mod tests {
             "native delivery: Room 1 could not be held: disk full".to_owned(),
             NoticeSeverity::Failure,
         );
-        notices.push("Doorbell envelope #0001 injected".to_owned(), NoticeSeverity::Info);
+        notices.push(
+            "Doorbell envelope #0001 injected".to_owned(),
+            NoticeSeverity::Info,
+        );
         let mut mode = InputMode::Normal;
         let mut scroll = 7;
         toggle_mail_log(&mut mode, &mut scroll, &mut notices);
@@ -5193,7 +5350,10 @@ mod tests {
             Some("1 notices: Opencode · 1 is already on ses_b (x3)")
         );
         assert!(
-            notices.ordered_lines().iter().any(|line| line.ends_with("(x3)")),
+            notices
+                .ordered_lines()
+                .iter()
+                .any(|line| line.ends_with("(x3)")),
             "the popup keeps the count"
         );
     }
@@ -5269,8 +5429,7 @@ mod tests {
         );
         assert_eq!(rig.notice.dropped, 2, "both routine statuses were dropped");
         assert!(
-            !rig
-                .notice
+            !rig.notice
                 .entries
                 .iter()
                 .any(|entry| entry.text.contains("Queued delivery")),
@@ -5299,11 +5458,9 @@ mod tests {
         rig.push_message(0, 0, "hello");
         rig.dispatch_keep();
         assert!(
-            rig.notice
-                .entries
-                .iter()
-                .any(|entry| entry.severity == NoticeSeverity::Info
-                    && entry.text.contains("queued")),
+            rig.notice.entries.iter().any(
+                |entry| entry.severity == NoticeSeverity::Info && entry.text.contains("queued")
+            ),
             "the queued status is routine"
         );
         rig.paused = false;
@@ -5435,7 +5592,10 @@ mod tests {
             &mut notice,
         );
         let saved = notice.entries.last().expect("a saved notice");
-        assert!(saved.text.contains("saved for native delivery"), "{saved:?}");
+        assert!(
+            saved.text.contains("saved for native delivery"),
+            "{saved:?}"
+        );
         assert_eq!(saved.severity, NoticeSeverity::Info);
     }
 
@@ -5484,12 +5644,14 @@ mod tests {
         rig.last_output = vec![Some(old()), Some(old())];
         let push_control = |rig: &mut ReportDispatch| {
             let (reply, _dropped) = std::sync::mpsc::sync_channel(1);
-            rig.doorbell.events.push_back(DoorbellEvent::Control(DoorbellControl {
-                from: 0,
-                to: 1,
-                action: crate::doorbell::ControlAction::Resume,
-                reply,
-            }));
+            rig.doorbell
+                .events
+                .push_back(DoorbellEvent::Control(DoorbellControl {
+                    from: 0,
+                    to: 1,
+                    action: crate::doorbell::ControlAction::Resume,
+                    reply,
+                }));
         };
         push_control(&mut rig);
         rig.dispatch_keep();
@@ -5635,12 +5797,28 @@ mod tests {
 
         // Old mail, the pending report, then new mail with no pass in
         // between: the outbox answers the three commands in that order.
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "old",
+            None,
+        )
+        .unwrap();
         crate::native_outbox::fail_pending_hold_at(&state_path);
         apply_test_report(&mut panes, router.as_mut(), 0, None, true);
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "new", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "new",
+            None,
+        )
+        .unwrap();
 
         let notices = drain_answered(&mut router, &mut mailroom);
         let view = mailroom.summary();
@@ -5685,14 +5863,30 @@ mod tests {
         let state_path = root.path().join("state").join("native-outbox.json");
 
         // Old mail gives the first report a hold to write.
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "old",
+            None,
+        )
+        .unwrap();
         crate::native_outbox::fail_pending_hold_at(&state_path);
         apply_test_report(&mut panes, router.as_mut(), 0, None, true);
         apply_test_report(&mut panes, router.as_mut(), 0, None, true);
         // Its own result proves the two reports above were both answered.
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "later", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "later",
+            None,
+        )
+        .unwrap();
 
         let notices = drain_answered(&mut router, &mut mailroom);
         let view = mailroom.summary();
@@ -5709,14 +5903,20 @@ mod tests {
             "exactly one pending failure is reported: {notices:?}"
         );
         assert!(
-            notices
-                .iter()
-                .any(|notice| notice.contains("Opencode · 1")),
+            notices.iter().any(|notice| notice.contains("Opencode · 1")),
             "the failure names the room: {notices:?}"
         );
         assert!(
-            send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "after", None)
-                .is_ok(),
+            send_native_mail(
+                &mut panes,
+                router.as_mut(),
+                &mut mailroom,
+                "Room X",
+                0,
+                "after",
+                None
+            )
+            .is_ok(),
             "a reported failure must not stop the room from accepting mail"
         );
     }
@@ -5798,9 +5998,7 @@ mod tests {
                 doorbell: ReportEvents {
                     events: std::collections::VecDeque::new(),
                 },
-                gates: (0..rooms)
-                    .map(|_| DeliveryGate::new(false))
-                    .collect(),
+                gates: (0..rooms).map(|_| DeliveryGate::new(false)).collect(),
                 last_output: vec![None; rooms],
                 spawned_at: vec![now; rooms],
                 pulses: vec![None; rooms],
@@ -5832,16 +6030,14 @@ mod tests {
         /// Queues one session report exactly as the doorbell hands it over.
         fn push_report(&mut self, from: usize, session: Option<&str>, pending: bool) {
             let (reply, _dropped) = std::sync::mpsc::sync_channel(1);
-            self.doorbell
-                .events
-                .push_back(DoorbellEvent::SessionReport(
-                    crate::doorbell::DoorbellSessionReport {
-                        from,
-                        session: session.map(str::to_owned),
-                        pending,
-                        reply,
-                    },
-                ));
+            self.doorbell.events.push_back(DoorbellEvent::SessionReport(
+                crate::doorbell::DoorbellSessionReport {
+                    from,
+                    session: session.map(str::to_owned),
+                    pending,
+                    reply,
+                },
+            ));
         }
 
         /// Queues one doorbell message exactly as the doorbell hands it over.
@@ -5850,7 +6046,9 @@ mod tests {
             envelope.from = from;
             envelope.to = to;
             envelope.body = body.to_owned();
-            self.doorbell.events.push_back(DoorbellEvent::Message(envelope));
+            self.doorbell
+                .events
+                .push_back(DoorbellEvent::Message(envelope));
         }
 
         /// Runs one event-loop pass and returns the notice the dispatch left.
@@ -6170,10 +6368,11 @@ mod tests {
         use crate::native_launch::{self, tests::fake_room};
         let _state = crate::pane::session_state::StateRootGuard::isolated();
         // Consume the launch generation a real startup would have taken.
-        let _launch_generation =
-            crate::native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
-                .next()
-                .unwrap();
+        let _launch_generation = crate::native_launch::GenerationAllocator::new(
+            crate::pane::session_state::state_directory(),
+        )
+        .next()
+        .unwrap();
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         // Rooms 0 and 2 keep ordinary bindings; room 1 starts on a stale id.
@@ -6276,7 +6475,10 @@ mod tests {
             }])
             .unwrap();
         let notice = apply_test_report(&mut panes, router.as_mut(), 1, Some("ses_b"), false);
-        assert!(notice.contains("now follows reported session ses_b"), "{notice}");
+        assert!(
+            notice.contains("now follows reported session ses_b"),
+            "{notice}"
+        );
         // The reporting room rebound with a new generation; the others are
         // untouched in binding, generation and adapter.
         let room0 = router.as_ref().unwrap().binding_for(0).unwrap();
@@ -6291,12 +6493,23 @@ mod tests {
         );
         let mut mailroom = Mailroom::new(50);
         for index in 0..3 {
-            send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", index, "hi", None)
-                .unwrap();
+            send_native_mail(
+                &mut panes,
+                router.as_mut(),
+                &mut mailroom,
+                "Room X",
+                index,
+                "hi",
+                None,
+            )
+            .unwrap();
         }
         let end = Instant::now() + Duration::from_secs(20);
         loop {
-            router.as_mut().unwrap().tick(Instant::now(), &mut mailroom, false, false);
+            router
+                .as_mut()
+                .unwrap()
+                .tick(Instant::now(), &mut mailroom, false, false);
             if mailroom.summary().matches("ACCEPTED").count() == 3 {
                 break;
             }
@@ -6311,7 +6524,8 @@ mod tests {
         let _state = crate::pane::session_state::StateRootGuard::isolated();
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let (mut panes, mut router, _fake) = report_test_opencode_room(root.path(), cwd.path(), "ses_b");
+        let (mut panes, mut router, _fake) =
+            report_test_opencode_room(root.path(), cwd.path(), "ses_b");
         let notice = apply_test_report(&mut panes, router.as_mut(), 9, Some("ses-x"), false);
         assert!(notice.contains("unknown room"), "{notice}");
         assert!(router.as_ref().unwrap().binding_for(0).is_some());
@@ -6327,15 +6541,29 @@ mod tests {
             report_test_opencode_room(root.path(), cwd.path(), "ses-old-1");
         let mut mailroom = Mailroom::new(50);
         let old = router.as_ref().unwrap().binding_for(0).unwrap();
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "old", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "old",
+            None,
+        )
+        .unwrap();
         let end = Instant::now() + Duration::from_millis(300);
         while Instant::now() < end {
-            router.as_mut().unwrap().tick(Instant::now(), &mut mailroom, true, false);
+            router
+                .as_mut()
+                .unwrap()
+                .tick(Instant::now(), &mut mailroom, true, false);
             std::thread::sleep(Duration::from_millis(20));
         }
         let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
-        assert!(notice.contains("now follows reported session ses_b"), "{notice}");
+        assert!(
+            notice.contains("now follows reported session ses_b"),
+            "{notice}"
+        );
         let binding = router.as_ref().unwrap().binding_for(0).unwrap();
         assert_eq!(binding.session, "ses_b");
         assert_eq!(binding.generation, 2);
@@ -6343,11 +6571,23 @@ mod tests {
             binding.endpoint, old.endpoint,
             "the rebind stays on the same owned server"
         );
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "new", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "new",
+            None,
+        )
+        .unwrap();
         pump_router(router.as_mut().unwrap(), &mut mailroom, 500);
         let received = fake.state.received.lock().unwrap().clone();
-        assert_eq!(received.len(), 1, "only post-report mail reaches the server");
+        assert_eq!(
+            received.len(),
+            1,
+            "only post-report mail reaches the server"
+        );
         assert!(received[0].1.contains("new"), "{received:?}");
         let view = mailroom.summary();
         assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
@@ -6366,10 +6606,11 @@ mod tests {
         let queue_args = root.path().join("codex.args");
         let program = report_test_stub(root.path(), "codex", &root.path().join("codex.log"));
         // Consume the launch generation a real startup would have taken.
-        let _launch_generation =
-            crate::native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
-                .next()
-                .unwrap();
+        let _launch_generation = crate::native_launch::GenerationAllocator::new(
+            crate::pane::session_state::state_directory(),
+        )
+        .next()
+        .unwrap();
         let specs = vec![report_test_spec(&program, cwd.path(), "Codex · 1", true)];
         let mut router =
             pane::start_native_router(&specs, &[None]).expect("native rooms start a router");
@@ -6385,9 +6626,9 @@ mod tests {
             .bind_codex(vec![crate::native_route::CodexEntry {
                 index: 0,
                 title: "Codex · 1".to_owned(),
-                room: Some(std::sync::Arc::new(panes[0].codex_room_for(
-                    "11111111-1111-4111-8111-111111111111".to_owned(),
-                ))),
+                room: Some(std::sync::Arc::new(
+                    panes[0].codex_room_for("11111111-1111-4111-8111-111111111111".to_owned()),
+                )),
                 generation: 1,
                 reason: None,
             }])
@@ -6397,21 +6638,33 @@ mod tests {
         let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some(thread), false);
         assert!(notice.contains("now follows reported session"), "{notice}");
         assert_eq!(
-            crate::pane::session_state::lookup_reported("codex", cwd.path(), "Codex · 1").as_deref(),
+            crate::pane::session_state::lookup_reported("codex", cwd.path(), "Codex · 1")
+                .as_deref(),
             Some(thread),
             "the reported thread survives a restart"
         );
         let binding = router.as_ref().unwrap().binding_for(0).unwrap();
         assert_eq!(binding.session, thread);
         assert_eq!(binding.generation, 2);
-        send_native_mail(&mut panes, router.as_mut(), &mut mailroom, "Room X", 0, "hi codex", None)
-            .unwrap();
+        send_native_mail(
+            &mut panes,
+            router.as_mut(),
+            &mut mailroom,
+            "Room X",
+            0,
+            "hi codex",
+            None,
+        )
+        .unwrap();
         // Acceptance and the queue CLI's own argument log come from
         // different processes, so wait for both instead of assuming one
         // implies the other.
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            router.as_mut().unwrap().tick(Instant::now(), &mut mailroom, false, false);
+            router
+                .as_mut()
+                .unwrap()
+                .tick(Instant::now(), &mut mailroom, false, false);
             let view = mailroom.summary();
             let logged = std::fs::read_to_string(&queue_args).unwrap_or_default();
             if view.contains("ACCEPTED by Codex") && logged.contains(thread) {
@@ -6432,7 +6685,8 @@ mod tests {
         let _state = crate::pane::session_state::StateRootGuard::isolated();
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let native_program = report_test_stub(root.path(), "opencode", &root.path().join("native.calls"));
+        let native_program =
+            report_test_stub(root.path(), "opencode", &root.path().join("native.calls"));
         let raw_program = report_test_stub(root.path(), "claude", &root.path().join("raw.calls"));
         let fake = fake_room(root.path(), "server", "v2.2.5");
         let mut specs = vec![
@@ -6456,7 +6710,10 @@ mod tests {
             report_test_pane(specs.remove(0), natives.remove(0), None),
         ];
         let notice = apply_test_report(&mut panes, router.as_mut(), 1, Some("ses-x"), false);
-        assert!(notice.contains("not a native OpenCode, Codex or Claude room"), "{notice}");
+        assert!(
+            notice.contains("not a native OpenCode, Codex or Claude room"),
+            "{notice}"
+        );
         assert!(router.as_ref().unwrap().binding_for(1).is_none());
     }
 
@@ -6473,16 +6730,20 @@ mod tests {
         let specs = vec![report_test_spec(&program, cwd.path(), "Codex · 1", true)];
         let mut router = pane::start_native_router(&specs, &[None]).expect("router starts");
         let mint = pane::CodexMint::Ready("11111111-1111-4111-8111-111111111111".to_owned());
-        let mut panes = vec![report_test_pane(specs.into_iter().next().unwrap(), None, Some(&mint))];
+        let mut panes = vec![report_test_pane(
+            specs.into_iter().next().unwrap(),
+            None,
+            Some(&mint),
+        )];
         router
             .as_mut()
             .unwrap()
             .bind_codex(vec![crate::native_route::CodexEntry {
                 index: 0,
                 title: "Codex · 1".to_owned(),
-                room: Some(std::sync::Arc::new(panes[0].codex_room_for(
-                    "11111111-1111-4111-8111-111111111111".to_owned(),
-                ))),
+                room: Some(std::sync::Arc::new(
+                    panes[0].codex_room_for("11111111-1111-4111-8111-111111111111".to_owned()),
+                )),
                 generation: 1,
                 reason: None,
             }])
@@ -6503,7 +6764,10 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(error.contains(thread), "the hold reason names the id: {error}");
+        assert!(
+            error.contains(thread),
+            "the hold reason names the id: {error}"
+        );
     }
 
     #[test]
@@ -6514,16 +6778,22 @@ mod tests {
         // reap wait follows the run on every way out, as for Ctrl+Q.
         let run_with = &production[production.find("fn run_with(").unwrap()..];
         let run_with = &run_with[..run_with.find("\n}\n").unwrap()];
-        let install = run_with.find("shutdown::install()").expect("handlers are installed");
+        let install = run_with
+            .find("shutdown::install()")
+            .expect("handlers are installed");
         let run = run_with.find("run_rooms(").expect("rooms run");
-        let wait = run_with.find("wait_for_reaps()").expect("reaping is awaited");
+        let wait = run_with
+            .find("wait_for_reaps()")
+            .expect("reaping is awaited");
         assert!(install < run && run < wait);
         // The loop leaves as soon as it is asked to, before doing anything else.
         let body = &production[production.find("fn run_loop").unwrap()..];
         let loop_start = body.find("    loop {\n").expect("event loop");
         let after = &body[loop_start + "    loop {\n".len()..];
         assert!(
-            after.trim_start().starts_with("if crate::shutdown::requested() {\n            break;"),
+            after
+                .trim_start()
+                .starts_with("if crate::shutdown::requested() {\n            break;"),
             "the first thing the loop does is check for a shutdown request"
         );
     }
@@ -6563,8 +6833,12 @@ mod tests {
         let source = include_str!("app.rs");
         let body = &source[source.find("fn run_rooms(").unwrap()..];
         let body = &body[..body.find("\n}\n").unwrap()];
-        let launch = body.find("launch_then_enter(").expect("launch_then_enter is used");
-        let enter = body.find("TerminalGuard::enter").expect("terminal is entered");
+        let launch = body
+            .find("launch_then_enter(")
+            .expect("launch_then_enter is used");
+        let enter = body
+            .find("TerminalGuard::enter")
+            .expect("terminal is entered");
         assert!(launch < enter);
         assert_eq!(body.matches("TerminalGuard::enter").count(), 1);
         assert!(!body.contains("TerminalGuard::enter()"));
@@ -6635,7 +6909,6 @@ mod tests {
             assert_eq!(calls, expected, "direct calls of .{method}( in app.rs");
         }
     }
-
 
     fn released(keys: &str) -> String {
         // Feeds one key at a time, as the event loop does, and collects what the
@@ -8018,7 +8291,9 @@ mod tests {
 
             #[allow(dead_code)]
             fn steps(steps: Vec<ScriptedStep>) -> Self {
-                Self { steps: steps.into() }
+                Self {
+                    steps: steps.into(),
+                }
             }
         }
 
@@ -8037,7 +8312,10 @@ mod tests {
             fn read(&mut self) -> io::Result<Event> {
                 match self.steps.pop_front() {
                     Some(ScriptedStep::Event(event)) => Ok(event),
-                    _ => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no scripted event")),
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "no scripted event",
+                    )),
                 }
             }
         }
@@ -8116,7 +8394,8 @@ mod tests {
             let mut pane_sizes = vec![pty_size()];
             let mut notice = Notices::default();
             let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-            let mut events = ScriptedEvents::new(vec![key(KeyCode::Char('q'), KeyModifiers::CONTROL)]);
+            let mut events =
+                ScriptedEvents::new(vec![key(KeyCode::Char('q'), KeyModifiers::CONTROL)]);
             let mut doorbell = SilentDoorbell::new(root.path().join("doorbell.sock"));
 
             run_loop(
@@ -8142,5 +8421,4 @@ mod tests {
             assert!(!panes[0].is_online(), "pane must be cleaned up on exit");
         }
     }
-
 }

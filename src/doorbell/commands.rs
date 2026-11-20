@@ -5,8 +5,9 @@ use std::{
     io::{self, IsTerminal, Read},
     process,
     sync::{
-        Arc, Mutex, mpsc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -436,7 +437,9 @@ fn parse_session_report_args(
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--session" => {
-                let value = args.next().ok_or_else(|| "--session requires an ID".to_owned())?;
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--session requires an ID".to_owned())?;
                 if session.replace(value).is_some() {
                     return Err("--session may appear only once".to_owned());
                 }
@@ -569,7 +572,10 @@ fn read_stdin_bounded(bound: Duration) -> Vec<u8> {
         }
         let _ = arrived.recv_timeout(remaining);
     }
-    buffer.lock().expect("stdin buffer is never poisoned").clone()
+    buffer
+        .lock()
+        .expect("stdin buffer is never poisoned")
+        .clone()
 }
 
 /// A hook may deliver the id as JSON on stdin, as `session_id` (Codex) or
@@ -618,7 +624,12 @@ pub(crate) fn session_report_command() -> Result<(), Box<dyn std::error::Error>>
 
 fn deliver_session_report(args: Vec<String>) -> Result<(), (ReportFailure, String)> {
     let report = parse_session_report_args(args).map_err(|error| (ReportFailure::Usage, error))?;
-    let malformed = || (ReportFailure::InvalidId, "ignoring a malformed session id".to_owned());
+    let malformed = || {
+        (
+            ReportFailure::InvalidId,
+            "ignoring a malformed session id".to_owned(),
+        )
+    };
     let session = match report.session {
         Some(id) => {
             if !valid_session_id(&id) {
@@ -653,7 +664,10 @@ fn deliver_session_report(args: Vec<String>) -> Result<(), (ReportFailure, Strin
         ));
     }
     let token = env::var("CROWDED_TOKEN").map_err(|_| {
-        (ReportFailure::NotConfigured, "CROWDED_TOKEN is not set".to_owned())
+        (
+            ReportFailure::NotConfigured,
+            "CROWDED_TOKEN is not set".to_owned(),
+        )
     })?;
     let room = env::var("CROWDED_ROOM").unwrap_or_else(|_| "external".to_owned());
     let now = SystemTime::now()
@@ -838,22 +852,18 @@ mod tests {
         let parsed = parse_session_report_args(["--pending".to_owned()]).unwrap();
         assert_eq!(parsed.session, None);
         assert!(parsed.pending);
-        let parsed = parse_session_report_args(
-            ["--session", "ses-x", "--pending"].map(str::to_owned),
-        )
-        .unwrap();
+        let parsed =
+            parse_session_report_args(["--session", "ses-x", "--pending"].map(str::to_owned))
+                .unwrap();
         assert_eq!(parsed.session.as_deref(), Some("ses-x"));
         assert!(parsed.pending);
         assert!(parse_session_report_args(Vec::<String>::new()).is_ok());
         assert!(parse_session_report_args(["--session".to_owned()]).is_err());
-        assert!(parse_session_report_args(
-            ["--session", "a", "--session", "b"].map(str::to_owned)
-        )
-        .is_err());
-        assert!(parse_session_report_args(
-            ["--pending", "--pending"].map(str::to_owned)
-        )
-        .is_err());
+        assert!(
+            parse_session_report_args(["--session", "a", "--session", "b"].map(str::to_owned))
+                .is_err()
+        );
+        assert!(parse_session_report_args(["--pending", "--pending"].map(str::to_owned)).is_err());
         assert!(parse_session_report_args(["--model", "x"].map(str::to_owned)).is_err());
         assert!(parse_session_report_args(["ses-x".to_owned()]).is_err());
     }
@@ -861,9 +871,18 @@ mod tests {
     #[test]
     fn session_stdin_distinguishes_absent_from_invalid() {
         assert!(matches!(parse_session_payload(b""), StdinSession::Absent));
-        assert!(matches!(parse_session_payload(b"not json"), StdinSession::Absent));
-        assert!(matches!(parse_session_payload(br#"{}"#,), StdinSession::Absent));
-        assert!(matches!(parse_session_payload(br#"{"other":1}"#), StdinSession::Absent));
+        assert!(matches!(
+            parse_session_payload(b"not json"),
+            StdinSession::Absent
+        ));
+        assert!(matches!(
+            parse_session_payload(br#"{}"#,),
+            StdinSession::Absent
+        ));
+        assert!(matches!(
+            parse_session_payload(br#"{"other":1}"#),
+            StdinSession::Absent
+        ));
         assert!(matches!(
             parse_session_payload(br#"{"session_id":"ses-x"}"#),
             StdinSession::Valid(_)
@@ -886,9 +905,15 @@ mod tests {
             StdinSession::Invalid
         ));
         let oversized = format!(r#"{{"session_id":"{}"}}"#, "s".repeat(129));
-        assert!(matches!(parse_session_payload(oversized.as_bytes()), StdinSession::Invalid));
+        assert!(matches!(
+            parse_session_payload(oversized.as_bytes()),
+            StdinSession::Invalid
+        ));
         // A truncated payload is absent, not a false rejection.
-        assert!(matches!(parse_session_payload(br#"{"session_id":"se"#,), StdinSession::Absent));
+        assert!(matches!(
+            parse_session_payload(br#"{"session_id":"se"#,),
+            StdinSession::Absent
+        ));
     }
 
     #[test]
@@ -902,9 +927,7 @@ mod tests {
             Some("ses-open-2".to_owned())
         );
         assert_eq!(
-            session_id_from_reader(
-                br#"{"session_id":"first","sessionID":"second"}"#.as_slice()
-            ),
+            session_id_from_reader(br#"{"session_id":"first","sessionID":"second"}"#.as_slice()),
             Some("first".to_owned())
         );
         assert_eq!(session_id_from_reader(br#"{}"#.as_slice()), None);
@@ -922,7 +945,12 @@ mod tests {
 
     #[test]
     fn session_report_allows_only_conservative_session_characters() {
-        for good in ["ses_abc", "ses-ABC.1", "11111111-2222-3333-4444-555555555555", "x"] {
+        for good in [
+            "ses_abc",
+            "ses-ABC.1",
+            "11111111-2222-3333-4444-555555555555",
+            "x",
+        ] {
             assert!(valid_session_id(good), "{good} must pass");
         }
         for bad in ["", "has space", "tab\there", "semi;colon", "quote\"q"] {
@@ -967,6 +995,4 @@ mod tests {
         assert_eq!(detail.todos.len(), 1);
         assert_eq!(detail.todos[0].content, "Build");
     }
-
-
 }

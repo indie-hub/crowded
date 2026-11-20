@@ -2279,8 +2279,7 @@ export const CrowdedPulse = async () => {
         assert_eq!(
             starts
                 .iter()
-                .filter(|entry| entry["hooks"][0]["command"]
-                    == "\"$CROWDED_BIN\" session-report")
+                .filter(|entry| entry["hooks"][0]["command"] == "\"$CROWDED_BIN\" session-report")
                 .count(),
             1
         );

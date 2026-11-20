@@ -1320,11 +1320,9 @@ transport = "raw"
             .and_then(serde_json::Value::as_array)
             .is_some_and(|entries| {
                 !entries.is_empty()
-                    && entries.iter().all(|value| {
-                        value
-                            .as_str()
-                            .is_some_and(|name| name.contains("headroom"))
-                    })
+                    && entries
+                        .iter()
+                        .all(|value| value.as_str().is_some_and(|name| name.contains("headroom")))
             });
         assert!(
             opencode.get("plugin").is_none() || headroom_plugins,

@@ -504,15 +504,30 @@ fn codex_session_candidates(
         if !year.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
             continue;
         }
-        for month in fs::read_dir(year.path()).ok().into_iter().flatten().flatten() {
+        for month in fs::read_dir(year.path())
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
             if !month.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
                 continue;
             }
-            for day in fs::read_dir(month.path()).ok().into_iter().flatten().flatten() {
+            for day in fs::read_dir(month.path())
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
                 if !day.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
                     continue;
                 }
-                for entry in fs::read_dir(day.path()).ok().into_iter().flatten().flatten() {
+                for entry in fs::read_dir(day.path())
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
                     let path = entry.path();
                     if path.extension().and_then(OsStr::to_str) != Some("jsonl") {
                         continue;

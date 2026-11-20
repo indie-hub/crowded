@@ -395,7 +395,13 @@ pub(super) fn clear_room(vendor: &str, cwd: &Path, room: &str) -> io::Result<()>
             ),
         )
     })?;
-    state.upsert(vendor, &cwd.to_string_lossy(), room, FRESH_STATE_MARKER, false);
+    state.upsert(
+        vendor,
+        &cwd.to_string_lossy(),
+        room,
+        FRESH_STATE_MARKER,
+        false,
+    );
     save_state(&state).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -455,7 +461,14 @@ pub(crate) fn upsert_reported(
             ),
         )
     })?;
-    state.upsert_full(vendor, &cwd.to_string_lossy(), room, session_id, false, true);
+    state.upsert_full(
+        vendor,
+        &cwd.to_string_lossy(),
+        room,
+        session_id,
+        false,
+        true,
+    );
     save_state(&state)
 }
 
@@ -837,12 +850,17 @@ mod tests {
         assert!(error.to_string().contains(MINTED), "{error}");
         assert!(error.to_string().contains(needle), "{error}");
         assert_eq!(fs::read(&path).unwrap_or_default(), before);
-        assert_eq!(lookup_minted("codex", Path::new("/repo"), "Codex · 1"), None);
+        assert_eq!(
+            lookup_minted("codex", Path::new("/repo"), "Codex · 1"),
+            None
+        );
     }
 
     #[test]
     fn a_malformed_session_state_is_never_replaced_by_a_minted_session() {
-        stored_state_is_untouched_by_upsert("key must be a string", |path| fs::write(path, b"{ not json").unwrap());
+        stored_state_is_untouched_by_upsert("key must be a string", |path| {
+            fs::write(path, b"{ not json").unwrap()
+        });
     }
 
     #[test]
@@ -883,15 +901,24 @@ mod tests {
         let _state = StateRootGuard::isolated();
         // A legacy generic entry is trusted by neither lookup.
         upsert("codex", Path::new("/repo"), "Codex · 1", MINTED);
-        assert_eq!(lookup_reported("codex", Path::new("/repo"), "Codex · 1"), None);
-        assert_eq!(lookup_minted("codex", Path::new("/repo"), "Codex · 1"), None);
+        assert_eq!(
+            lookup_reported("codex", Path::new("/repo"), "Codex · 1"),
+            None
+        );
+        assert_eq!(
+            lookup_minted("codex", Path::new("/repo"), "Codex · 1"),
+            None
+        );
         // A hook report supersedes the generic entry with reported provenance.
         upsert_reported("codex", Path::new("/repo"), "Codex · 1", MINTED).unwrap();
         assert_eq!(
             lookup_reported("codex", Path::new("/repo"), "Codex · 1").as_deref(),
             Some(MINTED)
         );
-        assert_eq!(lookup_minted("codex", Path::new("/repo"), "Codex · 1"), None);
+        assert_eq!(
+            lookup_minted("codex", Path::new("/repo"), "Codex · 1"),
+            None
+        );
     }
 
     #[test]
@@ -904,7 +931,10 @@ mod tests {
             Some("thread-reported")
         );
         // The stale mint is gone: exactly one entry survives for the room.
-        assert_eq!(lookup_minted("codex", Path::new("/repo"), "Codex · 1"), None);
+        assert_eq!(
+            lookup_minted("codex", Path::new("/repo"), "Codex · 1"),
+            None
+        );
         let state = load_state().unwrap();
         assert_eq!(
             state
@@ -926,7 +956,10 @@ mod tests {
             upsert_reported("codex", Path::new("/repo"), "Codex · 1", "thread-new").unwrap_err();
         assert!(error.to_string().contains("thread-new"), "{error}");
         assert_eq!(fs::read(&path).unwrap(), b"{ not json");
-        assert_eq!(lookup_reported("codex", Path::new("/repo"), "Codex · 1"), None);
+        assert_eq!(
+            lookup_reported("codex", Path::new("/repo"), "Codex · 1"),
+            None
+        );
     }
 
     #[test]
@@ -939,7 +972,10 @@ mod tests {
             upsert_reported("codex", Path::new("/repo"), "Codex · 1", "thread-new").unwrap_err();
         assert!(error.to_string().contains("thread-new"), "{error}");
         assert_eq!(fs::read(&path).unwrap(), br#"{"version":99,"sessions":[]}"#);
-        assert_eq!(lookup_reported("codex", Path::new("/repo"), "Codex · 1"), None);
+        assert_eq!(
+            lookup_reported("codex", Path::new("/repo"), "Codex · 1"),
+            None
+        );
     }
 
     #[test]
@@ -1132,7 +1168,13 @@ mod tests {
     #[test]
     fn upsert_supersedes_a_stale_entry_when_the_same_numeric_room_changes_vendor() {
         let mut state = SessionState::empty();
-        state.upsert("opencode", "/repo", "OpenCode · 2", "ses-opencode-stale", false);
+        state.upsert(
+            "opencode",
+            "/repo",
+            "OpenCode · 2",
+            "ses-opencode-stale",
+            false,
+        );
         state.upsert("codex", "/repo", "Codex · 2", "ses-codex-fresh", false);
 
         assert_eq!(

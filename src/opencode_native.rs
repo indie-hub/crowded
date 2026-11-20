@@ -180,7 +180,8 @@ impl Client {
             return Delivery::NotSent;
         }
         let path = format!("/api/session/{session}/prompt");
-        let body = json!({"id": message_id, "text": text, "delivery": "queue", "resume": self.resume});
+        let body =
+            json!({"id": message_id, "text": text, "delivery": "queue", "resume": self.resume});
         match self.request("POST", &path, Some(&body)) {
             Err(RequestError::NotSent) => Delivery::NotSent,
             Err(RequestError::Uncertain) => Delivery::Uncertain,
@@ -260,9 +261,7 @@ impl Client {
         let Some(returned) = item["payload"]["text"].as_str() else {
             return Delivery::Uncertain;
         };
-        if item["sessionID"].as_str() != Some(session)
-            || !returned.starts_with(text)
-        {
+        if item["sessionID"].as_str() != Some(session) || !returned.starts_with(text) {
             Delivery::Conflict
         } else {
             Delivery::Accepted
@@ -596,11 +595,7 @@ impl Server {
         let owned = self
             .binding
             .lock()
-            .map(|guard| {
-                guard
-                    .as_ref()
-                    .is_some_and(|owned| owned.accepts(binding))
-            })
+            .map(|guard| guard.as_ref().is_some_and(|owned| owned.accepts(binding)))
             .unwrap_or(false);
         if owned {
             return self
@@ -622,11 +617,7 @@ impl Server {
         let owned = self
             .binding
             .lock()
-            .map(|guard| {
-                guard
-                    .as_ref()
-                    .is_some_and(|owned| owned.accepts(binding))
-            })
+            .map(|guard| guard.as_ref().is_some_and(|owned| owned.accepts(binding)))
             .unwrap_or(false);
         if owned {
             return self
@@ -675,7 +666,7 @@ impl Server {
         let resolved = ResolvedCommand::resolve(program, &args, cwd)?;
         // Inherit OpenCode login settings; its descendants can also inherit this password.
         let mut command = resolved.standard();
-                command.current_dir(cwd);
+        command.current_dir(cwd);
         command.env("PWD", cwd);
         for (key, value) in variables {
             command.env(key, value);
@@ -880,7 +871,10 @@ mod tests {
             Delivery::Accepted
         );
         let client = fake(1, |_, _, _| {
-            Some(response(200, &json!({"data": item("msg_a", "hxllo\n\nextra")})))
+            Some(response(
+                200,
+                &json!({"data": item("msg_a", "hxllo\n\nextra")}),
+            ))
         });
         assert_eq!(client.queue("ses_a", "msg_a", "hello"), Delivery::Conflict);
         let client = fake(1, |_, _, _| {
@@ -905,7 +899,10 @@ mod tests {
             Delivery::Conflict
         );
         let client = fake(1, |_, _, _| {
-            Some(response(200, &json!({"data": item("msg_a", "extra hello")})))
+            Some(response(
+                200,
+                &json!({"data": item("msg_a", "extra hello")}),
+            ))
         });
         assert_eq!(client.queue("ses_a", "msg_a", "hello"), Delivery::Conflict);
     }
@@ -1049,7 +1046,8 @@ mod tests {
         // A length together with chunking is the classic framing conflict.
         let both = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         assert!(parse_response(both).is_none());
-        let chunked_only = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let chunked_only =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         assert_eq!(parse_response(chunked_only).unwrap().body, b"hello");
     }
 
@@ -1491,7 +1489,11 @@ mod tests {
                 .ok()
                 .unwrap();
             assert!(matches!(
-                outbox.events.recv_timeout(Duration::from_secs(3)).unwrap().event,
+                outbox
+                    .events
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap()
+                    .event,
                 Event::Queued(_)
             ));
             let bindings = HashMap::from([(binding.room.clone(), binding)]);
@@ -1650,7 +1652,8 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let variables = crate::native_launch::tests::isolated_variables(root.path());
         let mut server =
-            Server::start_with_environment(OsStr::new("opencode"), &[], cwd.path(), &variables).unwrap();
+            Server::start_with_environment(OsStr::new("opencode"), &[], cwd.path(), &variables)
+                .unwrap();
         let binding = server.claim("isolated-room".into(), 1).unwrap();
         assert_eq!(
             server

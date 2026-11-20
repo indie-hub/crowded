@@ -299,12 +299,14 @@ pub(crate) fn start(launch: NativeLaunch) -> io::Result<NativeRoom> {
     start_cancellable(launch, &AtomicBool::new(false))
 }
 
-fn start_cancellable(
-    launch: NativeLaunch,
-    cancelled: &AtomicBool,
-) -> io::Result<NativeRoom> {
+fn start_cancellable(launch: NativeLaunch, cancelled: &AtomicBool) -> io::Result<NativeRoom> {
     ensure_reaper()?;
-    check_version(&launch.guest, &launch.cwd, &launch.variables, VERSION_TIMEOUT)?;
+    check_version(
+        &launch.guest,
+        &launch.cwd,
+        &launch.variables,
+        VERSION_TIMEOUT,
+    )?;
     // The version check can be slow; do not start a server nobody waits for.
     if cancelled.load(Ordering::SeqCst) {
         return Err(io::Error::other("native launch was cancelled"));
@@ -341,8 +343,10 @@ impl Launch {
     pub(crate) fn wait(self, timeout: Duration) -> io::Result<NativeRoom> {
         match self.receiver.recv_timeout(timeout) {
             Ok(result) => result,
-                        // Returning drops the launch, which cancels it.
-            Err(_) => Err(io::Error::other("native OpenCode server did not start in time")),
+            // Returning drops the launch, which cancels it.
+            Err(_) => Err(io::Error::other(
+                "native OpenCode server did not start in time",
+            )),
         }
     }
 }
@@ -379,9 +383,11 @@ pub(crate) fn begin(launch: NativeLaunch) -> Launch {
 }
 
 fn parse_version(output: &str) -> Option<(u64, u64, u64)> {
-    let token = output
-        .split_whitespace()
-        .find(|token| token.trim_start_matches('v').starts_with(|c: char| c.is_ascii_digit()))?;
+    let token = output.split_whitespace().find(|token| {
+        token
+            .trim_start_matches('v')
+            .starts_with(|c: char| c.is_ascii_digit())
+    })?;
     let mut parts = token.trim_start_matches('v').split('.');
     let mut number = || {
         let part = parts.next()?;
@@ -405,7 +411,7 @@ fn check_version(
     timeout: Duration,
 ) -> io::Result<()> {
     let arguments = [OsString::from("--version")];
-        let mut command = ResolvedCommand::resolve(program, &arguments, cwd)?.standard();
+    let mut command = ResolvedCommand::resolve(program, &arguments, cwd)?.standard();
     command.current_dir(cwd).env("PWD", cwd);
     // The same environment the server and the terminal get, so the version that
     // is checked is the one that will run.
@@ -472,7 +478,11 @@ pub(crate) mod tests {
         let workers: Vec<_> = (0..8)
             .map(|_| {
                 let allocator = GenerationAllocator::new(path.clone());
-                thread::spawn(move || (0..5).map(|_| allocator.next().unwrap()).collect::<Vec<_>>())
+                thread::spawn(move || {
+                    (0..5)
+                        .map(|_| allocator.next().unwrap())
+                        .collect::<Vec<_>>()
+                })
             })
             .collect();
         let mut all: Vec<u64> = workers
@@ -489,7 +499,9 @@ pub(crate) mod tests {
         let directory = dir.path().join(".crowded");
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join(GENERATION_FILE), b"not a number").unwrap();
-        let error = GenerationAllocator::new(directory.clone()).next().unwrap_err();
+        let error = GenerationAllocator::new(directory.clone())
+            .next()
+            .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(
             fs::read(directory.join(GENERATION_FILE)).unwrap(),
@@ -598,7 +610,7 @@ pub(crate) mod tests {
         root: &Path,
         name: &str,
         version: &str,
-                delay: u64,
+        delay: u64,
     ) -> FakeRoom {
         fake_room_with_delays(root, name, version, 0, delay)
     }
@@ -652,8 +664,10 @@ pub(crate) mod tests {
                     use base64::{Engine, engine::general_purpose::STANDARD};
                     format!("Basic {}", STANDARD.encode(format!("opencode:{password}")))
                 };
-                let is_prompt = request.starts_with("POST /api/session/") && request.contains("/prompt ");
-                let is_inbox = request.starts_with("GET /api/session/") && request.contains("/inbox ");
+                let is_prompt =
+                    request.starts_with("POST /api/session/") && request.contains("/prompt ");
+                let is_inbox =
+                    request.starts_with("GET /api/session/") && request.contains("/inbox ");
                 let mode = *server_state.mode.lock().unwrap();
                 if is_prompt && mode == FakeMode::Drop {
                     continue;
@@ -681,7 +695,9 @@ pub(crate) mod tests {
                         .lock()
                         .unwrap()
                         .push(request_body["resume"].as_bool().unwrap_or(false));
-                    let delay = server_state.delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+                    let delay = server_state
+                        .delay_ms
+                        .load(std::sync::atomic::Ordering::SeqCst);
                     thread::sleep(Duration::from_millis(delay));
                     let mut received = server_state.received.lock().unwrap();
                     // A repeated ID keeps its first content, as the real server does.
@@ -703,10 +719,12 @@ pub(crate) mod tests {
                         .lock()
                         .unwrap()
                         .iter()
-                        .map(|(id, text)| serde_json::json!({
-                            "id": id, "sessionID": format!("ses_{tag}"),
-                            "payload": {"text": text}, "delivery": "queue"
-                        }))
+                        .map(|(id, text)| {
+                            serde_json::json!({
+                                "id": id, "sessionID": format!("ses_{tag}"),
+                                "payload": {"text": text}, "delivery": "queue"
+                            })
+                        })
                         .collect();
                     (200, serde_json::json!({"data": items}).to_string())
                 } else if request.starts_with("GET /api/info") {
@@ -763,8 +781,22 @@ pub(crate) mod tests {
         let shared = tempfile::tempdir().unwrap();
         let a = fake_room(root.path(), "a", "v2.2.5");
         let b = fake_room(root.path(), "b", "v2.2.5");
-        let room_a = start(NativeLaunch::direct(a.program.as_os_str(), shared.path(), "1".into(), 1, &[])).unwrap();
-        let room_b = start(NativeLaunch::direct(b.program.as_os_str(), shared.path(), "2".into(), 2, &[])).unwrap();
+        let room_a = start(NativeLaunch::direct(
+            a.program.as_os_str(),
+            shared.path(),
+            "1".into(),
+            1,
+            &[],
+        ))
+        .unwrap();
+        let room_b = start(NativeLaunch::direct(
+            b.program.as_os_str(),
+            shared.path(),
+            "2".into(),
+            2,
+            &[],
+        ))
+        .unwrap();
 
         assert_ne!(room_a.binding().session, room_b.binding().session);
         assert_ne!(room_a.binding().endpoint, room_b.binding().endpoint);
@@ -788,7 +820,7 @@ pub(crate) mod tests {
                 format!("msg_{}", "b".repeat(64)),
                 "hello".into(),
             );
-                        (
+            (
                 own.recv_timeout(Duration::from_secs(5)).unwrap(),
                 crossed.recv().unwrap(),
             )
@@ -816,7 +848,14 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let fake = fake_room(root.path(), "a", "v2.2.5");
-        let room = start(NativeLaunch::direct(fake.program.as_os_str(), cwd.path(), "1".into(), 1, &[])).unwrap();
+        let room = start(NativeLaunch::direct(
+            fake.program.as_os_str(),
+            cwd.path(),
+            "1".into(),
+            1,
+            &[],
+        ))
+        .unwrap();
 
         let password = fs::read_to_string(fake.dir.join("password")).unwrap();
         assert!(!password.is_empty());
@@ -831,7 +870,11 @@ pub(crate) mod tests {
         assert!(arguments[1].starts_with("http://127.0.0.1:"));
         assert_eq!(arguments[2], "--session");
         assert_eq!(arguments[3], room.binding().session);
-        assert!(arguments.iter().all(|argument| !argument.contains(&password)));
+        assert!(
+            arguments
+                .iter()
+                .all(|argument| !argument.contains(&password))
+        );
 
         // The server was launched without the secret on its command line.
         let argv = fs::read_to_string(fake.dir.join("argv")).unwrap();
@@ -873,7 +916,14 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let variables = isolated_variables(root.path());
-        let room = start(NativeLaunch::direct(OsStr::new("opencode"), cwd.path(), "1".into(), 1, &variables)).unwrap();
+        let room = start(NativeLaunch::direct(
+            OsStr::new("opencode"),
+            cwd.path(),
+            "1".into(),
+            1,
+            &variables,
+        ))
+        .unwrap();
         assert_eq!(room.binding().generation, 1);
         assert_eq!(room.tui_arguments().len(), 4);
         let server = room.server();
@@ -895,13 +945,23 @@ pub(crate) mod tests {
         // This stand-in takes 3 s to print its version.
         let fake = fake_room_with_delays(root.path(), "slow-version", "v2.2.5", 3, 0);
         let started = Instant::now();
-        let error = check_version(fake.program.as_os_str(), cwd.path(), &[], Duration::from_millis(300))
-            .unwrap_err();
+        let error = check_version(
+            fake.program.as_os_str(),
+            cwd.path(),
+            &[],
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(2));
         // With room to finish it passes.
-        check_version(fake_room(root.path(), "fast", "v2.2.5").program.as_os_str(), cwd.path(), &[], VERSION_TIMEOUT)
-            .unwrap();
+        check_version(
+            fake_room(root.path(), "fast", "v2.2.5").program.as_os_str(),
+            cwd.path(),
+            &[],
+            VERSION_TIMEOUT,
+        )
+        .unwrap();
     }
 
     #[cfg(unix)]
@@ -914,9 +974,15 @@ pub(crate) mod tests {
             ("banana", "could not read the OpenCode version"),
         ] {
             let fake = fake_room(root.path(), version, version);
-            let error = start(NativeLaunch::direct(fake.program.as_os_str(), cwd.path(), "1".into(), 1, &[]))
-                .err()
-                .expect("must refuse");
+            let error = start(NativeLaunch::direct(
+                fake.program.as_os_str(),
+                cwd.path(),
+                "1".into(),
+                1,
+                &[],
+            ))
+            .err()
+            .expect("must refuse");
             assert!(error.to_string().contains(expected), "{error}");
             // `serve` never ran, so no pid file exists.
             assert!(!fake.dir.join("pid").exists());
@@ -937,9 +1003,15 @@ pub(crate) mod tests {
             script.replace("printf '%s' \"$$\"", "printf '%s' \"1\""),
         )
         .unwrap();
-        let error = start(NativeLaunch::direct(fake.program.as_os_str(), cwd.path(), "1".into(), 1, &[]))
-            .err()
-            .expect("must refuse");
+        let error = start(NativeLaunch::direct(
+            fake.program.as_os_str(),
+            cwd.path(),
+            "1".into(),
+            1,
+            &[],
+        ))
+        .err()
+        .expect("must refuse");
         assert!(error.to_string().contains("identity"), "{error}");
     }
 
@@ -953,17 +1025,40 @@ pub(crate) mod tests {
         let variables = |config: &str| -> Variables {
             vec![
                 ("OPENCODE_CONFIG_CONTENT".into(), config.into()),
-                ("CROWDED_TEST_TOKEN".into(), format!("token-{config}").into()),
+                (
+                    "CROWDED_TEST_TOKEN".into(),
+                    format!("token-{config}").into(),
+                ),
                 // A room variable can never replace the generated password.
                 ("OPENCODE_PASSWORD".into(), "attacker".into()),
             ]
         };
-        let room_a = start(NativeLaunch::direct(a.program.as_os_str(), cwd.path(), "1".into(), 1, &variables("one"))).unwrap();
-        let room_b = start(NativeLaunch::direct(b.program.as_os_str(), cwd.path(), "2".into(), 2, &variables("two"))).unwrap();
+        let room_a = start(NativeLaunch::direct(
+            a.program.as_os_str(),
+            cwd.path(),
+            "1".into(),
+            1,
+            &variables("one"),
+        ))
+        .unwrap();
+        let room_b = start(NativeLaunch::direct(
+            b.program.as_os_str(),
+            cwd.path(),
+            "2".into(),
+            2,
+            &variables("two"),
+        ))
+        .unwrap();
         assert_eq!(fs::read_to_string(a.dir.join("config")).unwrap(), "one");
         assert_eq!(fs::read_to_string(b.dir.join("config")).unwrap(), "two");
-        assert_eq!(fs::read_to_string(a.dir.join("token")).unwrap(), "token-one");
-        assert_eq!(fs::read_to_string(b.dir.join("token")).unwrap(), "token-two");
+        assert_eq!(
+            fs::read_to_string(a.dir.join("token")).unwrap(),
+            "token-one"
+        );
+        assert_eq!(
+            fs::read_to_string(b.dir.join("token")).unwrap(),
+            "token-two"
+        );
         for (fake, room) in [(&a, &room_a), (&b, &room_b)] {
             let password = fs::read_to_string(fake.dir.join("password")).unwrap();
             assert_ne!(password, "attacker");
@@ -989,9 +1084,15 @@ pub(crate) mod tests {
         let pid = wait_for_pid_file(&fake.dir.join("pid"));
         let error = launch.wait(Duration::from_millis(50)).err().unwrap();
         assert!(error.to_string().contains("did not start in time"));
-        assert!(process_alive(&pid), "the child is running when the caller gives up");
+        assert!(
+            process_alive(&pid),
+            "the child is running when the caller gives up"
+        );
         wait_for_reaps();
-        assert!(!process_alive(&pid), "exit waits until the abandoned launch's child is gone");
+        assert!(
+            !process_alive(&pid),
+            "exit waits until the abandoned launch's child is gone"
+        );
     }
 
     #[cfg(unix)]
@@ -1040,7 +1141,10 @@ pub(crate) mod tests {
         NativeLaunch {
             guest: fake.program.clone().into_os_string(),
             program: wrapper.as_os_str().to_os_string(),
-            prefix: vec![OsString::from("wrap"), fake.program.clone().into_os_string()],
+            prefix: vec![
+                OsString::from("wrap"),
+                fake.program.clone().into_os_string(),
+            ],
             cwd: cwd.to_path_buf(),
             room: "1".into(),
             generation: 1,
@@ -1079,7 +1183,10 @@ pub(crate) mod tests {
 
         drop(room);
         wait_for_reaps();
-        assert!(!process_alive(&server), "the verified server pid is stopped");
+        assert!(
+            !process_alive(&server),
+            "the verified server pid is stopped"
+        );
     }
 
     #[cfg(unix)]
@@ -1113,11 +1220,27 @@ pub(crate) mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let fake = fake_room(root.path(), "a", "v2.2.5");
         let variables: Variables = vec![("OPENCODE_CONFIG_CONTENT".into(), "room-config".into())];
-        let _room = start(NativeLaunch::direct(fake.program.as_os_str(), cwd.path(), "1.1".into(), 1, &variables)).unwrap();
+        let _room = start(NativeLaunch::direct(
+            fake.program.as_os_str(),
+            cwd.path(),
+            "1.1".into(),
+            1,
+            &variables,
+        ))
+        .unwrap();
         let expected = cwd.path().to_str().unwrap();
-        assert_eq!(fs::read_to_string(fake.dir.join("version_config")).unwrap(), "room-config");
-        assert_eq!(fs::read_to_string(fake.dir.join("config")).unwrap(), "room-config");
-        assert_eq!(fs::read_to_string(fake.dir.join("version_pwd")).unwrap(), expected);
+        assert_eq!(
+            fs::read_to_string(fake.dir.join("version_config")).unwrap(),
+            "room-config"
+        );
+        assert_eq!(
+            fs::read_to_string(fake.dir.join("config")).unwrap(),
+            "room-config"
+        );
+        assert_eq!(
+            fs::read_to_string(fake.dir.join("version_pwd")).unwrap(),
+            expected
+        );
         assert_eq!(fs::read_to_string(fake.dir.join("pwd")).unwrap(), expected);
     }
 

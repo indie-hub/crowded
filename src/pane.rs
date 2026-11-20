@@ -232,7 +232,7 @@ pub(crate) fn spec_uses_headroom(spec: &RoomSpec) -> bool {
 pub(crate) fn resume_supported_specs(specs: &mut [RoomSpec]) -> Vec<bool> {
     // Runs across the whole slate first: which OpenCode session belongs to
     // which room cannot be decided from one room's view alone.
-        // Native-delivery rooms always start a fresh explicit session, so they
+    // Native-delivery rooms always start a fresh explicit session, so they
     // neither take part in the repair nor receive resume arguments.
     let slate: Vec<RoomSpec> = specs
         .iter()
@@ -630,7 +630,9 @@ fn attach_to_native_server(launch: &mut RoomSpec, native: &NativeRoom) -> io::Re
     let Some(position) = launch.args.iter().position(|arg| arg == "--standalone") else {
         return Err(io::Error::other("native delivery needs an OpenCode launch"));
     };
-    launch.args.splice(position..=position, native.tui_arguments());
+    launch
+        .args
+        .splice(position..=position, native.tui_arguments());
     Ok(())
 }
 
@@ -1021,13 +1023,13 @@ pub(crate) fn start_claude_sessions(
             refuse_claude_session_args(spec)?;
             let cwd = working_directory(spec.cwd.as_deref())?;
             controls::clear_resume_args(spec)?;
-            let start = if let Some(stored) = stored_claude_session(&cwd, &spec.title, &spec.variables)
-            {
-                controls::set_resume_session(spec, &stored)?;
-                ClaudeStart::Resume(stored)
-            } else {
-                ClaudeStart::Fresh
-            };
+            let start =
+                if let Some(stored) = stored_claude_session(&cwd, &spec.title, &spec.variables) {
+                    controls::set_resume_session(spec, &stored)?;
+                    ClaudeStart::Resume(stored)
+                } else {
+                    ClaudeStart::Fresh
+                };
             equip_claude_mod(spec, &cwd)?;
             Ok(start)
         })();
@@ -1175,8 +1177,7 @@ pub(crate) fn bind_claude_rooms(
 
 /// Whether a spec is a native room that receives mail through Codex.
 pub(crate) fn codex_native_spec(spec: &RoomSpec) -> bool {
-    spec.native_delivery
-        && matches!(controls::cli_vendor(spec), Ok(controls::CliVendor::Codex))
+    spec.native_delivery && matches!(controls::cli_vendor(spec), Ok(controls::CliVendor::Codex))
 }
 
 #[cfg(not(test))]
@@ -1849,7 +1850,7 @@ impl Pane {
         // already persisted opens with that id seeded, so the Room Pulse cost
         // gate is true immediately instead of only after an intro-triggered
         // capture -- which a resume deliberately skips.
-                let captured_session = match controls::cli_vendor(&spec) {
+        let captured_session = match controls::cli_vendor(&spec) {
             // A native room's session is the one it creates on this launch, so a
             // persisted legacy id is never trusted. Codex captures the new
             // thread itself; OpenCode's owned server creates it.
@@ -1944,7 +1945,7 @@ impl Pane {
     /// `session_state::SESSION_CAPTURE_GRACE` (OpenCode uses its own, longer
     /// bound), so it never blocks the UI loop.
     /// Resumed panes skip the intro and therefore never call this.
-            pub(crate) fn begin_session_capture(&self) -> bool {
+    pub(crate) fn begin_session_capture(&self) -> bool {
         // A native room's session is the one its owned server created; legacy
         // discovery would pick a session by directory and time instead.
         if self.native.is_some() {
@@ -1969,7 +1970,7 @@ impl Pane {
             self.cwd.clone(),
             self.spec.title.clone(),
             self.spawned_at,
-                        Arc::clone(&self.captured_session),
+            Arc::clone(&self.captured_session),
             opencode_model,
         );
         true
@@ -2080,7 +2081,7 @@ impl Pane {
         self.headroom_active
     }
 
-        pub(crate) fn needs_intro(&self) -> bool {
+    pub(crate) fn needs_intro(&self) -> bool {
         // The intro goes through the selected delivery path; a native room never
         // receives it as a terminal paste.
         self.spec.transport == Transport::Raw && !self.spec.native_delivery
@@ -2166,7 +2167,7 @@ impl Pane {
         output_is_quiet
     }
 
-        /// The room's launch configuration, for a path that must start it again
+    /// The room's launch configuration, for a path that must start it again
     /// with a session that became available later.
     pub(crate) fn room_spec(&self) -> &RoomSpec {
         &self.spec
@@ -2278,7 +2279,7 @@ impl Pane {
         })
     }
 
-        pub(crate) fn resend_whisper_submit(&mut self) -> io::Result<()> {
+    pub(crate) fn resend_whisper_submit(&mut self) -> io::Result<()> {
         self.refuse_native_paste()?;
         self.write_bytes(RAW_SUBMIT_BYTES)
     }
@@ -2336,7 +2337,7 @@ impl Pane {
     pub(crate) fn clear_context(
         &mut self,
         size: PtySize,
-        ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Refuse before the durable fresh-state marker below is written.
         self.refuse_native_relaunch()?;
         // Record durable fresh-state intent before reconfiguration so a later
@@ -2355,7 +2356,7 @@ impl Pane {
     pub(crate) fn resume_context(
         &mut self,
         size: PtySize,
-        ) -> Result<bool, Box<dyn std::error::Error>> {
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         self.refuse_native_relaunch()?;
         // One room resuming on its own request has no slate to be judged
         // against, so there is no refusal to honour. The objective checks
@@ -2368,7 +2369,7 @@ impl Pane {
         model: Option<&str>,
         effort: Option<&str>,
         size: PtySize,
-        ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Refuse before any model-switch subprocess runs.
         self.refuse_native_relaunch()?;
         let mut spec = self.spec.clone();
@@ -2564,7 +2565,11 @@ mod tests {
                     return text;
                 }
             }
-            assert!(Instant::now() < deadline, "{} never appeared", path.display());
+            assert!(
+                Instant::now() < deadline,
+                "{} never appeared",
+                path.display()
+            );
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -2714,12 +2719,17 @@ mod tests {
         assert!(result.is_err());
         assert!(mailroom.summary().contains("FAILED"), "{id}");
         assert!(!mailroom.summary().contains("INJECTED"));
-                // The reintroduction key cannot start a guessed session capture.
+        // The reintroduction key cannot start a guessed session capture.
         assert!(!pane.begin_session_capture());
         assert!(!pane.has_captured_session());
         // A queued envelope for the room is never injected: it fails visibly.
         let mut mailroom = Mailroom::new(10);
-        let id = mailroom.queue("Room 2".to_owned(), pane.title().to_owned(), "hi".into(), "q");
+        let id = mailroom.queue(
+            "Room 2".to_owned(),
+            pane.title().to_owned(),
+            "hi".into(),
+            "q",
+        );
         let mut pending = std::collections::VecDeque::from([(id, 0usize)]);
         let mut gates = vec![DeliveryGate::new(false)];
         let mut submit = std::collections::VecDeque::new();
@@ -2761,14 +2771,18 @@ mod tests {
         let mut pending = std::collections::VecDeque::from([(id, 0usize)]);
         let mut gates = vec![DeliveryGate::new(false)];
         let mut submit = std::collections::VecDeque::new();
-        run_inject_pass(&mut pending, &mut mailroom, &mut panes, &mut gates, &[true], &mut submit);
+        run_inject_pass(
+            &mut pending,
+            &mut mailroom,
+            &mut panes,
+            &mut gates,
+            &[true],
+            &mut submit,
+        );
         // A stale Enter resubmit record that is due.
         let now = Instant::now();
-        let mut stale = std::collections::VecDeque::from([(
-            now - Duration::from_secs(120),
-            0usize,
-            false,
-        )]);
+        let mut stale =
+            std::collections::VecDeque::from([(now - Duration::from_secs(120), 0usize, false)]);
         crate::app::resend_whisper_submits(&mut stale, &mut panes, &[true], now);
         assert!(stale.is_empty());
 
@@ -2801,7 +2815,7 @@ mod tests {
         let session = room.binding().session.clone();
         let pane =
             Pane::spawn_with_native(spec, native_test_size(), environment, Some(room)).unwrap();
-                assert!(!pane.has_captured_session());
+        assert!(!pane.has_captured_session());
         assert!(!pane.begin_session_capture());
         assert!(!pane.has_captured_session());
         // The legacy entry is untouched and the owned session is not recorded under it.
@@ -2829,7 +2843,11 @@ mod tests {
         .unwrap();
         fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let mut spec = native_spec(&fake.program, cwd.path(), &["--model", "opencode-go/mimo-v2.5"]);
+        let mut spec = native_spec(
+            &fake.program,
+            cwd.path(),
+            &["--model", "opencode-go/mimo-v2.5"],
+        );
         spec.use_headroom = true;
         spec.headroom_args = vec!["--no-serena".into()];
         spec.variables.push((
@@ -2853,11 +2871,13 @@ mod tests {
         let config_path = fs::read_to_string(fake.dir.join("config_path")).unwrap();
         assert!(!config_path.is_empty());
         assert!(
-            fs::read_to_string(&config_path).unwrap().contains("opencode-go/mimo-v2.5"),
+            fs::read_to_string(&config_path)
+                .unwrap()
+                .contains("opencode-go/mimo-v2.5"),
             "the wrapped server reads the room config from {config_path}"
         );
-        let pane = Pane::spawn_with_native(spec, native_test_size(), environment, Some(room))
-            .unwrap();
+        let pane =
+            Pane::spawn_with_native(spec, native_test_size(), environment, Some(room)).unwrap();
         assert!(pane.headroom_active());
         // The TUI only attaches; it is not wrapped a second time.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2895,8 +2915,7 @@ mod tests {
         let good = native_launch::tests::fake_room(root.path(), "good", "v2.2.5");
         let spec = native_spec(&good.program, cwd.path(), &[]);
         let environments = [GuestEnvironment::new([]), GuestEnvironment::new([])];
-        let first = launch_native_rooms(&[spec.clone(), ordinary.clone()], &environments)
-            .unwrap();
+        let first = launch_native_rooms(&[spec.clone(), ordinary.clone()], &environments).unwrap();
         assert_eq!(first[0].as_ref().unwrap().binding().room, "1.1");
         assert_eq!(first[0].as_ref().unwrap().binding().generation, 1);
         assert!(first[1].is_none());
@@ -2914,7 +2933,11 @@ mod tests {
         let error = launch_native_rooms(&[spec, stale], &environments)
             .err()
             .unwrap();
-        assert!(error.to_string().contains("native delivery could not start"));
+        assert!(
+            error
+                .to_string()
+                .contains("native delivery could not start")
+        );
         assert!(error.to_string().contains("OpenCode 2.2.5 or newer"));
         let pid = wait_for_file(&good.dir.join("pid"));
         native_launch::wait_for_reaps();
@@ -3026,7 +3049,11 @@ mod tests {
         ]);
         let variables = native_variables(&spec, &environment).unwrap();
         assert!(variables.iter().all(|(key, _)| key != "OPENCODE_PASSWORD"));
-        assert!(variables.iter().any(|(key, value)| key == "KEEP_ME" && value == "1"));
+        assert!(
+            variables
+                .iter()
+                .any(|(key, value)| key == "KEEP_ME" && value == "1")
+        );
         assert!(
             variables
                 .iter()
@@ -3057,12 +3084,10 @@ mod tests {
         let title = native.title().to_owned();
         let panes = vec![native, ordinary];
 
-
-
         // The detail panel reads legacy session entries a native room lacks.
         assert_eq!(crate::app::rooms_needing_detail(&panes), [1]);
 
-                // Ctrl+W reaches a native room too: it goes through the outbox, not
+        // Ctrl+W reaches a native room too: it goes through the outbox, not
         // the terminal, so the composer is allowed.
         assert_eq!(crate::app::compose_target(&panes, 1), Ok(0));
         let _ = &title;
@@ -3071,21 +3096,17 @@ mod tests {
         // An offline ordinary room is reported as offline, not as native.
         let panes = vec![panes.into_iter().next().unwrap(), offline];
         let error = crate::app::compose_target(&panes, 0).unwrap_err();
-                assert!(error.contains("offline"), "{error}");
+        assert!(error.contains("offline"), "{error}");
     }
 
     #[test]
     fn native_flag_and_owned_server_must_agree() {
         let mut native = room_spec("opencode", &[]);
         native.native_delivery = true;
-        let error = Pane::spawn_with_native(
-            native,
-            native_test_size(),
-            GuestEnvironment::new([]),
-            None,
-        )
-        .err()
-        .unwrap();
+        let error =
+            Pane::spawn_with_native(native, native_test_size(), GuestEnvironment::new([]), None)
+                .err()
+                .unwrap();
         assert!(error.to_string().contains("has no owned server"));
     }
 
@@ -3747,7 +3768,10 @@ mod tests {
         assert_eq!(config["model"], "room/model");
         assert_eq!(config["mcp"]["crowded"]["enabled"], false);
         let mcp = config["mcp"].as_object().unwrap();
-        assert!(mcp.keys().all(|key| key == "crowded" || key == "headroom"), "{config}");
+        assert!(
+            mcp.keys().all(|key| key == "crowded" || key == "headroom"),
+            "{config}"
+        );
 
         let headroom_plugins = config
             .get("plugin")
@@ -3755,9 +3779,9 @@ mod tests {
             .is_some_and(|entries| {
                 !entries.is_empty()
                     && entries.iter().all(|value| {
-                        value
-                            .as_str()
-                            .is_some_and(|name| name.contains("headroom") && name != "ambient-plugin")
+                        value.as_str().is_some_and(|name| {
+                            name.contains("headroom") && name != "ambient-plugin"
+                        })
                     })
             });
         assert!(
@@ -3766,9 +3790,9 @@ mod tests {
         );
 
         let headroom_providers = |value: &serde_json::Value| {
-            value
-                .as_object()
-                .is_some_and(|providers| !providers.is_empty() && providers.keys().all(|key| key == "headroom"))
+            value.as_object().is_some_and(|providers| {
+                !providers.is_empty() && providers.keys().all(|key| key == "headroom")
+            })
         };
         let headroom_provider = config.get("provider").is_some_and(headroom_providers);
         let headroom_providers_plural = config.get("providers").is_some_and(headroom_providers);
@@ -3784,7 +3808,10 @@ mod tests {
         let keys = config.as_object().unwrap();
         for key in keys.keys() {
             assert!(
-                matches!(key.as_str(), "model" | "mcp" | "plugin" | "provider" | "providers"),
+                matches!(
+                    key.as_str(),
+                    "model" | "mcp" | "plugin" | "provider" | "providers"
+                ),
                 "unexpected top-level key {key}: {config}"
             );
         }
@@ -4121,12 +4148,15 @@ mod tests {
         assert!(error.to_string().contains(NATIVE_PASTE_REFUSED), "{error}");
         // Neither may a resubmit or a relaunch paste into it.
         assert!(pane.resend_whisper_submit().is_err());
-        assert!(pane.restart(PtySize {
-            rows: 4,
-            cols: 20,
-            pixel_width: 0,
-            pixel_height: 0,
-        }).is_err());
+        assert!(
+            pane.restart(PtySize {
+                rows: 4,
+                cols: 20,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .is_err()
+        );
         assert!(captured.lock().unwrap().is_empty());
     }
 
@@ -4178,7 +4208,10 @@ mod tests {
         let mut fuse = DeliveryFuse::new(0);
         let mut paused = false;
         let mut notice = crate::app::Notices::default();
-        let mut deliver = |panes: &mut Vec<Pane>, router: &mut NativeRouter, mailroom: &mut Mailroom, body: &str| {
+        let mut deliver = |panes: &mut Vec<Pane>,
+                           router: &mut NativeRouter,
+                           mailroom: &mut Mailroom,
+                           body: &str| {
             let (mut envelope, _answers) = DoorbellEnvelope::for_test();
             envelope.from = 0;
             envelope.to = 0;
@@ -4200,7 +4233,10 @@ mod tests {
                 &mut notice,
                 Instant::now(),
             );
-            assert!(pending.is_empty() && submits.is_empty(), "native mail was queued for paste");
+            assert!(
+                pending.is_empty() && submits.is_empty(),
+                "native mail was queued for paste"
+            );
             // The writer thread is asynchronous; give a stray write time to land.
             thread::sleep(Duration::from_millis(100));
             notice.ordered_lines().join("; ")
@@ -4208,7 +4244,10 @@ mod tests {
 
         // Unbound: the router does not know the room at all.
         deliver(&mut panes, &mut router, &mut mailroom, "unbound");
-        assert!(captured.lock().unwrap().is_empty(), "unbound mail reached the terminal");
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "unbound mail reached the terminal"
+        );
 
         // Not started: refused with the launch's reason, nothing pasted.
         router
@@ -4221,7 +4260,10 @@ mod tests {
             }])
             .unwrap();
         let notice = deliver(&mut panes, &mut router, &mut mailroom, "unstarted");
-        assert!(notice.contains("not saved") && notice.contains("model unavailable"), "{notice}");
+        assert!(
+            notice.contains("not saved") && notice.contains("model unavailable"),
+            "{notice}"
+        );
         assert!(
             captured.lock().unwrap().is_empty(),
             "unstarted mail reached the terminal"
@@ -4378,7 +4420,12 @@ mod tests {
             self.router.as_mut().expect("the router stays mounted")
         }
 
-        fn bind(&mut self, room: Option<std::sync::Arc<crate::codex_native::Room>>, generation: u64, reason: Option<String>) {
+        fn bind(
+            &mut self,
+            room: Option<std::sync::Arc<crate::codex_native::Room>>,
+            generation: u64,
+            reason: Option<String>,
+        ) {
             use crate::native_route::CodexEntry;
             self.router_mut()
                 .bind_codex(vec![CodexEntry {
@@ -4391,7 +4438,11 @@ mod tests {
                 .unwrap();
         }
 
-        fn healthy_room(program: &Path, cwd: &Path, thread: &str) -> std::sync::Arc<crate::codex_native::Room> {
+        fn healthy_room(
+            program: &Path,
+            cwd: &Path,
+            thread: &str,
+        ) -> std::sync::Arc<crate::codex_native::Room> {
             std::sync::Arc::new(crate::codex_native::room(
                 program.as_os_str().to_owned(),
                 cwd,
@@ -4406,7 +4457,9 @@ mod tests {
             envelope.from = 0;
             envelope.to = 0;
             envelope.body = body.to_owned();
-            self.doorbell.events.push_back(crate::doorbell::DoorbellEvent::Message(envelope));
+            self.doorbell
+                .events
+                .push_back(crate::doorbell::DoorbellEvent::Message(envelope));
             answers
         }
 
@@ -4544,17 +4597,32 @@ mod tests {
         // Unbound: the router does not know the room at all.
         let answers = rig.send("unbound");
         rig.iterate();
-        assert!(answers.read().1 == "rejected", "unbound mail must be refused");
+        assert!(
+            answers.read().1 == "rejected",
+            "unbound mail must be refused"
+        );
         rig.assert_silent("unbound mail");
 
         // Not started: refused with the launch's reason, nothing pasted.
-        rig.bind(None, 1, Some("`codex exec` failed: model unavailable".into()));
+        rig.bind(
+            None,
+            1,
+            Some("`codex exec` failed: model unavailable".into()),
+        );
         let answers = rig.send("unstarted");
         rig.iterate();
         let (_, status, _, error) = answers.read();
         assert_eq!(status, "rejected");
-        assert!(error.unwrap().contains("model unavailable"), "the reason must stay visible");
-        assert!(rig.notice.ordered_lines().join("; ").contains("model unavailable"));
+        assert!(
+            error.unwrap().contains("model unavailable"),
+            "the reason must stay visible"
+        );
+        assert!(
+            rig.notice
+                .ordered_lines()
+                .join("; ")
+                .contains("model unavailable")
+        );
         rig.assert_silent("unstarted mail");
 
         // Failed: the CLI rejects it; the failure is visible, nothing pasted.
@@ -4563,9 +4631,19 @@ mod tests {
             "failing",
             "printf 'Error: no rollout found\\n' >&2\nexit 1",
         );
-        rig.bind(Some(IterationHarness::healthy_room(&failing, cwd.path(), "thread-a")), 2, None);
+        rig.bind(
+            Some(IterationHarness::healthy_room(
+                &failing,
+                cwd.path(),
+                "thread-a",
+            )),
+            2,
+            None,
+        );
         rig.send("failing");
-        rig.pump_until("failed mail", |view| view.contains("FAILED: no rollout found"));
+        rig.pump_until("failed mail", |view| {
+            view.contains("FAILED: no rollout found")
+        });
         rig.assert_silent("failed mail");
 
         // Uncertain: it may have submitted, so it is never resent or pasted.
@@ -4574,7 +4652,15 @@ mod tests {
             "hanging",
             "printf 'Queued message sub_1 for thread %s.\\n' 'thread-b'\nexec sleep 30",
         );
-        rig.bind(Some(IterationHarness::healthy_room(&hanging, cwd.path(), "thread-b")), 3, None);
+        rig.bind(
+            Some(IterationHarness::healthy_room(
+                &hanging,
+                cwd.path(),
+                "thread-b",
+            )),
+            3,
+            None,
+        );
         rig.send("hanging");
         rig.pump_until("uncertain mail", |view| {
             view.contains("UNCERTAIN: may have been accepted")
@@ -4595,11 +4681,22 @@ mod tests {
             "printf 'Queued message sub_1 for thread thread-a.\\n'",
         );
         let mut rig = IterationHarness::new(root.path());
-        rig.bind(Some(IterationHarness::healthy_room(&program, cwd.path(), "thread-a")), 1, None);
+        rig.bind(
+            Some(IterationHarness::healthy_room(
+                &program,
+                cwd.path(),
+                "thread-a",
+            )),
+            1,
+            None,
+        );
         let answers = rig.send("hello healthy");
         rig.pump_until("healthy mail", |view| view.contains("ACCEPTED by Codex"));
         let (ok, status, _, _) = answers.read();
-        assert!(ok && status == "accepted", "healthy mail must be accepted through the router");
+        assert!(
+            ok && status == "accepted",
+            "healthy mail must be accepted through the router"
+        );
         rig.assert_silent("healthy mail");
     }
 
@@ -4621,10 +4718,7 @@ mod tests {
         spec.program = program.as_os_str().to_owned();
         spec.cwd = Some(cwd.to_path_buf());
         spec.native_delivery = true;
-        spec.variables = vec![(
-            OsString::from("CROWDED_TEST_MINT"),
-            OsString::from(token),
-        )];
+        spec.variables = vec![(OsString::from("CROWDED_TEST_MINT"), OsString::from(token))];
         spec
     }
 
@@ -4928,9 +5022,21 @@ mod tests {
 
         let (starts, notices) = start_claude_sessions(&mut specs);
         assert!(notices.is_empty(), "{notices:?}");
-        assert!(matches!(&starts[0], Some(ClaudeStart::Fresh)), "{:?}", starts[0]);
-        assert!(!specs[0].args.iter().any(|a| a == "--resume"), "{:?}", specs[0].args);
-        assert!(!specs[0].args.iter().any(|a| a == "--session-id"), "{:?}", specs[0].args);
+        assert!(
+            matches!(&starts[0], Some(ClaudeStart::Fresh)),
+            "{:?}",
+            starts[0]
+        );
+        assert!(
+            !specs[0].args.iter().any(|a| a == "--resume"),
+            "{:?}",
+            specs[0].args
+        );
+        assert!(
+            !specs[0].args.iter().any(|a| a == "--session-id"),
+            "{:?}",
+            specs[0].args
+        );
     }
 
     /// A reported Claude session is resumed only when its exact session file
@@ -4949,9 +5055,21 @@ mod tests {
         let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
         let (starts, notices) = start_claude_sessions(&mut specs);
         assert!(notices.is_empty(), "{notices:?}");
-        assert!(matches!(&starts[0], Some(ClaudeStart::Fresh)), "{:?}", starts[0]);
-        assert!(!specs[0].args.iter().any(|a| a == "--resume"), "{:?}", specs[0].args);
-        assert!(!specs[0].args.iter().any(|a| a == "--session-id"), "{:?}", specs[0].args);
+        assert!(
+            matches!(&starts[0], Some(ClaudeStart::Fresh)),
+            "{:?}",
+            starts[0]
+        );
+        assert!(
+            !specs[0].args.iter().any(|a| a == "--resume"),
+            "{:?}",
+            specs[0].args
+        );
+        assert!(
+            !specs[0].args.iter().any(|a| a == "--session-id"),
+            "{:?}",
+            specs[0].args
+        );
         assert_eq!(
             session_state::lookup_reported("claude", cwd.path(), "Claude · 1"),
             Some(MINTED_A.to_owned()),
@@ -5080,20 +5198,42 @@ mod tests {
 
         let (mut sessions, notices) = start_claude_sessions(&mut specs);
         assert!(notices.is_empty(), "{notices:?}");
-        assert!(matches!(&sessions[0], Some(ClaudeStart::Fresh)), "{:?}", sessions[0]);
+        assert!(
+            matches!(&sessions[0], Some(ClaudeStart::Fresh)),
+            "{:?}",
+            sessions[0]
+        );
         assert!(session_state::lookup_minted("claude", cwd.path(), "Claude · 1").is_none());
         assert!(session_state::lookup_reported("claude", cwd.path(), "Claude · 1").is_none());
-        assert!(!specs[0].args.iter().any(|a| a == "--session-id"), "{:?}", specs[0].args);
-        assert!(!specs[0].args.iter().any(|a| a == "--resume"), "{:?}", specs[0].args);
+        assert!(
+            !specs[0].args.iter().any(|a| a == "--session-id"),
+            "{:?}",
+            specs[0].args
+        );
+        assert!(
+            !specs[0].args.iter().any(|a| a == "--resume"),
+            "{:?}",
+            specs[0].args
+        );
 
         let mut router = crate::native_route::NativeRouter::start(
             session_state::state_directory().join("native-outbox.json"),
             Vec::new(),
         )
         .unwrap();
-        assert!(bind_claude_rooms(&mut router, &specs, &mut sessions).unwrap().is_empty());
-        assert!(crate::claude_inbox::bootstrap_file(cwd.path(), 1).unwrap().exists());
-        let binding = router.binding_for(0).expect("fresh room is deliverable via bootstrap");
+        assert!(
+            bind_claude_rooms(&mut router, &specs, &mut sessions)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            crate::claude_inbox::bootstrap_file(cwd.path(), 1)
+                .unwrap()
+                .exists()
+        );
+        let binding = router
+            .binding_for(0)
+            .expect("fresh room is deliverable via bootstrap");
         assert!(
             binding.session.starts_with("unreported-"),
             "fresh room must not be bound to a guessed Claude session: {}",
@@ -5108,8 +5248,14 @@ mod tests {
         materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
         let mut again = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
         let (again_starts, _) = start_claude_sessions(&mut again);
-        assert!(matches!(&again_starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A), "{again_starts:?}");
-        assert_eq!(args_after(&again[0].args, "--resume").first(), Some(&OsString::from(MINTED_A)));
+        assert!(
+            matches!(&again_starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A),
+            "{again_starts:?}"
+        );
+        assert_eq!(
+            args_after(&again[0].args, "--resume").first(),
+            Some(&OsString::from(MINTED_A))
+        );
     }
 
     /// Two fresh Claude rooms in the same cwd get distinct per-room bootstrap
@@ -5130,15 +5276,27 @@ mod tests {
 
         let (mut sessions, notices) = start_claude_sessions(&mut specs);
         assert!(notices.is_empty(), "{notices:?}");
-        assert!(matches!(&sessions[0], Some(ClaudeStart::Fresh)), "{:?}", sessions[0]);
-        assert!(matches!(&sessions[1], Some(ClaudeStart::Fresh)), "{:?}", sessions[1]);
+        assert!(
+            matches!(&sessions[0], Some(ClaudeStart::Fresh)),
+            "{:?}",
+            sessions[0]
+        );
+        assert!(
+            matches!(&sessions[1], Some(ClaudeStart::Fresh)),
+            "{:?}",
+            sessions[1]
+        );
 
         let mut router = crate::native_route::NativeRouter::start(
             session_state::state_directory().join("native-outbox.json"),
             Vec::new(),
         )
         .unwrap();
-        assert!(bind_claude_rooms(&mut router, &specs, &mut sessions).unwrap().is_empty());
+        assert!(
+            bind_claude_rooms(&mut router, &specs, &mut sessions)
+                .unwrap()
+                .is_empty()
+        );
 
         let boot1 = crate::claude_inbox::bootstrap_file(cwd.path(), 1).unwrap();
         let boot2 = crate::claude_inbox::bootstrap_file(cwd.path(), 2).unwrap();
@@ -5146,7 +5304,9 @@ mod tests {
         assert!(boot2.exists(), "room 2 bootstrap must exist");
         assert_ne!(boot1, boot2, "bootstrap files must be per room");
         assert!(
-            !cwd.path().join(".crowded/claude-inbox/_bootstrap.json").exists(),
+            !cwd.path()
+                .join(".crowded/claude-inbox/_bootstrap.json")
+                .exists(),
             "shared bootstrap file must not exist"
         );
 
@@ -5154,7 +5314,10 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&boot1).unwrap()).unwrap();
         let c2: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&boot2).unwrap()).unwrap();
-        assert_ne!(c1["token"], c2["token"], "each room must have its own token");
+        assert_ne!(
+            c1["token"], c2["token"],
+            "each room must have its own token"
+        );
         assert!(c1["url"].as_str().is_some_and(|u| u.starts_with("http://")));
         assert!(c2["url"].as_str().is_some_and(|u| u.starts_with("http://")));
         // Different inbox instances may bind different loopback ports and always
@@ -5170,7 +5333,10 @@ mod tests {
         router
             .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), MINTED_A, 2)
             .unwrap();
-        assert!(!boot1.exists(), "room 1 bootstrap must be removed on report");
+        assert!(
+            !boot1.exists(),
+            "room 1 bootstrap must be removed on report"
+        );
         assert!(
             crate::claude_inbox::connection_file(cwd.path(), MINTED_A)
                 .unwrap()
@@ -5196,7 +5362,11 @@ mod tests {
         materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
         let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         let (starts, _) = start_claude_sessions(std::slice::from_mut(&mut spec));
-        assert!(matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A), "{:?}", starts[0]);
+        assert!(
+            matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A),
+            "{:?}",
+            starts[0]
+        );
         let mut panes = vec![
             crate::app::spawn_room(
                 &mut crate::app::LivePanes,
@@ -5356,7 +5526,10 @@ mod tests {
         rig.iterate();
 
         let shown = rig.notice.ordered_lines().join("; ");
-        assert!(shown.contains("no stored Claude session to resume"), "{shown}");
+        assert!(
+            shown.contains("no stored Claude session to resume"),
+            "{shown}"
+        );
         assert_eq!(
             fs::read(session_state::state_path()).unwrap(),
             before,
@@ -5504,7 +5677,10 @@ mod tests {
             "{starts:?}"
         );
         let shown = notices.join("; ");
-        assert!(shown.contains("session is learned from the room"), "{shown}");
+        assert!(
+            shown.contains("session is learned from the room"),
+            "{shown}"
+        );
         assert_eq!(
             session_state::lookup("claude", cwd.path(), "Claude · 1"),
             None
@@ -5531,7 +5707,10 @@ mod tests {
         let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
         spec.args = vec!["--resume".into(), MINTED_A.into()];
         let (starts, notices) = start_claude_sessions(std::slice::from_mut(&mut spec));
-        assert!(matches!(&starts[0], Some(ClaudeStart::Failed(_))), "{starts:?}");
+        assert!(
+            matches!(&starts[0], Some(ClaudeStart::Failed(_))),
+            "{starts:?}"
+        );
         let mut factory = RecordingPanes::default();
         let mut last_output = vec![None];
         crate::app::start_rooms(
@@ -5852,7 +6031,13 @@ mod tests {
             Pane::spawn_unavailable(spec, small_size(), GuestEnvironment::new([]), "offline")
                 .unwrap();
         bind_claude_room(rig.router.as_mut().unwrap(), &mut rig.panes, 0, MINTED_A).unwrap();
-        let old = rig.router.as_ref().unwrap().binding_for(0).unwrap().generation;
+        let old = rig
+            .router
+            .as_ref()
+            .unwrap()
+            .binding_for(0)
+            .unwrap()
+            .generation;
 
         let f5 = crossterm::event::Event::Key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
         let mut size = |_index: usize| Ok(small_size());
@@ -5861,7 +6046,10 @@ mod tests {
         let shown = rig.notice.ordered_lines().join("; ");
         assert!(shown.ends_with("restarted"), "{shown}");
         let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
-        assert!(binding.generation > old, "the native generation must advance");
+        assert!(
+            binding.generation > old,
+            "the native generation must advance"
+        );
         let args: Vec<String> = rig.panes[0]
             .room_spec()
             .args
@@ -5869,7 +6057,8 @@ mod tests {
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect();
         assert!(
-            args.windows(2).any(|pair| pair[0] == "--resume" && pair[1] == binding.session),
+            args.windows(2)
+                .any(|pair| pair[0] == "--resume" && pair[1] == binding.session),
             "{args:?}"
         );
         let launched = || {
@@ -5881,7 +6070,10 @@ mod tests {
         };
         let deadline = Instant::now() + Duration::from_secs(10);
         while launched() < 1 {
-            assert!(Instant::now() < deadline, "the fake claude was never relaunched");
+            assert!(
+                Instant::now() < deadline,
+                "the fake claude was never relaunched"
+            );
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(launched(), 1, "one exec per relaunch");
@@ -5909,14 +6101,11 @@ mod tests {
             None,
         );
 
-        let ctrl_r = crossterm::event::Event::Key(KeyEvent::new(
-            KeyCode::Char('r'),
-            KeyModifiers::CONTROL,
-        ));
+        let ctrl_r =
+            crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         let mut size = |_index: usize| Ok(small_size());
         assert!(
-            !crate::app::run_rooms_key_event(&ctrl_r, &mut rig.loop_state(0, &mut size))
-                .unwrap()
+            !crate::app::run_rooms_key_event(&ctrl_r, &mut rig.loop_state(0, &mut size)).unwrap()
         );
 
         let shown = rig.notice.ordered_lines().join("; ");
@@ -5997,8 +6186,20 @@ mod tests {
             bind_claude_room(router, &mut rig.panes, 0, MINTED_A).unwrap();
             bind_claude_room(router, &mut rig.panes, 1, MINTED_B).unwrap();
         }
-        let gen0 = rig.router.as_ref().unwrap().binding_for(0).unwrap().generation;
-        let gen1 = rig.router.as_ref().unwrap().binding_for(1).unwrap().generation;
+        let gen0 = rig
+            .router
+            .as_ref()
+            .unwrap()
+            .binding_for(0)
+            .unwrap()
+            .generation;
+        let gen1 = rig
+            .router
+            .as_ref()
+            .unwrap()
+            .binding_for(1)
+            .unwrap()
+            .generation;
 
         let f5 = crossterm::event::Event::Key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
         let requested = std::cell::Cell::new(usize::MAX);
@@ -6012,8 +6213,24 @@ mod tests {
         let shown = rig.notice.ordered_lines().join("; ");
         assert!(shown.contains("Claude · 2 restarted"), "{shown}");
         assert!(!shown.contains("Claude · 1 restarted"), "{shown}");
-        assert_eq!(rig.router.as_ref().unwrap().binding_for(0).unwrap().generation, gen0);
-        assert!(rig.router.as_ref().unwrap().binding_for(1).unwrap().generation > gen1);
+        assert_eq!(
+            rig.router
+                .as_ref()
+                .unwrap()
+                .binding_for(0)
+                .unwrap()
+                .generation,
+            gen0
+        );
+        assert!(
+            rig.router
+                .as_ref()
+                .unwrap()
+                .binding_for(1)
+                .unwrap()
+                .generation
+                > gen1
+        );
         let launched = |path: &Path| {
             fs::read_to_string(path)
                 .unwrap_or_default()
@@ -6042,8 +6259,18 @@ mod tests {
         let stub_root1 = tempfile::tempdir().unwrap();
         let log0 = stub_root0.path().join("codex.calls");
         let log1 = stub_root1.path().join("codex.calls");
-        let stub0 = gated_codex_stub(stub_root0.path(), &log0, &stub_root0.path().join("gate"), MINTED_B);
-        let stub1 = gated_codex_stub(stub_root1.path(), &log1, &stub_root1.path().join("gate"), MINTED_C);
+        let stub0 = gated_codex_stub(
+            stub_root0.path(),
+            &log0,
+            &stub_root0.path().join("gate"),
+            MINTED_B,
+        );
+        let stub1 = gated_codex_stub(
+            stub_root1.path(),
+            &log1,
+            &stub_root1.path().join("gate"),
+            MINTED_C,
+        );
         session_state::upsert_minted("codex", cwd.path(), "Room A", MINTED_A).unwrap();
         let mut rig = IterationHarness::new(root.path());
         rig.panes[0] = Pane::spawn_unavailable(
@@ -6092,24 +6319,29 @@ mod tests {
             ])
             .unwrap();
 
-        let ctrl_r = crossterm::event::Event::Key(KeyEvent::new(
-            KeyCode::Char('r'),
-            KeyModifiers::CONTROL,
-        ));
+        let ctrl_r =
+            crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         let requested = std::cell::Cell::new(usize::MAX);
         let mut size = |index: usize| {
             requested.set(index);
             Ok(small_size())
         };
         assert!(
-            !crate::app::run_rooms_key_event(&ctrl_r, &mut rig.loop_state(1, &mut size))
-                .unwrap()
+            !crate::app::run_rooms_key_event(&ctrl_r, &mut rig.loop_state(1, &mut size)).unwrap()
         );
         assert_eq!(requested.get(), 1, "the step sizes the focused pane");
         let shown = rig.notice.ordered_lines().join("; ");
         assert!(shown.contains("Room B restarted"), "{shown}");
         assert!(!shown.contains("Room A restarted"), "{shown}");
-        assert_eq!(rig.router.as_ref().unwrap().binding_for(0).unwrap().generation, gen0);
+        assert_eq!(
+            rig.router
+                .as_ref()
+                .unwrap()
+                .binding_for(0)
+                .unwrap()
+                .generation,
+            gen0
+        );
         let launched = |path: &Path| {
             fs::read_to_string(path)
                 .unwrap_or_default()
@@ -6183,10 +6415,8 @@ mod tests {
     fn an_online_ctrl_r_is_not_a_restart_and_forwards_0x12() {
         let (mut pane, captured) = pane_with_capture(4, 20);
         assert!(pane.is_online());
-        let ctrl_r = crossterm::event::Event::Key(KeyEvent::new(
-            KeyCode::Char('r'),
-            KeyModifiers::CONTROL,
-        ));
+        let ctrl_r =
+            crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         let mut notice = crate::app::Notices::default();
         let mut size = |_index: usize| Ok(small_size());
         let mut codex = [None];
@@ -6531,7 +6761,10 @@ mod tests {
                 })
                 .collect();
             let environments = vec![GuestEnvironment::new([]), GuestEnvironment::new([])];
-            let prompts = vec![Some("House rules".to_owned()), Some("House rules".to_owned())];
+            let prompts = vec![
+                Some("House rules".to_owned()),
+                Some("House rules".to_owned()),
+            ];
             let mints = mint_all(&mut specs, &environments, &prompts);
 
             for (index, token) in order.iter().enumerate() {
@@ -6543,7 +6776,10 @@ mod tests {
                 );
                 // The terminal phase resumes exactly the minted session.
                 resume_session(&mut specs[index], token).unwrap();
-                assert_eq!(args_after(&specs[index].args, "resume"), [OsString::from(*token)]);
+                assert_eq!(
+                    args_after(&specs[index].args, "resume"),
+                    [OsString::from(*token)]
+                );
             }
             // One exec per room; the unrelated rollout is never adopted.
             let execs = fs::read_to_string(&log)
@@ -6591,7 +6827,10 @@ mod tests {
             Some(MINTED_A)
         );
         resume_session(&mut specs[0], MINTED_A).unwrap();
-        assert_eq!(args_after(&specs[0].args, "resume"), [OsString::from(MINTED_A)]);
+        assert_eq!(
+            args_after(&specs[0].args, "resume"),
+            [OsString::from(MINTED_A)]
+        );
         assert_ne!(LEGACY, MINTED_A);
     }
 
@@ -6608,9 +6847,14 @@ mod tests {
         let mut specs = vec![codex_mint_spec(&failing, cwd.path(), "Codex · 1", MINTED_A)];
         let prompts = vec![Some("House rules".to_owned())];
         let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts);
-        let reason = failed(&mints[0]).expect("the room must not be started").to_owned();
+        let reason = failed(&mints[0])
+            .expect("the room must not be started")
+            .to_owned();
         assert!(reason.contains("model unavailable"), "{reason}");
-        assert_eq!(session_state::lookup_minted("codex", cwd.path(), "Codex · 1"), None);
+        assert_eq!(
+            session_state::lookup_minted("codex", cwd.path(), "Codex · 1"),
+            None
+        );
         assert!(!specs[0].args.iter().any(|arg| arg == "resume"));
 
         // The production startup decision starts no process for this room.
@@ -6655,7 +6899,10 @@ mod tests {
         let mints = start_codex_mints(&mut specs, &[GuestEnvironment::new([])], &prompts);
         assert_eq!(ready(&mints[0]), Some(MINTED_A));
         assert!(!marker.exists(), "a restart must not run exec again");
-        assert_eq!(args_after(&specs[0].args, "resume"), [OsString::from(MINTED_A)]);
+        assert_eq!(
+            args_after(&specs[0].args, "resume"),
+            [OsString::from(MINTED_A)]
+        );
     }
 
     #[cfg(unix)]
@@ -6728,15 +6975,31 @@ mod tests {
         assert_eq!(ready(&mints[0]), Some(MINTED_A), "{:?}", failed(&mints[0]));
         // Exec received the accepted options only.
         let executed = fs::read_to_string(&log).unwrap();
-        for kept in ["-c", "model_reasoning_effort", "-m", "gpt-5", "-s", "workspace-write"] {
-            assert!(executed.contains(kept), "{kept} missing from exec: {executed}");
+        for kept in [
+            "-c",
+            "model_reasoning_effort",
+            "-m",
+            "gpt-5",
+            "-s",
+            "workspace-write",
+        ] {
+            assert!(
+                executed.contains(kept),
+                "{kept} missing from exec: {executed}"
+            );
         }
         for dropped in ["--search", "--ask-for-approval", "--no-alt-screen", "never"] {
-            assert!(!executed.lines().any(|line| line == dropped), "{dropped} reached exec");
+            assert!(
+                !executed.lines().any(|line| line == dropped),
+                "{dropped} reached exec"
+            );
         }
         // The resumed terminal keeps every interactive option.
         resume_session(&mut specs[0], MINTED_A).unwrap();
-        assert_eq!(args_after(&specs[0].args, "resume"), [OsString::from(MINTED_A)]);
+        assert_eq!(
+            args_after(&specs[0].args, "resume"),
+            [OsString::from(MINTED_A)]
+        );
         for kept in [
             "--search",
             "--ask-for-approval",
@@ -6746,7 +7009,10 @@ mod tests {
             "-m",
             "-s",
         ] {
-            assert!(specs[0].args.iter().any(|arg| arg == kept), "{kept} missing from resume");
+            assert!(
+                specs[0].args.iter().any(|arg| arg == kept),
+                "{kept} missing from resume"
+            );
         }
     }
 
@@ -6770,10 +7036,15 @@ mod tests {
         let prompts = vec![Some("House rules".to_owned())];
         let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts);
         drop(state);
-        let reason = failed(&mints[0]).expect("an unsaved session must not be ready").to_owned();
+        let reason = failed(&mints[0])
+            .expect("an unsaved session must not be ready")
+            .to_owned();
         assert!(reason.contains(MINTED_A), "{reason}");
         assert!(reason.contains("could not be saved"), "{reason}");
-        assert_eq!(session_state::lookup_minted("codex", cwd.path(), "Codex · 1"), None);
+        assert_eq!(
+            session_state::lookup_minted("codex", cwd.path(), "Codex · 1"),
+            None
+        );
     }
 
     #[cfg(unix)]
@@ -6793,18 +7064,15 @@ mod tests {
         let mut specs = vec![fast_a, fast_b, hung];
         for (index, spec) in specs.iter_mut().enumerate() {
             if index < 2 {
-                spec.variables.push((
-                    OsString::from("CROWDED_TEST_DELAY"),
-                    OsString::from("0"),
-                ));
+                spec.variables
+                    .push((OsString::from("CROWDED_TEST_DELAY"), OsString::from("0")));
             }
         }
         // The stub sleeps only when asked; the hung room asks for a long wait
         // through its own delay variable.
-        specs[2].variables.push((
-            OsString::from("CROWDED_TEST_DELAY"),
-            OsString::from("30"),
-        ));
+        specs[2]
+            .variables
+            .push((OsString::from("CROWDED_TEST_DELAY"), OsString::from("30")));
         let stub_path = stub.clone();
         let script = fs::read_to_string(&stub_path).unwrap();
         fs::write(
@@ -6825,7 +7093,10 @@ mod tests {
         ];
         let started = Instant::now();
         let mut mints = start_codex_mints(&mut specs, &environments, &prompts);
-        assert!(started.elapsed() < Duration::from_secs(1), "minting blocked startup");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "minting blocked startup"
+        );
         let deadline = Instant::now() + Duration::from_secs(8);
         while ready(&mints[0]).is_none() || ready(&mints[1]).is_none() {
             let _ = poll_codex_mints(&mut mints);
@@ -6870,7 +7141,8 @@ mod tests {
     #[cfg(unix)]
     impl RecordingPanes {
         fn record(&mut self, kind: &'static str, spec: RoomSpec) -> Pane {
-            self.calls.push((kind, spec.title.clone(), spec.args.clone()));
+            self.calls
+                .push((kind, spec.title.clone(), spec.args.clone()));
             let (mut pane, _) = pane_with_capture(4, 20);
             pane.spec = spec;
             // Only an interactive pane has a process, as in production.
@@ -6933,7 +7205,9 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let program = Path::new("codex");
         let specs: Vec<RoomSpec> = (1..=4)
-            .map(|number| codex_mint_spec(program, cwd.path(), &format!("Codex · {number}"), MINTED_A))
+            .map(|number| {
+                codex_mint_spec(program, cwd.path(), &format!("Codex · {number}"), MINTED_A)
+            })
             .collect();
         let (_sender, receiver) = mpsc::channel();
         let codex = vec![
@@ -6962,15 +7236,25 @@ mod tests {
         assert_eq!(spawned.len(), 4);
         // Pending and failed mints start no process; the completed one resumes
         // exactly its minted session; a room that never had a mint is unchanged.
-        assert_eq!(factory.kinds(), ["pending", "unavailable", "interactive", "interactive"]);
-        assert_eq!(args_after(&factory.calls[2].2, "resume"), [OsString::from(MINTED_B)]);
+        assert_eq!(
+            factory.kinds(),
+            ["pending", "unavailable", "interactive", "interactive"]
+        );
+        assert_eq!(
+            args_after(&factory.calls[2].2, "resume"),
+            [OsString::from(MINTED_B)]
+        );
         assert!(!factory.calls[3].2.iter().any(|arg| arg == "resume"));
     }
 
     /// Runs the startup loop with the Windows Headroom lane on, and reports
     /// whether it finished within `wait`.
     #[cfg(unix)]
-    fn headroom_startup_finishes(codex: Vec<Option<CodexMint>>, wait: Duration, deadline: Duration) -> bool {
+    fn headroom_startup_finishes(
+        codex: Vec<Option<CodexMint>>,
+        wait: Duration,
+        deadline: Duration,
+    ) -> bool {
         let cwd = tempfile::tempdir().unwrap();
         let (_directory, path, _ext) = headroom_path();
         let specs: Vec<RoomSpec> = (0..codex.len())
@@ -6982,7 +7266,8 @@ mod tests {
                     MINTED_A,
                 );
                 spec.use_headroom = true;
-                spec.variables.push((OsString::from("PATH"), path.clone().unwrap()));
+                spec.variables
+                    .push((OsString::from("PATH"), path.clone().unwrap()));
                 assert!(spec_uses_headroom(&spec));
                 spec
             })
@@ -7055,9 +7340,12 @@ mod tests {
         assert!(!pane.is_online(), "the pane must have no process");
         let mut last_output = None;
         let started = Instant::now();
-        let timed_out =
-            crate::app::wait_for_headroom_ready(&mut pane, &mut last_output, Duration::from_secs(30))
-                .unwrap();
+        let timed_out = crate::app::wait_for_headroom_ready(
+            &mut pane,
+            &mut last_output,
+            Duration::from_secs(30),
+        )
+        .unwrap();
         assert!(!timed_out, "an exited pane must never be waited on");
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -7075,9 +7363,12 @@ mod tests {
         // so quiet output alone means ready.
         let mut last_output = Some(Instant::now() - Duration::from_secs(60));
         let started = Instant::now();
-        let timed_out =
-            crate::app::wait_for_headroom_ready(&mut pane, &mut last_output, Duration::from_secs(30))
-                .unwrap();
+        let timed_out = crate::app::wait_for_headroom_ready(
+            &mut pane,
+            &mut last_output,
+            Duration::from_secs(30),
+        )
+        .unwrap();
         assert!(!timed_out, "a ready pane must never be waited on");
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -7102,7 +7393,8 @@ mod tests {
                     MINTED_A,
                 );
                 spec.use_headroom = true;
-                spec.variables.push((OsString::from("PATH"), path.clone().unwrap()));
+                spec.variables
+                    .push((OsString::from("PATH"), path.clone().unwrap()));
                 assert!(spec_uses_headroom(&spec));
                 spec
             })
@@ -7164,13 +7456,20 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, stub)| {
-                codex_mint_spec(stub, cwd.path(), &format!("Codex · {}", index + 1), MINTED_A)
+                codex_mint_spec(
+                    stub,
+                    cwd.path(),
+                    &format!("Codex · {}", index + 1),
+                    MINTED_A,
+                )
             })
             .collect();
         let senders: Vec<_> = (0..3).map(|_| mpsc::channel()).collect();
         let (senders, receivers): (Vec<_>, Vec<_>) = senders.into_iter().unzip();
-        let mut codex: Vec<Option<CodexMint>> =
-            receivers.into_iter().map(|rx| Some(CodexMint::Pending(rx))).collect();
+        let mut codex: Vec<Option<CodexMint>> = receivers
+            .into_iter()
+            .map(|rx| Some(CodexMint::Pending(rx)))
+            .collect();
         let mut factory = RecordingPanes::default();
         let mut last_output = vec![None; 3];
         let environments = vec![GuestEnvironment::new([]); 3];
@@ -7198,26 +7497,27 @@ mod tests {
         let mut gates: Vec<DeliveryGate> = (0..3).map(|_| DeliveryGate::new(false)).collect();
         let mut pulses: Vec<Option<PulseSample>> = vec![None; 3];
         let mut notice = crate::app::Notices::default();
-        let mut complete = |factory: &mut RecordingPanes,
-                            codex: &mut Vec<Option<CodexMint>>,
-                            panes: &mut Vec<Pane>,
-                            router: &mut crate::native_route::NativeRouter| {
-            crate::app::complete_mints(
-                factory,
-                codex,
-                panes,
-                Some(router),
-                &mut gates,
-                &mut spawned_at,
-                &mut last_output,
-                &mut pulses,
-                &sizes,
-                &environments,
-                &mut notice,
-                Instant::now(),
-            )
-            .unwrap();
-        };
+        let mut complete =
+            |factory: &mut RecordingPanes,
+             codex: &mut Vec<Option<CodexMint>>,
+             panes: &mut Vec<Pane>,
+             router: &mut crate::native_route::NativeRouter| {
+                crate::app::complete_mints(
+                    factory,
+                    codex,
+                    panes,
+                    Some(router),
+                    &mut gates,
+                    &mut spawned_at,
+                    &mut last_output,
+                    &mut pulses,
+                    &sizes,
+                    &environments,
+                    &mut notice,
+                    Instant::now(),
+                )
+                .unwrap();
+            };
 
         // Nothing has finished: no process starts.
         complete(&mut factory, &mut codex, &mut panes, &mut router);
@@ -7233,10 +7533,15 @@ mod tests {
             .unwrap();
         complete(&mut factory, &mut codex, &mut panes, &mut router);
         assert_eq!(factory.kinds(), ["interactive"]);
-        assert_eq!(args_after(&factory.calls[0].2, "resume"), [OsString::from(MINTED_A)]);
+        assert_eq!(
+            args_after(&factory.calls[0].2, "resume"),
+            [OsString::from(MINTED_A)]
+        );
 
         // Room 2 fails and room 3 is still pending: neither starts a process.
-        senders[1].send(Err("`codex exec` failed".to_owned())).unwrap();
+        senders[1]
+            .send(Err("`codex exec` failed".to_owned()))
+            .unwrap();
         complete(&mut factory, &mut codex, &mut panes, &mut router);
         assert_eq!(factory.kinds(), ["interactive", "unavailable"]);
 
@@ -7249,17 +7554,29 @@ mod tests {
             }))
             .unwrap();
         complete(&mut factory, &mut codex, &mut panes, &mut router);
-        assert_eq!(factory.kinds(), ["interactive", "unavailable", "interactive"]);
-        assert_eq!(args_after(&factory.calls[2].2, "resume"), [OsString::from(MINTED_B)]);
+        assert_eq!(
+            factory.kinds(),
+            ["interactive", "unavailable", "interactive"]
+        );
+        assert_eq!(
+            args_after(&factory.calls[2].2, "resume"),
+            [OsString::from(MINTED_B)]
+        );
 
         let mut mailroom = Mailroom::new(50);
         for index in [0usize, 2] {
-            router.send(&mut mailroom, "Sender", index, "hi", None).unwrap();
+            router
+                .send(&mut mailroom, "Sender", index, "hi", None)
+                .unwrap();
         }
         let deadline = Instant::now() + Duration::from_secs(10);
         while !(root.path().join("queue0").exists() && root.path().join("queue2").exists()) {
             router.tick(Instant::now(), &mut mailroom, false, false);
-            assert!(Instant::now() < deadline, "an earlier room was dropped:\n{}", mailroom.summary());
+            assert!(
+                Instant::now() < deadline,
+                "an earlier room was dropped:\n{}",
+                mailroom.summary()
+            );
             thread::sleep(Duration::from_millis(20));
         }
         assert!(!root.path().join("queue1").exists());
@@ -7405,7 +7722,9 @@ mod tests {
         pane.spec.native_delivery = true;
         let mut panes = vec![pane];
         let mut mailroom = Mailroom::new(50);
-        router.send(&mut mailroom, "Sender", 0, "queued", None).unwrap();
+        router
+            .send(&mut mailroom, "Sender", 0, "queued", None)
+            .unwrap();
         // Paused passes save the message without sending it.
         for _ in 0..20 {
             crate::app::tick_native(
@@ -7443,7 +7762,10 @@ mod tests {
         let body = &body[..body.find("\n}\n").unwrap()];
         let refresh = body.find("refresh_codex_liveness(panes, router)").unwrap();
         let tick = body.find("router.tick(").unwrap();
-        assert!(refresh < tick, "liveness must be refreshed before the outbox is ticked");
+        assert!(
+            refresh < tick,
+            "liveness must be refreshed before the outbox is ticked"
+        );
     }
 
     #[test]
@@ -8612,7 +8934,11 @@ mod tests {
         materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
         let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
         let (mut starts, _) = start_claude_sessions(&mut specs);
-        assert!(matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A), "{:?}", starts[0]);
+        assert!(
+            matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A),
+            "{:?}",
+            starts[0]
+        );
         let mut router = crate::native_route::NativeRouter::start(
             session_state::state_directory().join("native-outbox.json"),
             Vec::new(),
@@ -8710,7 +9036,8 @@ mod tests {
         let _claude_config = ClaudeConfigDirGuard::new();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
-        let (specs, _, session) = claude_started_spec(root.path(), cwd.path(), "Claude · 1", _claude_config.path());
+        let (specs, _, session) =
+            claude_started_spec(root.path(), cwd.path(), "Claude · 1", _claude_config.path());
         let dir = cwd.path().join(".crowded").join("claude-mod");
         assert_eq!(
             specs[0].args,
@@ -9019,9 +9346,16 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             serde_json::from_str(&fs::read_to_string(&boot1).unwrap()).unwrap();
         let c2: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&boot2).unwrap()).unwrap();
-        assert_ne!(c1["token"], c2["token"], "rooms must have unique bootstrap identities");
+        assert_ne!(
+            c1["token"], c2["token"],
+            "rooms must have unique bootstrap identities"
+        );
         assert_ne!(boot1, boot2);
-        assert!(!cwd.path().join(".crowded/claude-inbox/_bootstrap.json").exists());
+        assert!(
+            !cwd.path()
+                .join(".crowded/claude-inbox/_bootstrap.json")
+                .exists()
+        );
 
         let mod_path = std::env::current_dir()
             .unwrap()
@@ -9088,7 +9422,10 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             if a && b {
                 break;
             }
-            assert!(Instant::now() < deadline, "mods never connected: a={a} b={b}");
+            assert!(
+                Instant::now() < deadline,
+                "mods never connected: a={a} b={b}"
+            );
             thread::sleep(Duration::from_millis(20));
         }
 
@@ -9107,10 +9444,22 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         });
         let log1 = fs::read_to_string(&marker1).unwrap();
         let log2 = fs::read_to_string(&marker2).unwrap();
-        assert!(log1.contains("SUBMITTED [whisper from Sender] to-room-1"), "{log1}");
-        assert!(!log1.contains("to-room-2"), "room 1 must not receive room 2 mail: {log1}");
-        assert!(log2.contains("SUBMITTED [whisper from Sender] to-room-2"), "{log2}");
-        assert!(!log2.contains("to-room-1"), "room 2 must not receive room 1 mail: {log2}");
+        assert!(
+            log1.contains("SUBMITTED [whisper from Sender] to-room-1"),
+            "{log1}"
+        );
+        assert!(
+            !log1.contains("to-room-2"),
+            "room 1 must not receive room 2 mail: {log1}"
+        );
+        assert!(
+            log2.contains("SUBMITTED [whisper from Sender] to-room-2"),
+            "{log2}"
+        );
+        assert!(
+            !log2.contains("to-room-1"),
+            "room 2 must not receive room 1 mail: {log2}"
+        );
 
         // Report room 1's session: its bootstrap becomes its session file; room 2
         // keeps its own bootstrap and endpoint unchanged.
@@ -9119,7 +9468,10 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         router
             .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), MINTED_A, generation)
             .unwrap();
-        assert!(!boot1.exists(), "room 1 bootstrap must be removed on report");
+        assert!(
+            !boot1.exists(),
+            "room 1 bootstrap must be removed on report"
+        );
         assert!(
             crate::claude_inbox::connection_file(cwd.path(), MINTED_A)
                 .unwrap()
@@ -9143,7 +9495,10 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             log1.contains("SUBMITTED [whisper from Sender] to-room-1-after-report"),
             "{log1}"
         );
-        assert!(!log2.contains("to-room-1-after-report"), "room 2 must not receive room 1 mail: {log2}");
+        assert!(
+            !log2.contains("to-room-1-after-report"),
+            "room 2 must not receive room 1 mail: {log2}"
+        );
 
         child1.kill().ok();
         child2.kill().ok();
@@ -9173,7 +9528,11 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             Vec::new(),
         )
         .unwrap();
-        assert!(bind_claude_rooms(&mut router, &specs, &mut starts).unwrap().is_empty());
+        assert!(
+            bind_claude_rooms(&mut router, &specs, &mut starts)
+                .unwrap()
+                .is_empty()
+        );
 
         let mod_path = std::env::current_dir()
             .unwrap()
@@ -9258,7 +9617,10 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             !rogue.contains("STATUS Crowded inbox connected"),
             "rogue mod must not connect: {rogue}"
         );
-        assert!(!rogue.contains("SUBMITTED"), "rogue mod must not submit: {rogue}");
+        assert!(
+            !rogue.contains("SUBMITTED"),
+            "rogue mod must not submit: {rogue}"
+        );
 
         // Room 1 still receives its own mail through its own connection.
         let mut mailroom = Mailroom::new(50);
@@ -9269,7 +9631,10 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             shown.contains("ACCEPTED by Claude (submitted; not proof it was acted on)")
         });
         let log1 = fs::read_to_string(&marker1).unwrap();
-        assert!(log1.contains("SUBMITTED [whisper from Sender] only-room-1"), "{log1}");
+        assert!(
+            log1.contains("SUBMITTED [whisper from Sender] only-room-1"),
+            "{log1}"
+        );
 
         child1.kill().ok();
         child2.kill().ok();
@@ -9298,7 +9663,11 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             Vec::new(),
         )
         .unwrap();
-        assert!(bind_claude_rooms(&mut router, &specs, &mut starts).unwrap().is_empty());
+        assert!(
+            bind_claude_rooms(&mut router, &specs, &mut starts)
+                .unwrap()
+                .is_empty()
+        );
 
         let mod_path = std::env::current_dir()
             .unwrap()
@@ -9375,12 +9744,11 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         use super::*;
         use crate::app::{DoorbellSource, EventSource, Notices};
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-        
+
         use ratatui::{Terminal, backend::TestBackend};
         use std::{
             collections::VecDeque,
-            fs,
-            io,
+            fs, io,
             path::{Path, PathBuf},
             time::{Duration, Instant},
         };
@@ -9403,7 +9771,9 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
 
             #[allow(dead_code)]
             fn steps(steps: Vec<ScriptedStep>) -> Self {
-                Self { steps: steps.into() }
+                Self {
+                    steps: steps.into(),
+                }
             }
         }
 
@@ -9422,7 +9792,10 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             fn read(&mut self) -> io::Result<Event> {
                 match self.steps.pop_front() {
                     Some(ScriptedStep::Event(event)) => Ok(event),
-                    _ => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no scripted event")),
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "no scripted event",
+                    )),
                 }
             }
         }
@@ -9667,7 +10040,10 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             let shown = notice.ordered_lines().join("; ");
             assert!(shown.contains("Claude · 2 restarted"), "{shown}");
             assert!(!shown.contains("Claude · 1 restarted"), "{shown}");
-            assert_eq!(router.as_ref().unwrap().binding_for(0).unwrap().generation, gen0);
+            assert_eq!(
+                router.as_ref().unwrap().binding_for(0).unwrap().generation,
+                gen0
+            );
             assert!(router.as_ref().unwrap().binding_for(1).unwrap().generation > gen1);
             let args1: Vec<String> = panes[1]
                 .room_spec()
@@ -9746,28 +10122,41 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
                 )
                 .unwrap(),
             );
-            let gen0 = crate::native_launch::GenerationAllocator::new(session_state::state_directory())
-                .next()
-                .unwrap();
+            let gen0 =
+                crate::native_launch::GenerationAllocator::new(session_state::state_directory())
+                    .next()
+                    .unwrap();
             let gen1 = gen0 + 1;
             {
                 use crate::native_route::CodexEntry;
-                router.as_mut().unwrap().bind_codex(vec![
-                    CodexEntry {
-                        index: 0,
-                        title: "Room A".into(),
-                        room: Some(IterationHarness::healthy_room(&stub0, cwd.path(), MINTED_A)),
-                        generation: gen0,
-                        reason: None,
-                    },
-                    CodexEntry {
-                        index: 1,
-                        title: "Room B".into(),
-                        room: Some(IterationHarness::healthy_room(&stub1, cwd.path(), MINTED_B)),
-                        generation: gen1,
-                        reason: None,
-                    },
-                ]).unwrap();
+                router
+                    .as_mut()
+                    .unwrap()
+                    .bind_codex(vec![
+                        CodexEntry {
+                            index: 0,
+                            title: "Room A".into(),
+                            room: Some(IterationHarness::healthy_room(
+                                &stub0,
+                                cwd.path(),
+                                MINTED_A,
+                            )),
+                            generation: gen0,
+                            reason: None,
+                        },
+                        CodexEntry {
+                            index: 1,
+                            title: "Room B".into(),
+                            room: Some(IterationHarness::healthy_room(
+                                &stub1,
+                                cwd.path(),
+                                MINTED_B,
+                            )),
+                            generation: gen1,
+                            reason: None,
+                        },
+                    ])
+                    .unwrap();
             }
             let mut codex = vec![None, None];
             let environments = vec![GuestEnvironment::new([]), GuestEnvironment::new([])];
@@ -9780,11 +10169,26 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             let mut events = ScriptedEvents::steps(vec![
                 ScriptedStep::Event(key(KeyCode::Tab, KeyModifiers::NONE)),
                 ScriptedStep::Event(key(KeyCode::Char('r'), KeyModifiers::CONTROL)),
-                ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle,
-                ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle,
-                ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle,
-                ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle,
-                ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle, ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
+                ScriptedStep::Idle,
                 ScriptedStep::Event(key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
             ]);
             let mut doorbell = SilentDoorbell::new(root.path().join("doorbell.sock"));
@@ -9821,13 +10225,20 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             let shown = notice.ordered_lines().join("; ");
             assert!(shown.contains("Room B restarted"), "{shown}");
             assert!(!shown.contains("Room A restarted"), "{shown}");
-            assert_eq!(router.as_ref().unwrap().binding_for(0).unwrap().generation, gen0);
+            assert_eq!(
+                router.as_ref().unwrap().binding_for(0).unwrap().generation,
+                gen0
+            );
             let prompt = fs::read_to_string(&log1).unwrap_or_default();
             assert!(
                 prompt.contains("Automatic delivery pauses after 100 successful messages"),
                 "the loop must pass its fuse size to the relaunch: {prompt}"
             );
-            assert!(pane_sizes[1].rows > 0 && pane_sizes[1].cols > 0, "focused pane sized by the loop: {:?}", pane_sizes[1]);
+            assert!(
+                pane_sizes[1].rows > 0 && pane_sizes[1].cols > 0,
+                "focused pane sized by the loop: {:?}",
+                pane_sizes[1]
+            );
         }
         /// The loop must size the focused pane it restarts, not pane 0. With
         /// three rooms the bottom pane spans the full width, so a size taken
@@ -9841,21 +10252,9 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             let stub_root0 = tempfile::tempdir().unwrap();
             let stub_root1 = tempfile::tempdir().unwrap();
             let stub_root2 = tempfile::tempdir().unwrap();
-            let stub0 = codex_stub_for_pane(
-                stub_root0.path(),
-                "claude",
-                "exec sleep 30",
-            );
-            let stub1 = codex_stub_for_pane(
-                stub_root1.path(),
-                "claude",
-                "exec sleep 30",
-            );
-            let stub2 = codex_stub_for_pane(
-                stub_root2.path(),
-                "claude",
-                "exec sleep 30",
-            );
+            let stub0 = codex_stub_for_pane(stub_root0.path(), "claude", "exec sleep 30");
+            let stub1 = codex_stub_for_pane(stub_root1.path(), "claude", "exec sleep 30");
+            let stub2 = codex_stub_for_pane(stub_root2.path(), "claude", "exec sleep 30");
             session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
             session_state::upsert_reported("claude", cwd.path(), "Claude · 2", MINTED_B).unwrap();
             session_state::upsert_reported("claude", cwd.path(), "Claude · 3", MINTED_C).unwrap();
@@ -9953,7 +10352,5 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
                 panes[2].visible_width()
             );
         }
-
     }
-
 }

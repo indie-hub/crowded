@@ -19,12 +19,12 @@ mod server;
 pub(crate) use commands::{
     control_command, pulse_command, roster_command, send_command, session_report_command,
 };
-pub(crate) use protocol::{
-    ControlAction, DoorbellEnvelope, DoorbellEvent, DoorbellSessionReport, Effort, ModelCatalogue,
-    PulseSource, PulseState, RoomCapabilities, RosterRoom, SupportedControl,
-};
 #[cfg(test)]
 pub(crate) use protocol::DoorbellControl;
 #[cfg(test)]
 pub(crate) use protocol::TestAnswers;
+pub(crate) use protocol::{
+    ControlAction, DoorbellEnvelope, DoorbellEvent, DoorbellSessionReport, Effort, ModelCatalogue,
+    PulseSource, PulseState, RoomCapabilities, RosterRoom, SupportedControl,
+};
 pub(crate) use server::Doorbell;

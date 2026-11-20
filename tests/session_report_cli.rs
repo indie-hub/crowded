@@ -65,7 +65,12 @@ impl MockSocket {
 fn session_report_binary() -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_crowded"));
     command.arg("session-report");
-    for variable in ["CROWDED_TOKEN", "CROWDED_ROOM", "CROWDED_BIN", "CROWDED_SOCKET"] {
+    for variable in [
+        "CROWDED_TOKEN",
+        "CROWDED_ROOM",
+        "CROWDED_BIN",
+        "CROWDED_SOCKET",
+    ] {
         command.env_remove(variable);
     }
     command
@@ -103,9 +108,19 @@ fn run_report_code(
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     let mut stdout = Vec::new();
-    child.stdout.take().unwrap().read_to_end(&mut stdout).unwrap();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
     let mut stderr = Vec::new();
-    child.stderr.take().unwrap().read_to_end(&mut stderr).unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
     (status.code(), stdout, stderr)
 }
 
@@ -229,7 +244,10 @@ fn session_report_rejects_a_present_non_string_id_before_contact() {
     // Only a missing key is absent, so --pending still reports on its own.
     let (success, _stdout, _stderr, socket) = run(&["--pending"], r#"{"other":1}"#);
     assert!(success);
-    assert!(socket.contacted(), "a missing key leaves --pending to report");
+    assert!(
+        socket.contacted(),
+        "a missing key leaves --pending to report"
+    );
 }
 
 /// With neither --session nor --pending, stdin is the whole report: a valid
@@ -241,7 +259,10 @@ fn session_report_waits_for_a_session_payload_that_arrives_late() {
     use std::os::unix::io::{FromRawFd, IntoRawFd};
     use std::os::unix::net::UnixStream;
     use std::process::Stdio;
-    for payload in [r#"{"session_id":"ses-late-1"}"#, r#"{"sessionID":"ses-late-2"}"#] {
+    for payload in [
+        r#"{"session_id":"ses-late-1"}"#,
+        r#"{"sessionID":"ses-late-2"}"#,
+    ] {
         let socket = MockSocket::bind();
         let (reader, mut writer) = UnixStream::pair().unwrap();
         let mut command = session_report_binary();
@@ -269,7 +290,10 @@ fn session_report_waits_for_a_session_payload_that_arrives_late() {
         // The write end is still open: only a complete payload ends the wait.
         std::mem::forget(writer);
         assert!(status.success(), "{payload}");
-        assert!(socket.contacted(), "{payload}: a late payload must reach the server");
+        assert!(
+            socket.contacted(),
+            "{payload}: a late payload must reach the server"
+        );
     }
 }
 
@@ -371,18 +395,23 @@ fn run_with(
 fn assert_quiet_failure(stdout: &[u8], stderr: &[u8], label: &str) {
     assert!(stdout.is_empty(), "{label}: stdout must stay silent");
     let stderr = String::from_utf8_lossy(stderr);
-    assert!(stderr.lines().count() <= 1, "{label}: at most one stderr line: {stderr}");
+    assert!(
+        stderr.lines().count() <= 1,
+        "{label}: at most one stderr line: {stderr}"
+    );
 }
 
 /// `--ack` exits 0 only when Crowded accepted the report.
 #[test]
 fn session_report_ack_exits_zero_only_when_the_server_accepted() {
     let socket = MockSocket::bind();
-    let (code, stdout, stderr) =
-        run_with(&["--pending", "--ack"], true, Some(&socket.path));
+    let (code, stdout, stderr) = run_with(&["--pending", "--ack"], true, Some(&socket.path));
     assert_eq!(code, Some(0));
     assert!(stdout.is_empty());
-    assert!(stderr.is_empty(), "an accepted report prints nothing: {stderr:?}");
+    assert!(
+        stderr.is_empty(),
+        "an accepted report prints nothing: {stderr:?}"
+    );
     assert!(socket.contacted());
 }
 
@@ -426,7 +455,10 @@ fn session_report_ack_exits_3_for_an_invalid_id_without_contacting_the_server() 
     assert_eq!(code, Some(3));
     assert_quiet_failure(&stdout, &stderr, "invalid id");
     std::thread::sleep(std::time::Duration::from_millis(500));
-    assert!(!socket.contacted(), "an invalid id never reaches the server");
+    assert!(
+        !socket.contacted(),
+        "an invalid id never reaches the server"
+    );
 }
 
 #[test]
@@ -452,8 +484,18 @@ fn session_report_without_ack_exits_zero_in_every_failure() {
     let missing = dir.path().join("nobody-listens.sock");
     let cases: Vec<(&str, Vec<&str>, bool, Option<&std::path::Path>)> = vec![
         ("no token", vec!["--pending"], false, None),
-        ("unreachable", vec!["--session", "ses-a"], true, Some(missing.as_path())),
-        ("rejected", vec!["--session", "ses-a"], true, Some(rejecting.path.as_path())),
+        (
+            "unreachable",
+            vec!["--session", "ses-a"],
+            true,
+            Some(missing.as_path()),
+        ),
+        (
+            "rejected",
+            vec!["--session", "ses-a"],
+            true,
+            Some(rejecting.path.as_path()),
+        ),
         ("invalid id", vec!["--session", "bad/id"], true, None),
         ("usage", vec!["--bogus"], true, None),
         ("nothing to report", vec![], true, None),
@@ -480,7 +522,12 @@ fn session_report_ack_exits_5_within_the_deadline_when_the_server_never_answers(
     let started = std::time::Instant::now();
     let (code, stdout, stderr) = run_with(&["--pending", "--ack"], true, Some(&socket.path));
     let elapsed = started.elapsed();
-    assert_eq!(code, Some(5), "stderr: {}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        code,
+        Some(5),
+        "stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
     assert!(elapsed < DEADLINE + MARGIN, "waited {elapsed:?}");
     assert_quiet_failure(&stdout, &stderr, "silent server");
     assert!(socket.contacted());
@@ -508,6 +555,11 @@ fn session_report_ack_accepts_a_reply_that_arrives_just_before_the_deadline() {
         std::time::Duration::from_millis(2500),
     );
     let (code, stdout, stderr) = run_with(&["--pending", "--ack"], true, Some(&socket.path));
-    assert_eq!(code, Some(0), "stderr: {}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        code,
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
     assert!(stdout.is_empty());
 }

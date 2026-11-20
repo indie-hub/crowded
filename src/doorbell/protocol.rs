@@ -393,7 +393,7 @@ impl DoorbellEnvelope {
             .send(WireResponse::accepted("queued", Some(envelope_id)));
     }
 
-        /// A message routed through the native outbox. `status` says how far it got:
+    /// A message routed through the native outbox. `status` says how far it got:
     /// "accepted" (OpenCode accepted it into its queue), "queued" (saved here,
     /// not yet sent), "held" (saved but not sent, needs attention) or
     /// "uncertain" (it may have been accepted; it is never resent).
@@ -420,9 +420,7 @@ impl DoorbellControl {
 
 impl DoorbellSessionReport {
     pub(crate) fn reply_recorded(&self, status: &str) {
-        let _ = self
-            .reply
-            .send(WireResponse::accepted(status, None));
+        let _ = self.reply.send(WireResponse::accepted(status, None));
     }
 
     pub(crate) fn reply_failed(&self, error: impl Into<String>) {
@@ -548,8 +546,7 @@ pub(super) fn validate_session_report(
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
     {
         return Err(
-            "session id must contain 1..=128 bytes of letters, numbers, `_`, `-` or `.`"
-                .to_owned(),
+            "session id must contain 1..=128 bytes of letters, numbers, `_`, `-` or `.`".to_owned(),
         );
     }
     if request.session.is_none() && !request.pending {
@@ -817,11 +814,7 @@ mod tests {
         assert!(validate_pulse(&oversized, &["left".to_owned(), "right".to_owned()]).is_err());
     }
 
-    fn session_report(
-        token: &str,
-        session: Option<&str>,
-        pending: bool,
-    ) -> SessionReportRequest {
+    fn session_report(token: &str, session: Option<&str>, pending: bool) -> SessionReportRequest {
         SessionReportRequest {
             token: token.to_owned(),
             id: "report-1".to_owned(),
@@ -851,21 +844,31 @@ mod tests {
     fn session_report_validation_rejects_what_it_cannot_trust() {
         let tokens = ["left".to_owned(), "right".to_owned()];
         // Unknown token: no room is bound.
-        assert!(validate_session_report(&session_report("intruder", Some("ses-x"), false), &tokens).is_err());
+        assert!(
+            validate_session_report(&session_report("intruder", Some("ses-x"), false), &tokens)
+                .is_err()
+        );
         // Empty, oversized, and strangely-shaped ids never reach a room.
-        for bad in ["", "has space", "has/slash", "semi;colon", "quote\"q", "back\\slash"] {
+        for bad in [
+            "",
+            "has space",
+            "has/slash",
+            "semi;colon",
+            "quote\"q",
+            "back\\slash",
+        ] {
             assert!(
-                validate_session_report(&session_report("left", Some(bad), false), &tokens).is_err(),
+                validate_session_report(&session_report("left", Some(bad), false), &tokens)
+                    .is_err(),
                 "{bad:?} must be rejected"
             );
         }
         let oversized = "s".repeat(129);
         assert!(
-            validate_session_report(&session_report("left", Some(&oversized), false), &tokens).is_err()
+            validate_session_report(&session_report("left", Some(&oversized), false), &tokens)
+                .is_err()
         );
         // Neither an id nor the pending flag: nothing to report.
-        assert!(
-            validate_session_report(&session_report("left", None, false), &tokens).is_err()
-        );
+        assert!(validate_session_report(&session_report("left", None, false), &tokens).is_err());
     }
 }

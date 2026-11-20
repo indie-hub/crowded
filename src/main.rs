@@ -9,13 +9,13 @@ mod config;
 mod doorbell;
 mod initializer;
 mod mailroom;
+mod mcp_cli;
 mod native_binding;
 mod native_launch;
 mod native_outbox;
 mod native_route;
 mod opencode_native;
 mod opencode_outbox;
-mod mcp_cli;
 mod pane;
 mod plugins;
 mod room_detail;
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("control") => doorbell::control_command(),
         Some("resume") => app::run_resumed(),
         Some("pulse") => doorbell::pulse_command(),
-    Some("session-report") => doorbell::session_report_command(),
+        Some("session-report") => doorbell::session_report_command(),
         Some("roster") => doorbell::roster_command(),
         Some("check") => checker::command(),
         Some("init") => initializer::command(),
@@ -76,8 +76,17 @@ mod tests {
     #[test]
     fn help_text_lists_all_subcommands() {
         let expected = [
-            "send", "control", "resume", "pulse", "session-report", "roster", "check", "init",
-            "mcp", "plugin", "toolbox",
+            "send",
+            "control",
+            "resume",
+            "pulse",
+            "session-report",
+            "roster",
+            "check",
+            "init",
+            "mcp",
+            "plugin",
+            "toolbox",
         ];
         for cmd in expected {
             assert!(USAGE.contains(cmd), "help text missing subcommand: {cmd}",);

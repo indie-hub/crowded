@@ -220,34 +220,35 @@ fn listener_loop(
                         }
                     }
                     Ok(WireRequest::SessionReport(request)) => {
-                if seen.contains(&request.id) {
-                    Some(WireResponse::accepted("duplicate", None))
-                } else {
-                    match validate_session_report(&request, &tokens) {
-                        Ok(from) => {
-                            let (reply, reply_rx) = mpsc::sync_channel(1);
-                            let event = DoorbellEvent::SessionReport(DoorbellSessionReport {
-                                from,
-                                session: request.session,
-                                pending: request.pending,
-                                reply,
-                            });
-                            match events.try_send(event) {
-                                Ok(()) => {
-                                    remember_id(request.id, &mut seen, &mut seen_order);
-                                    reply_rx.recv_timeout(Duration::from_secs(2)).ok()
+                        if seen.contains(&request.id) {
+                            Some(WireResponse::accepted("duplicate", None))
+                        } else {
+                            match validate_session_report(&request, &tokens) {
+                                Ok(from) => {
+                                    let (reply, reply_rx) = mpsc::sync_channel(1);
+                                    let event =
+                                        DoorbellEvent::SessionReport(DoorbellSessionReport {
+                                            from,
+                                            session: request.session,
+                                            pending: request.pending,
+                                            reply,
+                                        });
+                                    match events.try_send(event) {
+                                        Ok(()) => {
+                                            remember_id(request.id, &mut seen, &mut seen_order);
+                                            reply_rx.recv_timeout(Duration::from_secs(2)).ok()
+                                        }
+                                        Err(TrySendError::Full(_)) => {
+                                            Some(WireResponse::rejected("Doorbell queue is full"))
+                                        }
+                                        Err(TrySendError::Disconnected(_)) => break,
+                                    }
                                 }
-                                Err(TrySendError::Full(_)) => {
-                                    Some(WireResponse::rejected("Doorbell queue is full"))
-                                }
-                                Err(TrySendError::Disconnected(_)) => break,
+                                Err(error) => Some(WireResponse::rejected(error)),
                             }
                         }
-                        Err(error) => Some(WireResponse::rejected(error)),
                     }
-                }
-            }
-            Ok(WireRequest::Roster(request)) => {
+                    Ok(WireRequest::Roster(request)) => {
                         match validate_roster(&request, &tokens, &mut recent_by_room) {
                             Ok(_) => {
                                 let (reply, reply_rx) = mpsc::sync_channel(1);

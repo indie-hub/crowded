@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     path::PathBuf,
-        sync::{
+    sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, TryRecvError, TrySendError},
@@ -194,8 +194,7 @@ pub(crate) struct CodexEntry {
     pub(crate) reason: Option<String>,
 }
 
-const UNBOUND_CODEX: &str =
-    "this room has no Codex session; restart Crowded and send again";
+const UNBOUND_CODEX: &str = "this room has no Codex session; restart Crowded and send again";
 
 /// A Claude room handed to the router. Crowded chose the session id itself, so
 /// the room is bound as soon as it starts; a room that could not start carries
@@ -233,8 +232,8 @@ pub(crate) struct NativeRouter {
     adapter: Reaped<Arc<SwitchAdapter>>,
     path: PathBuf,
     rooms: HashMap<usize, (String, Binding)>,
-        bindings: HashMap<String, Binding>,
-        /// Held in a [`Reaped`] so the last handle to a server is never dropped
+    bindings: HashMap<String, Binding>,
+    /// Held in a [`Reaped`] so the last handle to a server is never dropped
     /// on the event loop.
     servers: Reaped<HashMap<String, Arc<Server>>>,
     /// Destination keys of the Codex rooms, for vendor-specific status text.
@@ -305,14 +304,16 @@ pub(crate) enum NoticeSeverity {
 
 impl NativeRouter {
     fn outbox(&self) -> &BackgroundOutbox {
-        self.outbox.as_ref().expect("the outbox is open until the router is dropped")
+        self.outbox
+            .as_ref()
+            .expect("the outbox is open until the router is dropped")
     }
 
     /// Opens the outbox at `path` (creating its private directory) and binds
     /// the rooms. State from an earlier run is loaded and listed; a corrupt or
     /// locked file is an error and is left as it is.
     pub(crate) fn start(path: PathBuf, rooms: Vec<RoomEntry>) -> io::Result<Self> {
-                if let Some(parent) = path.parent() {
+        if let Some(parent) = path.parent() {
             if parent.exists() && !parent.is_dir() {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
@@ -325,7 +326,10 @@ impl NativeRouter {
             create_private_directory(parent).map_err(|error| {
                 io::Error::new(
                     error.kind(),
-                    format!("cannot create {} for native delivery: {error}", parent.display()),
+                    format!(
+                        "cannot create {} for native delivery: {error}",
+                        parent.display()
+                    ),
                 )
             })?;
         }
@@ -337,7 +341,7 @@ impl NativeRouter {
             MAX_IN_FLIGHT,
             Arc::clone(&adapter) as Arc<dyn Adapter>,
         );
-                let mut bindings = HashMap::new();
+        let mut bindings = HashMap::new();
         let mut servers = HashMap::new();
         let mut titles = HashMap::new();
         let mut by_index = HashMap::new();
@@ -372,7 +376,7 @@ impl NativeRouter {
             adapter: Reaped::new(adapter),
             path,
             rooms: by_index,
-                                    bindings,
+            bindings,
             servers: Reaped::new(servers),
             codex,
             codex_rooms,
@@ -442,12 +446,9 @@ impl NativeRouter {
                         crate::codex_native::binding(&destination, &room.thread, entry.generation);
                     self.unbound.remove(&entry.index);
                     self.codex.insert(destination.clone());
-                    self.codex_live
-                        .insert(entry.index, Arc::clone(&room.live));
-                    self.titles
-                        .insert(destination.clone(), entry.title.clone());
-                    self.bindings
-                        .insert(destination.clone(), binding.clone());
+                    self.codex_live.insert(entry.index, Arc::clone(&room.live));
+                    self.titles.insert(destination.clone(), entry.title.clone());
+                    self.bindings.insert(destination.clone(), binding.clone());
                     self.rooms
                         .insert(entry.index, (entry.title.clone(), binding.clone()));
                     self.codex_rooms.insert(
@@ -499,10 +500,8 @@ impl NativeRouter {
                         crate::codex_native::binding(&destination, &session, entry.generation);
                     self.unbound.remove(&entry.index);
                     self.claude.insert(destination.clone());
-                    self.titles
-                        .insert(destination.clone(), entry.title.clone());
-                    self.bindings
-                        .insert(destination.clone(), binding.clone());
+                    self.titles.insert(destination.clone(), entry.title.clone());
+                    self.bindings.insert(destination.clone(), binding.clone());
                     self.rooms
                         .insert(entry.index, (entry.title.clone(), binding.clone()));
                     self.claude_rooms.insert(
@@ -686,16 +685,16 @@ impl NativeRouter {
     /// other reason stays put.
     pub(crate) fn rebind_room(&mut self, entry: RoomEntry) -> io::Result<()> {
         if entry.binding.room.is_empty() || entry.binding.generation == 0 {
-            return Err(io::Error::other("a rebinding needs its room and generation"));
+            return Err(io::Error::other(
+                "a rebinding needs its room and generation",
+            ));
         }
         let index = entry.index;
         let destination = entry.binding.room.clone();
         if let Backend::OpenCode(_) = entry.backend
             && !self.servers.get().contains_key(&destination)
         {
-            return Err(io::Error::other(
-                "that room has no owned OpenCode server",
-            ));
+            return Err(io::Error::other("that room has no owned OpenCode server"));
         }
         let rooms: Vec<String> = self
             .pending_rooms
@@ -717,8 +716,7 @@ impl NativeRouter {
             .insert(index, (entry.title.clone(), entry.binding.clone()));
         self.bindings
             .insert(destination.clone(), entry.binding.clone());
-        self.titles
-            .insert(destination.clone(), entry.title.clone());
+        self.titles.insert(destination.clone(), entry.title.clone());
         match &entry.backend {
             Backend::OpenCode(_) => {
                 self.codex.remove(&destination);
@@ -765,7 +763,7 @@ impl NativeRouter {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn rebind(&mut self, rooms: Vec<RoomEntry>) -> io::Result<()> {
         self.adapter.get().rebind(rooms.clone())?;
-                        self.bindings.clear();
+        self.bindings.clear();
         let mut servers = HashMap::new();
         self.rooms.clear();
         self.codex.clear();
@@ -812,7 +810,7 @@ impl NativeRouter {
         message: &str,
         reply: Option<Reply>,
     ) -> Result<(), String> {
-                if let Some(error) = &self.unavailable {
+        if let Some(error) = &self.unavailable {
             let error = format!("native delivery is unavailable: {error}");
             if let Some(reply) = reply {
                 reply(0, NativeReply::Failed(error.clone()));
@@ -831,9 +829,8 @@ impl NativeRouter {
                 .get(&to)
                 .map(|(title, _)| title.clone())
                 .unwrap_or_else(|| format!("room {}", to + 1));
-            let error = format!(
-                "{title} is not running; native mail is held until it is relaunched"
-            );
+            let error =
+                format!("{title} is not running; native mail is held until it is relaunched");
             if let Some(reply) = reply {
                 reply(0, NativeReply::Failed(error.clone()));
             }
@@ -853,12 +850,7 @@ impl NativeRouter {
             }
             return Err(error);
         };
-        let envelope = mailroom.record_native(
-            from.to_owned(),
-            title,
-            message.to_owned(),
-            "SAVING",
-        );
+        let envelope = mailroom.record_native(from.to_owned(), title, message.to_owned(), "SAVING");
         let command = Command::Enqueue {
             source: from.to_owned(),
             binding,
@@ -867,10 +859,11 @@ impl NativeRouter {
         let id = self.next_command_id();
         match self.outbox().try_send(id, command) {
             Ok(()) => {
-                self.waiting.push((id, Waiting::Enqueue { envelope, reply }));
+                self.waiting
+                    .push((id, Waiting::Enqueue { envelope, reply }));
                 Ok(())
             }
-                        Err(TrySendError::Full(_)) => {
+            Err(TrySendError::Full(_)) => {
                 let error = "native delivery is busy; try again".to_owned();
                 mailroom.set_native_status(envelope, format!("FAILED: {error}"));
                 if let Some(reply) = reply {
@@ -920,7 +913,7 @@ impl NativeRouter {
             }
             self.last_schedule = Some(now);
         }
-                self.resolve_pending(now);
+        self.resolve_pending(now);
         self.reconcile_uncertain(now);
         notices
     }
@@ -1082,12 +1075,14 @@ impl NativeRouter {
                             reply(envelope, NativeReply::Failed(error));
                         }
                     }
-                                        Some(Waiting::Schedule) => {
+                    Some(Waiting::Schedule) => {
                         self.schedule_in_flight = false;
-                        notices.push((format!("native delivery: {error}"), NoticeSeverity::Failure));
+                        notices
+                            .push((format!("native delivery: {error}"), NoticeSeverity::Failure));
                     }
                     Some(Waiting::Resolve) => {
-                        notices.push((format!("native delivery: {error}"), NoticeSeverity::Failure));
+                        notices
+                            .push((format!("native delivery: {error}"), NoticeSeverity::Failure));
                     }
                     None => {
                         // No command is waiting for this id: the failure
@@ -1124,9 +1119,7 @@ impl NativeRouter {
             Status::Queued { hold: None } if !current => {
                 "HELD: sent for an earlier launch of this room; not delivered".to_owned()
             }
-            Status::Queued { hold: None } if self.paused => {
-                "QUEUED: delivery is paused".to_owned()
-            }
+            Status::Queued { hold: None } if self.paused => "QUEUED: delivery is paused".to_owned(),
             Status::Queued { hold: None } => "QUEUED".to_owned(),
             Status::Queued { hold: Some(reason) } => held_text(reason),
             Status::Sending => "SENDING".to_owned(),
@@ -1193,7 +1186,7 @@ impl NativeRouter {
                 Some(Status::Queued { hold: Some(reason) }) => {
                     Some(NativeReply::Held(reason.clone()))
                 }
-                                // Not in the latest snapshot yet, or still waiting its turn.
+                // Not in the latest snapshot yet, or still waiting its turn.
                 None | Some(Status::Queued { hold: None } | Status::Sending) => {
                     (now >= entry.deadline).then_some(NativeReply::Queued)
                 }
@@ -1265,7 +1258,9 @@ mod tests {
 
     fn recorder(log: &Log) -> Option<Reply> {
         let log = Rc::clone(log);
-        Some(Box::new(move |id, outcome| log.borrow_mut().push((id, outcome))))
+        Some(Box::new(move |id, outcome| {
+            log.borrow_mut().push((id, outcome))
+        }))
     }
 
     fn pump(
@@ -1281,12 +1276,22 @@ mod tests {
             if done(mailroom) {
                 return;
             }
-            assert!(Instant::now() < deadline, "never finished:\n{}", mailroom.summary());
+            assert!(
+                Instant::now() < deadline,
+                "never finished:\n{}",
+                mailroom.summary()
+            );
             thread::sleep(Duration::from_millis(20));
         }
     }
 
-    fn pump_for(router: &mut NativeRouter, mailroom: &mut Mailroom, paused: bool, fused: bool, ms: u64) {
+    fn pump_for(
+        router: &mut NativeRouter,
+        mailroom: &mut Mailroom,
+        paused: bool,
+        fused: bool,
+        ms: u64,
+    ) {
         let end = Instant::now() + Duration::from_millis(ms);
         while Instant::now() < end {
             router.tick(Instant::now(), mailroom, paused, fused);
@@ -1296,11 +1301,7 @@ mod tests {
 
     /// Ticks until both messages have an answer of their own, collecting the
     /// notices each pass drained.
-    fn answered(
-        router: &mut NativeRouter,
-        mailroom: &mut Mailroom,
-        notices: &mut Vec<String>,
-    ) {
+    fn answered(router: &mut NativeRouter, mailroom: &mut Mailroom, notices: &mut Vec<String>) {
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             notices.extend(
@@ -1330,8 +1331,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let a = launch(root.path(), cwd.path(), "a", 1, 1);
         let path = state_path(root.path());
-        let mut router =
-            NativeRouter::start(path.clone(), vec![entry(&a, 0, "Room A")]).unwrap();
+        let mut router = NativeRouter::start(path.clone(), vec![entry(&a, 0, "Room A")]).unwrap();
         let mut mailroom = Mailroom::new(50);
         let log = Log::default();
 
@@ -1366,13 +1366,9 @@ mod tests {
 
         // Nothing is stuck: releasing the hold delivers the new message.
         router.clear_pending(0).unwrap();
-        pump(
-            &mut router,
-            &mut mailroom,
-            false,
-            false,
-            |mailroom| mailroom.summary().contains("ACCEPTED by OpenCode"),
-        );
+        pump(&mut router, &mut mailroom, false, false, |mailroom| {
+            mailroom.summary().contains("ACCEPTED by OpenCode")
+        });
         assert!(
             texts(&a).iter().any(|text| text.contains("new")),
             "{:?}",
@@ -1427,13 +1423,9 @@ mod tests {
         );
         let view = mailroom.summary();
         assert!(!view.contains("SAVING"), "{view}");
-        pump(
-            &mut router,
-            &mut mailroom,
-            false,
-            false,
-            |_| !log.borrow().is_empty(),
-        );
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            !log.borrow().is_empty()
+        });
         assert!(
             !matches!(log.borrow()[0].1, NativeReply::Failed(_)),
             "the message keeps its own result: {:?}",
@@ -1457,13 +1449,9 @@ mod tests {
         router
             .send(&mut mailroom, "Room X", 0, "lost reply", recorder(&log))
             .unwrap();
-        pump(
-            &mut router,
-            &mut mailroom,
-            false,
-            false,
-            |_| !log.borrow().is_empty(),
-        );
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            !log.borrow().is_empty()
+        });
         assert_eq!(log.borrow()[0].1, NativeReply::Uncertain);
 
         // A second message is saved and then held for the next session.
@@ -1574,9 +1562,17 @@ mod tests {
         let mut mailroom = Mailroom::new(50);
         let log = Log::default();
         router
-            .send(&mut mailroom, "Room B", 0, "multi\nline \u{2713} \u{fc}\u{f1}\u{ed}", recorder(&log))
+            .send(
+                &mut mailroom,
+                "Room B",
+                0,
+                "multi\nline \u{2713} \u{fc}\u{f1}\u{ed}",
+                recorder(&log),
+            )
             .unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| !log.borrow().is_empty());
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            !log.borrow().is_empty()
+        });
 
         assert_eq!(log.borrow()[0].1, NativeReply::Accepted);
         let received = a.fake.state.received.lock().unwrap().clone();
@@ -1614,8 +1610,14 @@ mod tests {
             let view = view.summary();
             view.contains("SENDING") && view.contains("QUEUED")
         });
-        pump(&mut router, &mut mailroom, false, false, |_| log.borrow().len() == 3);
-        assert!(log.borrow().iter().all(|(_, outcome)| *outcome == NativeReply::Accepted));
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            log.borrow().len() == 3
+        });
+        assert!(
+            log.borrow()
+                .iter()
+                .all(|(_, outcome)| *outcome == NativeReply::Accepted)
+        );
         let order: Vec<String> = texts(&a);
         assert_eq!(
             order,
@@ -1635,14 +1637,21 @@ mod tests {
         {
             let first = launch(root.path(), cwd.path(), "first", 1, 1);
             *first.fake.state.mode.lock().unwrap() = FakeMode::Drop;
-            let mut router = NativeRouter::start(path.clone(), vec![entry(&first, 0, "Room A")]).unwrap();
+            let mut router =
+                NativeRouter::start(path.clone(), vec![entry(&first, 0, "Room A")]).unwrap();
             let mut mailroom = Mailroom::new(50);
             let log = Log::default();
-            router.send(&mut mailroom, "Room B", 0, "lost reply", recorder(&log)).unwrap();
-            pump(&mut router, &mut mailroom, false, false, |_| !log.borrow().is_empty());
+            router
+                .send(&mut mailroom, "Room B", 0, "lost reply", recorder(&log))
+                .unwrap();
+            pump(&mut router, &mut mailroom, false, false, |_| {
+                !log.borrow().is_empty()
+            });
             assert_eq!(log.borrow()[0].1, NativeReply::Uncertain);
             // A second message is saved while delivery is paused.
-            router.send(&mut mailroom, "Room B", 0, "waiting", None).unwrap();
+            router
+                .send(&mut mailroom, "Room B", 0, "waiting", None)
+                .unwrap();
             pump_for(&mut router, &mut mailroom, true, false, 400);
             let view = mailroom.summary();
             assert!(view.contains("UNCERTAIN"), "{view}");
@@ -1664,8 +1673,12 @@ mod tests {
 
         // New mail reaches the new launch; the old mail neither follows nor repeats.
         let log = Log::default();
-        router.send(&mut mailroom, "Room B", 0, "fresh", recorder(&log)).unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| !log.borrow().is_empty());
+        router
+            .send(&mut mailroom, "Room B", 0, "fresh", recorder(&log))
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            !log.borrow().is_empty()
+        });
         assert_eq!(log.borrow()[0].1, NativeReply::Accepted);
         pump_for(&mut router, &mut mailroom, false, false, 400);
         assert_eq!(texts(&second), ["[whisper from Room B] fresh"]);
@@ -1681,13 +1694,21 @@ mod tests {
             NativeRouter::start(state_path(root.path()), vec![entry(&a, 0, "Room A")]).unwrap();
         let mut mailroom = Mailroom::new(50);
         let log = Log::default();
-        router.send(&mut mailroom, "Room B", 0, "hello", recorder(&log)).unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| !log.borrow().is_empty());
+        router
+            .send(&mut mailroom, "Room B", 0, "hello", recorder(&log))
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            !log.borrow().is_empty()
+        });
         match &log.borrow()[0].1 {
             NativeReply::Failed(reason) => assert!(reason.contains("401"), "{reason}"),
             other => panic!("expected a failure, got {other:?}"),
         }
-        assert!(mailroom.summary().contains("FAILED: OpenCode returned HTTP 401"));
+        assert!(
+            mailroom
+                .summary()
+                .contains("FAILED: OpenCode returned HTTP 401")
+        );
         assert!(texts(&a).is_empty());
     }
 
@@ -1703,8 +1724,12 @@ mod tests {
 
         // OpenCode stores the message, then the reply is lost.
         *a.fake.state.mode.lock().unwrap() = FakeMode::StoreThenDrop;
-        router.send(&mut mailroom, "Room B", 0, "kept", recorder(&log)).unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| log.borrow().len() == 1);
+        router
+            .send(&mut mailroom, "Room B", 0, "kept", recorder(&log))
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            log.borrow().len() == 1
+        });
         assert_eq!(log.borrow()[0].1, NativeReply::Uncertain);
 
         // A read-only look at the inbox settles it without sending anything again.
@@ -1715,8 +1740,12 @@ mod tests {
         assert_eq!(texts(&a), ["[whisper from Room B] kept"]);
 
         // The room's lane is free again.
-        router.send(&mut mailroom, "Room B", 0, "next", recorder(&log)).unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| log.borrow().len() == 2);
+        router
+            .send(&mut mailroom, "Room B", 0, "next", recorder(&log))
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            log.borrow().len() == 2
+        });
         assert_eq!(log.borrow()[1].1, NativeReply::Accepted);
         assert_eq!(
             texts(&a),
@@ -1734,18 +1763,27 @@ mod tests {
             NativeRouter::start(state_path(root.path()), vec![entry(&a, 0, "Room A")]).unwrap();
         let mut mailroom = Mailroom::new(50);
         let log = Log::default();
-        router.send(&mut mailroom, "Room B", 0, "lost", recorder(&log)).unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| log.borrow().len() == 1);
+        router
+            .send(&mut mailroom, "Room B", 0, "lost", recorder(&log))
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            log.borrow().len() == 1
+        });
         assert_eq!(log.borrow()[0].1, NativeReply::Uncertain);
 
         *a.fake.state.mode.lock().unwrap() = FakeMode::Normal;
-        router.send(&mut mailroom, "Room B", 0, "behind it", recorder(&log)).unwrap();
+        router
+            .send(&mut mailroom, "Room B", 0, "behind it", recorder(&log))
+            .unwrap();
         pump_for(&mut router, &mut mailroom, false, false, 600);
         // Nothing was resent, and the message behind it was not sent past it;
         // it says why it is waiting instead of looking merely queued.
         assert!(texts(&a).is_empty());
         let view = mailroom.summary();
-        assert!(view.contains("UNCERTAIN: may have been accepted; it will not be resent"), "{view}");
+        assert!(
+            view.contains("UNCERTAIN: may have been accepted; it will not be resent"),
+            "{view}"
+        );
         assert!(
             view.contains(crate::native_outbox::UNCERTAIN_HOLD),
             "{view}"
@@ -1762,15 +1800,22 @@ mod tests {
         let mut mailroom = Mailroom::new(50);
         let log = Log::default();
         a.fake.shutdown();
-        router.send(&mut mailroom, "Room B", 0, "dead", recorder(&log)).unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| log.borrow().len() == 1);
+        router
+            .send(&mut mailroom, "Room B", 0, "dead", recorder(&log))
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            log.borrow().len() == 1
+        });
         assert!(
             matches!(&log.borrow()[0].1, NativeReply::Held(reason) if reason.contains("not sent")),
             "{:?}",
             log.borrow()[0].1
         );
         let view = mailroom.summary();
-        assert!(view.contains("HELD: OpenCode request was not sent"), "{view}");
+        assert!(
+            view.contains("HELD: OpenCode request was not sent"),
+            "{view}"
+        );
         assert!(!view.contains("ACCEPTED"), "{view}");
     }
 
@@ -1783,12 +1828,16 @@ mod tests {
             NativeRouter::start(state_path(root.path()), vec![entry(&a, 0, "Room A")]).unwrap();
         let mut mailroom = Mailroom::new(50);
         let log = Log::default();
-        router.send(&mut mailroom, "Room B", 0, "later", recorder(&log)).unwrap();
+        router
+            .send(&mut mailroom, "Room B", 0, "later", recorder(&log))
+            .unwrap();
         pump_for(&mut router, &mut mailroom, true, false, 400);
         pump_for(&mut router, &mut mailroom, false, true, 400);
         assert!(texts(&a).is_empty());
         assert!(mailroom.summary().contains("QUEUED"));
-        pump(&mut router, &mut mailroom, false, false, |_| !log.borrow().is_empty());
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            !log.borrow().is_empty()
+        });
         assert_eq!(texts(&a), ["[whisper from Room B] later"]);
     }
 
@@ -1802,8 +1851,12 @@ mod tests {
         let mut router =
             NativeRouter::start(state_path(root.path()), vec![entry(&a, 0, "Room A")]).unwrap();
         let mut mailroom = Mailroom::new(50);
-        router.send(&mut mailroom, "Room B", 0, "in flight", None).unwrap();
-        pump(&mut router, &mut mailroom, false, false, |view| view.summary().contains("SENDING"));
+        router
+            .send(&mut mailroom, "Room B", 0, "in flight", None)
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |view| {
+            view.summary().contains("SENDING")
+        });
         // Exit while the send is still being answered. Closing waits for the
         // send to finish, not for the full close timeout.
         let closing = Instant::now();
@@ -1832,7 +1885,9 @@ mod tests {
             NativeRouter::start(state_path(root.path()), vec![entry(&a, 0, "Room A")]).unwrap();
         let mut mailroom = Mailroom::new(50);
         let log = Log::default();
-        router.send(&mut mailroom, "Room B", 0, "later", recorder(&log)).unwrap();
+        router
+            .send(&mut mailroom, "Room B", 0, "later", recorder(&log))
+            .unwrap();
         pump_for(&mut router, &mut mailroom, true, false, 600);
         assert!(log.borrow().is_empty(), "still within the wait");
         pump_for(&mut router, &mut mailroom, true, false, 1500);
@@ -1869,7 +1924,10 @@ mod tests {
             .expect("must refuse");
         let message = error.to_string();
         assert!(message.contains("not a directory"), "{message}");
-        assert!(message.contains(path.parent().unwrap().to_str().unwrap()), "{message}");
+        assert!(
+            message.contains(path.parent().unwrap().to_str().unwrap()),
+            "{message}"
+        );
         assert!(!message.contains("os error"), "{message}");
         assert_eq!(fs::read(path.parent().unwrap()).unwrap(), b"in the way");
     }
@@ -1891,7 +1949,10 @@ mod tests {
             return;
         };
         let message = error.to_string();
-        assert!(message.contains(path.parent().unwrap().to_str().unwrap()), "{message}");
+        assert!(
+            message.contains(path.parent().unwrap().to_str().unwrap()),
+            "{message}"
+        );
         assert!(message.contains("cannot create"), "{message}");
     }
 
@@ -1905,8 +1966,12 @@ mod tests {
         let mut router = NativeRouter::start(path.clone(), vec![entry(&a, 0, "Room A")]).unwrap();
         let mut mailroom = Mailroom::new(50);
         let log = Log::default();
-        router.send(&mut mailroom, "Room B", 0, "hi", recorder(&log)).unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| !log.borrow().is_empty());
+        router
+            .send(&mut mailroom, "Room B", 0, "hi", recorder(&log))
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            !log.borrow().is_empty()
+        });
         let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(path.parent().unwrap()), 0o700);
         assert_eq!(mode(&path), 0o600);
@@ -1921,13 +1986,25 @@ mod tests {
         let mut router =
             NativeRouter::start(state_path(root.path()), vec![entry(&old, 0, "Room A")]).unwrap();
         let mut mailroom = Mailroom::new(50);
-        router.send(&mut mailroom, "Room B", 0, "for the old launch", None).unwrap();
+        router
+            .send(&mut mailroom, "Room B", 0, "for the old launch", None)
+            .unwrap();
         pump_for(&mut router, &mut mailroom, true, false, 300);
 
         router.rebind(vec![entry(&new, 0, "Room A")]).unwrap();
         let log = Log::default();
-        router.send(&mut mailroom, "Room B", 0, "for the new launch", recorder(&log)).unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| !log.borrow().is_empty());
+        router
+            .send(
+                &mut mailroom,
+                "Room B",
+                0,
+                "for the new launch",
+                recorder(&log),
+            )
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            !log.borrow().is_empty()
+        });
         pump_for(&mut router, &mut mailroom, false, false, 300);
 
         assert_eq!(texts(&new), ["[whisper from Room B] for the new launch"]);
@@ -1954,7 +2031,10 @@ mod tests {
             source: "s".to_owned(),
             destination: stranger.room.clone(),
             binding: stranger,
-            hash: format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes())),
+            hash: format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes())
+            ),
             text,
             created_ms: 0,
             sequence: 1,
@@ -1985,7 +2065,11 @@ mod tests {
         ))
     }
 
-    fn codex_entry(index: usize, title: &str, room: Option<Arc<crate::codex_native::Room>>) -> CodexEntry {
+    fn codex_entry(
+        index: usize,
+        title: &str,
+        room: Option<Arc<crate::codex_native::Room>>,
+    ) -> CodexEntry {
         codex_entry_at(index, title, room, 1)
     }
 
@@ -2027,11 +2111,21 @@ mod tests {
         );
         let mut router = NativeRouter::start(state_path(root.path()), Vec::new()).unwrap();
         router
-            .bind_codex(vec![codex_entry(0, "Room A", Some(codex_room(&program, cwd.path(), "thread-a")))])
+            .bind_codex(vec![codex_entry(
+                0,
+                "Room A",
+                Some(codex_room(&program, cwd.path(), "thread-a")),
+            )])
             .unwrap();
         let mut mailroom = Mailroom::new(50);
         router
-            .send(&mut mailroom, "Room B", 0, "multi\nline \u{2713} \u{fc}", None)
+            .send(
+                &mut mailroom,
+                "Room B",
+                0,
+                "multi\nline \u{2713} \u{fc}",
+                None,
+            )
             .unwrap();
         pump(&mut router, &mut mailroom, false, false, |view| {
             view.summary().contains("ACCEPTED by Codex")
@@ -2039,7 +2133,10 @@ mod tests {
 
         // The text arrives as one exact argument, envelope note and all.
         let arguments = args_log(&log_path);
-        assert_eq!(&arguments[..4], ["queue", "--thread", "thread-a", "--message"]);
+        assert_eq!(
+            &arguments[..4],
+            ["queue", "--thread", "thread-a", "--message"]
+        );
         assert_eq!(
             arguments[4..].join("\n"),
             "[whisper from Room B] multi\nline \u{2713} \u{fc}"
@@ -2052,7 +2149,11 @@ mod tests {
         );
     }
 
-    fn marking_codex_room(root: &Path, cwd: &Path, name: &str) -> (Arc<crate::codex_native::Room>, PathBuf) {
+    fn marking_codex_room(
+        root: &Path,
+        cwd: &Path,
+        name: &str,
+    ) -> (Arc<crate::codex_native::Room>, PathBuf) {
         let marker = root.join(format!("{name}.args"));
         let program = codex_stub(
             root,
@@ -2070,7 +2171,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(8);
         while !marker.exists() {
             router.tick(Instant::now(), mailroom, false, false);
-            assert!(Instant::now() < deadline, "never delivered:\n{}", mailroom.summary());
+            assert!(
+                Instant::now() < deadline,
+                "never delivered:\n{}",
+                mailroom.summary()
+            );
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -2086,11 +2191,17 @@ mod tests {
             ];
             let mut router = NativeRouter::start(state_path(root.path()), Vec::new()).unwrap();
             for index in order {
-                let entry = codex_entry(index, &format!("Room {index}"), Some(Arc::clone(&rooms[index].0)));
+                let entry = codex_entry(
+                    index,
+                    &format!("Room {index}"),
+                    Some(Arc::clone(&rooms[index].0)),
+                );
                 router.bind_codex(vec![entry]).unwrap();
             }
             // A third room that is still pending or failed must not disturb them.
-            router.bind_codex(vec![codex_entry(2, "Room 2", None)]).unwrap();
+            router
+                .bind_codex(vec![codex_entry(2, "Room 2", None)])
+                .unwrap();
             let mut mailroom = Mailroom::new(50);
             for index in 0..2 {
                 deliver_to(&mut router, &mut mailroom, index, &rooms[index].1);
@@ -2106,11 +2217,17 @@ mod tests {
         let (codex, marker) = marking_codex_room(root.path(), cwd.path(), "thread-b");
         let mut router =
             NativeRouter::start(state_path(root.path()), vec![entry(&open, 0, "Room A")]).unwrap();
-        router.bind_codex(vec![codex_entry(1, "Room B", Some(codex))]).unwrap();
+        router
+            .bind_codex(vec![codex_entry(1, "Room B", Some(codex))])
+            .unwrap();
         let mut mailroom = Mailroom::new(50);
         let log = Log::default();
-        router.send(&mut mailroom, "Room X", 0, "to opencode", recorder(&log)).unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| !log.borrow().is_empty());
+        router
+            .send(&mut mailroom, "Room X", 0, "to opencode", recorder(&log))
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            !log.borrow().is_empty()
+        });
         assert_eq!(texts(&open).len(), 1);
         deliver_to(&mut router, &mut mailroom, 1, &marker);
     }
@@ -2173,7 +2290,9 @@ mod tests {
             .unwrap();
         let mut mailroom = Mailroom::new(50);
         // Old mail for B is saved before the rebind and never sent.
-        router.send(&mut mailroom, "Room X", 1, "old mail for B", None).unwrap();
+        router
+            .send(&mut mailroom, "Room X", 1, "old mail for B", None)
+            .unwrap();
         pump_for(&mut router, &mut mailroom, true, false, 300);
         router
             .rebind_room(rebound_opencode(&b, 1, "Room B", "ses_b", 2))
@@ -2184,12 +2303,17 @@ mod tests {
                 .send(&mut mailroom, "Room X", index, text, recorder(&log))
                 .unwrap();
         }
-        pump(&mut router, &mut mailroom, false, false, |_| log.borrow().len() == 3);
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            log.borrow().len() == 3
+        });
         pump_for(&mut router, &mut mailroom, false, false, 300);
         assert_eq!(texts(&a), ["[whisper from Room X] to A"]);
         assert_eq!(texts(&b), ["[whisper from Room X] to B new"]);
         let arguments = args_log(&marker);
-        assert_eq!(&arguments[..4], ["queue", "--thread", "thread-a", "--message"]);
+        assert_eq!(
+            &arguments[..4],
+            ["queue", "--thread", "thread-a", "--message"]
+        );
         let view = mailroom.summary();
         assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
         let binding = router.binding_for(1).expect("B stays bound");
@@ -2214,7 +2338,9 @@ mod tests {
         router
             .send(&mut mailroom, "Room X", 1, "held mail", recorder(&log))
             .unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| !log.borrow().is_empty());
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            !log.borrow().is_empty()
+        });
         assert_eq!(
             log.borrow()[0].1,
             NativeReply::Held("session pending after clear".to_owned())
@@ -2356,7 +2482,10 @@ mod tests {
             view.summary().contains("ACCEPTED by OpenCode")
         });
         let view = mailroom.summary();
-        assert!(!view.contains("HELD: session pending after clear"), "{view}");
+        assert!(
+            !view.contains("HELD: session pending after clear"),
+            "{view}"
+        );
         assert!(
             view.contains("HELD: sent for an earlier launch"),
             "the mail saved before the mark stays held: {view}"
@@ -2377,7 +2506,9 @@ mod tests {
         router
             .send(&mut mailroom, "Room X", 1, "held mail", recorder(&log))
             .unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| !log.borrow().is_empty());
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            !log.borrow().is_empty()
+        });
         assert_eq!(
             log.borrow()[0].1,
             NativeReply::Held("session pending after clear".to_owned())
@@ -2406,7 +2537,9 @@ mod tests {
             .bind_codex(vec![codex_entry(1, "Room B", Some(codex_a))])
             .unwrap();
         let mut mailroom = Mailroom::new(50);
-        router.send(&mut mailroom, "Room X", 1, "before", None).unwrap();
+        router
+            .send(&mut mailroom, "Room X", 1, "before", None)
+            .unwrap();
         pump(&mut router, &mut mailroom, false, false, |view| {
             view.summary().matches("ACCEPTED by Codex").count() == 1
         });
@@ -2419,18 +2552,31 @@ mod tests {
                 backend: Backend::Codex(codex_b),
             })
             .unwrap();
-        router.send(&mut mailroom, "Room X", 1, "after", None).unwrap();
+        router
+            .send(&mut mailroom, "Room X", 1, "after", None)
+            .unwrap();
         pump(&mut router, &mut mailroom, false, false, |view| {
             view.summary().matches("ACCEPTED by Codex").count() == 2
         });
         let arguments = args_log(&marker_b);
-        assert_eq!(&arguments[..4], ["queue", "--thread", "thread-b", "--message"]);
+        assert_eq!(
+            &arguments[..4],
+            ["queue", "--thread", "thread-b", "--message"]
+        );
         assert_eq!(&arguments[4..].join("\n"), "[whisper from Room X] after");
-        assert_eq!(args_log(&marker_a).len(), 5, "the old thread got exactly one message");
+        assert_eq!(
+            args_log(&marker_a).len(),
+            5,
+            "the old thread got exactly one message"
+        );
         // The OpenCode room is untouched by the Codex rebind.
         let log = Log::default();
-        router.send(&mut mailroom, "Room X", 0, "still A", recorder(&log)).unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| !log.borrow().is_empty());
+        router
+            .send(&mut mailroom, "Room X", 0, "still A", recorder(&log))
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            !log.borrow().is_empty()
+        });
         assert_eq!(texts(&a), ["[whisper from Room X] still A"]);
     }
 
@@ -2438,14 +2584,19 @@ mod tests {
     fn an_unbound_codex_room_is_still_native_and_holds_mail_with_a_reason() {
         let root = tempfile::tempdir().unwrap();
         let mut router = NativeRouter::start(state_path(root.path()), Vec::new()).unwrap();
-        router.bind_codex(vec![codex_entry(0, "Room A", None)]).unwrap();
+        router
+            .bind_codex(vec![codex_entry(0, "Room A", None)])
+            .unwrap();
         assert!(router.is_native(0));
         let mut mailroom = Mailroom::new(50);
         let log = Log::default();
         let error = router
             .send(&mut mailroom, "Room B", 0, "hello", recorder(&log))
             .unwrap_err();
-        assert!(error.contains("Room A") && error.contains("no Codex session"), "{error}");
+        assert!(
+            error.contains("Room A") && error.contains("no Codex session"),
+            "{error}"
+        );
         assert_eq!(log.borrow()[0].1, NativeReply::Failed(error));
         assert_eq!(mailroom.summary().matches("Room B").count(), 0);
     }
@@ -2465,11 +2616,17 @@ mod tests {
         );
         let mut router = NativeRouter::start(state_path(root.path()), Vec::new()).unwrap();
         router
-            .bind_codex(vec![codex_entry(0, "Room A", Some(codex_room(&program, cwd.path(), "thread-a")))])
+            .bind_codex(vec![codex_entry(
+                0,
+                "Room A",
+                Some(codex_room(&program, cwd.path(), "thread-a")),
+            )])
             .unwrap();
         let mut mailroom = Mailroom::new(50);
         let log = Log::default();
-        router.send(&mut mailroom, "Room B", 0, "once", recorder(&log)).unwrap();
+        router
+            .send(&mut mailroom, "Room B", 0, "once", recorder(&log))
+            .unwrap();
         // The attempt outlives the caller's wait, so the answer is "saved,
         // still waiting"; the message later becomes uncertain.
         pump(&mut router, &mut mailroom, false, false, |view| {
@@ -2520,7 +2677,9 @@ mod tests {
             .unwrap();
         let mut mailroom = Mailroom::new(50);
         for (to, text) in [(0, "one"), (0, "two"), (1, "three")] {
-            router.send(&mut mailroom, "Sender", to, text, None).unwrap();
+            router
+                .send(&mut mailroom, "Sender", to, text, None)
+                .unwrap();
         }
         pump(&mut router, &mut mailroom, false, false, |view| {
             let view = view.summary();
@@ -2556,21 +2715,35 @@ mod tests {
         );
         let mut router = NativeRouter::start(state_path(root.path()), Vec::new()).unwrap();
         router
-            .bind_codex(vec![codex_entry(0, "Room A", Some(codex_room(&program, cwd.path(), "thread-a")))])
+            .bind_codex(vec![codex_entry(
+                0,
+                "Room A",
+                Some(codex_room(&program, cwd.path(), "thread-a")),
+            )])
             .unwrap();
         let mut mailroom = Mailroom::new(50);
         let log = Log::default();
-        router.send(&mut mailroom, "Sender", 0, "stale", recorder(&log)).unwrap();
+        router
+            .send(&mut mailroom, "Sender", 0, "stale", recorder(&log))
+            .unwrap();
         pump_for(&mut router, &mut mailroom, true, false, 400);
 
         // A new launch of the same room: new thread, and the saved mail belongs
         // to the old one.
         router
-            .bind_codex(vec![codex_entry(0, "Room A", Some(codex_room(&program, cwd.path(), "thread-b")))])
+            .bind_codex(vec![codex_entry(
+                0,
+                "Room A",
+                Some(codex_room(&program, cwd.path(), "thread-b")),
+            )])
             .unwrap();
         pump_for(&mut router, &mut mailroom, false, false, 600);
         assert!(!count.exists(), "mail for an earlier launch was queued");
-        assert!(mailroom.summary().contains("HELD: sent for an earlier launch"));
+        assert!(
+            mailroom
+                .summary()
+                .contains("HELD: sent for an earlier launch")
+        );
     }
 
     #[test]
@@ -2596,7 +2769,9 @@ mod tests {
             )])
             .unwrap();
         let mut mailroom = Mailroom::new(50);
-        router.send(&mut mailroom, "Sender", 0, "old launch", None).unwrap();
+        router
+            .send(&mut mailroom, "Sender", 0, "old launch", None)
+            .unwrap();
         pump_for(&mut router, &mut mailroom, true, false, 400);
 
         // Same session id, new launch generation.
@@ -2609,8 +2784,15 @@ mod tests {
             )])
             .unwrap();
         pump_for(&mut router, &mut mailroom, false, false, 600);
-        assert!(!count.exists(), "mail from an earlier generation was queued");
-        assert!(mailroom.summary().contains("HELD: sent for an earlier launch"));
+        assert!(
+            !count.exists(),
+            "mail from an earlier generation was queued"
+        );
+        assert!(
+            mailroom
+                .summary()
+                .contains("HELD: sent for an earlier launch")
+        );
     }
 
     #[test]
@@ -2628,10 +2810,16 @@ mod tests {
         );
         let mut router = NativeRouter::start(state_path(root.path()), Vec::new()).unwrap();
         router
-            .bind_codex(vec![codex_entry(0, "Room A", Some(codex_room(&program, cwd.path(), "thread-a")))])
+            .bind_codex(vec![codex_entry(
+                0,
+                "Room A",
+                Some(codex_room(&program, cwd.path(), "thread-a")),
+            )])
             .unwrap();
         let mut mailroom = Mailroom::new(50);
-        router.send(&mut mailroom, "Sender", 0, "queued", None).unwrap();
+        router
+            .send(&mut mailroom, "Sender", 0, "queued", None)
+            .unwrap();
         pump_for(&mut router, &mut mailroom, true, false, 300);
 
         // The room's process is gone: new mail is refused and saved mail is held.
@@ -2693,7 +2881,10 @@ mod tests {
     /// A mod that polls in the background and receipts every message as started.
     fn polling(
         mod_: crate::claude_inbox::FakeMod,
-    ) -> (Arc<AtomicBool>, thread::JoinHandle<crate::claude_inbox::FakeMod>) {
+    ) -> (
+        Arc<AtomicBool>,
+        thread::JoinHandle<crate::claude_inbox::FakeMod>,
+    ) {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let handle = thread::spawn(move || {

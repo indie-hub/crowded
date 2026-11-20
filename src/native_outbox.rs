@@ -87,29 +87,42 @@ mod tests {
         let mut outbox = Outbox::open(&path, 2, 2, 1).unwrap();
         // The pending report lands before the mail: the mail is saved after.
         outbox
-            .schedule(&bindings, false, false, &["a".to_owned()], fake(&Arc::new(AtomicUsize::new(0)), accepted))
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &["a".to_owned()],
+                fake(&Arc::new(AtomicUsize::new(0)), accepted),
+            )
             .unwrap();
         // Command order decides, not wall-clock time: no sleep needed.
-        let id = outbox.enqueue("source".into(), binding("a", 1), "held mail".into()).unwrap().id;
+        let id = outbox
+            .enqueue("source".into(), binding("a", 1), "held mail".into())
+            .unwrap()
+            .id;
         let calls = Arc::new(AtomicUsize::new(0));
         outbox
-            .schedule(&bindings, false, false, &["a".to_owned()], fake(&calls, accepted))
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &["a".to_owned()],
+                fake(&calls, accepted),
+            )
             .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing may be sent while pending");
         assert_eq!(
-            hold_of(&mut outbox, &id),
-            Some(PENDING_HOLD.to_owned())
+            calls.load(Ordering::SeqCst),
+            0,
+            "nothing may be sent while pending"
         );
+        assert_eq!(hold_of(&mut outbox, &id), Some(PENDING_HOLD.to_owned()));
         // Clearing the pending mark does not release the hold on its own;
         // only adopting the mail onto a binding does.
         outbox
             .schedule(&bindings, false, false, &[], fake(&calls, accepted))
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            hold_of(&mut outbox, &id),
-            Some(PENDING_HOLD.to_owned())
-        );
+        assert_eq!(hold_of(&mut outbox, &id), Some(PENDING_HOLD.to_owned()));
     }
 
     #[test]
@@ -119,13 +132,28 @@ mod tests {
         let bindings = HashMap::from([("a".to_owned(), binding("a", 1))]);
         let mut outbox = Outbox::open(&path, 2, 2, 1).unwrap();
         outbox
-            .schedule(&bindings, false, false, &["a".to_owned()], fake(&Arc::new(AtomicUsize::new(0)), accepted))
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &["a".to_owned()],
+                fake(&Arc::new(AtomicUsize::new(0)), accepted),
+            )
             .unwrap();
         // Command order decides, not wall-clock time: no sleep needed.
-        let id = outbox.enqueue("source".into(), binding("a", 1), "held mail".into()).unwrap().id;
+        let id = outbox
+            .enqueue("source".into(), binding("a", 1), "held mail".into())
+            .unwrap()
+            .id;
         let calls = Arc::new(AtomicUsize::new(0));
         outbox
-            .schedule(&bindings, false, false, &["a".to_owned()], fake(&calls, accepted))
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &["a".to_owned()],
+                fake(&calls, accepted),
+            )
             .unwrap();
         assert_eq!(hold_of(&mut outbox, &id), Some(PENDING_HOLD.to_owned()));
         let next = pending_binding("a", 2);
@@ -147,12 +175,21 @@ mod tests {
         let path = dir.path().join("outbox.json");
         let bindings = HashMap::from([("a".to_owned(), binding("a", 1))]);
         let mut outbox = Outbox::open(&path, 2, 2, 1).unwrap();
-        let id = outbox.enqueue("source".into(), binding("a", 1), "old mail".into()).unwrap().id;
+        let id = outbox
+            .enqueue("source".into(), binding("a", 1), "old mail".into())
+            .unwrap()
+            .id;
         // Saved before the pending mark lands, even in the same millisecond:
         // command order decides, so the later retarget must leave it alone.
         let calls = Arc::new(AtomicUsize::new(0));
         outbox
-            .schedule(&bindings, false, false, &["a".to_owned()], fake(&calls, accepted))
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &["a".to_owned()],
+                fake(&calls, accepted),
+            )
             .unwrap();
         // Saved before the report, so it belongs to the ended session.
         assert_eq!(hold_of(&mut outbox, &id), Some(STALE_HOLD.to_owned()));
@@ -179,7 +216,8 @@ mod tests {
         let mut outbox = Outbox::open(&path, 2, 2, 1).unwrap();
         let id = outbox
             .enqueue("source".into(), binding("a", 1), "old mail".into())
-            .unwrap().id;
+            .unwrap()
+            .id;
         // The pending command lands on its own: the boundary classification
         // is what holds this mail, not a later schedule.
         outbox.set_pending(&["a".to_owned()]).unwrap();
@@ -207,7 +245,8 @@ mod tests {
         let mut outbox = Outbox::open(&path, 2, 2, 1).unwrap();
         let id = outbox
             .enqueue("source".into(), binding("a", 1), "old mail".into())
-            .unwrap().id;
+            .unwrap()
+            .id;
         // Point the state at a missing parent, so the next save fails.
         let blocked = dir.path().join("blocked");
         std::fs::write(&blocked, b"not a directory").unwrap();
@@ -245,20 +284,32 @@ mod tests {
         let bindings = HashMap::from([("a".to_owned(), binding("a", 1))]);
         let mut outbox = Outbox::open(&path, 2, 2, 1).unwrap();
         outbox
-            .schedule(&bindings, false, false, &["a".to_owned()], fake(&Arc::new(AtomicUsize::new(0)), accepted))
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &["a".to_owned()],
+                fake(&Arc::new(AtomicUsize::new(0)), accepted),
+            )
             .unwrap();
         // Command order decides, not wall-clock time: no sleep needed.
-        let id = outbox.enqueue("source".into(), binding("a", 1), "held mail".into()).unwrap().id;
+        let id = outbox
+            .enqueue("source".into(), binding("a", 1), "held mail".into())
+            .unwrap()
+            .id;
         outbox
-            .schedule(&bindings, false, false, &["a".to_owned()], fake(&Arc::new(AtomicUsize::new(0)), accepted))
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &["a".to_owned()],
+                fake(&Arc::new(AtomicUsize::new(0)), accepted),
+            )
             .unwrap();
         assert!(outbox.retarget("a", &pending_binding("b", 2)).is_err());
         let message = outbox.state.messages.iter().find(|m| m.id == id).unwrap();
         assert_eq!(message.binding, binding("a", 1));
-        assert_eq!(
-            hold_of(&mut outbox, &id),
-            Some(PENDING_HOLD.to_owned())
-        );
+        assert_eq!(hold_of(&mut outbox, &id), Some(PENDING_HOLD.to_owned()));
     }
 
     #[test]
@@ -268,13 +319,27 @@ mod tests {
         let bindings = HashMap::from([("a".to_owned(), binding("a", 1))]);
         let mut outbox = Outbox::open(&path, 2, 2, 1).unwrap();
         outbox
-            .schedule(&bindings, false, false, &["a".to_owned()], fake(&Arc::new(AtomicUsize::new(0)), accepted))
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &["a".to_owned()],
+                fake(&Arc::new(AtomicUsize::new(0)), accepted),
+            )
             .unwrap();
         // Command order decides, not wall-clock time: no sleep needed.
-        outbox.enqueue("source".into(), binding("a", 1), "held mail".into()).unwrap();
+        outbox
+            .enqueue("source".into(), binding("a", 1), "held mail".into())
+            .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         outbox
-            .schedule(&bindings, false, false, &["a".to_owned()], fake(&calls, accepted))
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &["a".to_owned()],
+                fake(&calls, accepted),
+            )
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         outbox.retarget("a", &binding("a", 1)).unwrap();
@@ -389,9 +454,19 @@ mod tests {
         let next_bindings = HashMap::from([("a".to_owned(), next)]);
         let delivered = Arc::new(AtomicUsize::new(0));
         outbox
-            .schedule(&next_bindings, false, false, &[], fake(&delivered, accepted))
+            .schedule(
+                &next_bindings,
+                false,
+                false,
+                &[],
+                fake(&delivered, accepted),
+            )
             .unwrap();
-        assert_eq!(delivered.load(Ordering::SeqCst), 0, "old mail reached the new session");
+        assert_eq!(
+            delivered.load(Ordering::SeqCst),
+            0,
+            "old mail reached the new session"
+        );
         assert_eq!(hold_of(&mut outbox, &id), Some(STALE_HOLD.to_owned()));
         assert_eq!(
             outbox
@@ -470,7 +545,10 @@ mod tests {
             .schedule(&bindings, false, false, &[], as_adapter)
             .unwrap();
         wait(&mut outbox, &bindings);
-        assert_eq!(*adapter.order.lock().unwrap(), vec!["older".to_owned(), "newer".to_owned()]);
+        assert_eq!(
+            *adapter.order.lock().unwrap(),
+            vec!["older".to_owned(), "newer".to_owned()]
+        );
     }
 
     fn held() -> AdapterResult {
@@ -487,9 +565,17 @@ mod tests {
         let b = binding("a", 1);
         let bindings = HashMap::from([("a".to_owned(), b.clone())]);
         let calls = Arc::new(AtomicUsize::new(0));
-        outbox.enqueue("s".into(), b.clone(), "first".into()).unwrap();
         outbox
-            .schedule(&bindings, false, false, &[], fake(&calls, || AdapterResult::Uncertain))
+            .enqueue("s".into(), b.clone(), "first".into())
+            .unwrap();
+        outbox
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &[],
+                fake(&calls, || AdapterResult::Uncertain),
+            )
             .unwrap();
         wait(&mut outbox, &bindings);
         assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
@@ -679,7 +765,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
-        #[test]
+    #[test]
     fn mail_for_an_earlier_launch_is_held_with_a_reason_and_does_not_block_or_fill_the_outbox() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outbox.json");
@@ -688,10 +774,18 @@ mod tests {
         let current = HashMap::from([(new.room.clone(), new.clone())]);
         let calls = Arc::new(AtomicUsize::new(0));
         let mut outbox = Outbox::open(&path, 2, 2, 2).unwrap();
-        outbox.enqueue("s".into(), old.clone(), "stale one".into()).unwrap();
-        outbox.enqueue("s".into(), old.clone(), "stale two".into()).unwrap();
+        outbox
+            .enqueue("s".into(), old.clone(), "stale one".into())
+            .unwrap();
+        outbox
+            .enqueue("s".into(), old.clone(), "stale two".into())
+            .unwrap();
         // The outbox is full of live work until the launch changes.
-        assert!(outbox.enqueue("s".into(), new.clone(), "fresh".into()).is_err());
+        assert!(
+            outbox
+                .enqueue("s".into(), new.clone(), "fresh".into())
+                .is_err()
+        );
 
         outbox
             .schedule(&current, false, false, &[], fake(&calls, accepted))
@@ -703,9 +797,18 @@ mod tests {
         assert_eq!(outbox.state.messages[1].status, held);
 
         // Two stale messages and a capacity of two: fresh mail is still taken.
-        let fresh = outbox.enqueue("s".into(), new.clone(), "fresh".into()).unwrap().id;
-        outbox.enqueue("s".into(), new.clone(), "fresh two".into()).unwrap();
-                assert!(outbox.enqueue("s".into(), new.clone(), "too many".into()).is_err());
+        let fresh = outbox
+            .enqueue("s".into(), new.clone(), "fresh".into())
+            .unwrap()
+            .id;
+        outbox
+            .enqueue("s".into(), new.clone(), "fresh two".into())
+            .unwrap();
+        assert!(
+            outbox
+                .enqueue("s".into(), new.clone(), "too many".into())
+                .is_err()
+        );
         outbox
             .schedule(&current, false, false, &[], fake(&calls, accepted))
             .unwrap();
@@ -737,14 +840,16 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut outbox = Outbox::open(&path, 4, 1, 2).unwrap();
         outbox.stale_held_limit = 2;
-        outbox.enqueue("s".into(), old.clone(), "one".into()).unwrap();
-        outbox.enqueue("s".into(), old.clone(), "two".into()).unwrap();
+        outbox
+            .enqueue("s".into(), old.clone(), "one".into())
+            .unwrap();
+        outbox
+            .enqueue("s".into(), old.clone(), "two".into())
+            .unwrap();
         outbox
             .schedule(&current, false, false, &[], fake(&calls, accepted))
             .unwrap();
-        let error = outbox
-            .enqueue("s".into(), new, "fresh".into())
-            .unwrap_err();
+        let error = outbox.enqueue("s".into(), new, "fresh".into()).unwrap_err();
         assert!(error.to_string().contains("earlier launches"), "{error}");
         // Refusing is the only effect: both held messages are still there.
         assert_eq!(outbox.state.messages.len(), 2);
@@ -761,8 +866,11 @@ mod tests {
         drop(Outbox::open(&path, 2, 2, 1).unwrap());
         assert_eq!(mode(&path.with_extension("lock")), 0o600);
         // A lock file left by an older build with looser permissions is tightened.
-        fs::set_permissions(path.with_extension("lock"), fs::Permissions::from_mode(0o644))
-            .unwrap();
+        fs::set_permissions(
+            path.with_extension("lock"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
         drop(Outbox::open(&path, 2, 2, 1).unwrap());
         assert_eq!(mode(&path.with_extension("lock")), 0o600);
     }
@@ -776,7 +884,9 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut outbox = Outbox::open(&path, 2, 3, 1).unwrap();
         for n in 0..10 {
-            outbox.enqueue("s".into(), b.clone(), format!("m{n}")).unwrap();
+            outbox
+                .enqueue("s".into(), b.clone(), format!("m{n}"))
+                .unwrap();
             outbox
                 .schedule(&bindings, false, false, &[], fake(&calls, accepted))
                 .unwrap();
@@ -791,7 +901,9 @@ mod tests {
         drop(outbox);
         let mut outbox = Outbox::open(&path, 2, 3, 1).unwrap();
         for n in 10..16 {
-            outbox.enqueue("s".into(), b.clone(), format!("m{n}")).unwrap();
+            outbox
+                .enqueue("s".into(), b.clone(), format!("m{n}"))
+                .unwrap();
             outbox
                 .schedule(&bindings, false, false, &[], fake(&calls, accepted))
                 .unwrap();
@@ -800,9 +912,17 @@ mod tests {
         assert_eq!(outbox.state.messages.len(), 3);
 
         // Work that is not finished is never evicted to make room.
-        outbox.enqueue("s".into(), b.clone(), "live one".into()).unwrap();
-        outbox.enqueue("s".into(), b.clone(), "live two".into()).unwrap();
-        assert!(outbox.enqueue("s".into(), b.clone(), "no room".into()).is_err());
+        outbox
+            .enqueue("s".into(), b.clone(), "live one".into())
+            .unwrap();
+        outbox
+            .enqueue("s".into(), b.clone(), "live two".into())
+            .unwrap();
+        assert!(
+            outbox
+                .enqueue("s".into(), b.clone(), "no room".into())
+                .is_err()
+        );
         assert!(outbox.state.messages.iter().any(|m| m.text == "live one"));
         assert!(outbox.state.messages.iter().any(|m| m.text == "live two"));
     }
@@ -817,7 +937,9 @@ mod tests {
         {
             let mut outbox = Outbox::open(&path, 50, 50, 1).unwrap();
             for n in 0..8 {
-                outbox.enqueue("s".into(), b.clone(), format!("m{n}")).unwrap();
+                outbox
+                    .enqueue("s".into(), b.clone(), format!("m{n}"))
+                    .unwrap();
                 outbox
                     .schedule(&bindings, false, false, &[], fake(&calls, accepted))
                     .unwrap();
@@ -895,9 +1017,15 @@ mod tests {
             }
             Ok(())
         };
-        let id = outbox.enqueue("s".into(), b.clone(), "once".into()).unwrap().id;
+        let id = outbox
+            .enqueue("s".into(), b.clone(), "once".into())
+            .unwrap()
+            .id;
         assert_eq!(outbox.state.messages[0].id, id);
-        assert_eq!(outbox.state.messages[0].status, Status::Queued { hold: None });
+        assert_eq!(
+            outbox.state.messages[0].status,
+            Status::Queued { hold: None }
+        );
         outbox
             .schedule(&bindings, false, false, &[], fake(&calls, accepted))
             .unwrap();
@@ -923,8 +1051,14 @@ mod tests {
             }
             Ok(())
         };
-        let error = outbox.enqueue("s".into(), b.clone(), "stuck".into()).unwrap_err();
-        assert!(error.get_ref().is_none_or(|inner| !inner.is::<DurabilityUncertain>()));
+        let error = outbox
+            .enqueue("s".into(), b.clone(), "stuck".into())
+            .unwrap_err();
+        assert!(
+            error
+                .get_ref()
+                .is_none_or(|inner| !inner.is::<DurabilityUncertain>())
+        );
         // It is held in memory and never sent.
         assert_eq!(
             outbox.state.messages[0].status,
@@ -946,10 +1080,21 @@ mod tests {
         let bindings = HashMap::from([(b.room.clone(), b.clone())]);
         let calls = Arc::new(AtomicUsize::new(0));
         let mut outbox = Outbox::open(&path, 4, 4, 2).unwrap();
-        let first = outbox.enqueue("s".into(), b.clone(), "first".into()).unwrap().id;
-        outbox.enqueue("s".into(), b.clone(), "second".into()).unwrap();
+        let first = outbox
+            .enqueue("s".into(), b.clone(), "first".into())
+            .unwrap()
+            .id;
         outbox
-            .schedule(&bindings, false, false, &[], fake(&calls, || AdapterResult::Uncertain))
+            .enqueue("s".into(), b.clone(), "second".into())
+            .unwrap();
+        outbox
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &[],
+                fake(&calls, || AdapterResult::Uncertain),
+            )
             .unwrap();
         wait(&mut outbox, &bindings);
         assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
@@ -969,16 +1114,34 @@ mod tests {
 
         // Wrong evidence settles nothing.
         let accepted_outcome = || Resolution::Accepted(Some("receipt".into()));
-        assert!(outbox.resolve("missing", &b, &hash, accepted_outcome()).is_err());
-        assert!(outbox.resolve(&first, &binding("a", 2), &hash, accepted_outcome()).is_err());
-        assert!(outbox.resolve(&first, &b, "wrong hash", accepted_outcome()).is_err());
+        assert!(
+            outbox
+                .resolve("missing", &b, &hash, accepted_outcome())
+                .is_err()
+        );
+        assert!(
+            outbox
+                .resolve(&first, &binding("a", 2), &hash, accepted_outcome())
+                .is_err()
+        );
+        assert!(
+            outbox
+                .resolve(&first, &b, "wrong hash", accepted_outcome())
+                .is_err()
+        );
         assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
 
-        outbox.resolve(&first, &b, &hash, accepted_outcome()).unwrap();
+        outbox
+            .resolve(&first, &b, &hash, accepted_outcome())
+            .unwrap();
         assert_eq!(outbox.state.messages[0].status, Status::Accepted);
         assert_eq!(outbox.state.messages[0].receipt.as_deref(), Some("receipt"));
         // Only an uncertain message can be settled, and only once.
-        assert!(outbox.resolve(&first, &b, &hash, accepted_outcome()).is_err());
+        assert!(
+            outbox
+                .resolve(&first, &b, &hash, accepted_outcome())
+                .is_err()
+        );
 
         // The lane is free again, and nothing was resent for the settled message.
         outbox
@@ -998,7 +1161,10 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut outbox = Outbox::open(&path, 1, 1, 1).unwrap();
         for text in ["first", "second"] {
-            let id = outbox.enqueue("s".into(), b.clone(), text.into()).unwrap().id;
+            let id = outbox
+                .enqueue("s".into(), b.clone(), text.into())
+                .unwrap()
+                .id;
             outbox
                 .schedule(&bindings, false, false, &[], fake(&calls, accepted))
                 .unwrap();
@@ -1036,7 +1202,8 @@ mod tests {
             let b = binding("history", 1);
             let id = outbox
                 .enqueue("source".into(), b.clone(), text.into())
-                .unwrap().id;
+                .unwrap()
+                .id;
             let mut state = outbox.state.clone();
             let item = state.messages.iter_mut().find(|m| m.id == id).unwrap();
             item.status = Status::Accepted;
@@ -1087,11 +1254,15 @@ mod tests {
         outbox
             .enqueue("s".into(), current.clone(), "second".into())
             .unwrap();
+        outbox.enqueue("s".into(), current, "third".into()).unwrap();
         outbox
-            .enqueue("s".into(), current, "third".into())
-            .unwrap();
-        outbox
-            .schedule(&bindings, false, false, &[], fake(&calls, || panic!("adapter")))
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &[],
+                fake(&calls, || panic!("adapter")),
+            )
             .unwrap();
         wait(&mut outbox, &bindings);
         assert_eq!(outbox.state.messages[1].status, Status::Uncertain);
@@ -1157,8 +1328,7 @@ const STALE_HELD_LIMIT: usize = 1000;
 pub(crate) const PENDING_HOLD: &str = "session pending after clear";
 /// The hold on a message whose enqueue reported an error. It is never sent, and
 /// shows as held after a restart, so a caller that retries cannot cause a duplicate.
-pub(crate) const UNCONFIRMED_HOLD: &str =
-    "saving this message was not confirmed; it was not sent";
+pub(crate) const UNCONFIRMED_HOLD: &str = "saving this message was not confirmed; it was not sent";
 
 /// Finished work kept only as history: it never counts as live work.
 fn is_history(status: &Status) -> bool {
@@ -1281,7 +1451,7 @@ pub(crate) enum Command {
     /// Adopts a pending room's held mail onto a binding. Only messages held
     /// with [`PENDING_HOLD`] move; mail held for any other reason stays put.
     Retarget { room: String, binding: Binding },
-        Acknowledge {
+    Acknowledge {
         id: String,
         binding: Binding,
         hash: String,
@@ -1320,7 +1490,10 @@ pub(crate) enum Event {
     /// pending and retarget commands have no entry in the router's waiting
     /// queue, so they answer for themselves instead of taking the reply of
     /// whichever command happens to be waiting next.
-    HoldFailed { rooms: Vec<String>, error: String },
+    HoldFailed {
+        rooms: Vec<String>,
+        error: String,
+    },
 }
 
 /// One command, with the id the router gave it. The worker answers under
@@ -1461,7 +1634,7 @@ impl BackgroundOutbox {
                     Command::Retarget { room, binding } => outbox
                         .retarget(&room, &binding)
                         .map(|()| Event::Updated(outbox.state.messages.clone())),
-                                        Command::Acknowledge { id, binding, hash } => outbox
+                    Command::Acknowledge { id, binding, hash } => outbox
                         .acknowledge(&id, &binding, &hash)
                         .map(|()| Event::Updated(outbox.state.messages.clone())),
                     Command::Resolve {
@@ -1503,7 +1676,7 @@ pub(crate) struct Outbox {
     path: PathBuf,
     _lock: File,
     state: State,
-        capacity: usize,
+    capacity: usize,
     history: usize,
     max_in_flight: usize,
     stale_held_limit: usize,
@@ -1571,7 +1744,7 @@ impl Outbox {
             .parent()
             .ok_or_else(|| io::Error::other("outbox has no parent"))?;
         fs::create_dir_all(parent)?;
-                let mut lock_options = OpenOptions::new();
+        let mut lock_options = OpenOptions::new();
         lock_options
             .create(true)
             .truncate(false)
@@ -1616,7 +1789,7 @@ impl Outbox {
             path: path.into(),
             _lock: lock,
             state,
-                        capacity,
+            capacity,
             history,
             max_in_flight,
             stale_held_limit: STALE_HELD_LIMIT,
@@ -1818,16 +1991,14 @@ impl Outbox {
         binding: Binding,
         text: String,
     ) -> io::Result<QueuedMail> {
-                let mut next = self.state.clone();
+        let mut next = self.state.clone();
         // History is bounded on its own, so it can never fill the outbox.
         self.trim_history(&mut next);
         // Mail held for an earlier launch is kept but is not live work.
         let pending = next
             .messages
             .iter()
-            .filter(|m| {
-                                !is_history(&m.status) && !is_stale_hold(m)
-            })
+            .filter(|m| !is_history(&m.status) && !is_stale_hold(m))
             .count();
         if pending >= self.capacity {
             return Err(io::Error::other("outbox full"));
@@ -1872,7 +2043,7 @@ impl Outbox {
             created_ms: now()?,
             sequence: *sequence,
             attempts: Vec::new(),
-                        receipt: None,
+            receipt: None,
             // Saved held first: if confirming the save fails, the message can
             // never be sent, in this run or after a restart.
             status: Status::Queued {
@@ -1980,7 +2151,7 @@ impl Outbox {
                 message.status = Status::Queued { hold: None };
             }
             match &message.status {
-                                Status::Queued { hold: None } => {
+                Status::Queued { hold: None } => {
                     if bindings.get(room) != Some(&message.binding) {
                         // Mail from this launch's own placeholder may move to
                         // the session the placeholder became. Mail for another
@@ -2006,8 +2177,7 @@ impl Outbox {
                         // the pending hold, so a later report never moves
                         // anything saved before it.
                         let mut next = self.state.clone();
-                        if let Some(item) = next.messages.iter_mut().find(|m| m.id == message.id)
-                        {
+                        if let Some(item) = next.messages.iter_mut().find(|m| m.id == message.id) {
                             item.status = Status::Queued {
                                 hold: Some(STALE_HOLD.to_owned()),
                             };
@@ -2049,7 +2219,7 @@ impl Outbox {
                         });
                     });
                 }
-                                // Held mail of an earlier launch does not stand in front of newer mail.
+                // Held mail of an earlier launch does not stand in front of newer mail.
                 Status::Queued { hold: Some(reason) } if reason == STALE_HOLD => {}
                 // Nothing is sent past a message that may already have arrived:
                 // its newer mail is held with a visible reason, not left queued.
@@ -2078,7 +2248,8 @@ impl Outbox {
             }
             let current = bindings.get(&item.destination);
             let same_launch = current.is_some_and(|current| {
-                current == &completion.binding || same_launch_placeholder(&completion.binding, current)
+                current == &completion.binding
+                    || same_launch_placeholder(&completion.binding, current)
             });
             if !same_launch {
                 item.status = Status::Uncertain;
@@ -2104,7 +2275,7 @@ impl Outbox {
         Ok(())
     }
 
-        /// Only an uncertain message with the same binding and content hash can be
+    /// Only an uncertain message with the same binding and content hash can be
     /// settled, and only to accepted or failed: nothing is ever resent.
     pub fn resolve(
         &mut self,
@@ -2120,7 +2291,9 @@ impl Outbox {
             .find(|m| m.id == id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "message not found"))?;
         if &item.binding != binding || item.hash != hash || item.status != Status::Uncertain {
-            return Err(io::Error::other("evidence does not match an uncertain message"));
+            return Err(io::Error::other(
+                "evidence does not match an uncertain message",
+            ));
         }
         item.status = match outcome {
             Resolution::Accepted(receipt) => {

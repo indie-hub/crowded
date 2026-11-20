@@ -9,8 +9,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ExitStatus, Stdio},
     sync::{
-        Arc, mpsc,
+        Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -172,7 +173,11 @@ fn thread_started(output: &[u8]) -> Option<String> {
 /// warning noise: its own `Error:` line when there is one, else the last line.
 fn exec_reason(output: &[u8]) -> String {
     let text = String::from_utf8_lossy(output);
-    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
     let line = lines
         .iter()
         .rev()
@@ -497,7 +502,10 @@ impl CodexAdapter {
     pub(crate) fn new(rooms: Vec<(Binding, Room)>) -> io::Result<Self> {
         let mut by_room = HashMap::new();
         for (binding, room) in rooms {
-            if by_room.insert(binding.room.clone(), (binding, room)).is_some() {
+            if by_room
+                .insert(binding.room.clone(), (binding, room))
+                .is_some()
+            {
                 return Err(io::Error::other("duplicate native room"));
             }
         }
@@ -889,13 +897,15 @@ mod tests {
         let program = stub(
             dir,
             "codex",
-            &format!(
-                "printf 'Queued message sub_1 for thread %s.\\n' '{THREAD}'\nsleep 30"
-            ),
+            &format!("printf 'Queued message sub_1 for thread %s.\\n' '{THREAD}'\nsleep 30"),
         );
         let started = Instant::now();
         assert_eq!(
-            deliver(&room_for(&program, dir), "hello", Duration::from_millis(300)),
+            deliver(
+                &room_for(&program, dir),
+                "hello",
+                Duration::from_millis(300)
+            ),
             Delivery::Uncertain
         );
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -932,7 +942,9 @@ mod tests {
             // Something follows the thread and the full stop.
             format!("Queued message sub_1 for thread {THREAD}. trailing"),
             // The thread appears, but not as the line's own target.
-            format!("Queued message sub_1 for thread 99999999-0000-0000-0000-000000000000. ({THREAD})"),
+            format!(
+                "Queued message sub_1 for thread 99999999-0000-0000-0000-000000000000. ({THREAD})"
+            ),
             // A prefix of the line only.
             "Queued message".to_owned(),
         ] {
@@ -1082,33 +1094,21 @@ mod tests {
         ));
         let mut wrong_hash = message(&adapter_room, "hello");
         wrong_hash.hash = "wrong".into();
-        assert!(matches!(
-            adapter.send(wrong_hash),
-            AdapterResult::Failed(_)
-        ));
+        assert!(matches!(adapter.send(wrong_hash), AdapterResult::Failed(_)));
         let mut unknown = message(&adapter_room, "hello");
         unknown.destination = "4".into();
-        assert!(matches!(
-            adapter.send(unknown),
-            AdapterResult::Dropped(_)
-        ));
+        assert!(matches!(adapter.send(unknown), AdapterResult::Dropped(_)));
         assert!(matches!(
             adapter.send(message(&adapter_room, "hello")),
             AdapterResult::Accepted(None)
         ));
-        assert_eq!(
-            fs::read_to_string(dir.join("count")).unwrap().trim(),
-            "1"
-        );
+        assert_eq!(fs::read_to_string(dir.join("count")).unwrap().trim(), "1");
         // Once the room's process is gone, nothing is started for it again.
         live.store(false, Ordering::SeqCst);
         assert!(matches!(
             adapter.send(message(&adapter_room, "hello")),
             AdapterResult::Dropped(reason) if reason.contains("no longer running")
         ));
-        assert_eq!(
-            fs::read_to_string(dir.join("count")).unwrap().trim(),
-            "1"
-        );
+        assert_eq!(fs::read_to_string(dir.join("count")).unwrap().trim(), "1");
     }
 }

@@ -55,7 +55,7 @@ impl Mailroom {
         (id, result)
     }
 
-        /// Lists a native-outbox message in the same history, so its status shows
+    /// Lists a native-outbox message in the same history, so its status shows
     /// beside terminal deliveries. The status is updated as the outbox reports.
     pub(crate) fn record_native(
         &mut self,

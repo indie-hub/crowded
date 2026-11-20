@@ -130,7 +130,13 @@ impl ClaudeInbox {
 
     /// Names the launch generation and writes the file the room's mod reads.
     /// A room whose file cannot be written must not start.
-    pub(crate) fn attach(&self, cwd: &Path, room: usize, session: &str, generation: u64) -> io::Result<()> {
+    pub(crate) fn attach(
+        &self,
+        cwd: &Path,
+        room: usize,
+        session: &str,
+        generation: u64,
+    ) -> io::Result<()> {
         self.relaunch(generation);
         let path = connection_file(cwd, session)?;
         let parent = path
@@ -1103,14 +1109,21 @@ mod tests {
         let second = "22222222-2222-4222-8222-222222222222";
         inbox.prepare(cwd.path(), 1, 1).unwrap();
         let bootstrap = bootstrap_file(cwd.path(), 1).unwrap();
-        assert!(bootstrap.exists(), "bootstrap must exist before first report");
+        assert!(
+            bootstrap.exists(),
+            "bootstrap must exist before first report"
+        );
 
-        inbox.adopt_reported_session(cwd.path(), 1, first, 2).unwrap();
+        inbox
+            .adopt_reported_session(cwd.path(), 1, first, 2)
+            .unwrap();
         let first_file = connection_file(cwd.path(), first).unwrap();
         assert!(first_file.exists(), "first session file must exist");
         assert!(!bootstrap.exists(), "bootstrap must be removed on report");
 
-        inbox.adopt_reported_session(cwd.path(), 1, second, 3).unwrap();
+        inbox
+            .adopt_reported_session(cwd.path(), 1, second, 3)
+            .unwrap();
         let second_file = connection_file(cwd.path(), second).unwrap();
         assert!(second_file.exists(), "second session file must exist");
         assert!(
@@ -1137,6 +1150,9 @@ mod tests {
             inbox.attach(cwd.path(), 1, session, 1).unwrap();
             assert!(session_file.exists());
         }
-        assert!(!session_file.exists(), "session file must be removed on drop");
+        assert!(
+            !session_file.exists(),
+            "session file must be removed on drop"
+        );
     }
 }
