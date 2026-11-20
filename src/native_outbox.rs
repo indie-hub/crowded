@@ -1306,6 +1306,317 @@ mod tests {
         assert_eq!(reopened.state.messages[0].text, "keep me");
         assert_eq!(reopened.state.messages[0].status, Status::Uncertain);
     }
+
+    /// Decision table for the native session and hold rules: one row per hold
+    /// reason and one row per 0.46.x bug, over the current predicates. Step C
+    /// moves these predicates verbatim into native_session.rs; this table
+    /// stays green through every move.
+    fn message_with_hold(room: &str, generation: u64, hold: Option<&str>) -> Message {
+        Message {
+            id: format!("row-{room}-{generation}"),
+            source: "table".into(),
+            destination: room.into(),
+            binding: Binding {
+                room: room.into(),
+                session: "session".into(),
+                endpoint: "endpoint".into(),
+                generation,
+            },
+            text: "row".into(),
+            hash: "row".into(),
+            created_ms: 0,
+            sequence: 1,
+            attempts: Vec::new(),
+            receipt: None,
+            status: Status::Queued {
+                hold: hold.map(str::to_owned),
+            },
+        }
+    }
+
+    #[test]
+    fn hold_reasons_classify_stale_and_retryable() {
+        struct Row {
+            hold: Option<&'static str>,
+            retryable: bool,
+            stale: bool,
+        }
+        let rows = [
+            Row {
+                hold: None,
+                retryable: false,
+                stale: false,
+            },
+            Row {
+                hold: Some(STALE_HOLD),
+                retryable: false,
+                stale: true,
+            },
+            Row {
+                hold: Some(PENDING_HOLD),
+                retryable: false,
+                stale: false,
+            },
+            Row {
+                hold: Some(CLAUDE_HOLD),
+                retryable: true,
+                stale: false,
+            },
+            Row {
+                hold: Some(UNCERTAIN_HOLD),
+                retryable: true,
+                stale: false,
+            },
+            Row {
+                hold: Some(UNCONFIRMED_HOLD),
+                retryable: false,
+                stale: false,
+            },
+        ];
+        for row in rows {
+            let message = message_with_hold("a", 1, row.hold);
+            assert_eq!(
+                is_stale_hold(&message),
+                row.stale,
+                "stale for {:?}",
+                row.hold
+            );
+            assert_eq!(
+                is_retryable_hold(row.hold.unwrap_or("")),
+                row.retryable,
+                "retryable for {:?}",
+                row.hold
+            );
+        }
+    }
+
+    #[test]
+    fn ab39d84_first_report_keeps_its_launch_generation() {
+        // The launch placeholder names one launch, never a session; the real
+        // session that replaces it on the first report keeps the launch
+        // generation, so mail saved against the placeholder still belongs to
+        // this launch and a later session switch takes a new generation.
+        assert_eq!(unreported_session("1", 5), "unreported-1-5");
+        let placeholder = Binding {
+            room: "1".into(),
+            session: unreported_session("1", 5),
+            endpoint: "claude".into(),
+            generation: 5,
+        };
+        assert!(is_unreported_placeholder(&placeholder));
+        let reported = Binding {
+            room: "1".into(),
+            session: "8c3f4b96-3b74-4021-9f83-2c3d4e5f6071".into(),
+            endpoint: "claude".into(),
+            generation: 5,
+        };
+        assert!(!is_unreported_placeholder(&reported));
+        struct Row {
+            held: Binding,
+            current: Binding,
+            same_launch: bool,
+        }
+        let rows = [
+            // First report keeps the generation: the placeholder's mail moves.
+            Row {
+                held: placeholder.clone(),
+                current: reported.clone(),
+                same_launch: true,
+            },
+            // Older generation: mail belongs to a launch that is gone.
+            Row {
+                held: placeholder.clone(),
+                current: Binding {
+                    generation: 6,
+                    ..reported.clone()
+                },
+                same_launch: false,
+            },
+            // A real session is never a launch placeholder.
+            Row {
+                held: reported.clone(),
+                current: reported.clone(),
+                same_launch: false,
+            },
+            // Another room is another launch even with the same generation.
+            Row {
+                held: placeholder.clone(),
+                current: Binding {
+                    room: "2".into(),
+                    ..reported.clone()
+                },
+                same_launch: false,
+            },
+        ];
+        for row in rows {
+            assert_eq!(
+                same_launch_placeholder(&row.held, &row.current),
+                row.same_launch,
+                "held {:?} current {:?}",
+                row.held,
+                row.current
+            );
+        }
+    }
+
+    #[test]
+    fn retarget_never_moves_mail_for_another_launch_83c281b() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let current = binding("a", 1);
+        let bindings = HashMap::from([("a".to_owned(), current.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut outbox = Outbox::open(&path, 4, 4, 1).unwrap();
+        // Mail saved before the pending mark: the mark holds it as stale.
+        let old = outbox
+            .enqueue("source".into(), current.clone(), "old".into())
+            .unwrap()
+            .id;
+        outbox
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &["a".to_owned()],
+                fake(&calls, accepted),
+            )
+            .unwrap();
+        assert_eq!(hold_of(&mut outbox, &old), Some(STALE_HOLD.to_owned()));
+        // Mail saved while the mark is set: held for the next session.
+        let new = outbox
+            .enqueue("source".into(), current.clone(), "new".into())
+            .unwrap()
+            .id;
+        outbox
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &["a".to_owned()],
+                fake(&calls, accepted),
+            )
+            .unwrap();
+        assert_eq!(hold_of(&mut outbox, &new), Some(PENDING_HOLD.to_owned()));
+        // A new generation adopts only the pending-held mail.
+        let next = pending_binding("a", 2);
+        outbox.retarget("a", &next).unwrap();
+        for (id, hold, want) in [(&old, Some(STALE_HOLD), &current), (&new, None, &next)] {
+            let message = outbox
+                .state
+                .messages
+                .iter()
+                .find(|message| &message.id == id)
+                .unwrap();
+            assert_eq!(
+                message.status,
+                Status::Queued {
+                    hold: hold.map(str::to_owned)
+                },
+                "hold for {id}"
+            );
+            assert_eq!(&message.binding, want, "binding for {id}");
+        }
+        // ...and the stale mail is never sent: only the adopted mail goes out.
+        let live = HashMap::from([("a".to_owned(), next)]);
+        outbox
+            .schedule(&live, false, false, &[], fake(&calls, accepted))
+            .unwrap();
+        wait(&mut outbox, &live);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A gate adapter: not ready until its mod registers, then accepts.
+    struct Gate {
+        ready: Arc<std::sync::atomic::AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Adapter for Gate {
+        fn send(&self, _: Message) -> AdapterResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.ready.load(Ordering::SeqCst) {
+                return accepted();
+            }
+            AdapterResult::Dropped(CLAUDE_HOLD.to_owned())
+        }
+
+        fn ready(&self, _: &str) -> bool {
+            self.ready.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn retryable_hold_reoffered_once_mod_ready_e069509() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let startup = Binding {
+            room: "a".to_owned(),
+            session: unreported_session("a", 1),
+            endpoint: "claude".to_owned(),
+            generation: 1,
+        };
+        let bindings = HashMap::from([("a".to_owned(), startup.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adapter: Arc<dyn Adapter> = Arc::new(Gate {
+            ready: Arc::clone(&ready),
+            calls: Arc::clone(&calls),
+        });
+        let mut outbox = Outbox::open(&path, 4, 4, 1).unwrap();
+        let id = outbox
+            .enqueue("source".into(), startup, "house rules".into())
+            .unwrap()
+            .id;
+        // No mod: one attempt, then held, never retried while missing.
+        outbox
+            .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(hold_of(&mut outbox, &id), Some(CLAUDE_HOLD.to_owned()));
+        outbox
+            .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // The mod registers: offered exactly once more, then accepted.
+        ready.store(true, Ordering::SeqCst);
+        outbox
+            .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // ...and never re-sent afterwards.
+        outbox
+            .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn room_number_reaches_mod_through_files_7245fc1() {
+        // The Claude mod sandbox has no process global, so the mod resolves
+        // its room number from its per-room connection file, which carries the
+        // numeric room. (The mod side is pinned by the node deliver tests;
+        // this row pins the Rust side of the contract.)
+        let cwd = tempfile::tempdir().unwrap();
+        // Bound past the reads: dropping an inbox removes its files.
+        let one = crate::claude_inbox::ClaudeInbox::start().unwrap();
+        let two = crate::claude_inbox::ClaudeInbox::start().unwrap();
+        one.prepare(cwd.path(), 1, 7).unwrap();
+        two.prepare(cwd.path(), 2, 7).unwrap();
+        for room in [1_usize, 2] {
+            let raw = std::fs::read(crate::claude_inbox::bootstrap_file(cwd.path(), room).unwrap())
+                .unwrap();
+            let connection: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            assert_eq!(connection["room"], room);
+            assert_ne!(connection["url"].as_str().unwrap_or(""), "");
+            assert_ne!(connection["token"].as_str().unwrap_or(""), "");
+        }
+        let first =
+            std::fs::read(crate::claude_inbox::bootstrap_file(cwd.path(), 1).unwrap()).unwrap();
+        let second =
+            std::fs::read(crate::claude_inbox::bootstrap_file(cwd.path(), 2).unwrap()).unwrap();
+        assert_ne!(first, second, "each room gets its own connection");
+    }
 }
 
 /// The hold reason of mail whose binding is no longer the room's current one.
