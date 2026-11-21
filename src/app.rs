@@ -4236,7 +4236,9 @@ fn run_rooms(
 /// Test-only rig shared with the native delivery lifecycle harness: only the
 /// pieces the harness drives are visible outside [`tests`].
 #[cfg(all(test, unix))]
-pub(crate) use tests::{ReportDispatch, report_test_pane, report_test_spec, report_test_stub};
+pub(crate) use tests::{
+    ReportDispatch, report_test_opencode_room, report_test_pane, report_test_spec, report_test_stub,
+};
 
 #[cfg(test)]
 mod tests {
@@ -4476,7 +4478,7 @@ mod tests {
     }
 
     #[cfg(all(test, unix))]
-    fn report_test_opencode_room(
+    pub(crate) fn report_test_opencode_room(
         root: &std::path::Path,
         cwd: &std::path::Path,
         session: &str,
@@ -6159,7 +6161,7 @@ mod tests {
 
         /// Runs one event-loop pass like [`ReportDispatch::dispatch`], but
         /// keeps the notices so a test can check each one's severity.
-        fn dispatch_keep(&mut self) {
+        pub(crate) fn dispatch_keep(&mut self) {
             let rooms = self.panes.len();
             let now = Instant::now();
             run_rooms_iteration(
@@ -6188,6 +6190,55 @@ mod tests {
                 now,
             )
             .unwrap();
+        }
+
+        /// Pauses delivery, as the production pause does: mail is saved but
+        /// not offered.
+        pub(crate) fn set_paused(&mut self, paused: bool) {
+            self.paused = paused;
+        }
+
+        /// Sends one envelope to a room through the production native path.
+        pub(crate) fn send_mail(&mut self, to: usize, body: &str) -> Result<(), String> {
+            crate::app::send_native_mail(
+                &mut self.panes,
+                self.router.as_mut(),
+                &mut self.mailroom,
+                "Sender",
+                to,
+                body,
+                None,
+            )
+        }
+
+        /// Queues one control envelope as the doorbell delivers it.
+        pub(crate) fn push_control(&mut self, to: usize, action: crate::doorbell::ControlAction) {
+            let (reply, _dropped) = std::sync::mpsc::sync_channel(1);
+            self.doorbell
+                .events
+                .push_back(crate::doorbell::DoorbellEvent::Control(
+                    crate::doorbell::DoorbellControl {
+                        from: 0,
+                        to,
+                        action,
+                        reply,
+                    },
+                ));
+        }
+
+        /// The arguments this room's terminal was started with.
+        pub(crate) fn tui_arguments(&self, index: usize) -> Option<Vec<std::ffi::OsString>> {
+            self.panes[index].native_arguments()
+        }
+
+        /// Whether the room's delivery gate is the fresh one.
+        pub(crate) fn gate_ready(&self, index: usize) -> bool {
+            self.gates[index] == DeliveryGate::Ready
+        }
+
+        /// The room's last observed pulse state.
+        pub(crate) fn pulse_state(&self, index: usize) -> Option<PulseState> {
+            self.pulses[index].as_ref().map(|pulse| pulse.state)
         }
 
         /// Relaunches one room through the production restart path, so a

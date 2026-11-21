@@ -11,10 +11,12 @@
 
 use std::path::PathBuf;
 
-use crate::app::{ReportDispatch, report_test_pane, report_test_spec, report_test_stub};
+use crate::app::{
+    ReportDispatch, report_test_opencode_room, report_test_pane, report_test_spec, report_test_stub,
+};
 use crate::claude_inbox::{Claim, FakeMod, bootstrap_file};
 use crate::native_route::{ClaudeEntry, NativeRouter};
-use crate::native_session::{is_unreported_placeholder, unreported_session};
+use crate::native_session::{STALE_HOLD, is_unreported_placeholder, unreported_session};
 use crate::pane::{self, ClaudeRelaunch, ClaudeStart, session_state::StateRootGuard};
 
 /// One bound Claude room per title, each with its own working directory, on a
@@ -447,4 +449,152 @@ fn two_rooms_with_interleaved_reports_keep_their_mail_apart() {
     settle(&mut fx.rig, "ACCEPTED by Claude");
     fx.assert_quiet_then_marker(&mod0, 0, "marker-quiet-7a", "room 1 got room 2's mail");
     fx.assert_quiet_then_marker(&mod1, 1, "marker-quiet-7b", "room 2 got room 1's mail");
+}
+
+/// The texts the fake OpenCode server was asked to deliver, in order.
+#[cfg(unix)]
+fn opencode_received(fake: &crate::native_launch::tests::FakeRoom) -> Vec<String> {
+    fake.state
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, text)| text.clone())
+        .collect()
+}
+
+/// Pumps the production loop until the condition holds, yielding so worker
+/// threads run; the deadline only guards a hang.
+#[cfg(unix)]
+fn pump_opencode_until(rig: &mut ReportDispatch, mut done: impl FnMut(&ReportDispatch) -> bool) {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < end {
+        rig.dispatch();
+        if done(rig) {
+            return;
+        }
+        std::thread::yield_now();
+    }
+    panic!("never reached: {}", rig.mailroom.summary());
+}
+
+/// The first OpenCode test in this harness: the seven above all drive the
+/// Claude mod path. This one runs the real control path on an owned OpenCode
+/// room, twice, and checks that mail for an earlier launch stays stale while
+/// each new session is served once and in order.
+#[cfg(unix)]
+#[test]
+fn clearing_an_opencode_room_keeps_old_mail_stale_and_serves_each_new_session() {
+    use crate::doorbell::{ControlAction, PulseState};
+
+    const A: &str = "ses_old";
+    let _state = StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let (panes, router, fake) = report_test_opencode_room(root.path(), cwd.path(), A);
+    let mut rig = ReportDispatch::new(panes, router);
+    let start = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    assert_eq!(start.session, A);
+
+    // Paused: the envelope is saved for this launch but never sent.
+    rig.set_paused(true);
+    rig.send_mail(0, "M1-before-first-clear").unwrap();
+    rig.dispatch();
+
+    rig.push_control(0, ControlAction::ClearContext);
+    rig.dispatch_keep();
+    let first = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    assert_ne!(first.session, start.session);
+    assert!(first.generation > start.generation);
+    assert_eq!(first.endpoint, start.endpoint);
+    let arguments = rig.tui_arguments(0).expect("the room runs a terminal");
+    assert!(
+        arguments
+            .iter()
+            .any(|argument| argument == std::ffi::OsStr::new(&first.session)),
+        "{arguments:?}"
+    );
+    assert!(rig.gate_ready(0));
+    assert_eq!(rig.pulse_state(0), Some(PulseState::Starting));
+
+    // Delivery resumes: the mail saved for the old launch is held as stale and
+    // never offered to the new session.
+    rig.set_paused(false);
+    pump_opencode_until(&mut rig, |rig| rig.mailroom.summary().contains(STALE_HOLD));
+    let held = opencode_received(&fake);
+    assert!(held.iter().all(|text| !text.contains("M1")), "{held:?}");
+
+    // New mail reaches the new session once, then a later marker is accepted.
+    rig.send_mail(0, "M2-after-first-clear").unwrap();
+    pump_opencode_until(&mut rig, |_| {
+        opencode_received(&fake)
+            .iter()
+            .any(|text| text.contains("M2"))
+    });
+    rig.send_mail(0, "M3-marker").unwrap();
+    pump_opencode_until(&mut rig, |_| {
+        opencode_received(&fake)
+            .iter()
+            .any(|text| text.contains("M3"))
+    });
+    let seen = opencode_received(&fake);
+    assert_eq!(
+        seen.iter()
+            .filter(|text| text.contains("M2-after-first-clear"))
+            .count(),
+        1,
+        "{seen:?}"
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|text| text.contains("M3-marker"))
+            .count(),
+        1,
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .position(|text| text.contains("M2-after-first-clear"))
+            < seen.iter().position(|text| text.contains("M3-marker")),
+        "{seen:?}"
+    );
+
+    // Both receipts must be collected before the binding moves again: a
+    // completion still in flight would look uncertain once the clear lands.
+    pump_opencode_until(&mut rig, |rig| {
+        rig.mailroom
+            .summary()
+            .matches("ACCEPTED by OpenCode")
+            .count()
+            >= 2
+    });
+
+    // A second clear moves to another session: mail queued before it stays
+    // stale, and only mail after it is served.
+    rig.set_paused(true);
+    rig.send_mail(0, "M4-before-second-clear").unwrap();
+    rig.dispatch();
+    rig.push_control(0, ControlAction::ClearContext);
+    rig.dispatch_keep();
+    let second = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    assert_ne!(second.session, first.session);
+    assert!(second.generation > first.generation);
+    rig.set_paused(false);
+    rig.send_mail(0, "M5-after-second-clear").unwrap();
+    pump_opencode_until(&mut rig, |_| {
+        opencode_received(&fake)
+            .iter()
+            .any(|text| text.contains("M5"))
+    });
+    let seen = opencode_received(&fake);
+    assert_eq!(
+        seen.iter()
+            .filter(|text| text.contains("M5-after-second-clear"))
+            .count(),
+        1,
+        "{seen:?}"
+    );
+    assert!(seen.iter().all(|text| !text.contains("M4")), "{seen:?}");
+    assert!(seen.iter().all(|text| !text.contains("M1")), "{seen:?}");
+    fake.shutdown();
 }

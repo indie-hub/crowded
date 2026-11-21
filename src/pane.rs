@@ -2370,6 +2370,13 @@ impl Pane {
         self.native.is_some() && owned_server_room(&self.spec)
     }
 
+    /// The arguments this room's terminal was started with, when it runs on an
+    /// owned server. Only the test rig asks for them.
+    #[cfg(all(test, unix))]
+    pub(crate) fn native_arguments(&self) -> Option<Vec<std::ffi::OsString>> {
+        self.native.as_ref().map(NativeRoom::tui_arguments)
+    }
+
     /// Clears an owned OpenCode room: the durable fresh-state marker, a new
     /// session on the same server, then a TUI respawn that attaches to it.
     ///
