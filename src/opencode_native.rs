@@ -493,7 +493,7 @@ impl Server {
     }
 
     /// The session this server's room currently uses. A clear moves it, so it
-    /// is read under the same lock the binding lives behind.
+    /// is read under its own lock, separate from the binding's.
     fn launch_session(&self) -> io::Result<String> {
         Ok(self
             .session
@@ -615,6 +615,11 @@ impl Server {
             binding.generation,
             binding.session.clone(),
         )?;
+        *self
+            .session
+            .lock()
+            .map_err(|_| io::Error::other("server session state is poisoned"))? =
+            binding.session.clone();
         Ok(())
     }
 
@@ -1141,7 +1146,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn a_new_session_replaces_the_binding_and_keeps_the_server() {
         let client = fake(2, |i, headers, _| {
             assert!(headers.starts_with("POST /api/session "));
@@ -1179,6 +1183,23 @@ mod tests {
         assert!(launch.accepts(&fresh));
         assert!(!launch.accepts(&old));
         assert_eq!(launch.bound().unwrap().generation, 9);
+    }
+
+    #[test]
+    fn adopt_keeps_the_handoff_session_in_step_with_the_binding() {
+        let client = fake(0, |_, _, _| None);
+        let server = bound_server(&client, "1", 3, "ses_old");
+        let adopted = Binding {
+            room: "1".into(),
+            session: "ses_reported".into(),
+            endpoint: format!("http://{}", client.address),
+            generation: 3,
+        };
+        server.adopt(&adopted).unwrap();
+        assert_eq!(server.launch_session().unwrap(), "ses_reported");
+        assert_eq!(server.handoff().unwrap().session, "ses_reported");
+        let owned = server.binding.lock().unwrap();
+        assert_eq!(owned.as_ref().unwrap().bound(), Some(&adopted));
     }
 
     #[test]
