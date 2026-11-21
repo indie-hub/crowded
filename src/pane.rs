@@ -1791,15 +1791,15 @@ impl Pane {
         // portable-pty defaults an omitted cwd to HOME rather than inheriting
         // Crowded's directory, so the project directory must be explicit.
         let cwd = working_directory(spec.cwd.as_deref())?;
-        let mut guest = opencode_launch(&spec)?;
+        let mut guest = opencode_launch(spec)?;
         if let Some(native) = &native {
             attach_to_native_server(&mut guest, native)?;
         }
         let path = environment_value(&guest.variables, "PATH");
         let path_ext = environment_value(&guest.variables, "PATHEXT");
-        let (program, args, tui_headroom) = if codex_native_spec(&spec) {
-            let (program, args) = codex_phase_command(&spec, &guest.args);
-            (program, args, spec_uses_headroom(&spec))
+        let (program, args, tui_headroom) = if codex_native_spec(spec) {
+            let (program, args) = codex_phase_command(spec, &guest.args);
+            (program, args, spec_uses_headroom(spec))
         } else {
             headroom_launch(
                 &spec.program,
@@ -1811,7 +1811,7 @@ impl Pane {
             )
         };
         let headroom_active = if native_room {
-            spec_uses_headroom(&spec)
+            spec_uses_headroom(spec)
         } else {
             tui_headroom
         };
@@ -1828,7 +1828,7 @@ impl Pane {
         for (key, value) in &environment.variables {
             command.env(key, value);
         }
-        if claude_native_spec(&spec) {
+        if claude_native_spec(spec) {
             // A nested-session marker would make this Claude Code child stop
             // keeping transcripts, so the room never inherits one.
             command.env_remove("CLAUDE_CODE_CHILD_SESSION");
@@ -1864,7 +1864,7 @@ impl Pane {
         // already persisted opens with that id seeded, so the Room Pulse cost
         // gate is true immediately instead of only after an intro-triggered
         // capture -- which a resume deliberately skips.
-        let captured_session = match controls::cli_vendor(&spec) {
+        let captured_session = match controls::cli_vendor(spec) {
             // A native room's session is the one it creates on this launch, so a
             // persisted legacy id is never trusted. Codex captures the new
             // thread itself; OpenCode's owned server creates it.
