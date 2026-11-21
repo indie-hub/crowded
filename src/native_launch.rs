@@ -266,6 +266,19 @@ impl NativeRoom {
         &self.binding
     }
 
+    /// Starts a new session on this room's owned server and moves the room to
+    /// it: the same endpoint and server, a new generation and session, so the
+    /// caller can respawn the TUI against [`Self::tui_arguments`].
+    pub(crate) fn clear_session(&mut self, generation: u64) -> io::Result<Binding> {
+        let binding = self
+            .server
+            .get()
+            .new_session(self.binding.room.clone(), generation)?;
+        self.binding = binding.clone();
+        self.handoff.session = binding.session.clone();
+        Ok(binding)
+    }
+
     /// Sharing the server is for the outbox adapter, which must keep and drop
     /// its handle off the terminal event loop.
     pub(crate) fn server(&self) -> Arc<Server> {
@@ -598,6 +611,20 @@ pub(crate) mod tests {
         pub(crate) stop: AtomicBool,
         /// The `resume` flag of every prompt the server saw.
         pub(crate) resumes: Mutex<Vec<bool>>,
+        /// How many sessions this stand-in has created, and the current one.
+        pub(crate) sessions: std::sync::atomic::AtomicUsize,
+        pub(crate) session: Mutex<String>,
+    }
+
+    /// The session the stand-in currently serves. The first one keeps the
+    /// historical name; later ones are numbered, as a real server would.
+    fn serving_session(state: &FakeState, tag: &str) -> String {
+        let held = state.session.lock().unwrap();
+        if held.is_empty() {
+            format!("ses_{tag}")
+        } else {
+            held.clone()
+        }
     }
 
     #[cfg(unix)]
@@ -709,11 +736,12 @@ pub(crate) mod tests {
                         }
                     };
                     let item = serde_json::json!({
-                        "id": id, "sessionID": format!("ses_{tag}"),
+                        "id": id, "sessionID": serving_session(&server_state, &tag),
                         "payload": {"text": stored}, "delivery": "queue"
                     });
                     (200, serde_json::json!({"data": item}).to_string())
                 } else if is_inbox {
+                    let session = serving_session(&server_state, &tag);
                     let items: Vec<_> = server_state
                         .received
                         .lock()
@@ -721,7 +749,7 @@ pub(crate) mod tests {
                         .iter()
                         .map(|(id, text)| {
                             serde_json::json!({
-                                "id": id, "sessionID": format!("ses_{tag}"),
+                                "id": id, "sessionID": session,
                                 "payload": {"text": text}, "delivery": "queue"
                             })
                         })
@@ -731,7 +759,17 @@ pub(crate) mod tests {
                     let pid = fs::read_to_string(&pid_file).unwrap_or_default();
                     (200, format!("{{\"pid\":{}}}", pid.trim()))
                 } else if request.starts_with("POST /api/session ") {
-                    (200, format!("{{\"data\":{{\"id\":\"ses_{tag}\"}}}}"))
+                    let created = server_state
+                        .sessions
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    let id = if created == 1 {
+                        format!("ses_{tag}")
+                    } else {
+                        format!("ses_{tag}_{created}")
+                    };
+                    *server_state.session.lock().unwrap() = id.clone();
+                    (200, format!("{{\"data\":{{\"id\":\"{id}\"}}}}"))
                 } else {
                     (404, "{}".to_owned())
                 };
@@ -840,6 +878,51 @@ pub(crate) mod tests {
         wait_for_reaps();
         assert!(!process_alive(&pid_a));
         assert!(!process_alive(&pid_b));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_session_moves_the_room_to_a_new_session_on_the_same_server() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let fake = fake_room(root.path(), "clear", "v2.2.5");
+        let mut room = start(NativeLaunch::direct(
+            fake.program.as_os_str(),
+            cwd.path(),
+            "1".into(),
+            1,
+            &[],
+        ))
+        .unwrap();
+        let launch = room.binding().clone();
+        let fresh = room.clear_session(9).unwrap();
+
+        assert_ne!(fresh.session, launch.session);
+        assert_eq!(fresh.room, launch.room);
+        assert_eq!(fresh.endpoint, launch.endpoint);
+        assert_eq!(fresh.generation, 9);
+        assert_eq!(room.binding(), &fresh);
+        let args: Vec<String> = room
+            .tui_arguments()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&fresh.session), "{args:?}");
+        assert!(!args.contains(&launch.session), "{args:?}");
+
+        // The server keeps its endpoint and accepts only the new binding.
+        let refused = room
+            .server()
+            .queue_async(&launch, format!("msg_{}", "c".repeat(64)), "hello".into())
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(refused, crate::opencode_native::Delivery::NotSent);
+        let accepted = room
+            .server()
+            .queue_async(&fresh, format!("msg_{}", "d".repeat(64)), "hello".into())
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(accepted, crate::opencode_native::Delivery::NotSent);
     }
 
     #[cfg(unix)]

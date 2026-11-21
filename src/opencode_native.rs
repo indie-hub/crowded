@@ -461,7 +461,7 @@ fn stop_process(pid: u32) {
 pub(crate) struct Server {
     child: Option<Child>,
     client: Arc<Client>,
-    session: String,
+    session: Mutex<String>,
     url: String,
     binding: Mutex<Option<LaunchBinding>>,
     /// The authenticated server's own pid; when it differs from the spawned
@@ -492,10 +492,20 @@ impl Server {
         Ok(())
     }
 
+    /// The session this server's room currently uses. A clear moves it, so it
+    /// is read under the same lock the binding lives behind.
+    fn launch_session(&self) -> io::Result<String> {
+        Ok(self
+            .session
+            .lock()
+            .map_err(|_| io::Error::other("server session state is poisoned"))?
+            .clone())
+    }
+
     pub(crate) fn handoff(&self) -> io::Result<Handoff> {
         Ok(Handoff {
             url: self.url.clone(),
-            session: self.session.clone(),
+            session: self.launch_session()?,
             password: self
                 .client
                 .password()
@@ -532,7 +542,7 @@ impl Server {
                 child_pid: reported_pid,
                 reported_pid,
                 endpoint: self.client.address,
-                session: self.session.clone(),
+                session: self.launch_session()?,
                 generation,
             })?
             .clone();
@@ -543,12 +553,12 @@ impl Server {
         Ok(result)
     }
 
-    /// Starts a new session on this owned server for a cleared room: the
-    /// server, endpoint and ownership evidence stay, only the session and its
-    /// generation change. The session is created first, so a failed request
-    /// leaves the previous binding untouched.
-    #[allow(dead_code)]
-    pub(crate) fn new_session(&mut self, room: String, generation: u64) -> io::Result<Binding> {
+    /// Starts a new session on this owned server and moves the stored binding
+    /// to it. The session is created before the room and generation are
+    /// checked, so a rejected adoption leaves one unused session on the server
+    /// and the old binding intact. `adopt_report` accepts equal or older
+    /// nonzero generations, so the caller must pass a new one.
+    pub(crate) fn new_session(&self, room: String, generation: u64) -> io::Result<Binding> {
         let session = self.client.create_session()?;
         let mut owned = self
             .binding
@@ -558,7 +568,10 @@ impl Server {
             .as_mut()
             .ok_or_else(|| io::Error::other("server is not bound"))?;
         let binding = launch.adopt_report(room, generation, session.clone())?;
-        self.session = session;
+        *self
+            .session
+            .lock()
+            .map_err(|_| io::Error::other("server session state is poisoned"))? = session;
         Ok(binding)
     }
 
@@ -724,7 +737,7 @@ impl Server {
             Ok((client, session, url, server_pid)) => Ok(Self {
                 child: Some(child),
                 client,
-                session,
+                session: Mutex::new(session),
                 url,
                 binding: Mutex::new(None),
                 server_pid: Some(server_pid),
@@ -1106,6 +1119,28 @@ mod tests {
         assert_eq!(client.create_session().unwrap(), "ses_explicit");
     }
 
+    fn bound_server(client: &Arc<Client>, room: &str, generation: u64, session: &str) -> Server {
+        let mut launch = LaunchBinding::new(room.into(), generation, 42).unwrap();
+        launch
+            .bind(OwnershipEvidence {
+                child_pid: 42,
+                reported_pid: 42,
+                endpoint: client.address,
+                session: session.into(),
+                generation,
+            })
+            .unwrap();
+        Server {
+            child: None,
+            client: Arc::clone(client),
+            session: Mutex::new(session.into()),
+            url: format!("http://{}", client.address),
+            binding: Mutex::new(Some(launch)),
+            server_pid: Some(42),
+        }
+    }
+
+    #[test]
     #[test]
     fn a_new_session_replaces_the_binding_and_keeps_the_server() {
         let client = fake(2, |i, headers, _| {
@@ -1115,30 +1150,21 @@ mod tests {
                 _ => Some(response(500, &json!({}))),
             }
         });
-        let mut launch = LaunchBinding::new("1".into(), 3, 42).unwrap();
-        let old = launch
-            .bind(OwnershipEvidence {
-                child_pid: 42,
-                reported_pid: 42,
-                endpoint: client.address,
-                session: "ses_old".into(),
-                generation: 3,
-            })
+        let server = bound_server(&client, "1", 3, "ses_old");
+        let old = server
+            .binding
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .bound()
             .unwrap()
             .clone();
-        let mut server = Server {
-            child: None,
-            client: Arc::clone(&client),
-            session: "ses_old".into(),
-            url: format!("http://{}", client.address),
-            binding: Mutex::new(Some(launch)),
-            server_pid: Some(42),
-        };
         let fresh = server.new_session("1".into(), 9).unwrap();
         assert_eq!(fresh.session, "ses_fresh");
         assert_eq!(fresh.endpoint, old.endpoint);
         assert_eq!(fresh.generation, 9);
-        assert_eq!(server.session, "ses_fresh");
+        assert_eq!(*server.session.lock().unwrap(), "ses_fresh");
         {
             let owned = server.binding.lock().unwrap();
             let launch = owned.as_ref().unwrap();
@@ -1147,12 +1173,36 @@ mod tests {
         }
         // A failed creation leaves the binding and the session in place.
         assert!(server.new_session("1".into(), 10).is_err());
-        assert_eq!(server.session, "ses_fresh");
+        assert_eq!(*server.session.lock().unwrap(), "ses_fresh");
         let owned = server.binding.lock().unwrap();
         let launch = owned.as_ref().unwrap();
         assert!(launch.accepts(&fresh));
         assert!(!launch.accepts(&old));
         assert_eq!(launch.bound().unwrap().generation, 9);
+    }
+
+    #[test]
+    fn a_new_session_for_another_room_is_refused_and_keeps_the_old_binding() {
+        let client = fake(1, |_, headers, _| {
+            assert!(headers.starts_with("POST /api/session "));
+            Some(response(200, &json!({"data": {"id": "ses_fresh"}})))
+        });
+        let server = bound_server(&client, "1", 3, "ses_old");
+        let old = server
+            .binding
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .bound()
+            .unwrap()
+            .clone();
+        assert!(server.new_session("2".into(), 9).is_err());
+        let owned = server.binding.lock().unwrap();
+        let launch = owned.as_ref().unwrap();
+        assert!(launch.accepts(&old));
+        assert_eq!(launch.bound().unwrap().session, "ses_old");
+        assert_eq!(*server.session.lock().unwrap(), "ses_old");
     }
 
     #[test]
@@ -1354,7 +1404,7 @@ mod tests {
         let mut server = Server {
             child: Some(child),
             client,
-            session: "ses_a".into(),
+            session: Mutex::new("ses_a".into()),
             url: "http://127.0.0.1:1234".into(),
             binding: Mutex::new(None),
             server_pid: None,
@@ -1439,7 +1489,7 @@ mod tests {
         let mut server = Server {
             child: Some(child),
             client,
-            session: "ses_a".into(),
+            session: Mutex::new("ses_a".into()),
             url: "http://127.0.0.1:1234".into(),
             binding: Mutex::new(None),
             server_pid: None,
@@ -1515,7 +1565,7 @@ mod tests {
             let mut server = Server {
                 child: Some(child),
                 client,
-                session: "ses_a".into(),
+                session: Mutex::new("ses_a".into()),
                 url: "http://127.0.0.1:1234".into(),
                 binding: Mutex::new(None),
                 server_pid: None,
@@ -1610,7 +1660,7 @@ mod tests {
         let mut server = Server {
             child: Some(child),
             client,
-            session: "ses_a".into(),
+            session: Mutex::new("ses_a".into()),
             url: "http://127.0.0.1:1234".into(),
             binding: Mutex::new(None),
             server_pid: None,
@@ -1656,7 +1706,7 @@ mod tests {
         let server = Server {
             child: Some(child),
             client,
-            session: "ses_a".into(),
+            session: Mutex::new("ses_a".into()),
             url: "http://127.0.0.1:1234".into(),
             binding: Mutex::new(None),
             server_pid: None,
