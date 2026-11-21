@@ -1758,9 +1758,23 @@ impl Pane {
         environment: GuestEnvironment,
         native: Option<NativeRoom>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut pane = Self::spawn_attached(&spec, size, environment, native.as_ref())?;
+        pane.native = native;
+        Ok(pane)
+    }
+
+    /// The same spawn, borrowing the server instead of taking it, so a caller
+    /// that must keep the [`NativeRoom`] can build a replacement pane first and
+    /// move the server in only once that succeeds.
+    fn spawn_attached(
+        spec: &RoomSpec,
+        size: PtySize,
+        environment: GuestEnvironment,
+        native: Option<&NativeRoom>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Only an OpenCode native room runs on a Crowded-owned server. A Codex
         // native room keeps its own process and is queued through the CLI.
-        let owned_server = owned_server_room(&spec);
+        let owned_server = owned_server_room(spec);
         if owned_server != native.is_some() {
             return Err(io::Error::other(if owned_server {
                 "native delivery room has no owned server"
@@ -1861,7 +1875,7 @@ impl Pane {
         };
 
         Ok(Self {
-            spec,
+            spec: spec.clone(),
             cwd,
             spawned_at,
             captured_session,
@@ -1876,7 +1890,7 @@ impl Pane {
             scroll_offset: 0,
             headroom_active,
             _opencode_config: opencode_config,
-            native,
+            native: None,
         })
     }
 
@@ -2350,6 +2364,54 @@ impl Pane {
         self.reconfigure(size, controls::clear_resume_args)
     }
 
+    /// Whether this room runs on a Crowded-owned OpenCode server, so a clear
+    /// can start a new session on it without relaunching the server.
+    #[allow(dead_code)]
+    pub(crate) fn opencode_native(&self) -> bool {
+        self.native.is_some() && owned_server_room(&self.spec)
+    }
+
+    /// Clears an owned OpenCode room: the durable fresh-state marker, a new
+    /// session on the same server, then a TUI respawn that attaches to it. The
+    /// server is moved, never dropped, and nothing changes until each step
+    /// succeeds.
+    #[allow(dead_code)]
+    pub(crate) fn clear_opencode_session(
+        &mut self,
+        size: PtySize,
+        generation: u64,
+    ) -> Result<crate::native_outbox::Binding, Box<dyn std::error::Error>> {
+        if !self.opencode_native() {
+            return Err(io::Error::other(
+                "only a room on an owned OpenCode server can start a new session this way",
+            )
+            .into());
+        }
+        // A marker that cannot be saved fails the clear: the old session is
+        // still trusted, so a fresh launch could strand it.
+        let vendor = controls::cli_vendor(&self.spec)?;
+        let cwd = working_directory(self.spec.cwd.as_deref())?;
+        session_state::clear_room(vendor.key(), &cwd, &self.spec.title)?;
+        let binding = self
+            .native
+            .as_mut()
+            .expect("open code native room has its server")
+            .clear_session(generation)?;
+        // Build the replacement while this pane still owns everything, so a
+        // failure leaves the old child, server and binding untouched.
+        let replacement = Self::spawn_attached(
+            &self.spec,
+            size,
+            self.environment.clone(),
+            self.native.as_ref(),
+        )?;
+        let native = self.native.take();
+        self.cleanup();
+        *self = replacement;
+        self.native = native;
+        Ok(binding)
+    }
+
     /// Returns whether a conversation was actually resumed. A room whose
     /// recorded session cannot be verified as its own starts fresh instead, and
     /// then still needs its intro and a new session captured.
@@ -2615,6 +2677,143 @@ mod tests {
         let pane =
             Pane::spawn_with_native(spec, native_test_size(), environment, Some(room)).unwrap();
         (pane, fake)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clearing_an_opencode_room_attaches_the_tui_to_a_new_session_on_the_same_server() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut pane, fake) = spawn_native_pane(
+            root.path(),
+            cwd.path(),
+            "clear-one",
+            &["--model", "provider/alpha"],
+            "token-clear",
+        );
+        let title = pane.spec.title.clone();
+        let old = pane.native.as_ref().unwrap().binding().clone();
+        let binding = pane.clear_opencode_session(native_test_size(), 9).unwrap();
+
+        assert_ne!(binding.session, old.session);
+        assert_eq!(binding.generation, 9);
+        assert_eq!(binding.endpoint, old.endpoint);
+        assert_eq!(pane.native.as_ref().unwrap().binding(), &binding);
+        // The terminal's real arguments, as the stand-in received them.
+        let argv = fake.dir.join("tui_argv");
+        let started = Instant::now();
+        let mut seen = String::new();
+        while started.elapsed() < Duration::from_secs(5) {
+            seen = fs::read_to_string(&argv).unwrap_or_default();
+            if seen.contains(&binding.session) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let attached = seen
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find(|pair| pair[0] == "--session")
+            .map(|pair| pair[1].to_owned());
+        assert_eq!(
+            attached.as_deref(),
+            Some(binding.session.as_str()),
+            "{seen}"
+        );
+        assert_ne!(attached.as_deref(), Some(old.session.as_str()), "{seen}");
+        assert_eq!(
+            session_state::lookup("opencode", cwd.path(), &title).as_deref(),
+            Some(session_state::FRESH_STATE_MARKER)
+        );
+
+        // The owned server survived the respawn and serves only the new session.
+        let server = pane.native.as_ref().unwrap().server();
+        let refused = server
+            .queue_async(&old, format!("msg_{}", "a".repeat(64)), "old".into())
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(refused, crate::opencode_native::Delivery::NotSent);
+        let accepted = server
+            .queue_async(&binding, format!("msg_{}", "b".repeat(64)), "new".into())
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(accepted, crate::opencode_native::Delivery::NotSent);
+        fake.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_new_session_leaves_the_opencode_pane_untouched() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut pane, fake) = spawn_native_pane(
+            root.path(),
+            cwd.path(),
+            "clear-fail",
+            &["--model", "provider/alpha"],
+            "token-fail",
+        );
+        let old = pane.native.as_ref().unwrap().binding().clone();
+        let old_args = pane.spec.args.clone();
+        fake.shutdown();
+
+        let error = pane
+            .clear_opencode_session(native_test_size(), 9)
+            .unwrap_err();
+        assert!(error.to_string().contains("session"), "{error}");
+        assert_eq!(pane.spec.args, old_args);
+        assert_eq!(pane.native.as_ref().unwrap().binding(), &old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_opencode_clear_whose_marker_cannot_be_saved_changes_nothing() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut pane, fake) = spawn_native_pane(
+            root.path(),
+            cwd.path(),
+            "clear-marker",
+            &["--model", "provider/alpha"],
+            "token-marker",
+        );
+        let old = pane.native.as_ref().unwrap().binding().clone();
+        let old_args = pane.spec.args.clone();
+        let path = session_state::state_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"not a state file").unwrap();
+
+        let error = pane
+            .clear_opencode_session(native_test_size(), 9)
+            .unwrap_err();
+        assert!(error.to_string().contains("cleared marker"), "{error}");
+        assert_eq!(pane.spec.args, old_args);
+        assert_eq!(pane.native.as_ref().unwrap().binding(), &old);
+        fake.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_room_on_an_owned_opencode_server_can_start_a_new_session() {
+        let _state = session_state::StateRootGuard::isolated();
+        let mut pane = Pane::spawn(
+            room_spec("sh", &["-c", "exec sleep 5"]),
+            native_test_size(),
+            GuestEnvironment::new([]),
+        )
+        .unwrap();
+        assert!(!pane.opencode_native());
+        let error = pane
+            .clear_opencode_session(native_test_size(), 9)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("owned OpenCode server"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
