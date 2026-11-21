@@ -18,11 +18,11 @@ use std::{
 
 /// Verbatim-moved session and hold rules, owned by [`crate::native_session`].
 use crate::native_session::{
-    CLAUDE_HOLD, PENDING_HOLD, STALE_HOLD, UNCERTAIN_HOLD, UNCONFIRMED_HOLD, is_retryable_hold,
-    is_stale_hold, same_launch_placeholder,
+    CLAUDE_HOLD, PENDING_HOLD, STALE_HOLD, UNCONFIRMED_HOLD, is_retryable_hold, is_stale_hold,
+    same_launch_placeholder,
 };
 #[cfg(test)]
-use crate::native_session::{is_unreported_placeholder, unreported_session};
+use crate::native_session::{UNCERTAIN_HOLD, is_unreported_placeholder, unreported_session};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Binding {
@@ -563,19 +563,20 @@ mod tests {
         AdapterResult::Dropped(CLAUDE_HOLD.to_owned())
     }
 
-    /// Mail behind an uncertain message is never sent past it and never left
-    /// looking merely queued: it carries a visible hold reason.
+    /// A message that may already have arrived is never resent, and it must
+    /// not hold the room's later mail: nothing can settle it within a launch.
     #[test]
-    fn newer_mail_behind_an_uncertain_message_shows_a_hold_reason() {
+    fn newer_mail_behind_an_uncertain_message_is_still_sent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outbox.json");
         let mut outbox = Outbox::open(&path, 4, 4, 2).unwrap();
         let b = binding("a", 1);
         let bindings = HashMap::from([("a".to_owned(), b.clone())]);
         let calls = Arc::new(AtomicUsize::new(0));
-        outbox
+        let first = outbox
             .enqueue("s".into(), b.clone(), "first".into())
-            .unwrap();
+            .unwrap()
+            .id;
         outbox
             .schedule(
                 &bindings,
@@ -587,17 +588,33 @@ mod tests {
             .unwrap();
         wait(&mut outbox, &bindings);
         assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
+
         outbox.enqueue("s".into(), b, "second".into()).unwrap();
         outbox
             .schedule(&bindings, false, false, &[], fake(&calls, accepted))
             .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            outbox.state.messages[1].status,
-            Status::Queued {
-                hold: Some(UNCERTAIN_HOLD.to_owned())
-            }
-        );
+        assert_eq!(outbox.state.messages[1].status, Status::Sending);
+        wait(&mut outbox, &bindings);
+        assert_eq!(outbox.state.messages[1].status, Status::Accepted);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // The uncertain row survives a restart with its one attempt and is
+        // never sent again.
+        drop(outbox);
+        let mut outbox = Outbox::open(&path, 4, 4, 2).unwrap();
+        let first_row = outbox
+            .state
+            .messages
+            .iter()
+            .find(|m| m.id == first)
+            .unwrap();
+        assert_eq!(first_row.status, Status::Uncertain);
+        assert_eq!(first_row.attempts.len(), 1);
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&calls, accepted))
+            .unwrap();
+        outbox.collect(&bindings).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     fn dropped() -> AdapterResult {
@@ -1108,17 +1125,13 @@ mod tests {
         assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
         let hash = outbox.state.messages[0].hash.clone();
 
-        // The second message waits behind the uncertain one and says why.
+        // The second message is not held behind the uncertain one.
         outbox
             .schedule(&bindings, false, false, &[], fake(&calls, accepted))
             .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            outbox.state.messages[1].status,
-            Status::Queued {
-                hold: Some(UNCERTAIN_HOLD.to_owned())
-            }
-        );
+        assert_eq!(outbox.state.messages[1].status, Status::Sending);
+        wait(&mut outbox, &bindings);
+        assert_eq!(outbox.state.messages[1].status, Status::Accepted);
 
         // Wrong evidence settles nothing.
         let accepted_outcome = || Resolution::Accepted(Some("receipt".into()));
@@ -1151,12 +1164,8 @@ mod tests {
                 .is_err()
         );
 
-        // The lane is free again, and nothing was resent for the settled message.
-        outbox
-            .schedule(&bindings, false, false, &[], fake(&calls, accepted))
-            .unwrap();
-        assert_eq!(outbox.state.messages[1].status, Status::Sending);
-        wait(&mut outbox, &bindings);
+        // Settling resent nothing: one attempt for the first, one for the second.
+        assert_eq!(outbox.state.messages[0].attempts.len(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -1206,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn uncertain_mail_of_this_launch_still_holds_newer_mail() {
+    fn uncertain_mail_of_this_launch_does_not_hold_newer_mail() {
         let dir = tempfile::tempdir().unwrap();
         let mut outbox = Outbox::open(&dir.path().join("outbox.json"), 3, 2, 1).unwrap();
         let current = Binding {
@@ -1233,14 +1242,67 @@ mod tests {
         outbox
             .schedule(&bindings, false, false, &[], fake(&calls, accepted))
             .unwrap();
+        wait(&mut outbox, &bindings);
         assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
-        assert_eq!(
-            outbox.state.messages[1].status,
-            Status::Queued {
-                hold: Some(UNCERTAIN_HOLD.to_owned())
-            }
-        );
+        assert_eq!(outbox.state.messages[1].status, Status::Accepted);
+        assert_eq!(outbox.state.messages[0].attempts.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Mail an older build held behind an uncertain message was never sent, so
+    /// it is released and sent instead of staying held forever.
+    #[test]
+    fn mail_held_behind_an_uncertain_message_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut outbox = Outbox::open(&dir.path().join("outbox.json"), 3, 2, 1).unwrap();
+        let b = binding("a", 1);
+        let bindings = HashMap::from([("a".to_owned(), b.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let id = outbox
+            .enqueue("s".into(), b.clone(), "held".into())
+            .unwrap()
+            .id;
+        let mut state = outbox.state.clone();
+        state.messages[0].status = Status::Queued {
+            hold: Some(UNCERTAIN_HOLD.to_owned()),
+        };
+        outbox.update(state, &id).unwrap();
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&calls, accepted))
+            .unwrap();
+        assert_eq!(outbox.state.messages[0].status, Status::Sending);
+        wait(&mut outbox, &bindings);
+        assert_eq!(outbox.state.messages[0].status, Status::Accepted);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn uncertain_mail_does_not_hold_another_rooms_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut outbox = Outbox::open(&dir.path().join("outbox.json"), 4, 4, 2).unwrap();
+        let a = binding("a", 1);
+        let b = binding("b", 1);
+        let bindings = HashMap::from([("a".to_owned(), a.clone()), ("b".to_owned(), b.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        outbox.enqueue("s".into(), a, "lost".into()).unwrap();
+        outbox
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &[],
+                fake(&calls, || AdapterResult::Uncertain),
+            )
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        outbox.enqueue("s".into(), b, "other".into()).unwrap();
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&calls, accepted))
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
+        assert_eq!(outbox.state.messages[1].status, Status::Accepted);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1340,8 +1402,8 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        // An adapter that panics leaves the message uncertain, and an uncertain
-        // message holds back the mail behind it with a visible reason.
+        // An adapter that panics leaves the message uncertain, and the mail
+        // behind it still goes out.
         outbox
             .enqueue("s".into(), current.clone(), "second".into())
             .unwrap();
@@ -1360,12 +1422,10 @@ mod tests {
         outbox
             .schedule(&bindings, false, false, &[], fake(&calls, accepted))
             .unwrap();
-        assert_eq!(
-            outbox.state.messages[2].status,
-            Status::Queued {
-                hold: Some(UNCERTAIN_HOLD.to_owned())
-            }
-        );
+        assert_eq!(outbox.state.messages[2].status, Status::Sending);
+        wait(&mut outbox, &bindings);
+        assert_eq!(outbox.state.messages[2].status, Status::Accepted);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -2452,18 +2512,8 @@ impl Outbox {
         // Their later mail is held, never sent ahead of an older hold, and
         // still gets an answer instead of waiting without one.
         let mut unready = HashSet::new();
-        // Rooms where an uncertain message keeps newer mail from going out.
-        let mut stuck = HashSet::new();
         for mut message in self.state.messages.clone() {
             let room = &message.destination;
-            if stuck.contains(room) {
-                if matches!(&message.status, Status::Queued { hold: None })
-                    && bindings.get(room) == Some(&message.binding)
-                {
-                    self.set_hold(&message.id, UNCERTAIN_HOLD)?;
-                }
-                continue;
-            }
             if unready.contains(room) {
                 if matches!(&message.status, Status::Queued { hold: None })
                     && bindings.get(room) == Some(&message.binding)
@@ -2575,21 +2625,12 @@ impl Outbox {
                 }
                 // Held mail of an earlier launch does not stand in front of newer mail.
                 Status::Queued { hold: Some(reason) } if reason == STALE_HOLD => {}
-                // Nothing is sent past a message that may already have arrived:
-                // its newer mail is held with a visible reason, not left queued.
-                // An uncertain message of an earlier launch can never be settled
-                // by this one, so it does not stand in front of newer mail; it
-                // stays uncertain and is never resent.
-                Status::Uncertain => {
-                    let this_launch = bindings.get(room).is_some_and(|current| {
-                        current == &message.binding
-                            || same_launch_placeholder(&message.binding, current)
-                    });
-                    if this_launch {
-                        blocked.insert(room.clone());
-                        stuck.insert(room.clone());
-                    }
-                }
+                // A message that may already have arrived is never resent, and
+                // it does not hold the room's later mail: nothing can settle it
+                // within a launch, so blocking would strand the room until a
+                // relaunch. A later message may arrive without it; the
+                // uncertain row stays visible.
+                Status::Uncertain => {}
                 Status::Queued { .. } | Status::Sending => {
                     blocked.insert(room.clone());
                 }

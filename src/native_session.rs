@@ -9,8 +9,9 @@ use crate::native_outbox::{Binding, Message, Status};
 pub(crate) const STALE_HOLD: &str = "sent for an earlier launch of this room; not delivered";
 /// The hold reason a Claude room's mail carries until the room-side mod exists.
 pub(crate) const CLAUDE_HOLD: &str = "no Claude mod connected";
-/// The hold on mail behind a message that may already have arrived. Nothing is
-/// sent past an uncertain message until it is settled.
+/// The hold an older build wrote on mail behind a message that may already
+/// have arrived. Nothing is sent past an uncertain message, so that mail was
+/// never sent; this build releases it instead of stalling the room.
 pub(crate) const UNCERTAIN_HOLD: &str =
     "an earlier message to this room is uncertain; nothing new is sent";
 /// The hold on a message saved while its room reported itself between

@@ -1754,7 +1754,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_reply_with_no_trace_stays_uncertain_and_later_mail_waits_visibly() {
+    fn a_lost_reply_with_no_trace_stays_uncertain_and_later_mail_is_still_delivered() {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let a = launch(root.path(), cwd.path(), "a", 1, 1);
@@ -1775,17 +1775,20 @@ mod tests {
         router
             .send(&mut mailroom, "Room B", 0, "behind it", recorder(&log))
             .unwrap();
-        pump_for(&mut router, &mut mailroom, false, false, 600);
-        // Nothing was resent, and the message behind it was not sent past it;
-        // it says why it is waiting instead of looking merely queued.
-        assert!(texts(&a).is_empty());
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            log.borrow().len() == 2
+        });
+        // The message that may already have arrived was not resent, and it did
+        // not hold the mail behind it.
+        assert_eq!(texts(&a), ["[whisper from Room B] behind it"]);
+        assert_eq!(log.borrow()[1].1, NativeReply::Accepted);
         let view = mailroom.summary();
         assert!(
             view.contains("UNCERTAIN: may have been accepted; it will not be resent"),
             "{view}"
         );
         assert!(
-            view.contains(crate::native_session::UNCERTAIN_HOLD),
+            !view.contains(crate::native_session::UNCERTAIN_HOLD),
             "{view}"
         );
     }
