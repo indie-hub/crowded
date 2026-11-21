@@ -1951,8 +1951,9 @@ pub(crate) fn relaunch_claude_room(
 }
 
 /// Clears one owned OpenCode room onto a new session on the same server and
-/// moves the router with it. Mail held for the previous launch stays held;
-/// only mail held pending a clear adopts the new session.
+/// moves the router with it. Mail held for the previous launch stays held and
+/// is never re-sent to the new session; only mail held pending a clear adopts
+/// it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn relaunch_opencode_room(
     index: usize,
@@ -1972,36 +1973,34 @@ pub(crate) fn relaunch_opencode_room(
     let binding = panes[index]
         .clear_opencode_session(size, generation)
         .map_err(|error| launch_failure(&title, index + 1, error))?;
-    if let Some(router) = router {
-        let server = router.server_for(index).ok_or_else(|| {
-            launch_failure(
-                &title,
-                index + 1,
-                io::Error::other("that room has no owned OpenCode server"),
-            )
-        })?;
-        // The pane and its server already run the new session here. If the
-        // router cannot follow, mail is held rather than pasted, but the room
-        // is out of step until it is cleared again: say so instead of hiding it.
-        router
-            .rebind_room(crate::native_route::RoomEntry {
-                index,
-                title: title.clone(),
-                binding: binding.clone(),
-                backend: crate::native_route::Backend::OpenCode(server),
-            })
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "{title}: the room now runs session {} but the router could not follow it ({error}); the mail is held, so run `control {} clear` again",
-                    binding.session,
-                    index + 1
-                ))
-            })?;
-    }
+    // The pane already runs a new terminal on the new session, so its gate,
+    // timestamp and pulse must describe that terminal whatever the router does.
     delivery_gates[index] = DeliveryGate::new(false);
     last_output[index] = None;
     spawned_at[index] = now;
     room_pulses[index] = Some(PulseSample::now(PulseState::Starting, None));
+    if let Some(router) = router {
+        // The pane and its server already run the new session. If the router
+        // cannot follow, mail is held rather than pasted, but the room is out of
+        // step until it is cleared again: say so instead of hiding it.
+        let outcome = match router.server_for(index) {
+            Some(server) => router.rebind_room(crate::native_route::RoomEntry {
+                index,
+                title: title.clone(),
+                binding: binding.clone(),
+                backend: crate::native_route::Backend::OpenCode(server),
+            }),
+            None => Err(io::Error::other("that room has no owned OpenCode server")),
+        };
+        if let Err(error) = outcome {
+            return Err(io::Error::other(format!(
+                "{title}: the room now runs session {} but the router could not follow it ({error}); the mail is held, so run `control {} clear` again",
+                binding.session,
+                index + 1
+            ))
+            .into());
+        }
+    }
     Ok(())
 }
 
@@ -6722,6 +6721,113 @@ mod tests {
             .unwrap_or_default();
         assert!(notice.contains("clear context"), "{notice}");
         assert!(rig.router.is_none());
+    }
+
+    /// A router that cannot follow a cleared room still leaves the room's own
+    /// state describing the terminal that started, and says so.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_clear_whose_router_cannot_follow_keeps_the_new_terminal_state() {
+        use crate::native_launch::{self, tests::fake_room};
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let fake = fake_room(root.path(), "control-fail", "v2.2.5");
+        let size = PtySize {
+            rows: 6,
+            cols: 60,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let spec = report_test_spec(&fake.program, cwd.path(), "Opencode · 1", true);
+        let launch_generation =
+            native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+                .next()
+                .unwrap();
+        let native = native_launch::start(native_launch::NativeLaunch::direct(
+            fake.program.as_os_str(),
+            cwd.path(),
+            "1.1".to_owned(),
+            launch_generation,
+            &[],
+        ))
+        .unwrap();
+        let router = NativeRouter::start(
+            root.path().join("outbox.json"),
+            vec![crate::native_route::RoomEntry {
+                index: 0,
+                title: spec.title.clone(),
+                binding: native.binding().clone(),
+                backend: crate::native_route::Backend::OpenCode(native.server()),
+            }],
+        )
+        .unwrap();
+        let pane =
+            Pane::spawn_with_native(spec, size, pane::GuestEnvironment::new([]), Some(native))
+                .unwrap();
+        let mut rig = ReportDispatch::new(vec![pane], Some(router));
+        let old = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        // No server the router can hand to a rebind: the clear itself still
+        // works, because the pane owns the server.
+        rig.router
+            .as_mut()
+            .unwrap()
+            .unbind_room(0, "test: no server".to_owned())
+            .unwrap();
+        let now = Instant::now();
+
+        let error = relaunch_opencode_room(
+            0,
+            size,
+            &mut rig.panes,
+            rig.router.as_mut(),
+            &mut rig.gates,
+            &mut rig.last_output,
+            &mut rig.spawned_at,
+            &mut rig.pulses,
+            now,
+        )
+        .unwrap_err();
+        let said = error.to_string();
+        assert!(said.contains("clear"), "{said}");
+        assert!(said.contains("held"), "{said}");
+        // The terminal that started is the new one, and the room says so.
+        let session = said
+            .split("runs session ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .expect("the error names the new session")
+            .to_owned();
+        assert_ne!(session, old.session);
+        let argv = fake.dir.join("tui_argv");
+        let end = Instant::now() + Duration::from_secs(5);
+        let mut seen = String::new();
+        while Instant::now() < end {
+            seen = std::fs::read_to_string(&argv).unwrap_or_default();
+            if seen.contains(&session) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(seen.contains(&session), "{seen}");
+        assert!(matches!(rig.gates[0], DeliveryGate::Ready));
+        assert!(rig.last_output[0].is_none());
+        assert_eq!(rig.spawned_at[0], now);
+        assert_eq!(
+            rig.pulses[0].as_ref().map(|pulse| pulse.state),
+            Some(PulseState::Starting)
+        );
+        // The router cannot reach the new session: the room has no binding and
+        // the server received nothing.
+        assert!(rig.router.as_ref().unwrap().binding_for(0).is_none());
+        let sent =
+            rig.router
+                .as_mut()
+                .unwrap()
+                .send(&mut rig.mailroom, "Sender", 0, "after-clear", None);
+        assert!(sent.is_err(), "a room with no binding must refuse mail");
+        assert!(fake.state.received.lock().unwrap().is_empty());
+        fake.shutdown();
     }
 
     #[cfg(all(test, unix))]
