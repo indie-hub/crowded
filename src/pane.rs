@@ -2372,9 +2372,14 @@ impl Pane {
     }
 
     /// Clears an owned OpenCode room: the durable fresh-state marker, a new
-    /// session on the same server, then a TUI respawn that attaches to it. The
-    /// server is moved, never dropped, and nothing changes until each step
-    /// succeeds.
+    /// session on the same server, then a TUI respawn that attaches to it.
+    ///
+    /// Each failure path is defined: a marker that cannot be saved or a session
+    /// that cannot be created changes nothing; a respawn that fails puts the
+    /// old binding back on the server and the room, so the old terminal, its
+    /// arguments and `binding()` are as before. The marker deliberately stays
+    /// written once set, even if the clear fails later: a stale session id must
+    /// never be resumed.
     #[allow(dead_code)]
     pub(crate) fn clear_opencode_session(
         &mut self,
@@ -2392,19 +2397,38 @@ impl Pane {
         let vendor = controls::cli_vendor(&self.spec)?;
         let cwd = working_directory(self.spec.cwd.as_deref())?;
         session_state::clear_room(vendor.key(), &cwd, &self.spec.title)?;
-        let binding = self
+        let native = self
             .native
             .as_mut()
-            .expect("open code native room has its server")
-            .clear_session(generation)?;
-        // Build the replacement while this pane still owns everything, so a
-        // failure leaves the old child, server and binding untouched.
-        let replacement = Self::spawn_attached(
+            .expect("open code native room has its server");
+        let previous = native.binding().clone();
+        let binding = native.clear_session(generation)?;
+        // Build the replacement before giving up the server, then roll the
+        // session back if the terminal cannot be restarted.
+        let replacement = match Self::spawn_attached(
             &self.spec,
             size,
             self.environment.clone(),
             self.native.as_ref(),
-        )?;
+        ) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                let restored = self
+                    .native
+                    .as_mut()
+                    .expect("open code native room has its server")
+                    .restore_binding(&previous);
+                return match restored {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(io::Error::other(format!(
+                        "the new session was created but the terminal could not be restarted \
+                         ({error}), and restoring the previous session also failed \
+                         ({rollback}): this room needs a restart"
+                    ))
+                    .into()),
+                };
+            }
+        };
         let native = self.native.take();
         self.cleanup();
         *self = replacement;
@@ -2756,6 +2780,7 @@ mod tests {
             &["--model", "provider/alpha"],
             "token-fail",
         );
+        let title = pane.spec.title.clone();
         let old = pane.native.as_ref().unwrap().binding().clone();
         let old_args = pane.spec.args.clone();
         fake.shutdown();
@@ -2766,6 +2791,66 @@ mod tests {
         assert!(error.to_string().contains("session"), "{error}");
         assert_eq!(pane.spec.args, old_args);
         assert_eq!(pane.native.as_ref().unwrap().binding(), &old);
+        // The marker was written first and stays: a stale id must never be
+        // resumed, even though no new session was created.
+        assert_eq!(
+            session_state::lookup("opencode", cwd.path(), &title).as_deref(),
+            Some(session_state::FRESH_STATE_MARKER)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_terminal_restart_puts_the_old_session_back() {
+        let _state = session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (mut pane, fake) = spawn_native_pane(
+            root.path(),
+            cwd.path(),
+            "clear-rollback",
+            &["--model", "provider/alpha"],
+            "token-rollback",
+        );
+        let title = pane.spec.title.clone();
+        let old = pane.native.as_ref().unwrap().binding().clone();
+        let old_args = pane.native.as_ref().unwrap().tui_arguments();
+        let created = fake
+            .state
+            .sessions
+            .load(std::sync::atomic::Ordering::SeqCst);
+        // Only the respawn resolves the program, so this fails there and not
+        // before the session has already been created and bound.
+        pane.spec.program = OsString::from("/nonexistent/crowded-clear/opencode");
+
+        let error = pane
+            .clear_opencode_session(native_test_size(), 9)
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        // The clear got as far as creating a second session, then rolled back.
+        assert_eq!(
+            fake.state
+                .sessions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            created + 1
+        );
+        assert_eq!(
+            session_state::lookup("opencode", cwd.path(), &title).as_deref(),
+            Some(session_state::FRESH_STATE_MARKER)
+        );
+        // The room and the server agree on the old session again.
+        let native = pane.native.as_ref().unwrap();
+        assert_eq!(native.binding(), &old);
+        assert_eq!(native.tui_arguments(), old_args);
+        let server = native.server();
+        let accepted = server
+            .queue_async(&old, format!("msg_{}", "e".repeat(64)), "old".into())
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(accepted, crate::opencode_native::Delivery::NotSent);
+        // The old terminal was never replaced, so it is still running.
+        assert!(!pane.child.poll_exit().unwrap());
+        fake.shutdown();
     }
 
     #[cfg(unix)]

@@ -266,6 +266,15 @@ impl NativeRoom {
         &self.binding
     }
 
+    /// Puts the room back on a binding it held before a failed clear, so the
+    /// server, the room and its terminal arguments name the same session again.
+    pub(crate) fn restore_binding(&mut self, binding: &Binding) -> io::Result<()> {
+        self.server.get().adopt(binding)?;
+        self.binding = binding.clone();
+        self.handoff.session = binding.session.clone();
+        Ok(())
+    }
+
     /// Starts a new session on this room's owned server and moves the room to
     /// it: the same endpoint and server, a new generation and session, so the
     /// caller can respawn the TUI against [`Self::tui_arguments`].
