@@ -1958,7 +1958,7 @@ pub(crate) fn relaunch_opencode_room(
     index: usize,
     size: portable_pty::PtySize,
     panes: &mut [Pane],
-    mut router: Option<&mut NativeRouter>,
+    router: Option<&mut NativeRouter>,
     delivery_gates: &mut [DeliveryGate],
     last_output: &mut [Option<Instant>],
     spawned_at: &mut [Instant],
@@ -1972,7 +1972,7 @@ pub(crate) fn relaunch_opencode_room(
     let binding = panes[index]
         .clear_opencode_session(size, generation)
         .map_err(|error| launch_failure(&title, index + 1, error))?;
-    if let Some(router) = router.as_deref_mut() {
+    if let Some(router) = router {
         let server = router.server_for(index).ok_or_else(|| {
             launch_failure(
                 &title,
