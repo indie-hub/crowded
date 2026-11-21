@@ -1953,7 +1953,8 @@ pub(crate) fn relaunch_claude_room(
 /// Clears one owned OpenCode room onto a new session on the same server and
 /// moves the router with it. Mail held for the previous launch stays held and
 /// is never re-sent to the new session; only mail held pending a clear adopts
-/// it.
+/// it. The advice to clear again assumes the router still holds a binding for
+/// the room, which a failed rebind leaves but an unbound room does not.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn relaunch_opencode_room(
     index: usize,
@@ -6774,6 +6775,13 @@ mod tests {
             .unwrap()
             .unbind_room(0, "test: no server".to_owned())
             .unwrap();
+        // Seed state that the resets must actually change, so a missing reset
+        // cannot pass by matching the values it was given.
+        let stale = Instant::now() - Duration::from_secs(60);
+        rig.gates[0] = DeliveryGate::new(true);
+        rig.last_output[0] = Some(stale);
+        rig.spawned_at[0] = stale;
+        rig.pulses[0] = Some(PulseSample::now(PulseState::Working, None));
         let now = Instant::now();
 
         let error = relaunch_opencode_room(
