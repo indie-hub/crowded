@@ -2428,7 +2428,8 @@ impl Pane {
                     Err(rollback) => Err(io::Error::other(format!(
                         "the new session was created but the terminal could not be restarted \
                          ({error}), and restoring the previous session also failed \
-                         ({rollback}): this room needs a restart"
+                         ({rollback}): run the control clear command for this room again, \
+                         or restart Crowded"
                     ))
                     .into()),
                 };
