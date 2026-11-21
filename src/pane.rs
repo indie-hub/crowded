@@ -2366,7 +2366,6 @@ impl Pane {
 
     /// Whether this room runs on a Crowded-owned OpenCode server, so a clear
     /// can start a new session on it without relaunching the server.
-    #[allow(dead_code)]
     pub(crate) fn opencode_native(&self) -> bool {
         self.native.is_some() && owned_server_room(&self.spec)
     }
@@ -2380,7 +2379,6 @@ impl Pane {
     /// arguments and `binding()` are as before. The marker deliberately stays
     /// written once set, even if the clear fails later: a stale session id must
     /// never be resumed.
-    #[allow(dead_code)]
     pub(crate) fn clear_opencode_session(
         &mut self,
         size: PtySize,

@@ -1950,6 +1950,61 @@ pub(crate) fn relaunch_claude_room(
     Ok(())
 }
 
+/// Clears one owned OpenCode room onto a new session on the same server and
+/// moves the router with it. Mail held for the previous launch stays held;
+/// only mail held pending a clear adopts the new session.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn relaunch_opencode_room(
+    index: usize,
+    size: portable_pty::PtySize,
+    panes: &mut [Pane],
+    mut router: Option<&mut NativeRouter>,
+    delivery_gates: &mut [DeliveryGate],
+    last_output: &mut [Option<Instant>],
+    spawned_at: &mut [Instant],
+    room_pulses: &mut [Option<PulseSample>],
+    now: Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let title = panes[index].title().to_owned();
+    let generation =
+        pane::next_generation().map_err(|error| launch_failure(&title, index + 1, error))?;
+    // A failed clear changes nothing, so the room keeps its old session.
+    let binding = panes[index]
+        .clear_opencode_session(size, generation)
+        .map_err(|error| launch_failure(&title, index + 1, error))?;
+    if let Some(router) = router.as_deref_mut() {
+        let server = router.server_for(index).ok_or_else(|| {
+            launch_failure(
+                &title,
+                index + 1,
+                io::Error::other("that room has no owned OpenCode server"),
+            )
+        })?;
+        // The pane and its server already run the new session here. If the
+        // router cannot follow, mail is held rather than pasted, but the room
+        // is out of step until it is cleared again: say so instead of hiding it.
+        router
+            .rebind_room(crate::native_route::RoomEntry {
+                index,
+                title: title.clone(),
+                binding: binding.clone(),
+                backend: crate::native_route::Backend::OpenCode(server),
+            })
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "{title}: the room now runs session {} but the router could not follow it ({error}); the mail is held, so run `control {} clear` again",
+                    binding.session,
+                    index + 1
+                ))
+            })?;
+    }
+    delivery_gates[index] = DeliveryGate::new(false);
+    last_output[index] = None;
+    spawned_at[index] = now;
+    room_pulses[index] = Some(PulseSample::now(PulseState::Starting, None));
+    Ok(())
+}
+
 /// Revives one room after F5 or an offline Ctrl+R. A native Codex room comes
 /// back into its session; every other room respawns exactly as before.
 #[allow(clippy::too_many_arguments)]
@@ -3031,6 +3086,7 @@ where
                     };
                     let codex_native = panes[control.to].codex_native();
                     let claude_native = panes[control.to].claude_native();
+                    let opencode_native = panes[control.to].opencode_native();
                     let prompt = if codex_native {
                         house_rules(
                             control.to + 1,
@@ -3101,6 +3157,18 @@ where
                             now,
                         )
                         .map(|()| true),
+                        ControlAction::ClearContext if opencode_native => relaunch_opencode_room(
+                            control.to,
+                            size,
+                            panes,
+                            router.as_mut(),
+                            delivery_gates,
+                            last_output,
+                            spawned_at,
+                            room_pulses,
+                            now,
+                        )
+                        .map(|()| false),
                         ControlAction::ClearContext => {
                             panes[control.to].clear_context(size).map(|_| false)
                         }
@@ -6388,6 +6456,272 @@ mod tests {
             rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
             "ses-reported-9"
         );
+    }
+
+    /// Clearing an owned OpenCode room moves the pane and the router onto a new
+    /// session on the same server, and resets the delivery gate.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn clearing_an_opencode_native_room_rebinds_the_router_to_the_new_session() {
+        use crate::native_launch::{self, tests::fake_room};
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let fake = fake_room(root.path(), "clear", "v2.2.5");
+        let size = PtySize {
+            rows: 6,
+            cols: 60,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let spec = report_test_spec(&fake.program, cwd.path(), "Opencode · 1", true);
+        // Consume the launch generation a real startup would have taken, so the
+        // clear mints a strictly higher one.
+        let launch_generation =
+            native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+                .next()
+                .unwrap();
+        let native = native_launch::start(native_launch::NativeLaunch::direct(
+            fake.program.as_os_str(),
+            cwd.path(),
+            "1.1".to_owned(),
+            launch_generation,
+            &[],
+        ))
+        .unwrap();
+        let router = NativeRouter::start(
+            root.path().join("outbox.json"),
+            vec![crate::native_route::RoomEntry {
+                index: 0,
+                title: spec.title.clone(),
+                binding: native.binding().clone(),
+                backend: crate::native_route::Backend::OpenCode(native.server()),
+            }],
+        )
+        .unwrap();
+        let pane =
+            Pane::spawn_with_native(spec, size, pane::GuestEnvironment::new([]), Some(native))
+                .unwrap();
+        let mut rig = ReportDispatch::new(vec![pane], Some(router));
+        rig.gates[0] = DeliveryGate::MessageSent;
+        let old = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+
+        relaunch_opencode_room(
+            0,
+            size,
+            &mut rig.panes,
+            rig.router.as_mut(),
+            &mut rig.gates,
+            &mut rig.last_output,
+            &mut rig.spawned_at,
+            &mut rig.pulses,
+            Instant::now(),
+        )
+        .unwrap();
+
+        let new = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        assert_ne!(new.session, old.session);
+        assert!(new.generation > old.generation);
+        assert_eq!(new.room, old.room);
+        assert_eq!(new.endpoint, old.endpoint);
+        // The terminal the fake server received names the new session.
+        let argv = fake.dir.join("tui_argv");
+        let end = Instant::now() + Duration::from_secs(5);
+        let mut seen = String::new();
+        while Instant::now() < end {
+            seen = std::fs::read_to_string(&argv).unwrap_or_default();
+            if seen.contains(&new.session) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(seen.contains(&new.session), "{seen}");
+        assert!(matches!(rig.gates[0], DeliveryGate::Ready));
+        assert_eq!(
+            rig.pulses[0].as_ref().map(|pulse| pulse.state),
+            Some(PulseState::Starting)
+        );
+        fake.shutdown();
+    }
+
+    /// A clear that cannot create a session leaves the router on the old
+    /// binding and reports the failure.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn a_failed_opencode_clear_leaves_the_router_on_the_old_session() {
+        use crate::native_launch::{self, tests::fake_room};
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let fake = fake_room(root.path(), "clear-fail", "v2.2.5");
+        let size = PtySize {
+            rows: 6,
+            cols: 60,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let spec = report_test_spec(&fake.program, cwd.path(), "Opencode · 1", true);
+        // Consume the launch generation a real startup would have taken, so the
+        // clear mints a strictly higher one.
+        let launch_generation =
+            native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+                .next()
+                .unwrap();
+        let native = native_launch::start(native_launch::NativeLaunch::direct(
+            fake.program.as_os_str(),
+            cwd.path(),
+            "1.1".to_owned(),
+            launch_generation,
+            &[],
+        ))
+        .unwrap();
+        let router = NativeRouter::start(
+            root.path().join("outbox.json"),
+            vec![crate::native_route::RoomEntry {
+                index: 0,
+                title: spec.title.clone(),
+                binding: native.binding().clone(),
+                backend: crate::native_route::Backend::OpenCode(native.server()),
+            }],
+        )
+        .unwrap();
+        let pane =
+            Pane::spawn_with_native(spec, size, pane::GuestEnvironment::new([]), Some(native))
+                .unwrap();
+        let mut rig = ReportDispatch::new(vec![pane], Some(router));
+        let old = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        fake.shutdown();
+
+        let error = relaunch_opencode_room(
+            0,
+            size,
+            &mut rig.panes,
+            rig.router.as_mut(),
+            &mut rig.gates,
+            &mut rig.last_output,
+            &mut rig.spawned_at,
+            &mut rig.pulses,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        let kept = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        assert_eq!(kept, old);
+    }
+
+    /// The control arm routes ClearContext for an owned OpenCode room to the
+    /// clear path instead of the native refusal.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn plain_clear_control_reaches_the_opencode_clear_path() {
+        use crate::doorbell::{DoorbellControl, DoorbellEvent};
+        use crate::native_launch::{self, tests::fake_room};
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let fake = fake_room(root.path(), "control", "v2.2.5");
+        let size = PtySize {
+            rows: 6,
+            cols: 60,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let spec = report_test_spec(&fake.program, cwd.path(), "Opencode · 1", true);
+        // Consume the launch generation a real startup would have taken, so the
+        // clear mints a strictly higher one.
+        let launch_generation =
+            native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+                .next()
+                .unwrap();
+        let native = native_launch::start(native_launch::NativeLaunch::direct(
+            fake.program.as_os_str(),
+            cwd.path(),
+            "1.1".to_owned(),
+            launch_generation,
+            &[],
+        ))
+        .unwrap();
+        let router = NativeRouter::start(
+            root.path().join("outbox.json"),
+            vec![crate::native_route::RoomEntry {
+                index: 0,
+                title: spec.title.clone(),
+                binding: native.binding().clone(),
+                backend: crate::native_route::Backend::OpenCode(native.server()),
+            }],
+        )
+        .unwrap();
+        let pane =
+            Pane::spawn_with_native(spec, size, pane::GuestEnvironment::new([]), Some(native))
+                .unwrap();
+        let mut rig = ReportDispatch::new(vec![pane], Some(router));
+        rig.sizes = vec![size];
+        let old = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        let (reply, _dropped) = std::sync::mpsc::sync_channel(1);
+        rig.doorbell
+            .events
+            .push_back(DoorbellEvent::Control(DoorbellControl {
+                from: 0,
+                to: 0,
+                action: crate::doorbell::ControlAction::ClearContext,
+                reply,
+            }));
+        rig.dispatch_keep();
+        let notice = rig
+            .notice
+            .entries
+            .last()
+            .map(|entry| entry.text.clone())
+            .unwrap_or_default();
+        assert!(!notice.contains("cannot be restarted"), "{notice}");
+        let new = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        assert!(new.generation > old.generation, "{notice}");
+        assert_ne!(new.session, old.session);
+        fake.shutdown();
+    }
+
+    /// A plain room's clear still goes through the ordinary path, not the
+    /// OpenCode one: the arm only matches owned-server rooms.
+    #[cfg(all(test, unix))]
+    #[test]
+    fn clear_control_on_a_plain_room_uses_the_ordinary_path() {
+        use crate::doorbell::{DoorbellControl, DoorbellEvent};
+        let _state = crate::pane::session_state::StateRootGuard::isolated();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let stub = report_test_stub(root.path(), "sh", &root.path().join("calls"));
+        let size = PtySize {
+            rows: 6,
+            cols: 60,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pane = report_test_pane(
+            report_test_spec(&stub, cwd.path(), "Plain · 1", false),
+            None,
+            None,
+        );
+        let mut rig = ReportDispatch::new(vec![pane], None);
+        rig.sizes = vec![size];
+        assert!(!rig.panes[0].opencode_native());
+        let (reply, _dropped) = std::sync::mpsc::sync_channel(1);
+        rig.doorbell
+            .events
+            .push_back(DoorbellEvent::Control(DoorbellControl {
+                from: 0,
+                to: 0,
+                action: crate::doorbell::ControlAction::ClearContext,
+                reply,
+            }));
+        rig.dispatch_keep();
+        let notice = rig
+            .notice
+            .entries
+            .last()
+            .map(|entry| entry.text.clone())
+            .unwrap_or_default();
+        assert!(notice.contains("clear context"), "{notice}");
+        assert!(rig.router.is_none());
     }
 
     #[cfg(all(test, unix))]
