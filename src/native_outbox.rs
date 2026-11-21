@@ -1161,6 +1161,89 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_mail_of_an_earlier_launch_does_not_hold_this_launchs_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut outbox = Outbox::open(&dir.path().join("outbox.json"), 3, 2, 1).unwrap();
+        let old_launch = Binding {
+            session: "gone".into(),
+            ..binding("a", 1)
+        };
+        let current = Binding {
+            session: "live".into(),
+            ..binding("a", 2)
+        };
+        let bindings = HashMap::from([("a".to_owned(), current.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        // A persisted message of an earlier launch that may already have arrived.
+        let old = outbox
+            .enqueue("s".into(), old_launch, "old".into())
+            .unwrap()
+            .id;
+        let mut state = outbox.state.clone();
+        state.messages[0].status = Status::Uncertain;
+        outbox.update(state, &old).unwrap();
+        // This launch's startup intro, then F4.
+        outbox
+            .enqueue("s".into(), current.clone(), "intro".into())
+            .unwrap();
+        outbox
+            .enqueue("s".into(), current.clone(), "f4".into())
+            .unwrap();
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&calls, accepted))
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
+        assert_eq!(outbox.state.messages[1].status, Status::Accepted);
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&calls, accepted))
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(outbox.state.messages[2].status, Status::Accepted);
+        // The old message stays uncertain and is never resent.
+        assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn uncertain_mail_of_this_launch_still_holds_newer_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut outbox = Outbox::open(&dir.path().join("outbox.json"), 3, 2, 1).unwrap();
+        let current = Binding {
+            session: "live".into(),
+            ..binding("a", 2)
+        };
+        let bindings = HashMap::from([("a".to_owned(), current.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        outbox
+            .enqueue("s".into(), current.clone(), "uncertain".into())
+            .unwrap();
+        outbox
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &[],
+                fake(&calls, || AdapterResult::Uncertain),
+            )
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
+        outbox.enqueue("s".into(), current, "later".into()).unwrap();
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&calls, accepted))
+            .unwrap();
+        assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
+        assert_eq!(
+            outbox.state.messages[1].status,
+            Status::Queued {
+                hold: Some(UNCERTAIN_HOLD.to_owned())
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn acknowledged_history_is_bounded_and_receipts_are_bound() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outbox.json");
@@ -2494,9 +2577,18 @@ impl Outbox {
                 Status::Queued { hold: Some(reason) } if reason == STALE_HOLD => {}
                 // Nothing is sent past a message that may already have arrived:
                 // its newer mail is held with a visible reason, not left queued.
+                // An uncertain message of an earlier launch can never be settled
+                // by this one, so it does not stand in front of newer mail; it
+                // stays uncertain and is never resent.
                 Status::Uncertain => {
-                    blocked.insert(room.clone());
-                    stuck.insert(room.clone());
+                    let this_launch = bindings.get(room).is_some_and(|current| {
+                        current == &message.binding
+                            || same_launch_placeholder(&message.binding, current)
+                    });
+                    if this_launch {
+                        blocked.insert(room.clone());
+                        stuck.insert(room.clone());
+                    }
                 }
                 Status::Queued { .. } | Status::Sending => {
                     blocked.insert(room.clone());
