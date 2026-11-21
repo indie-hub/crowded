@@ -145,8 +145,16 @@ impl ClaudeInbox {
             .ok_or_else(|| io::Error::other("the Claude inbox file has no directory"))?;
         create_private_directory(parent)?;
         self.write_connection(&path, room)?;
+        let bootstrap = bootstrap_file(cwd, room)?;
+        if let Err(error) = self.write_connection(&bootstrap, room) {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
         if let Ok(mut file) = self.file.lock() {
             *file = Some(path);
+        }
+        if let Ok(mut stored) = self.bootstrap.lock() {
+            *stored = Some(bootstrap);
         }
         Ok(())
     }
@@ -169,8 +177,8 @@ impl ClaudeInbox {
     }
 
     /// Binds a reported session to an inbox already connected via its per-room
-    /// bootstrap file. The mod's receiver stays bound while the bootstrap file
-    /// is replaced by the session-specific connection file.
+    /// bootstrap file. The mod's receiver stays bound and the bootstrap remains
+    /// the room's fallback until the next relaunch.
     pub(crate) fn adopt_reported_session(
         &self,
         cwd: &Path,
@@ -191,11 +199,6 @@ impl ClaudeInbox {
             {
                 let _ = fs::remove_file(previous);
             }
-        }
-        if let Ok(mut bootstrap) = self.bootstrap.lock()
-            && let Some(path) = bootstrap.take()
-        {
-            let _ = fs::remove_file(path);
         }
         Ok(())
     }
@@ -1120,7 +1123,7 @@ mod tests {
             .unwrap();
         let first_file = connection_file(cwd.path(), first).unwrap();
         assert!(first_file.exists(), "first session file must exist");
-        assert!(!bootstrap.exists(), "bootstrap must be removed on report");
+        assert!(bootstrap.exists(), "bootstrap must remain after a report");
 
         inbox
             .adopt_reported_session(cwd.path(), 1, second, 3)
@@ -1130,6 +1133,33 @@ mod tests {
         assert!(
             !first_file.exists(),
             "previous session file must be removed on second report"
+        );
+    }
+
+    /// A resumed launch leaves both its session file and its per-room fallback;
+    /// a bootstrap that cannot be written leaves neither and fails the launch.
+    #[test]
+    fn attach_writes_a_bootstrap_and_cleans_up_on_failure() {
+        let inbox = inbox(Duration::from_millis(200));
+        let cwd = tempfile::tempdir().unwrap();
+        let session = "44444444-4444-4444-8444-444444444444";
+        let session_file = connection_file(cwd.path(), session).unwrap();
+        let boot = bootstrap_file(cwd.path(), 1).unwrap();
+
+        inbox.attach(cwd.path(), 1, session, 1).unwrap();
+        assert!(session_file.exists(), "session file must exist");
+        assert!(boot.exists(), "bootstrap must exist for a resumed launch");
+
+        fs::remove_file(&session_file).unwrap();
+        fs::remove_file(&boot).unwrap();
+        fs::create_dir_all(&boot).unwrap();
+        assert!(
+            inbox.attach(cwd.path(), 1, session, 2).is_err(),
+            "a bootstrap that cannot be written must fail the launch"
+        );
+        assert!(
+            !session_file.exists(),
+            "session file must be removed on failure"
         );
     }
 

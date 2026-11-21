@@ -3045,16 +3045,13 @@ fn two_fresh_claude_rooms_in_one_cwd_have_distinct_bootstrap_inboxes() {
         "each room must resolve to its own endpoint"
     );
 
-    // Reporting room 1's session replaces only room 1's bootstrap with its
-    // session file; room 2 remains on its own bootstrap.
+    // Reporting room 1's session leaves room 1's bootstrap in place alongside
+    // its session file; room 2 remains on its own bootstrap.
     session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
     router
         .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), MINTED_A, 2)
         .unwrap();
-    assert!(
-        !boot1.exists(),
-        "room 1 bootstrap must be removed on report"
-    );
+    assert!(boot1.exists(), "room 1 bootstrap must remain on report");
     assert!(
         crate::claude_inbox::connection_file(cwd.path(), MINTED_A)
             .unwrap()
@@ -7143,17 +7140,14 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         "room 2 must not receive room 1 mail: {log2}"
     );
 
-    // Report room 1's session: its bootstrap becomes its session file; room 2
-    // keeps its own bootstrap and endpoint unchanged.
+    // Report room 1's session: its session file is added beside its bootstrap;
+    // room 2 keeps its own bootstrap and endpoint unchanged.
     session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
     let generation = next_generation().unwrap();
     router
         .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), MINTED_A, generation)
         .unwrap();
-    assert!(
-        !boot1.exists(),
-        "room 1 bootstrap must be removed on report"
-    );
+    assert!(boot1.exists(), "room 1 bootstrap must remain on report");
     assert!(
         crate::claude_inbox::connection_file(cwd.path(), MINTED_A)
             .unwrap()
@@ -7186,6 +7180,123 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
     child2.kill().ok();
     let _ = child1.wait();
     let _ = child2.wait();
+}
+
+/// A resumed Claude room whose bound id is not the id Claude actually runs
+/// still finds its own per-room bootstrap and receives mail.
+#[cfg(unix)]
+#[test]
+fn a_resumed_claude_room_with_a_phantom_bound_id_connects_via_its_bootstrap() {
+    use std::process::{Command, Stdio};
+    if Command::new("node").arg("--version").output().is_err() {
+        eprintln!("SKIP: node is not on PATH, cannot run the embedded mod");
+        return;
+    }
+    let _state = session_state::StateRootGuard::isolated();
+    let _claude_config = ClaudeConfigDirGuard::new();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+
+    session_state::upsert_reported("claude", cwd.path(), "Claude · 2", MINTED_A).unwrap();
+    materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
+    let mut specs = vec![
+        claude_native_spec_for(&stub, cwd.path(), "Claude · 1"),
+        claude_native_spec_for(&stub, cwd.path(), "Claude · 2"),
+    ];
+    let (mut starts, notices) = start_claude_sessions(&mut specs);
+    assert!(notices.is_empty(), "{notices:?}");
+    assert!(
+        matches!(&starts[1], Some(ClaudeStart::Resume(id)) if id == MINTED_A),
+        "{:?}",
+        starts[1]
+    );
+
+    let mut router = crate::native_route::NativeRouter::start(
+        session_state::state_directory().join("native-outbox.json"),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(
+        bind_claude_rooms(&mut router, &specs, &mut starts)
+            .unwrap()
+            .is_empty()
+    );
+    let boot2 = crate::claude_inbox::bootstrap_file(cwd.path(), 2).unwrap();
+    assert!(
+        boot2.exists(),
+        "a resumed room must keep its per-room bootstrap"
+    );
+
+    let mod_path = std::env::current_dir()
+        .unwrap()
+        .join("src/claude_mod/hooks/deliver.mjs");
+    let driver = root.path().join("drive-mod.mjs");
+    fs::write(
+        &driver,
+        r#"import { appendFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
+const [modPath, cwd, session, marker] = process.argv.slice(2);
+const room = process.env.CROWDED_ROOM;
+delete globalThis.process;
+const { register } = await import(pathToFileURL(modPath).href);
+const log = (t) => appendFileSync(marker, `${t}\n`);
+const $ = {
+  fs: { exists: async (p) => readFile(p).then(() => true, () => false), read: (p) => readFile(p, "utf8") },
+  session: { id: async () => session },
+  env: { get: async (name) => (name === "CROWDED_ROOM" ? room : undefined) },
+  http: { fetch: async (url, init) => fetch(url, init).then(async (r) => ({ ok: r.ok, status: r.status, text: await r.text() })) },
+  clock: { every: (ms, cb) => setInterval(() => { void cb(); }, ms) },
+  ui: { status: (t) => log(`STATUS ${t}`) },
+  prompt: { submit: async (input) => { log(`SUBMITTED ${input.text}`); return {}; } },
+};
+let handler = null;
+register((event, fn) => { handler = fn; });
+await handler($, { cwd, isInteractive: true }, async (e) => e);
+"#,
+    )
+    .unwrap();
+    let marker = root.path().join("room2.log");
+    // The live id differs from the bound id; no <MINTED_B>.json is written.
+    let mut child = Command::new("node")
+        .arg(&driver)
+        .arg(&mod_path)
+        .arg(cwd.path())
+        .arg(MINTED_B)
+        .arg(&marker)
+        .env("CROWDED_ROOM", "2")
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("node runs room 2 mod");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let connected = fs::read_to_string(&marker)
+            .unwrap_or_default()
+            .contains("STATUS Crowded inbox connected");
+        if connected {
+            break;
+        }
+        let log = fs::read_to_string(&marker).unwrap_or_default();
+        assert!(Instant::now() < deadline, "the mod never connected: {log}");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let mut mailroom = Mailroom::new(50);
+    router
+        .send(&mut mailroom, "Sender", 1, "after-resume", None)
+        .unwrap();
+    pump_router(&mut router, &mut mailroom, |shown| {
+        shown.matches("ACCEPTED by Claude (submitted;").count() == 1
+    });
+    let log = fs::read_to_string(&marker).unwrap();
+    assert!(
+        log.contains("SUBMITTED [whisper from Sender] after-resume"),
+        "{log}"
+    );
+
+    child.kill().ok();
+    let _ = child.wait();
 }
 
 /// A stale session file for another room must not be used: in a room-2
