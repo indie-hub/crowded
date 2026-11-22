@@ -16,7 +16,7 @@ use std::{
 };
 
 use crate::{
-    claude_inbox::ClaudeInbox,
+    claude_inbox::{ClaudeInbox, LateReceipt},
     codex_native::{CodexAdapter, Room},
     mailroom::Mailroom,
     native_launch::Reaped,
@@ -24,6 +24,7 @@ use crate::{
         Adapter, AdapterResult, BackgroundOutbox, Binding, Command, Event, Message, Resolution,
         Status, TaggedEvent,
     },
+    native_session::{is_retryable_hold, same_launch_placeholder},
     opencode_native::{Delivery, Server},
     opencode_outbox::{OpenCodeAdapter, native_id},
     pane::{session_state::create_private_directory, whisper_note},
@@ -932,98 +933,145 @@ impl NativeRouter {
         }
         self.resolve_pending(now);
         self.reconcile_uncertain(now);
-        self.settle_claude_late();
+        notices.extend(self.settle_claude_late());
         notices
     }
 
-    /// Forwards authenticated Claude receipts that arrived after their waiter
-    /// timed out to the outbox, where `Command::Resolve` settles the matching
-    /// Uncertain row exactly once. Late evidence is retained, not drained:
-    /// an event leaves `pending_late` only when the fresh snapshot shows its
-    /// row Accepted/Failed or conclusively unmatched (binding or hash
-    /// mismatch). A missing row, a row still Sending/Queued, a resolve
-    /// already in flight, a full command queue, or a failed resolve keeps
-    /// the event for the next tick. Restart drops the retention list, so a
-    /// row whose receipt arrived before the restart stays honestly Uncertain.
     /// Settles inbox-owned late Claude receipts against the cached snapshot.
-    /// The inbox keeps each authenticated receipt until the router acks it:
-    /// a row that is Accepted, Acknowledged, or Failed in the snapshot is an
-    /// observed durable settle and its evidence is acked; a row that is
-    /// Uncertain with a matching binding and hash gets one Command::Resolve
-    /// unless one is already in flight. Anything else keeps the evidence: a
-    /// row still Sending or Queued, a binding or hash mismatch against the
-    /// cached snapshot (the cache may lag; Outbox::resolve itself refuses a
-    /// real mismatch), a full command queue, or a refused resolve that the
-    /// next tick retries. A row absent from the snapshot is acked only when
-    /// a snapshot received after the evidence was first peeked still lacks
-    /// it. Restart drops inbox and router state together, so an unreceipted
-    /// row stays honestly Uncertain.
-    fn settle_claude_late(&mut self) {
+    ///
+    /// The inbox owns each authenticated receipt until the router acks it. A
+    /// matching Uncertain row gets one `Command::Resolve`; the evidence is
+    /// acked only by that command's own `Event::Updated` showing the row
+    /// Accepted or Failed, never by a terminal row seen in some other
+    /// snapshot, so a partial save that already changed memory cannot ack
+    /// evidence for a write that did not land. A row already settled with the
+    /// same outcome is resolved again: `Outbox::resolve` re-saves it and the
+    /// same ack rule finishes the retry. A conclusive mismatch ends with an
+    /// ack and a notice: a different content hash, a binding that is neither
+    /// the row's nor this launch's placeholder adoption, or a settlement with
+    /// a different outcome. A row that can never settle from this evidence
+    /// (Queued under a non-retryable hold, or trimmed from the outbox) is also
+    /// acked with a notice, so nothing is retained forever. Everything else
+    /// keeps the evidence: a row still Sending, a retryable Queued hold, a
+    /// lagging snapshot with the row missing or mismatched, an in-flight
+    /// resolve, or a full or refused command queue.
+    fn settle_claude_late(&mut self) -> Vec<(String, NoticeSeverity)> {
+        let mut notices = Vec::new();
         let mut events = Vec::new();
         for inbox in self.claude_inboxes.values() {
             events.extend(inbox.peek_late());
         }
-        let mut to_send = Vec::new();
-        let mut to_ack: Vec<(usize, String)> = Vec::new();
-        for event in &events {
-            let inboxes: Vec<usize> = self
-                .claude_inboxes
-                .iter()
-                .filter_map(|(index, inbox)| {
-                    inbox
-                        .peek_late()
-                        .iter()
-                        .any(|e| e.id == event.id)
-                        .then_some(*index)
-                })
-                .collect();
-            match self.messages.iter().find(|m| m.id == event.id) {
-                Some(message)
-                    if message.status == Status::Accepted
-                        || matches!(message.status, Status::Acknowledged)
-                        || matches!(message.status, Status::Failed { .. }) =>
-                {
-                    for index in inboxes {
-                        to_ack.push((index, event.id.clone()));
-                    }
+        let mut to_send: Vec<(LateReceipt, Binding)> = Vec::new();
+        let mut to_ack: Vec<(String, NoticeSeverity, &'static str)> = Vec::new();
+        for event in events {
+            let expected = match &event.held {
+                None => Resolution::Accepted(Some("submitted".to_owned())),
+                Some(reason) => Resolution::Failed(reason.clone()),
+            };
+            let in_flight = self.resolving.values().any(|id| id == &event.id);
+            let newer = self
+                .first_seen
+                .get(&event.id)
+                .is_some_and(|seen| self.snapshot_seq > *seen);
+            let Some(message) = self.messages.iter().find(|m| m.id == event.id) else {
+                if newer {
                     self.first_seen.remove(&event.id);
+                    to_ack.push((
+                        event.id.clone(),
+                        NoticeSeverity::Info,
+                        "its message is no longer in the outbox",
+                    ));
+                } else {
+                    self.first_seen
+                        .entry(event.id.clone())
+                        .or_insert(self.snapshot_seq);
                 }
-                Some(message) if message.status == Status::Uncertain => {
-                    self.first_seen.remove(&event.id);
-                    if message.binding != event.binding || message.hash != event.sha256 {
-                        continue;
-                    }
-                    if self.resolving.values().any(|id| id == &event.id) {
-                        continue;
-                    }
-                    to_send.push(event.clone());
-                }
-                Some(_) => {
-                    self.first_seen.remove(&event.id);
-                }
-                None => match self.first_seen.get(&event.id) {
-                    Some(&seen) if self.snapshot_seq > seen => {
-                        for index in inboxes {
-                            to_ack.push((index, event.id.clone()));
-                        }
+                continue;
+            };
+            match &message.status {
+                Status::Uncertain => {
+                    if message.hash != event.sha256 {
+                        to_ack.push((
+                            event.id.clone(),
+                            NoticeSeverity::Failure,
+                            "the outbox row has different content",
+                        ));
+                    } else if message.binding == event.binding {
                         self.first_seen.remove(&event.id);
-                    }
-                    _ => {
+                        if !in_flight {
+                            to_send.push((event.clone(), message.binding.clone()));
+                        }
+                    } else if !newer {
+                        // The cached snapshot may lag the outbox. Look again
+                        // in a snapshot received after this first peek.
                         self.first_seen
                             .entry(event.id.clone())
                             .or_insert(self.snapshot_seq);
+                    } else if same_launch_placeholder(&event.binding, &message.binding) {
+                        // The row moved from this launch's placeholder to the
+                        // session it became; settle it under the row's binding.
+                        if !in_flight {
+                            to_send.push((event.clone(), message.binding.clone()));
+                        }
+                    } else {
+                        to_ack.push((
+                            event.id.clone(),
+                            NoticeSeverity::Failure,
+                            "the outbox row belongs to another binding",
+                        ));
                     }
-                },
+                }
+                Status::Acknowledged => {
+                    self.first_seen.remove(&event.id);
+                    to_ack.push((
+                        event.id.clone(),
+                        NoticeSeverity::Info,
+                        "the outbox row is already acknowledged",
+                    ));
+                }
+                Status::Accepted | Status::Failed { .. } => {
+                    let same_outcome = match (&message.status, &expected) {
+                        (Status::Accepted, Resolution::Accepted(receipt)) => {
+                            message.receipt.as_ref() == receipt.as_ref()
+                        }
+                        (Status::Failed { reason }, Resolution::Failed(same)) => reason == same,
+                        _ => false,
+                    };
+                    self.first_seen.remove(&event.id);
+                    if same_outcome {
+                        // Replay the settle so its own fresh snapshot acks it;
+                        // an earlier save may have failed the directory sync.
+                        if !in_flight {
+                            to_send.push((event.clone(), message.binding.clone()));
+                        }
+                    } else {
+                        to_ack.push((
+                            event.id.clone(),
+                            NoticeSeverity::Failure,
+                            "the outbox row settled with a different outcome",
+                        ));
+                    }
+                }
+                Status::Queued { hold: Some(reason) } if !is_retryable_hold(reason) => {
+                    to_ack.push((
+                        event.id.clone(),
+                        NoticeSeverity::Info,
+                        "the outbox row is held and will never be sent",
+                    ));
+                }
+                // A retryable hold waits for the room, and Sending waits for
+                // its completion: both can still settle this evidence.
+                Status::Queued { .. } | Status::Sending => {}
             }
         }
-        for event in to_send {
+        for (event, binding) in to_send {
             let outcome = match event.held.clone() {
                 None => Resolution::Accepted(Some("submitted".to_owned())),
                 Some(reason) => Resolution::Failed(reason),
             };
             let command = Command::Resolve {
                 id: event.id.clone(),
-                binding: event.binding.clone(),
+                binding,
                 hash: event.sha256.clone(),
                 outcome,
             };
@@ -1033,11 +1081,16 @@ impl NativeRouter {
                 self.resolving.insert(command_id, event.id.clone());
             }
         }
-        for (index, id) in to_ack {
-            if let Some(inbox) = self.claude_inboxes.get(&index) {
+        for (id, severity, reason) in to_ack {
+            for inbox in self.claude_inboxes.values() {
                 inbox.ack_late(&id);
             }
+            notices.push((
+                format!("native delivery: dropped a late Claude receipt for {id}: {reason}"),
+                severity,
+            ));
         }
+        notices
     }
 
     /// An uncertain message may already be in OpenCode's queue. Look for it
@@ -1176,7 +1229,25 @@ impl NativeRouter {
                     match self.take_waiting(id) {
                         Some(Waiting::Schedule) => self.schedule_in_flight = false,
                         Some(Waiting::Resolve) => {
-                            self.resolving.remove(&id);
+                            if let Some(message_id) = self.resolving.remove(&id) {
+                                let settled = messages.iter().any(|message| {
+                                    message.id == message_id
+                                        && matches!(
+                                            message.status,
+                                            Status::Accepted
+                                                | Status::Acknowledged
+                                                | Status::Failed { .. }
+                                        )
+                                });
+                                if settled {
+                                    // The resolve's own fresh snapshot confirms
+                                    // the durable settle: only now may the
+                                    // inbox drop the evidence.
+                                    for inbox in self.claude_inboxes.values() {
+                                        inbox.ack_late(&message_id);
+                                    }
+                                }
+                            }
                         }
                         Some(Waiting::Enqueue { .. }) | None => {}
                     }
@@ -3234,13 +3305,13 @@ mod tests {
         );
     }
 
-    /// Inbox-owned evidence survives a lagging snapshot and is never dropped
-    /// on a cached mismatch: a missing row or a row still Sending keeps the
-    /// evidence and sends nothing; a settled row acks it; a binding or hash
-    /// mismatch against the cached snapshot keeps it without sending, and
-    /// only a matching Uncertain row sends exactly one resolve.
+    /// Inbox-owned evidence survives a lagging snapshot: a missing row or a
+    /// cached mismatch is kept until a snapshot received after the first peek
+    /// can decide. A conclusive mismatch (a different hash, or another
+    /// binding that is not this launch's placeholder adoption) is acked with a
+    /// notice, so evidence is not retained forever.
     #[test]
-    fn retained_evidence_survives_a_lagging_snapshot_and_never_drops_on_mismatch() {
+    fn retained_evidence_waits_for_a_newer_snapshot_and_drops_on_a_conclusive_mismatch() {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let mut router = claude_router(root.path(), cwd.path());
@@ -3251,9 +3322,9 @@ mod tests {
         let connection = crate::claude_inbox::mod_of(cwd.path(), CLAUDE_A);
         let mod_ = crate::claude_inbox::FakeMod::register(&connection.url, &connection.token);
 
-        // Plant two evidence items through the real inbox flow: deliver,
+        // Plant three evidence items through the real inbox flow: deliver,
         // claim, timeout, then the late receipt.
-        for id in ["a".repeat(64), "b".repeat(64)] {
+        for id in ["a".repeat(64), "b".repeat(64), "d".repeat(64)] {
             let message = crate::native_outbox::Message {
                 id: id.clone(),
                 source: "Sender".to_owned(),
@@ -3274,7 +3345,7 @@ mod tests {
             assert!(matches!(sending.join().unwrap(), AdapterResult::Uncertain));
             assert_eq!(mod_.receipt(&claim, "started", ""), 200);
         }
-        assert_eq!(inbox.peek_late().len(), 2);
+        assert_eq!(inbox.peek_late().len(), 3);
         let row = |id: &str, status| crate::native_outbox::Message {
             id: id.to_owned(),
             source: "Sender".to_owned(),
@@ -3290,54 +3361,129 @@ mod tests {
         };
         let waiting = router.waiting.len();
 
-        // A missing row is a lagging snapshot: keep the evidence, send nothing.
-        router.settle_claude_late();
-        assert_eq!(inbox.peek_late().len(), 2);
-        assert_eq!(router.waiting.len(), waiting);
-
-        // A row still Sending: keep, send nothing.
+        // Rows still Sending: keep, send nothing.
         router.messages.push(row(&"a".repeat(64), Status::Sending));
         router.messages.push(row(&"b".repeat(64), Status::Sending));
-        router.settle_claude_late();
+        router.messages.push(row(&"d".repeat(64), Status::Sending));
+        let notices = router.settle_claude_late();
+        assert!(notices.is_empty());
+        assert_eq!(inbox.peek_late().len(), 3);
+        assert_eq!(router.waiting.len(), waiting);
+
+        // A different content hash is conclusive: the row can never match.
+        router.messages[0].status = Status::Uncertain;
+        router.messages[0].hash = "z".repeat(64);
+        let notices = router.settle_claude_late();
         assert_eq!(inbox.peek_late().len(), 2);
-        assert_eq!(router.waiting.len(), waiting);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].0.contains("different content"), "{notices:?}");
 
-        // A settled row is an observed durable settle: ack its evidence.
-        router.messages[0].status = Status::Accepted;
-        router.settle_claude_late();
-        assert_eq!(inbox.peek_late().len(), 1);
-        assert_eq!(router.waiting.len(), waiting);
-
-        // A cached binding mismatch is not conclusive: keep without sending,
-        // and let Outbox::resolve itself refuse a real mismatch.
+        // A cached binding mismatch may lag: keep it in this snapshot, then ack
+        // it once a snapshot received after the first peek still mismatches and
+        // the binding is not this launch's placeholder adoption.
         router.messages[1].status = Status::Uncertain;
         router.messages[1].binding.generation = 2;
+        let notices = router.settle_claude_late();
+        assert!(notices.is_empty());
+        assert_eq!(inbox.peek_late().len(), 2);
+        router.snapshot_seq += 1;
+        let notices = router.settle_claude_late();
+        assert_eq!(inbox.peek_late().len(), 1);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].0.contains("another binding"), "{notices:?}");
+
+        // A row missing from this snapshot may be a lagging cache: keep it,
+        // then ack once a snapshot received after the first peek still lacks it.
+        router.messages.clear();
         router.settle_claude_late();
         assert_eq!(inbox.peek_late().len(), 1);
-        assert_eq!(router.waiting.len(), waiting);
-
-        // A cached hash mismatch: same, keep without sending.
-        router.messages[1].binding.generation = 1;
-        router.messages[1].hash = "z".repeat(64);
-        router.settle_claude_late();
-        assert_eq!(inbox.peek_late().len(), 1);
-        assert_eq!(router.waiting.len(), waiting);
-
-        // A matching Uncertain row sends exactly one resolve and keeps the
-        // evidence until the fresh snapshot confirms the settle; a second
-        // settle sends nothing more while the first is in flight.
-        router.messages[1].hash = "c".repeat(64);
-        router.settle_claude_late();
-        assert_eq!(inbox.peek_late().len(), 1);
-        assert_eq!(router.waiting.len(), waiting + 1);
-        assert_eq!(router.resolving.len(), 1);
-        router.settle_claude_late();
-        assert_eq!(router.waiting.len(), waiting + 1);
-
-        // The fresh snapshot confirms Accepted: ack the last evidence.
-        router.messages[1].status = Status::Accepted;
-        router.settle_claude_late();
+        router.snapshot_seq += 1;
+        let notices = router.settle_claude_late();
         assert!(inbox.peek_late().is_empty());
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].0.contains("no longer in the outbox"),
+            "{notices:?}"
+        );
+    }
+
+    /// A receipt whose row moved from this launch's placeholder to the real
+    /// session is settled under the row's binding: resolving with the stale
+    /// placeholder would be refused and the message would stay Uncertain.
+    #[test]
+    fn a_placeholder_receipt_settles_the_row_under_its_adopted_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut router = NativeRouter::start(state_path(root.path()), Vec::new()).unwrap();
+        router
+            .claude_inbox(0)
+            .unwrap()
+            .attach(cwd.path(), 1, CLAUDE_A, 1)
+            .unwrap();
+        let placeholder = crate::native_session::unreported_session("1", 1);
+        router
+            .bind_claude(vec![ClaudeEntry {
+                index: 0,
+                title: "Claude · 1".to_owned(),
+                session: Some(placeholder.clone()),
+                generation: 1,
+                reason: None,
+            }])
+            .unwrap();
+        router
+            .claude_inbox(0)
+            .unwrap()
+            .set_test_timeout(Duration::from_millis(50));
+        let mut mailroom = Mailroom::new(50);
+        let connection = crate::claude_inbox::mod_of(cwd.path(), CLAUDE_A);
+        let mod_ = crate::claude_inbox::FakeMod::register(&connection.url, &connection.token);
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let claiming = thread::spawn(move || {
+            let claim = mod_.claim();
+            flag.store(true, Ordering::SeqCst);
+            (claim, mod_)
+        });
+        let log = Log::default();
+        router
+            .send(&mut mailroom, "Sender", 0, "slow", recorder(&log))
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            done.load(Ordering::SeqCst)
+        });
+        let (claim, mod_) = claiming.join().unwrap();
+        // The launch's first report keeps its generation: the row's binding
+        // becomes the real session while the claim still carries the placeholder.
+        router
+            .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), CLAUDE_A, 1)
+            .unwrap();
+        assert_eq!(
+            answered_with(&mut router, &mut mailroom, &log),
+            NativeReply::Uncertain
+        );
+        let row = router
+            .messages
+            .iter()
+            .find(|message| message.id == claim.id)
+            .cloned()
+            .expect("the sent row is in the snapshot");
+        assert_eq!(row.binding.session, CLAUDE_A, "the row adopted the report");
+        assert_eq!(mod_.receipt(&claim, "started", ""), 200);
+        let evidence = router.claude_inbox(0).unwrap().peek_late();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].binding.session, placeholder,
+            "the evidence keeps the claim-time binding"
+        );
+        pump(&mut router, &mut mailroom, false, false, |mailroom| {
+            mailroom.summary().contains("ACCEPTED")
+        });
+        assert!(
+            router.claude_inbox(0).unwrap().peek_late().is_empty(),
+            "the adopted settle must ack the evidence"
+        );
+        let view = mailroom.summary();
+        assert!(!view.contains("UNCERTAIN"), "{view}");
     }
 
     /// A resolve the outbox refuses keeps the inbox-owned evidence for the

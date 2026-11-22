@@ -1157,11 +1157,21 @@ mod tests {
             .unwrap();
         assert_eq!(outbox.state.messages[0].status, Status::Accepted);
         assert_eq!(outbox.state.messages[0].receipt.as_deref(), Some("receipt"));
-        // Only an uncertain message can be settled, and only once.
+        // A replay with the same outcome re-saves the row so a partial save can
+        // land; a different outcome is still refused.
+        outbox
+            .resolve(&first, &b, &hash, accepted_outcome())
+            .expect("the same settle must replay");
         assert!(
             outbox
-                .resolve(&first, &b, &hash, accepted_outcome())
-                .is_err()
+                .resolve(
+                    &first,
+                    &b,
+                    &hash,
+                    Resolution::Accepted(Some("other".into()))
+                )
+                .is_err(),
+            "a different outcome must not overwrite a settled row"
         );
 
         // Settling resent nothing: one attempt for the first, one for the second.
@@ -1254,6 +1264,102 @@ mod tests {
                 .status,
             Status::Failed { .. }
         ));
+    }
+
+    /// A resolve whose directory sync fails after the file was replaced leaves
+    /// the row Accepted in memory. The same settle replays, re-saves and reports
+    /// Ok, so the router drops the evidence only after it durably landed.
+    #[test]
+    fn resolve_replays_after_a_partial_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let b = binding("a", 1);
+        let bindings = HashMap::from([(b.room.clone(), b.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut outbox = Outbox::open(&path, 4, 4, 1).unwrap();
+        let id = outbox
+            .enqueue("s".into(), b.clone(), "late".into())
+            .unwrap()
+            .id;
+        outbox
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &[],
+                fake(&calls, || AdapterResult::Uncertain),
+            )
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
+        let hash = outbox.state.messages[0].hash.clone();
+        let resolution = || Resolution::Accepted(Some("submitted".into()));
+
+        outbox.sync_parent = |_| Err(io::Error::other("injected directory sync failure"));
+        let error = outbox.resolve(&id, &b, &hash, resolution()).unwrap_err();
+        assert!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<DurabilityUncertain>()
+                .is_some()
+        );
+        assert_eq!(
+            outbox.state.messages[0].status,
+            Status::Accepted,
+            "memory tracks the renamed file"
+        );
+
+        outbox.sync_parent = sync_parent;
+        outbox
+            .resolve(&id, &b, &hash, resolution())
+            .expect("resolve must replay after a partial save");
+        assert_eq!(outbox.state.messages[0].status, Status::Accepted);
+        drop(outbox);
+        let reopened = Outbox::open(&path, 4, 4, 1).unwrap();
+        assert_eq!(reopened.state.messages[0].status, Status::Accepted);
+        assert_eq!(
+            reopened.state.messages[0].receipt.as_deref(),
+            Some("submitted")
+        );
+        assert_eq!(reopened.state.messages[0].attempts.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "settling never resends");
+    }
+
+    /// Mail the mod never collected is held, not uncertain: it never reached
+    /// the room. A later schedule offers it once when the room can receive.
+    #[test]
+    fn an_uncollected_mod_hold_is_retried_once_when_the_room_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let b = binding("a", 1);
+        let bindings = HashMap::from([(b.room.clone(), b.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut outbox = Outbox::open(&path, 4, 4, 1).unwrap();
+        let mut message = message_with_hold("a", 1, Some(crate::native_session::UNCOLLECTED_HOLD));
+        message.binding = b.clone();
+        message.hash = format!("{:x}", Sha256::digest(message.text.as_bytes()));
+        let id = message.id.clone();
+        let mut state = outbox.state.clone();
+        state.messages.push(message);
+        outbox.update(state, &id).unwrap();
+        drop(outbox);
+
+        let mut outbox = Outbox::open(&path, 4, 4, 1).unwrap();
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&calls, accepted))
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the uncollected mail is offered again once"
+        );
+        assert_eq!(outbox.state.messages[0].status, Status::Accepted);
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&calls, accepted))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "and never sent twice");
     }
 
     #[test]
@@ -1608,6 +1714,11 @@ mod tests {
             Row {
                 hold: Some(UNCONFIRMED_HOLD),
                 retryable: false,
+                stale: false,
+            },
+            Row {
+                hold: Some(crate::native_session::UNCOLLECTED_HOLD),
+                retryable: true,
                 stale: false,
             },
         ];
@@ -2470,6 +2581,11 @@ impl Outbox {
         self.update(next, id)
     }
 
+    /// Trims terminal rows only, never a live, queued or Uncertain one, so such
+    /// a row is never absent from a snapshot. The router's late-receipt
+    /// reconciliation relies on that: a row missing from a snapshot received
+    /// after the evidence was first peeked was trimmed, and its evidence can
+    /// be acked.
     fn trim_history(&self, state: &mut State) {
         let mut terminal = state
             .messages
@@ -2767,7 +2883,10 @@ impl Outbox {
     }
 
     /// Only an uncertain message with the same binding and content hash can be
-    /// settled, and only to accepted or failed: nothing is ever resent.
+    /// settled, and only to accepted or failed: nothing is ever resent. A row
+    /// already settled with the same outcome is re-saved and reported Ok, so a
+    /// resolve whose directory sync failed after the rename can replay and
+    /// the caller drops its evidence only after a successful save.
     pub fn resolve(
         &mut self,
         id: &str,
@@ -2781,7 +2900,20 @@ impl Outbox {
             .iter_mut()
             .find(|m| m.id == id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "message not found"))?;
-        if &item.binding != binding || item.hash != hash || item.status != Status::Uncertain {
+        if &item.binding != binding || item.hash != hash {
+            return Err(io::Error::other(
+                "evidence does not match an uncertain message",
+            ));
+        }
+        let same_outcome = match (&item.status, &outcome) {
+            (Status::Accepted, Resolution::Accepted(receipt)) => item.receipt == *receipt,
+            (Status::Failed { reason }, Resolution::Failed(same)) => reason == same,
+            _ => false,
+        };
+        if same_outcome {
+            return self.update(self.state.clone(), id);
+        }
+        if item.status != Status::Uncertain {
             return Err(io::Error::other(
                 "evidence does not match an uncertain message",
             ));

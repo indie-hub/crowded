@@ -22,6 +22,9 @@ pub(crate) const PENDING_HOLD: &str = "session pending after clear";
 /// The hold on a message whose enqueue reported an error. It is never sent, and
 /// shows as held after a restart, so a caller that retries cannot cause a duplicate.
 pub(crate) const UNCONFIRMED_HOLD: &str = "saving this message was not confirmed; it was not sent";
+/// The hold for mail no mod collected in time. The mail never reached the
+/// room, so a later offer is a first send, not a resend.
+pub(crate) const UNCOLLECTED_HOLD: &str = "Claude mod did not collect the message";
 
 /// The session name a Claude room is bound to before its own hook reports the
 /// real session. It names one launch, never a session, and is never persisted.
@@ -76,5 +79,5 @@ pub(crate) fn is_stale_hold(message: &Message) -> bool {
 /// Holds retried once the room can receive again: the room could not take the
 /// mail, and the mail never reached it.
 pub(crate) fn is_retryable_hold(reason: &str) -> bool {
-    reason == CLAUDE_HOLD || reason == UNCERTAIN_HOLD
+    reason == CLAUDE_HOLD || reason == UNCERTAIN_HOLD || reason == UNCOLLECTED_HOLD
 }
