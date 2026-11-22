@@ -975,7 +975,6 @@ impl NativeRouter {
                 .is_some_and(|seen| self.snapshot_seq > *seen);
             let Some(message) = self.messages.iter().find(|m| m.id == event.id) else {
                 if newer {
-                    self.first_seen.remove(&event.id);
                     to_ack.push((
                         event.id.clone(),
                         NoticeSeverity::Info,
@@ -997,7 +996,6 @@ impl NativeRouter {
                             "the outbox row has different content",
                         ));
                     } else if message.binding == event.binding {
-                        self.first_seen.remove(&event.id);
                         if !in_flight {
                             to_send.push((event.clone(), message.binding.clone()));
                         }
@@ -1022,7 +1020,6 @@ impl NativeRouter {
                     }
                 }
                 Status::Acknowledged => {
-                    self.first_seen.remove(&event.id);
                     to_ack.push((
                         event.id.clone(),
                         NoticeSeverity::Info,
@@ -1037,7 +1034,6 @@ impl NativeRouter {
                         (Status::Failed { reason }, Resolution::Failed(same)) => reason == same,
                         _ => false,
                     };
-                    self.first_seen.remove(&event.id);
                     if same_outcome {
                         // Replay the settle so its own fresh snapshot acks it;
                         // an earlier save may have failed the directory sync.
@@ -1079,9 +1075,15 @@ impl NativeRouter {
             if self.outbox().try_send(command_id, command).is_ok() {
                 self.waiting.push((command_id, Waiting::Resolve));
                 self.resolving.insert(command_id, event.id.clone());
+                // A tagged resolve is on its way to a durable answer; the
+                // tracking it needed is done.
+                self.first_seen.remove(&event.id);
             }
         }
+        // Every conclusive ack clears the event's tracking here, so no ack
+        // path can forget it and a settled message never leaks an entry.
         for (id, severity, reason) in to_ack {
+            self.first_seen.remove(&id);
             for inbox in self.claude_inboxes.values() {
                 inbox.ack_late(&id);
             }
@@ -1246,6 +1248,7 @@ impl NativeRouter {
                                     for inbox in self.claude_inboxes.values() {
                                         inbox.ack_late(&message_id);
                                     }
+                                    self.first_seen.remove(&message_id);
                                 }
                             }
                         }
@@ -3370,13 +3373,23 @@ mod tests {
         assert_eq!(inbox.peek_late().len(), 3);
         assert_eq!(router.waiting.len(), waiting);
 
-        // A different content hash is conclusive: the row can never match.
+        // A binding mismatch records tracking for a later snapshot. Once the
+        // same evidence's row shows different content, the ack is conclusive
+        // and the tracking it needed must be released.
         router.messages[0].status = Status::Uncertain;
+        router.messages[0].binding.generation = 2;
+        let notices = router.settle_claude_late();
+        assert!(notices.is_empty());
+        assert_eq!(router.first_seen.len(), 1, "a lagging mismatch is tracked");
         router.messages[0].hash = "z".repeat(64);
         let notices = router.settle_claude_late();
         assert_eq!(inbox.peek_late().len(), 2);
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].0.contains("different content"), "{notices:?}");
+        assert!(
+            router.first_seen.is_empty(),
+            "a hash-mismatch ack must release tracking"
+        );
 
         // A cached binding mismatch may lag: keep it in this snapshot, then ack
         // it once a snapshot received after the first peek still mismatches and
@@ -3391,12 +3404,17 @@ mod tests {
         assert_eq!(inbox.peek_late().len(), 1);
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(notices[0].0.contains("another binding"), "{notices:?}");
+        assert!(
+            router.first_seen.is_empty(),
+            "a conclusive-mismatch ack must release tracking"
+        );
 
         // A row missing from this snapshot may be a lagging cache: keep it,
         // then ack once a snapshot received after the first peek still lacks it.
         router.messages.clear();
         router.settle_claude_late();
         assert_eq!(inbox.peek_late().len(), 1);
+        assert_eq!(router.first_seen.len(), 1, "a lagging absence is tracked");
         router.snapshot_seq += 1;
         let notices = router.settle_claude_late();
         assert!(inbox.peek_late().is_empty());
@@ -3405,11 +3423,17 @@ mod tests {
             notices[0].0.contains("no longer in the outbox"),
             "{notices:?}"
         );
+        assert!(
+            router.first_seen.is_empty(),
+            "a trimmed-row ack must release tracking"
+        );
     }
 
     /// A receipt whose row moved from this launch's placeholder to the real
     /// session is settled under the row's binding: resolving with the stale
-    /// placeholder would be refused and the message would stay Uncertain.
+    /// placeholder would be refused and the message would stay Uncertain. The
+    /// tracking a lagging mismatch records must be released by the tagged
+    /// resolve, so repeated settlements leave nothing behind.
     #[test]
     fn a_placeholder_receipt_settles_the_row_under_its_adopted_binding() {
         let root = tempfile::tempdir().unwrap();
@@ -3421,69 +3445,102 @@ mod tests {
             .attach(cwd.path(), 1, CLAUDE_A, 1)
             .unwrap();
         let placeholder = crate::native_session::unreported_session("1", 1);
-        router
-            .bind_claude(vec![ClaudeEntry {
-                index: 0,
-                title: "Claude · 1".to_owned(),
-                session: Some(placeholder.clone()),
-                generation: 1,
-                reason: None,
-            }])
-            .unwrap();
-        router
-            .claude_inbox(0)
-            .unwrap()
-            .set_test_timeout(Duration::from_millis(50));
         let mut mailroom = Mailroom::new(50);
         let connection = crate::claude_inbox::mod_of(cwd.path(), CLAUDE_A);
         let mod_ = crate::claude_inbox::FakeMod::register(&connection.url, &connection.token);
-        let done = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&done);
-        let claiming = thread::spawn(move || {
-            let claim = mod_.claim();
-            flag.store(true, Ordering::SeqCst);
-            (claim, mod_)
-        });
-        let log = Log::default();
-        router
-            .send(&mut mailroom, "Sender", 0, "slow", recorder(&log))
-            .unwrap();
-        pump(&mut router, &mut mailroom, false, false, |_| {
-            done.load(Ordering::SeqCst)
-        });
-        let (claim, mod_) = claiming.join().unwrap();
-        // The launch's first report keeps its generation: the row's binding
-        // becomes the real session while the claim still carries the placeholder.
-        router
-            .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), CLAUDE_A, 1)
-            .unwrap();
-        assert_eq!(
-            answered_with(&mut router, &mut mailroom, &log),
-            NativeReply::Uncertain
-        );
-        let row = router
-            .messages
-            .iter()
-            .find(|message| message.id == claim.id)
-            .cloned()
-            .expect("the sent row is in the snapshot");
-        assert_eq!(row.binding.session, CLAUDE_A, "the row adopted the report");
-        assert_eq!(mod_.receipt(&claim, "started", ""), 200);
-        let evidence = router.claude_inbox(0).unwrap().peek_late();
-        assert_eq!(evidence.len(), 1);
-        assert_eq!(
-            evidence[0].binding.session, placeholder,
-            "the evidence keeps the claim-time binding"
-        );
-        pump(&mut router, &mut mailroom, false, false, |mailroom| {
-            mailroom.summary().contains("ACCEPTED")
-        });
-        assert!(
-            router.claude_inbox(0).unwrap().peek_late().is_empty(),
-            "the adopted settle must ack the evidence"
-        );
-        let view = mailroom.summary();
-        assert!(!view.contains("UNCERTAIN"), "{view}");
+
+        for round in 1..=3 {
+            router
+                .bind_claude(vec![ClaudeEntry {
+                    index: 0,
+                    title: "Claude · 1".to_owned(),
+                    session: Some(placeholder.clone()),
+                    generation: 1,
+                    reason: None,
+                }])
+                .unwrap();
+            // Long enough to report the launch while the delivery is in flight.
+            router
+                .claude_inbox(0)
+                .unwrap()
+                .set_test_timeout(Duration::from_secs(1));
+            let log = Log::default();
+            // The mod is borrowed for the whole round: a scoped claim lets the
+            // router keep ticking while it blocks.
+            let claim = std::thread::scope(|scope| {
+                let done = Arc::new(AtomicBool::new(false));
+                let flag = Arc::clone(&done);
+                let mod_ref = &mod_;
+                let claiming = scope.spawn(move || {
+                    let claim = mod_ref.claim();
+                    flag.store(true, Ordering::SeqCst);
+                    claim
+                });
+                router
+                    .send(
+                        &mut mailroom,
+                        "Sender",
+                        0,
+                        &format!("slow {round}"),
+                        recorder(&log),
+                    )
+                    .unwrap();
+                pump(&mut router, &mut mailroom, false, false, |_| {
+                    done.load(Ordering::SeqCst)
+                });
+                claiming.join().unwrap()
+            });
+            // The launch's first report keeps its generation: the row's binding
+            // becomes the real session while the claim carries the placeholder.
+            router
+                .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), CLAUDE_A, 1)
+                .unwrap();
+            assert_eq!(
+                answered_with(&mut router, &mut mailroom, &log),
+                NativeReply::Uncertain
+            );
+            let row = router
+                .messages
+                .iter()
+                .find(|message| message.id == claim.id)
+                .cloned()
+                .expect("the sent row is in the snapshot");
+            assert_eq!(row.binding.session, CLAUDE_A, "the row adopted the report");
+            assert_eq!(mod_.receipt(&claim, "started", ""), 200);
+            let evidence = router.claude_inbox(0).unwrap().peek_late();
+            assert_eq!(evidence.len(), 1);
+            assert_eq!(
+                evidence[0].binding.session, placeholder,
+                "the evidence keeps the claim-time binding"
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                router.tick(Instant::now(), &mut mailroom, false, false);
+                let settled = router
+                    .messages
+                    .iter()
+                    .any(|message| message.id == claim.id && message.status == Status::Accepted);
+                if settled {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "round {round} never settled:\n{}",
+                    mailroom.summary()
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                router.claude_inbox(0).unwrap().peek_late().is_empty(),
+                "round {round}: the adopted settle must ack the evidence"
+            );
+            assert!(
+                router.first_seen.is_empty(),
+                "round {round}: a completed placeholder settle must release tracking"
+            );
+            let view = mailroom.summary();
+            assert!(!view.contains("UNCERTAIN"), "{view}");
+        }
     }
 
     /// A resolve the outbox refuses keeps the inbox-owned evidence for the
