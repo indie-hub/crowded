@@ -16,7 +16,7 @@ use std::{
 };
 
 use crate::{
-    claude_inbox::ClaudeInbox,
+    claude_inbox::{ClaudeInbox, LateReceipt},
     codex_native::{CodexAdapter, Room},
     mailroom::Mailroom,
     native_launch::Reaped,
@@ -259,6 +259,16 @@ pub(crate) struct NativeRouter {
     titles: HashMap<String, String>,
     reconciling: HashMap<String, Receiver<Delivery>>,
     last_reconcile: HashMap<String, Instant>,
+    /// Late Claude receipts not yet durably settled. Late evidence is kept
+    /// here until the router sees its row Accepted/Failed in a fresh snapshot
+    /// or conclusively unmatched (binding or hash mismatch): a missing row, a
+    /// row still Sending/Queued, a full command queue, or a failed resolve
+    /// keeps the evidence for the next tick instead of dropping it.
+    pending_late: Vec<LateReceipt>,
+    /// Resolve commands in flight, by command id to message id, so a late
+    /// event is not sent twice while its first resolve is unanswered. A
+    /// failed resolve leaves the event pending for the next tick's retry.
+    resolving: HashMap<u64, String>,
     /// Commands the router is waiting an answer for, each with the id it
     /// was sent under. An event is matched by that id, never by position, so
     /// it can only ever reach the command that asked for it.
@@ -389,6 +399,8 @@ impl NativeRouter {
             titles,
             reconciling: HashMap::new(),
             last_reconcile: HashMap::new(),
+            pending_late: Vec::new(),
+            resolving: HashMap::new(),
             waiting: Vec::new(),
             command_ids: 0,
             schedule_in_flight: false,
@@ -921,34 +933,67 @@ impl NativeRouter {
 
     /// Forwards authenticated Claude receipts that arrived after their waiter
     /// timed out to the outbox, where `Command::Resolve` settles the matching
-    /// Uncertain row exactly once. Reuses the existing resolve retry: a full
-    /// command queue simply drops the event for the next tick's drain.
+    /// Uncertain row exactly once. Late evidence is retained, not drained:
+    /// an event leaves `pending_late` only when the fresh snapshot shows its
+    /// row Accepted/Failed or conclusively unmatched (binding or hash
+    /// mismatch). A missing row, a row still Sending/Queued, a resolve
+    /// already in flight, a full command queue, or a failed resolve keeps
+    /// the event for the next tick. Restart drops the retention list, so a
+    /// row whose receipt arrived before the restart stays honestly Uncertain.
     fn settle_claude_late(&mut self) {
-        let mut late = Vec::new();
         for inbox in self.claude_inboxes.values() {
-            late.extend(inbox.take_late());
+            for event in inbox.take_late() {
+                if !self
+                    .pending_late
+                    .iter()
+                    .any(|pending| pending.id == event.id)
+                {
+                    self.pending_late.push(event);
+                }
+            }
         }
-        for event in late {
+        let mut settled = Vec::new();
+        let mut to_send = Vec::new();
+        for (index, event) in self.pending_late.iter().enumerate() {
             let Some(message) = self.messages.iter().find(|m| m.id == event.id) else {
                 continue;
             };
+            if message.status == Status::Accepted || matches!(message.status, Status::Failed { .. })
+            {
+                settled.push(index);
+                continue;
+            }
             if message.status != Status::Uncertain {
                 continue;
             }
-            let outcome = match event.held {
+            if message.binding != event.binding || message.hash != event.sha256 {
+                settled.push(index);
+                continue;
+            }
+            if self.resolving.values().any(|id| id == &event.id) {
+                continue;
+            }
+            to_send.push(event.clone());
+        }
+        for event in to_send {
+            let outcome = match event.held.clone() {
                 None => Resolution::Accepted(Some("submitted".to_owned())),
                 Some(reason) => Resolution::Failed(reason),
             };
             let command = Command::Resolve {
-                id: event.id,
-                binding: event.binding,
-                hash: event.sha256,
+                id: event.id.clone(),
+                binding: event.binding.clone(),
+                hash: event.sha256.clone(),
                 outcome,
             };
             let command_id = self.next_command_id();
             if self.outbox().try_send(command_id, command).is_ok() {
                 self.waiting.push((command_id, Waiting::Resolve));
+                self.resolving.insert(command_id, event.id.clone());
             }
+        }
+        for index in settled.into_iter().rev() {
+            self.pending_late.remove(index);
         }
     }
 
@@ -1081,10 +1126,16 @@ impl NativeRouter {
                 Event::Updated(messages) => {
                     // Only the command that asked for this answer acts on it:
                     // an update from a hold command, which keeps no waiter,
-                    // leaves a waiting schedule exactly where it was.
+                    // leaves a waiting schedule exactly where it was. A
+                    // resolve answer clears its in-flight marker; the retained
+                    // late event itself leaves only when the fresh snapshot
+                    // shows its row settled or conclusively unmatched.
                     match self.take_waiting(id) {
                         Some(Waiting::Schedule) => self.schedule_in_flight = false,
-                        Some(Waiting::Resolve) | Some(Waiting::Enqueue { .. }) | None => {}
+                        Some(Waiting::Resolve) => {
+                            self.resolving.remove(&id);
+                        }
+                        Some(Waiting::Enqueue { .. }) | None => {}
                     }
                     self.messages = messages;
                     self.sync_mailroom(mailroom);
@@ -1115,6 +1166,10 @@ impl NativeRouter {
                             .push((format!("native delivery: {error}"), NoticeSeverity::Failure));
                     }
                     Some(Waiting::Resolve) => {
+                        // The resolve did not persist: clear its in-flight
+                        // marker but keep the retained late event, so the next
+                        // tick retries it instead of dropping the evidence.
+                        self.resolving.remove(&id);
                         notices
                             .push((format!("native delivery: {error}"), NoticeSeverity::Failure));
                     }
@@ -3012,5 +3067,398 @@ mod tests {
         );
         stop.store(true, Ordering::SeqCst);
         kept_mod.join().unwrap();
+    }
+
+    /// A late receipt settles its Uncertain row through the real tick and the
+    /// settlement survives a router restart: the outbox file still says
+    /// Accepted with a single attempt. A restart before any receipt leaves the
+    /// row honestly Uncertain instead of settling it.
+    #[test]
+    fn a_late_receipt_settles_through_tick_and_persists() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut router = claude_router(root.path(), cwd.path());
+        router
+            .claude_inbox(0)
+            .unwrap()
+            .set_test_timeout(Duration::from_millis(50));
+        let mut mailroom = Mailroom::new(50);
+        let connection = crate::claude_inbox::mod_of(cwd.path(), CLAUDE_A);
+        let mod_ = crate::claude_inbox::FakeMod::register(&connection.url, &connection.token);
+
+        // The mod claims in the background while the main thread ticks: the
+        // schedule only runs on a tick, so a blocking claim would deadlock it.
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let claiming = thread::spawn(move || {
+            let claim = mod_.claim();
+            flag.store(true, Ordering::SeqCst);
+            (claim, mod_)
+        });
+        let log = Log::default();
+        router
+            .send(&mut mailroom, "Sender", 0, "slow", recorder(&log))
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            done.load(Ordering::SeqCst)
+        });
+        let (claim, mod_) = claiming.join().unwrap();
+        assert_eq!(
+            answered_with(&mut router, &mut mailroom, &log),
+            NativeReply::Uncertain,
+            "the unreceipted claim must go uncertain first"
+        );
+        assert_eq!(
+            mod_.receipt(&claim, "started", ""),
+            200,
+            "the late receipt is authenticated"
+        );
+        pump(&mut router, &mut mailroom, false, false, |mailroom| {
+            mailroom.summary().contains("ACCEPTED")
+        });
+        let view = mailroom.summary();
+        assert!(
+            view.contains("ACCEPTED by Claude (submitted; not proof it was acted on)"),
+            "{view}"
+        );
+        assert!(
+            !view.contains("UNCERTAIN"),
+            "no row may stay uncertain after its late receipt settled: {view}"
+        );
+        assert!(
+            router.pending_late.is_empty(),
+            "settled evidence must leave the retention list"
+        );
+        drop(router);
+        let raw = fs::read(state_path(root.path())).unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let row = &saved["messages"][0];
+        assert_eq!(row["status"], "Accepted");
+        assert_eq!(
+            row["receipt"], "submitted",
+            "the late receipt means submitted, never more"
+        );
+        assert_eq!(
+            row["attempts"].as_array().unwrap().len(),
+            1,
+            "settling must never resend"
+        );
+
+        // Restart before any receipt: the row stays honestly Uncertain and no
+        // retained evidence settles it on its own.
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut router = claude_router(root.path(), cwd.path());
+        router
+            .claude_inbox(0)
+            .unwrap()
+            .set_test_timeout(Duration::from_millis(50));
+        let mut mailroom = Mailroom::new(50);
+        let connection = crate::claude_inbox::mod_of(cwd.path(), CLAUDE_A);
+        let mod_ = crate::claude_inbox::FakeMod::register(&connection.url, &connection.token);
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let claiming = thread::spawn(move || {
+            let _ = mod_.claim();
+            flag.store(true, Ordering::SeqCst);
+        });
+        let log = Log::default();
+        router
+            .send(&mut mailroom, "Sender", 0, "vanished", recorder(&log))
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            done.load(Ordering::SeqCst)
+        });
+        claiming.join().unwrap();
+        assert_eq!(
+            answered_with(&mut router, &mut mailroom, &log),
+            NativeReply::Uncertain
+        );
+        drop(router);
+        let mut router = claude_router(root.path(), cwd.path());
+        let mut mailroom = Mailroom::new(50);
+        pump_for(&mut router, &mut mailroom, false, false, 400);
+        let view = mailroom.summary();
+        assert!(
+            view.contains("UNCERTAIN"),
+            "a restarted row with no receipt stays uncertain: {view}"
+        );
+        assert!(!view.contains("ACCEPTED"), "{view}");
+        assert!(router.pending_late.is_empty());
+    }
+
+    /// Retained late evidence survives a lagging snapshot: a missing row or a
+    /// row still Sending keeps the event and sends nothing, while a settled
+    /// or conclusively mismatched row drops it.
+    #[test]
+    fn retained_late_evidence_survives_a_lagging_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut router = claude_router(root.path(), cwd.path());
+        let binding = router.bindings.values().next().unwrap().clone();
+        let event = crate::claude_inbox::LateReceipt {
+            id: "a".repeat(64),
+            sha256: "b".repeat(64),
+            binding: binding.clone(),
+            held: None,
+        };
+        let row = |status| crate::native_outbox::Message {
+            id: "a".repeat(64),
+            source: "Sender".to_owned(),
+            destination: "1".to_owned(),
+            binding: binding.clone(),
+            text: "slow".to_owned(),
+            hash: "b".repeat(64),
+            created_ms: 0,
+            sequence: 1,
+            attempts: Vec::new(),
+            receipt: None,
+            status,
+        };
+
+        // A missing row keeps the evidence and sends nothing.
+        router.pending_late.push(event.clone());
+        let waiting = router.waiting.len();
+        router.settle_claude_late();
+        assert_eq!(router.pending_late.len(), 1);
+        assert_eq!(router.waiting.len(), waiting);
+
+        // A row still Sending keeps the evidence and sends nothing.
+        router.messages.push(row(Status::Sending));
+        router.settle_claude_late();
+        assert_eq!(router.pending_late.len(), 1);
+        assert_eq!(router.waiting.len(), waiting);
+
+        // A settled row drops the evidence without sending.
+        router.messages[0].status = Status::Accepted;
+        router.settle_claude_late();
+        assert!(router.pending_late.is_empty());
+        assert_eq!(router.waiting.len(), waiting);
+
+        // A conclusively mismatched binding drops the evidence without
+        // sending: the outbox would refuse to resolve it.
+        let mut other_binding = binding.clone();
+        other_binding.generation = 2;
+        router.pending_late.push(crate::claude_inbox::LateReceipt {
+            binding: other_binding,
+            ..event.clone()
+        });
+        router.messages[0].status = Status::Uncertain;
+        router.settle_claude_late();
+        assert!(router.pending_late.is_empty());
+        assert_eq!(router.waiting.len(), waiting);
+
+        // A matching Uncertain row sends exactly one resolve and keeps the
+        // evidence until the fresh snapshot confirms the settlement; a second
+        // settle sends nothing more while the first is in flight.
+        router.pending_late.push(event);
+        router.settle_claude_late();
+        assert_eq!(router.pending_late.len(), 1);
+        assert_eq!(router.waiting.len(), waiting + 1);
+        assert_eq!(router.resolving.len(), 1);
+        router.settle_claude_late();
+        assert_eq!(router.waiting.len(), waiting + 1);
+    }
+
+    /// A resolve the outbox refuses keeps the retained evidence for the next
+    /// tick instead of dropping it: the row is settled only once the worker
+    /// confirms it, which is the same retry path a persistence failure takes.
+    #[test]
+    fn a_failed_resolve_keeps_late_evidence_for_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut router = claude_router(root.path(), cwd.path());
+        let binding = router.bindings.values().next().unwrap().clone();
+        // A snapshot row with no matching outbox row: the worker refuses the
+        // resolve with an error, so the evidence must be kept for retry.
+        router.messages.push(crate::native_outbox::Message {
+            id: "c".repeat(64),
+            source: "Sender".to_owned(),
+            destination: "1".to_owned(),
+            binding: binding.clone(),
+            text: "slow".to_owned(),
+            hash: "d".repeat(64),
+            created_ms: 0,
+            sequence: 1,
+            attempts: Vec::new(),
+            receipt: None,
+            status: Status::Uncertain,
+        });
+        router.pending_late.push(crate::claude_inbox::LateReceipt {
+            id: "c".repeat(64),
+            sha256: "d".repeat(64),
+            binding,
+            held: None,
+        });
+        router.settle_claude_late();
+        assert_eq!(router.pending_late.len(), 1);
+        assert_eq!(router.resolving.len(), 1);
+        let mut mailroom = Mailroom::new(50);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            router.tick(Instant::now(), &mut mailroom, false, false);
+            if router.resolving.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the refused resolve never answered"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            router.pending_late.len(),
+            1,
+            "a refused resolve must keep its evidence"
+        );
+    }
+
+    /// A full command queue keeps late evidence instead of dropping it. The
+    /// worker drains the queue concurrently so saturation is best-effort: the
+    /// test asserts retention either way and reports which branch ran.
+    #[test]
+    fn a_full_command_queue_keeps_late_evidence_for_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut router = claude_router(root.path(), cwd.path());
+        let binding = router.bindings.values().next().unwrap().clone();
+        router.messages.push(crate::native_outbox::Message {
+            id: "e".repeat(64),
+            source: "Sender".to_owned(),
+            destination: "1".to_owned(),
+            binding: binding.clone(),
+            text: "slow".to_owned(),
+            hash: "f".repeat(64),
+            created_ms: 0,
+            sequence: 1,
+            attempts: Vec::new(),
+            receipt: None,
+            status: Status::Uncertain,
+        });
+        router.pending_late.push(crate::claude_inbox::LateReceipt {
+            id: "e".repeat(64),
+            sha256: "f".repeat(64),
+            binding,
+            held: None,
+        });
+        let mut saw_full = false;
+        for _ in 0..4 {
+            for _ in 0..96 {
+                let id = router.next_command_id();
+                let command = Command::Schedule {
+                    bindings: router.bindings.clone(),
+                    paused: true,
+                    fused: false,
+                    pending: Vec::new(),
+                };
+                if router.outbox().try_send(id, command).is_err() {
+                    saw_full = true;
+                    break;
+                }
+            }
+            let id = router.next_command_id();
+            let command = Command::Schedule {
+                bindings: router.bindings.clone(),
+                paused: true,
+                fused: false,
+                pending: Vec::new(),
+            };
+            if router.outbox().try_send(id, command).is_err() {
+                saw_full = true;
+                break;
+            }
+        }
+        router.settle_claude_late();
+        assert_eq!(
+            router.pending_late.len(),
+            1,
+            "a full queue must keep late evidence (saw_full={saw_full})"
+        );
+        if saw_full {
+            assert!(
+                router.resolving.is_empty(),
+                "nothing may send on a full queue"
+            );
+        }
+    }
+
+    /// A resolve whose disk write fails keeps the retained evidence: the
+    /// worker saves before swapping its in-memory row, so the retry after the
+    /// disk is writable again settles the same Uncertain row Accepted.
+    #[test]
+    fn a_failed_persist_keeps_late_evidence_for_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut router = claude_router(root.path(), cwd.path());
+        router
+            .claude_inbox(0)
+            .unwrap()
+            .set_test_timeout(Duration::from_millis(50));
+        let mut mailroom = Mailroom::new(50);
+        let connection = crate::claude_inbox::mod_of(cwd.path(), CLAUDE_A);
+        let mod_ = crate::claude_inbox::FakeMod::register(&connection.url, &connection.token);
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        let claiming = thread::spawn(move || {
+            let claim = mod_.claim();
+            flag.store(true, Ordering::SeqCst);
+            (claim, mod_)
+        });
+        let log = Log::default();
+        router
+            .send(&mut mailroom, "Sender", 0, "slow", recorder(&log))
+            .unwrap();
+        pump(&mut router, &mut mailroom, false, false, |_| {
+            done.load(Ordering::SeqCst)
+        });
+        let (claim, mod_) = claiming.join().unwrap();
+        assert_eq!(
+            answered_with(&mut router, &mut mailroom, &log),
+            NativeReply::Uncertain
+        );
+        let receipt_status = mod_.receipt(&claim, "started", "");
+        assert_eq!(receipt_status, 200);
+        // Make the outbox unwritable before the late receipt is settled: the
+        // worker's resolve then fails its save and answers with an error.
+        let outbox_dir = state_path(root.path());
+        let outbox_dir = outbox_dir.parent().unwrap();
+        let mut permissions = fs::metadata(outbox_dir).unwrap().permissions();
+        permissions.set_mode(0o555);
+        fs::set_permissions(outbox_dir, permissions).unwrap();
+        // The worker refuses every resolve while the disk is unwritable, so
+        // each tick drains an error and retains the evidence: the pending
+        // list never empties until the disk is writable again.
+        let mut saw_save_error = false;
+        for _ in 0..15 {
+            for (text, _) in router.tick(Instant::now(), &mut mailroom, false, false) {
+                if text.contains("denied") || text.contains("Read-only") {
+                    saw_save_error = true;
+                }
+            }
+            assert_eq!(
+                router.pending_late.len(),
+                1,
+                "a failed persist must keep its evidence"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            saw_save_error,
+            "the unwritable disk must refuse at least one write"
+        );
+        let mut permissions = fs::metadata(outbox_dir).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(outbox_dir, permissions).unwrap();
+        assert_eq!(
+            router.pending_late.len(),
+            1,
+            "a failed persist must keep its evidence"
+        );
+        pump(&mut router, &mut mailroom, false, false, |mailroom| {
+            mailroom.summary().contains("ACCEPTED")
+        });
+        assert!(router.pending_late.is_empty());
     }
 }
