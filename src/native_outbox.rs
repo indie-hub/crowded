@@ -1169,6 +1169,93 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    /// A late 'started' receipt settles an Uncertain row Accepted exactly once
+    /// with a single adapter call, and the settlement survives a reopen; a
+    /// late 'held' receipt settles Failed with the mod's reason.
+    #[test]
+    fn a_late_receipt_settles_an_uncertain_row_once_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let b = binding("a", 1);
+        let bindings = HashMap::from([(b.room.clone(), b.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut outbox = Outbox::open(&path, 4, 4, 2).unwrap();
+        let id = outbox
+            .enqueue("s".into(), b.clone(), "late".into())
+            .unwrap()
+            .id;
+        outbox
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &[],
+                fake(&calls, || AdapterResult::Uncertain),
+            )
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
+        let hash = outbox.state.messages[0].hash.clone();
+
+        outbox
+            .resolve(
+                &id,
+                &b,
+                &hash,
+                Resolution::Accepted(Some("submitted".into())),
+            )
+            .unwrap();
+        assert_eq!(outbox.state.messages[0].status, Status::Accepted);
+        assert_eq!(outbox.state.messages[0].attempts.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(outbox);
+        let mut outbox = Outbox::open(&path, 4, 4, 2).unwrap();
+        assert_eq!(outbox.state.messages[0].status, Status::Accepted);
+        assert_eq!(outbox.state.messages[0].attempts.len(), 1);
+
+        let held = outbox
+            .enqueue("s".into(), b.clone(), "slow hold".into())
+            .unwrap()
+            .id;
+        outbox
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &[],
+                fake(&calls, || AdapterResult::Uncertain),
+            )
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        let held_hash = outbox
+            .state
+            .messages
+            .iter()
+            .find(|m| m.id == held)
+            .unwrap()
+            .hash
+            .clone();
+        outbox
+            .resolve(
+                &held,
+                &b,
+                &held_hash,
+                Resolution::Failed("prompt is open".into()),
+            )
+            .unwrap();
+        assert!(matches!(
+            outbox
+                .state
+                .messages
+                .iter()
+                .find(|m| m.id == held)
+                .unwrap()
+                .status,
+            Status::Failed { .. }
+        ));
+    }
+
     #[test]
     fn uncertain_mail_of_an_earlier_launch_does_not_hold_this_launchs_mail() {
         let dir = tempfile::tempdir().unwrap();

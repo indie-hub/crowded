@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::{
-    native_outbox::{AdapterResult, Message},
+    native_outbox::{AdapterResult, Binding, Message},
     native_session::{CLAUDE_HOLD, STALE_HOLD},
     pane::session_state::create_private_directory,
 };
@@ -41,6 +41,10 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
 const RESPONSE_LIMIT: usize = 60 * 1024;
 /// What a started receipt says: submitted is not proof the agent acted on it.
 const STARTED: &str = "submitted";
+/// Bound on in-memory claim and late-receipt state so a flood of timeouts
+/// cannot grow either without limit.
+const MAX_CLAIMED: usize = 64;
+const MAX_LATE: usize = 64;
 
 type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
@@ -62,9 +66,26 @@ struct State {
     generation: u64,
     receiver: Option<Receiver>,
     queue: VecDeque<Mail>,
-    /// Claimed message ids and their content hash, until their receipt arrives.
-    claimed: HashMap<String, String>,
+    /// Claimed message ids with their content hash and binding, until their
+    /// receipt arrives. The binding lets a late receipt settle the outbox row.
+    claimed: HashMap<String, Claimed>,
     waiters: HashMap<String, mpsc::Sender<Outcome>>,
+    /// Authenticated receipts that arrived after their waiter timed out.
+    late: Vec<LateReceipt>,
+}
+
+struct Claimed {
+    sha256: String,
+    binding: Binding,
+}
+
+/// An authenticated receipt that arrived after deliver() timed out. `held`
+/// carries the mod's reason; `None` means the prompt was submitted.
+pub(crate) struct LateReceipt {
+    pub(crate) id: String,
+    pub(crate) sha256: String,
+    pub(crate) binding: Binding,
+    pub(crate) held: Option<String>,
 }
 
 struct Receiver {
@@ -76,6 +97,7 @@ struct Mail {
     id: String,
     text: String,
     sha256: String,
+    binding: Binding,
 }
 
 /// What the mod reported about a claimed message.
@@ -97,6 +119,7 @@ impl State {
         }
         self.queue.clear();
         self.claimed.clear();
+        self.late.clear();
         for (_, waiter) in self.waiters.drain() {
             let _ = waiter.send(Outcome::Held(STALE_HOLD.to_owned()));
         }
@@ -265,6 +288,7 @@ impl ClaudeInbox {
                 id: message.id.clone(),
                 text: message.text.clone(),
                 sha256: message.hash.clone(),
+                binding: message.binding.clone(),
             });
             state.waiters.insert(message.id.clone(), sender);
         }
@@ -285,6 +309,20 @@ impl ClaudeInbox {
             .receiver
             .as_ref()
             .is_some_and(|registered| self.receiver_is_live(registered))
+    }
+
+    /// Drains authenticated receipts that arrived after their waiter timed
+    /// out. Only the current generation is returned; older events belong to
+    /// a launch that is gone and the outbox would refuse them anyway.
+    pub(crate) fn take_late(&self) -> Vec<LateReceipt> {
+        let Ok(mut state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let generation = state.generation;
+        let late = std::mem::take(&mut state.late);
+        late.into_iter()
+            .filter(|event| event.binding.generation == generation)
+            .collect()
     }
 
     fn receiver_is_live(&self, registered: &Receiver) -> bool {
@@ -555,7 +593,21 @@ fn next(state: &mut State, now: &Clock, body: &serde_json::Value) -> (u16, Strin
     registered.last_poll = now();
     match state.queue.pop_front() {
         Some(mail) => {
-            state.claimed.insert(mail.id.clone(), mail.sha256.clone());
+            // shortcut: claimed and late queues are bounded in-memory state; a
+            // restart or overflow leaves the row Uncertain instead of settling
+            // it, which the outbox already reports honestly.
+            if state.claimed.len() >= MAX_CLAIMED
+                && let Some(old) = state.claimed.keys().next().cloned()
+            {
+                state.claimed.remove(&old);
+            }
+            state.claimed.insert(
+                mail.id.clone(),
+                Claimed {
+                    sha256: mail.sha256.clone(),
+                    binding: mail.binding.clone(),
+                },
+            );
             (
                 200,
                 serde_json::json!({
@@ -582,16 +634,27 @@ fn receipt(state: &mut State, body: &serde_json::Value) -> (u16, String) {
             error_body("the receipt does not match a claimed message"),
         );
     };
-    if !state.claimed.get(id).is_some_and(|known| known == sha256) {
+    let Some(known) = state.claimed.get(id) else {
+        return (
+            409,
+            error_body("the receipt does not match a claimed message"),
+        );
+    };
+    if known.sha256 != sha256 {
         return (
             409,
             error_body("the receipt does not match a claimed message"),
         );
     }
-    state.claimed.remove(id);
-    let outcome = match state_name {
-        "started" => Outcome::Started,
-        "held" => Outcome::Held(match field("reason") {
+    let Some(claimed) = state.claimed.remove(id) else {
+        return (
+            409,
+            error_body("the receipt does not match a claimed message"),
+        );
+    };
+    let held = match state_name {
+        "started" => None,
+        "held" => Some(match field("reason") {
             Some(reason) if !reason.is_empty() => reason.to_owned(),
             _ => "the Claude mod held the prompt".to_owned(),
         }),
@@ -602,9 +665,23 @@ fn receipt(state: &mut State, body: &serde_json::Value) -> (u16, String) {
             );
         }
     };
+    let outcome = match held.clone() {
+        None => Outcome::Started,
+        Some(reason) => Outcome::Held(reason),
+    };
     if let Some(waiter) = state.waiters.remove(id) {
         let _ = waiter.send(outcome);
+        return (200, "{}".to_owned());
     }
+    if state.late.len() >= MAX_LATE {
+        state.late.remove(0);
+    }
+    state.late.push(LateReceipt {
+        id: id.to_owned(),
+        sha256: sha256.to_owned(),
+        binding: claimed.binding,
+        held,
+    });
     (200, "{}".to_owned())
 }
 
@@ -771,6 +848,7 @@ impl FakeMod {
 }
 
 #[cfg(all(test, unix))]
+#[derive(Clone)]
 pub(crate) struct Claim {
     pub(crate) id: String,
     pub(crate) text: String,
@@ -955,6 +1033,76 @@ mod tests {
             mod_.next_claim().is_none(),
             "id-4 was offered after its hold"
         );
+    }
+
+    /// A receipt that arrives after deliver() timed out is kept for late
+    /// settlement with its binding; a repeat or a wrong hash settles nothing.
+    #[test]
+    fn a_late_receipt_is_kept_for_settlement_with_its_binding() {
+        let inbox = inbox(Duration::from_millis(50));
+        let mod_ = FakeMod::register(&inbox.url, &inbox.token);
+        let late = delivered(Arc::clone(&inbox), message(1, "id-late", "slow"));
+        let claim = mod_.claim();
+        assert_eq!(claim.id, "id-late");
+        assert!(matches!(late.join().unwrap(), AdapterResult::Uncertain));
+        assert_eq!(mod_.receipt(&claim, "started", ""), 200);
+        let settled = inbox.take_late();
+        assert_eq!(settled.len(), 1, "one late receipt expected");
+        assert_eq!(settled[0].id, "id-late");
+        assert_eq!(settled[0].sha256, claim.sha256);
+        assert_eq!(settled[0].binding.generation, 1);
+        assert!(settled[0].held.is_none());
+        assert!(inbox.take_late().is_empty(), "late events drain once");
+        assert_eq!(
+            mod_.receipt(&claim, "started", ""),
+            409,
+            "a repeat receipt must not settle again"
+        );
+        assert!(inbox.take_late().is_empty());
+    }
+
+    /// A late receipt with the wrong hash is refused and an on-time receipt
+    /// never becomes a late event.
+    #[test]
+    fn a_wrong_hash_or_an_on_time_receipt_produces_no_late_event() {
+        let slow = inbox(Duration::from_millis(50));
+        let mod_ = FakeMod::register(&slow.url, &slow.token);
+        let late = delivered(Arc::clone(&slow), message(1, "id-bad", "slow"));
+        let claim = mod_.claim();
+        assert_eq!(claim.id, "id-bad");
+        assert!(matches!(late.join().unwrap(), AdapterResult::Uncertain));
+        let mut forged = claim.clone();
+        forged.sha256 = "0".repeat(64);
+        assert_eq!(mod_.receipt(&forged, "started", ""), 409);
+        assert!(
+            slow.take_late().is_empty(),
+            "wrong hash must settle nothing"
+        );
+
+        let quick = inbox(Duration::from_secs(2));
+        let mod_ = FakeMod::register(&quick.url, &quick.token);
+        let fast = delivered(Arc::clone(&quick), message(1, "id-fast", "quick"));
+        let claim = mod_.claim();
+        assert_eq!(mod_.receipt(&claim, "started", ""), 200);
+        assert!(matches!(
+            fast.join().unwrap(),
+            AdapterResult::Accepted(Some(_))
+        ));
+        assert!(quick.take_late().is_empty(), "on-time receipt is not late");
+    }
+
+    /// A late 'held' receipt keeps the mod's reason so the row can fail with it.
+    #[test]
+    fn a_late_held_receipt_keeps_its_reason() {
+        let inbox = inbox(Duration::from_millis(50));
+        let mod_ = FakeMod::register(&inbox.url, &inbox.token);
+        let late = delivered(Arc::clone(&inbox), message(1, "id-held", "slow"));
+        let claim = mod_.claim();
+        assert!(matches!(late.join().unwrap(), AdapterResult::Uncertain));
+        assert_eq!(mod_.receipt(&claim, "held", "prompt is open"), 200);
+        let settled = inbox.take_late();
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].held.as_deref(), Some("prompt is open"));
     }
 
     /// Liveness is judged by missed polls on the inbox's own clock.

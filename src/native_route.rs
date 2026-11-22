@@ -915,7 +915,41 @@ impl NativeRouter {
         }
         self.resolve_pending(now);
         self.reconcile_uncertain(now);
+        self.settle_claude_late();
         notices
+    }
+
+    /// Forwards authenticated Claude receipts that arrived after their waiter
+    /// timed out to the outbox, where `Command::Resolve` settles the matching
+    /// Uncertain row exactly once. Reuses the existing resolve retry: a full
+    /// command queue simply drops the event for the next tick's drain.
+    fn settle_claude_late(&mut self) {
+        let mut late = Vec::new();
+        for inbox in self.claude_inboxes.values() {
+            late.extend(inbox.take_late());
+        }
+        for event in late {
+            let Some(message) = self.messages.iter().find(|m| m.id == event.id) else {
+                continue;
+            };
+            if message.status != Status::Uncertain {
+                continue;
+            }
+            let outcome = match event.held {
+                None => Resolution::Accepted(Some("submitted".to_owned())),
+                Some(reason) => Resolution::Failed(reason),
+            };
+            let command = Command::Resolve {
+                id: event.id,
+                binding: event.binding,
+                hash: event.sha256,
+                outcome,
+            };
+            let command_id = self.next_command_id();
+            if self.outbox().try_send(command_id, command).is_ok() {
+                self.waiting.push((command_id, Waiting::Resolve));
+            }
+        }
     }
 
     /// An uncertain message may already be in OpenCode's queue. Look for it
