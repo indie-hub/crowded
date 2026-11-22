@@ -70,8 +70,11 @@ struct State {
     /// receipt arrives. The binding lets a late receipt settle the outbox row.
     claimed: HashMap<String, Claimed>,
     waiters: HashMap<String, mpsc::Sender<Outcome>>,
-    /// Authenticated receipts that arrived after their waiter timed out.
-    late: Vec<LateReceipt>,
+    /// Authenticated receipts, keyed by message id. The inbox owns each
+    /// entry until the router acks it after observing the row durably
+    /// settled, so evidence is recorded before the waiter is sent and never
+    /// lives only in the waiter's channel.
+    late: HashMap<String, LateReceipt>,
 }
 
 struct Claimed {
@@ -120,7 +123,9 @@ impl State {
         }
         self.queue.clear();
         self.claimed.clear();
-        self.late.clear();
+        // Retained late evidence survives a generation change: it settles its
+        // own old row, and resolve checks the row's own binding. Only a
+        // router or Crowded restart drops it, leaving the row Uncertain.
         for (_, waiter) in self.waiters.drain() {
             let _ = waiter.send(Outcome::Held(STALE_HOLD.to_owned()));
         }
@@ -314,18 +319,24 @@ impl ClaudeInbox {
             .is_some_and(|registered| self.receiver_is_live(registered))
     }
 
-    /// Drains authenticated receipts that arrived after their waiter timed
-    /// out. Only the current generation is returned; older events belong to
-    /// a launch that is gone and the outbox would refuse them anyway.
-    pub(crate) fn take_late(&self) -> Vec<LateReceipt> {
-        let Ok(mut state) = self.state.lock() else {
+    /// Peeks at the retained authenticated receipts without removing them.
+    /// The router classifies each peeked event against its cached snapshot
+    /// and acks only an observed durable settle, so a lagging snapshot or a
+    /// failed resolve never loses evidence. No generation filter: an event
+    /// settles its own old row, and resolve checks the row's own binding.
+    pub(crate) fn peek_late(&self) -> Vec<LateReceipt> {
+        let Ok(state) = self.state.lock() else {
             return Vec::new();
         };
-        let generation = state.generation;
-        let late = std::mem::take(&mut state.late);
-        late.into_iter()
-            .filter(|event| event.binding.generation == generation)
-            .collect()
+        state.late.values().cloned().collect()
+    }
+
+    /// Drops retained evidence after the router observed its row durably
+    /// settled (or only after a newer snapshot still lacks the row).
+    pub(crate) fn ack_late(&self, id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.late.remove(id);
+        }
     }
 
     /// Shortens the receipt wait in tests so a busy mod's late receipt is
@@ -613,10 +624,11 @@ fn next(state: &mut State, now: &Clock, body: &serde_json::Value) -> (u16, Strin
         return (401, error_body("the receiver is not bound to this room"));
     };
     registered.last_poll = now();
-    // Backpressure: an unsettled claim is never evicted, so when the claim
-    // table is full no new mail is handed out. The queued mail waits for its
-    // own deliver() timeout and is held as uncollected, then retried later.
-    if state.claimed.len() >= MAX_CLAIMED {
+    // Backpressure: unsettled claims and retained evidence are never
+    // evicted, so while their combined count is at the cap no new mail is
+    // handed out. The queued mail waits for its own deliver() timeout and is
+    // held as uncollected, then retried later.
+    if state.claimed.len() + state.late.len() >= MAX_CLAIMED {
         return (200, "null".to_owned());
     }
     match state.queue.pop_front() {
@@ -682,18 +694,12 @@ fn receipt(state: &mut State, body: &serde_json::Value) -> (u16, String) {
             );
         }
     };
-    if let Some(waiter) = state.waiters.remove(id) {
-        let outcome = match held.clone() {
-            None => Outcome::Started,
-            Some(reason) => Outcome::Held(reason),
-        };
-        let _ = waiter.send(outcome);
-        state.claimed.remove(id);
-        return (200, "{}".to_owned());
-    }
-    // An unsettled late event is never evicted: when the late queue is full
-    // the claim is kept and the mod is told to retry, instead of destroying
-    // evidence either way.
+    // Evidence first: the inbox records the authenticated receipt before the
+    // waiter is sent, so the waiter is only a latency hint and never the
+    // sole copy. An unsettled event is never evicted: when the late table is
+    // full the claim is kept and the mod is told to retry, instead of
+    // destroying evidence either way. A repeat receipt never reaches here:
+    // the first receipt removed the claim, so it gets a 409 above.
     if state.late.len() >= MAX_LATE {
         return (503, error_body("the late receipt queue is full"));
     }
@@ -703,12 +709,22 @@ fn receipt(state: &mut State, body: &serde_json::Value) -> (u16, String) {
             error_body("the receipt does not match a claimed message"),
         );
     };
-    state.late.push(LateReceipt {
-        id: id.to_owned(),
-        sha256: sha256.to_owned(),
-        binding: claimed.binding,
-        held,
-    });
+    state.late.insert(
+        id.to_owned(),
+        LateReceipt {
+            id: id.to_owned(),
+            sha256: sha256.to_owned(),
+            binding: claimed.binding,
+            held: held.clone(),
+        },
+    );
+    if let Some(waiter) = state.waiters.remove(id) {
+        let outcome = match held {
+            None => Outcome::Started,
+            Some(reason) => Outcome::Held(reason),
+        };
+        let _ = waiter.send(outcome);
+    }
     (200, "{}".to_owned())
 }
 
@@ -1074,23 +1090,26 @@ mod tests {
         assert_eq!(claim.id, "id-late");
         assert!(matches!(late.join().unwrap(), AdapterResult::Uncertain));
         assert_eq!(mod_.receipt(&claim, "started", ""), 200);
-        let settled = inbox.take_late();
+        let settled = inbox.peek_late();
         assert_eq!(settled.len(), 1, "one late receipt expected");
         assert_eq!(settled[0].id, "id-late");
         assert_eq!(settled[0].sha256, claim.sha256);
         assert_eq!(settled[0].binding.generation, 1);
         assert!(settled[0].held.is_none());
-        assert!(inbox.take_late().is_empty(), "late events drain once");
+        inbox.ack_late("id-late");
+        assert!(inbox.peek_late().is_empty(), "acked evidence is gone");
         assert_eq!(
             mod_.receipt(&claim, "started", ""),
             409,
             "a repeat receipt must not settle again"
         );
-        assert!(inbox.take_late().is_empty());
+        assert!(inbox.peek_late().is_empty());
     }
 
-    /// A late receipt with the wrong hash is refused and an on-time receipt
-    /// never becomes a late event.
+    /// A late receipt with the wrong hash is refused. An on-time receipt
+    /// still records its evidence before the waiter is sent: the waiter is
+    /// only a latency hint, and the router acks the evidence once the row is
+    /// Accepted.
     #[test]
     fn a_wrong_hash_or_an_on_time_receipt_produces_no_late_event() {
         let slow = inbox(Duration::from_millis(50));
@@ -1103,7 +1122,7 @@ mod tests {
         forged.sha256 = "0".repeat(64);
         assert_eq!(mod_.receipt(&forged, "started", ""), 409);
         assert!(
-            slow.take_late().is_empty(),
+            slow.peek_late().is_empty(),
             "wrong hash must settle nothing"
         );
 
@@ -1116,7 +1135,13 @@ mod tests {
             fast.join().unwrap(),
             AdapterResult::Accepted(Some(_))
         ));
-        assert!(quick.take_late().is_empty(), "on-time receipt is not late");
+        assert_eq!(
+            quick.peek_late().len(),
+            1,
+            "evidence is recorded even on time, before the waiter send"
+        );
+        quick.ack_late(&claim.id);
+        assert!(quick.peek_late().is_empty());
     }
 
     /// A late 'held' receipt keeps the mod's reason so the row can fail with it.
@@ -1128,7 +1153,7 @@ mod tests {
         let claim = mod_.claim();
         assert!(matches!(late.join().unwrap(), AdapterResult::Uncertain));
         assert_eq!(mod_.receipt(&claim, "held", "prompt is open"), 200);
-        let settled = inbox.take_late();
+        let settled = inbox.peek_late();
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].held.as_deref(), Some("prompt is open"));
     }
@@ -1138,17 +1163,17 @@ mod tests {
     /// receipt sent first is honored instead of going uncertain.
     #[test]
     fn an_outcome_sent_before_abandon_is_honored_not_uncertain() {
-        let inbox = inbox(Duration::from_millis(50));
+        let raced = inbox(Duration::from_millis(50));
         let (sender, receiver) = mpsc::channel();
         sender.send(Outcome::Started).unwrap();
-        inbox
+        raced
             .state
             .lock()
             .unwrap()
             .waiters
             .insert("id-race".to_owned(), sender);
         assert!(matches!(
-            inbox.abandon("id-race", &receiver),
+            raced.abandon("id-race", &receiver),
             AdapterResult::Accepted(_)
         ));
 
@@ -1156,16 +1181,38 @@ mod tests {
         sender
             .send(Outcome::Held("prompt is open".to_owned()))
             .unwrap();
-        inbox
+        raced
             .state
             .lock()
             .unwrap()
             .waiters
             .insert("id-race-held".to_owned(), sender);
         assert!(matches!(
-            inbox.abandon("id-race-held", &receiver),
+            raced.abandon("id-race-held", &receiver),
             AdapterResult::Dropped(reason) if reason == "prompt is open"
         ));
+        assert!(
+            raced.peek_late().is_empty(),
+            "abandon itself records no evidence"
+        );
+
+        // Receipt first, then the timeout: the outcome is honored and exactly
+        // one evidence entry exists, recorded before the waiter send, for the
+        // router to ack once the row is Accepted.
+        let raced = inbox(Duration::from_millis(50));
+        let mod_ = FakeMod::register(&raced.url, &raced.token);
+        let pending = delivered(Arc::clone(&raced), message(1, "id-first", "text"));
+        let claim = mod_.claim();
+        assert_eq!(mod_.receipt(&claim, "started", ""), 200);
+        assert!(matches!(
+            pending.join().unwrap(),
+            AdapterResult::Accepted(Some(_))
+        ));
+        let peeked = raced.peek_late();
+        assert_eq!(peeked.len(), 1, "exactly one evidence entry, no stray dup");
+        assert_eq!(peeked[0].id, "id-first");
+        raced.ack_late("id-first");
+        assert!(raced.peek_late().is_empty());
     }
 
     /// A malformed receipt state leaves the claim intact, so the mod's valid
@@ -1181,13 +1228,19 @@ mod tests {
             409,
             "a malformed state must not settle"
         );
-        assert!(inbox.take_late().is_empty());
+        assert!(inbox.peek_late().is_empty());
         assert_eq!(mod_.receipt(&claim, "started", ""), 200);
         assert!(matches!(
             pending.join().unwrap(),
             AdapterResult::Accepted(Some(_))
         ));
-        assert!(inbox.take_late().is_empty());
+        assert_eq!(
+            inbox.peek_late().len(),
+            1,
+            "the valid retry records evidence before the waiter send"
+        );
+        inbox.ack_late(&claim.id);
+        assert!(inbox.peek_late().is_empty());
     }
 
     /// A receipt after a generation change matches nothing: the old claim is
@@ -1205,7 +1258,7 @@ mod tests {
             409,
             "a stale generation must not settle"
         );
-        assert!(inbox.take_late().is_empty());
+        assert!(inbox.peek_late().is_empty());
     }
 
     /// Backpressure instead of eviction: with 64 unsettled claims /next hands
@@ -1267,37 +1320,73 @@ mod tests {
         assert_eq!(receipt(&mut state, &receipt_body).0, 200);
         assert_eq!(state.claimed.len(), 63);
         assert_eq!(state.late.len(), 1);
+        // The cap counts claims and retained evidence together, so turning a
+        // claim into evidence does not free a slot: only the router's ack
+        // does, once the row is durably settled.
+        let (status, raw) = poll(&mut state);
+        assert_eq!(status, 200);
+        assert_eq!(raw, "null", "evidence still counts against the cap");
+        state.late.remove("id-cap-00");
         let (status, raw) = poll(&mut state);
         assert_eq!(status, 200);
         let mail: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(mail["id"], "id-cap-64");
     }
 
-    /// With 64 late events retained, the 65th receipt is refused with its
-    /// claim intact instead of evicting anyone's evidence; after a drain the
-    /// retry settles normally.
+    /// With 64 retained evidence items, one more authenticated receipt is
+    /// refused without evicting anyone's evidence and the claim is kept, so
+    /// a later retry settles normally. Driven directly against the inbox
+    /// state: through HTTP the combined cap stops new claims first, so this
+    /// arm is defense in depth for the never-evict rule.
     #[test]
     fn a_full_late_queue_refuses_new_receipts_without_evicting() {
-        let inbox = inbox(Duration::from_millis(20));
-        let mod_ = FakeMod::register(&inbox.url, &inbox.token);
+        let now: Clock = Arc::new(Instant::now);
+        let mut state = State {
+            generation: 1,
+            receiver: Some(Receiver {
+                id: "r".to_owned(),
+                last_poll: now(),
+            }),
+            ..Default::default()
+        };
+        let slow_hash = format!("{:x}", Sha256::digest(b"slow"));
+        let binding = || Binding {
+            room: "1".to_owned(),
+            session: "session".to_owned(),
+            endpoint: "claude".to_owned(),
+            generation: 1,
+        };
         for n in 0..64 {
             let id = format!("id-late-{n:02}");
-            let pending = delivered(Arc::clone(&inbox), message(1, &id, "slow"));
-            let claim = mod_.claim();
-            assert!(matches!(pending.join().unwrap(), AdapterResult::Uncertain));
-            assert_eq!(mod_.receipt(&claim, "started", ""), 200);
+            state.late.insert(
+                id.clone(),
+                LateReceipt {
+                    id,
+                    sha256: slow_hash.clone(),
+                    binding: binding(),
+                    held: None,
+                },
+            );
         }
-        let pending = delivered(Arc::clone(&inbox), message(1, "id-late-64", "slow"));
-        let claim = mod_.claim();
-        assert!(matches!(pending.join().unwrap(), AdapterResult::Uncertain));
-        assert_eq!(
-            mod_.receipt(&claim, "started", ""),
-            503,
-            "a full late queue must refuse, not evict"
+        state.claimed.insert(
+            "id-late-64".to_owned(),
+            Claimed {
+                sha256: slow_hash.clone(),
+                binding: binding(),
+            },
         );
-        assert_eq!(inbox.take_late().len(), 64);
-        assert_eq!(mod_.receipt(&claim, "started", ""), 200);
-        assert_eq!(inbox.take_late().len(), 1);
+        let body = serde_json::json!({
+            "receiver": "r",
+            "id": "id-late-64",
+            "sha256": slow_hash,
+            "state": "started",
+        });
+        assert_eq!(receipt(&mut state, &body).0, 503);
+        assert!(state.claimed.contains_key("id-late-64"));
+        assert_eq!(state.late.len(), 64);
+        state.late.remove("id-late-00");
+        assert_eq!(receipt(&mut state, &body).0, 200);
+        assert_eq!(state.late.len(), 64);
     }
 
     /// Liveness is judged by missed polls on the inbox's own clock.
