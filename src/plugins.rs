@@ -1243,15 +1243,6 @@ mod tests {
             assert!(link.join("SKILL.md").is_file());
         }
 
-        // TEMP-DIAG(T1-repair): removed before the final commit.
-        eprintln!(
-            "DIAG mjs metadata: {:?}; dir: {:?}",
-            fs::symlink_metadata(project.join(".opencode/plugins/greetings.mjs")),
-            fs::read_dir(project.join(".opencode/plugins")).map(|entries| entries
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .collect::<Vec<_>>())
-        );
-
         let (skills, adapters) = enable_plugin(&project, "greetings").unwrap();
         assert_eq!(skills, 0);
         let adapters = adapters.unwrap();
@@ -1274,6 +1265,18 @@ mod tests {
                 .unwrap()
                 .replace('\\', "/")
                 .contains(".crowded/plugins/greetings/hooks/activate.js")
+        );
+        // TEMP-DIAG(T1-repair): removed before the final commit.
+        let mjs = project.join(".opencode/plugins/greetings.mjs");
+        eprintln!(
+            "DIAG mjs metadata={:?} symlink={:?} link_target={:?} dir={:?} state={:?}",
+            fs::metadata(&mjs),
+            fs::symlink_metadata(&mjs),
+            fs::read_link(&mjs),
+            fs::read_dir(project.join(".opencode/plugins")).map(|entries| entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .collect::<Vec<_>>()),
+            fs::read_to_string(project.join(".crowded/plugins/greetings/.crowded-adapters.json"))
         );
         assert!(project.join(".opencode/plugins/greetings.mjs").is_file());
 
