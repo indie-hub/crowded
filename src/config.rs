@@ -909,7 +909,12 @@ transport = "raw"
         }
         #[cfg(not(unix))]
         {
-            let error = room_specs_from_toml(headroom).unwrap_err();
+            // `unwrap_err` would need `Debug` on the config; match instead so
+            // no product-code derive is required for this Windows-only arm.
+            let error = match room_specs_from_toml(headroom) {
+                Ok(_) => panic!("headroom refusal expected on Windows"),
+                Err(error) => error,
+            };
             assert!(error.to_string().contains("Windows"), "{error}");
         }
 
