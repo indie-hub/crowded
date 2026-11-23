@@ -519,19 +519,27 @@ fn collect_adapter_links(
         }
         links.push(AdapterLink {
             path: Path::new(relative_directory).join(&file),
-            // Symlink targets are parsed literally by the kernel: the mixed
-            // separators left by joining multi-level literals ("../../a/b\c")
-            // do not resolve on Windows (ERROR_INVALID_NAME, os error 123).
-            // Extending component-wise normalizes to one separator per
-            // platform; a no-op on Unix.
+            // Windows parses file-symlink targets literally in the kernel:
+            // a relative target that traverses upward fails on follow
+            // (ERROR_INVALID_NAME), even though normal file APIs resolve
+            // the same path. Directory junctions already use absolute
+            // targets, so file links do the same on Windows (built
+            // component-wise so no mixed separators survive). Unix keeps
+            // relative targets.
+            #[cfg(windows)]
             target: {
-                let mut target = PathBuf::from("../..");
-                for part in [INSTALLS_DIRECTORY, name, relative_directory] {
-                    target.extend(Path::new(part).components());
-                }
-                target.push(&file);
-                target
+                let mut absolute = PathBuf::new();
+                absolute.extend(installed.components());
+                absolute.extend(Path::new(relative_directory).components());
+                absolute.push(&file);
+                absolute
             },
+            #[cfg(not(windows))]
+            target: PathBuf::from("../../")
+                .join(INSTALLS_DIRECTORY)
+                .join(name)
+                .join(relative_directory)
+                .join(file),
             copied: false,
         });
     }

@@ -1264,18 +1264,6 @@ mod tests {
                 .replace('\\', "/")
                 .contains(".crowded/plugins/greetings/hooks/activate.js")
         );
-        // TEMP-DIAG2(T1-repair): removed before the final commit.
-        let mjs = project.join(".opencode/plugins/greetings.mjs");
-        let link_target = fs::read_link(&mjs);
-        let resolved = link_target
-            .as_ref()
-            .map(|target| mjs.parent().unwrap().join(target));
-        eprintln!(
-            "DIAG2 link_target={link_target:?} resolved={resolved:?} resolved_meta={:?} link_meta={:?} link_follow={:?}",
-            resolved.as_ref().map(fs::metadata),
-            fs::symlink_metadata(&mjs),
-            fs::metadata(&mjs),
-        );
         assert!(project.join(".opencode/plugins/greetings.mjs").is_file());
 
         // Reproduce v0.15.0's partial state: adapters off, skills still linked.
