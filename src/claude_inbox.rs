@@ -683,7 +683,10 @@ fn receipt(state: &mut State, body: &serde_json::Value) -> (u16, String) {
         // twice.
         "held" => Some(match field("reason") {
             Some(reason) if !reason.is_empty() => format!("{MOD_HOLD_PREFIX}{reason}"),
-            _ => "the Claude mod held the prompt".to_owned(),
+            // A held receipt with no usable reason is still the mod's decision:
+            // it gets the same namespace, or the row would look retryable and
+            // block the room's later mail.
+            _ => format!("{MOD_HOLD_PREFIX}held the prompt"),
         }),
         _ => {
             return (
@@ -906,7 +909,7 @@ pub(crate) fn mod_of(cwd: &Path, session: &str) -> FakeMod {
 mod tests {
     use super::*;
     use crate::native_outbox::Binding;
-    use crate::native_session::is_retryable_hold;
+    use crate::native_session::{is_final_hold, is_retryable_hold};
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -1051,6 +1054,40 @@ mod tests {
         assert_ne!(reason, CLAUDE_HOLD);
         assert_eq!(reason, format!("{MOD_HOLD_PREFIX}{CLAUDE_HOLD}"));
         assert!(!is_retryable_hold(&reason));
+    }
+
+    /// A held receipt with an empty, absent or non-string reason is still the
+    /// mod's decision: it is namespaced, final, and never re-offered.
+    #[test]
+    fn a_held_receipt_without_a_usable_reason_is_still_final() {
+        let raw = |mod_: &FakeMod, claim: &Claim, extra: &str| {
+            mod_.post(
+                "/receipt",
+                format!(
+                    "{{\"receiver\":\"{}\",\"id\":\"{}\",\"sha256\":\"{}\",\"state\":\"held\"{extra}}}",
+                    mod_.receiver, claim.id, claim.sha256
+                ),
+            )
+            .0
+        };
+        for (id, extra) in [
+            ("id-empty-reason", ",\"reason\":\"\""),
+            ("id-no-reason", ""),
+            ("id-object-reason", ",\"reason\":{\"drop\":true}"),
+        ] {
+            let inbox = inbox(Duration::from_secs(2));
+            let mod_ = FakeMod::register(&inbox.url, &inbox.token);
+            let held = delivered(Arc::clone(&inbox), message(1, id, "held"));
+            let claim = mod_.claim();
+            assert_eq!(raw(&mod_, &claim, extra), 200, "{id}");
+            let reason = match held.join().unwrap() {
+                AdapterResult::Dropped(reason) => reason,
+                _ => panic!("a held receipt must drop the message"),
+            };
+            assert_eq!(reason, format!("{MOD_HOLD_PREFIX}held the prompt"), "{id}");
+            assert!(is_final_hold(&reason), "{id}");
+            assert!(!is_retryable_hold(&reason), "{id}");
+        }
     }
 
     /// Held mail waits for a registered mod: readiness follows registration

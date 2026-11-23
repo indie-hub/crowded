@@ -2206,6 +2206,7 @@ mod tests {
     fn a_final_held_head_does_not_block_later_mail() {
         for reason in [
             format!("{MOD_HOLD_PREFIX}prompt is open"),
+            format!("{MOD_HOLD_PREFIX}held the prompt"),
             TOO_LARGE_HOLD.to_owned(),
             UNCONFIRMED_HOLD.to_owned(),
         ] {
