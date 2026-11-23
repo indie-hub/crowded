@@ -19,7 +19,8 @@ use std::{
 use crate::{
     native_outbox::{AdapterResult, Binding, Message},
     native_session::{
-        CLAUDE_HOLD, DISCONNECTED_HOLD, MOD_HOLD_PREFIX, STALE_HOLD, UNCOLLECTED_HOLD,
+        CLAUDE_HOLD, DISCONNECTED_HOLD, MOD_HOLD_PREFIX, STALE_HOLD, TOO_LARGE_HOLD,
+        UNCOLLECTED_HOLD,
     },
     pane::session_state::create_private_directory,
 };
@@ -31,8 +32,6 @@ const RECEIPT_WAIT: Duration = Duration::from_secs(2);
 const BODY_LIMIT: usize = 64 * 1024;
 const HEAD_LIMIT: usize = 8 * 1024;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
-/// The hold for mail the mod could not receive inside its response limit.
-pub(crate) const TOO_LARGE_HOLD: &str = "the message is too large for the Claude mod";
 /// A whole request must arrive within this, so no client can hold the listener.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
 /// The mod refuses a response over 64 KiB; stay below it with room to spare.

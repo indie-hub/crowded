@@ -25,6 +25,8 @@ pub(crate) const UNCONFIRMED_HOLD: &str = "saving this message was not confirmed
 /// The hold for mail no mod collected in time. The mail never reached the
 /// room, so a later offer is a first send, not a resend.
 pub(crate) const UNCOLLECTED_HOLD: &str = "Claude mod did not collect the message";
+/// The hold for mail the mod could not receive inside its response limit.
+pub(crate) const TOO_LARGE_HOLD: &str = "the message is too large for the Claude mod";
 /// The hold for a room whose registered mod stopped polling. The mail was
 /// never queued for the mod, so a later offer is a first send, not a resend.
 pub(crate) const DISCONNECTED_HOLD: &str = "Claude mod disconnected";
@@ -89,4 +91,13 @@ pub(crate) fn is_retryable_hold(reason: &str) -> bool {
         || reason == UNCERTAIN_HOLD
         || reason == UNCOLLECTED_HOLD
         || reason == DISCONNECTED_HOLD
+}
+
+/// Holds that never stand in front of later mail: the mod refused the prompt,
+/// the message can never be taken, or its save was never confirmed. Nothing
+/// clears them, so blocking on one would strand the room. Every other
+/// non-retryable hold - OpenCode's and Codex's "inspect before retry" reasons,
+/// routing failures, unknown older reasons - keeps blocking its lane.
+pub(crate) fn is_final_hold(reason: &str) -> bool {
+    reason.starts_with(MOD_HOLD_PREFIX) || reason == TOO_LARGE_HOLD || reason == UNCONFIRMED_HOLD
 }

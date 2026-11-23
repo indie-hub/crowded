@@ -16,16 +16,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(test)]
-use crate::claude_inbox::TOO_LARGE_HOLD;
 /// Verbatim-moved session and hold rules, owned by [`crate::native_session`].
 use crate::native_session::{
-    CLAUDE_HOLD, PENDING_HOLD, STALE_HOLD, UNCONFIRMED_HOLD, is_retryable_hold, is_stale_hold,
-    same_launch_placeholder,
+    CLAUDE_HOLD, PENDING_HOLD, STALE_HOLD, UNCONFIRMED_HOLD, is_final_hold, is_retryable_hold,
+    is_stale_hold, same_launch_placeholder,
 };
 #[cfg(test)]
 use crate::native_session::{
-    DISCONNECTED_HOLD, MOD_HOLD_PREFIX, UNCERTAIN_HOLD, is_unreported_placeholder,
+    DISCONNECTED_HOLD, MOD_HOLD_PREFIX, TOO_LARGE_HOLD, UNCERTAIN_HOLD, is_unreported_placeholder,
     unreported_session,
 };
 
@@ -788,12 +786,11 @@ mod tests {
         outbox
             .schedule(&bindings, false, false, &[], fake(&calls, accepted))
             .unwrap();
-        // The dropped head is final: it stays visible and the lane moves on to
-        // its next message, still in order.
-        assert_eq!(outbox.state.messages[1].status, Status::Sending);
-        wait(&mut outbox, &bindings);
-        assert_eq!(outbox.state.messages[1].status, Status::Accepted);
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            outbox.state.messages[1].status,
+            Status::Queued { hold: None }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -2127,6 +2124,68 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    /// A non-final hold keeps blocking its lane exactly as before: the vendors'
+    /// own "inspect before retry" reasons and unknown older reasons are not
+    /// final-hold decisions, so later mail must not pass a head that is known
+    /// not to have been sent.
+    #[test]
+    fn a_non_final_held_head_still_blocks_later_mail() {
+        for reason in [
+            "Codex room binding changed; inspect before retry",
+            "the Codex room process is no longer running; mail was not sent",
+            "native room binding changed; inspect before retry",
+            "native room is not bound",
+            "native routing is unavailable",
+            "an older build stored this reason",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("outbox.json");
+            let mut outbox = Outbox::open(&path, 4, 4, 2).unwrap();
+            let b = binding("a", 1);
+            let bindings = HashMap::from([("a".to_owned(), b.clone())]);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let head = outbox
+                .enqueue("s".into(), b.clone(), "head".into())
+                .unwrap()
+                .id;
+            outbox
+                .schedule(
+                    &bindings,
+                    false,
+                    false,
+                    &[],
+                    Arc::new(DroppingFake {
+                        calls: Arc::clone(&calls),
+                        reason: reason.to_owned(),
+                    }),
+                )
+                .unwrap();
+            wait(&mut outbox, &bindings);
+            assert_eq!(
+                hold_of(&mut outbox, &head),
+                Some(reason.to_owned()),
+                "hold {reason}"
+            );
+
+            let later = outbox.enqueue("s".into(), b, "later".into()).unwrap().id;
+            outbox
+                .schedule(&bindings, false, false, &[], fake(&calls, accepted))
+                .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "hold {reason}");
+            assert_eq!(
+                outbox
+                    .state
+                    .messages
+                    .iter()
+                    .find(|message| message.id == later)
+                    .unwrap()
+                    .status,
+                Status::Queued { hold: None },
+                "hold {reason}"
+            );
+        }
+    }
+
     /// An adapter that drops every message with one fixed reason.
     struct DroppingFake {
         calls: Arc<AtomicUsize>,
@@ -3176,15 +3235,16 @@ impl Outbox {
                 }
                 // Held mail of an earlier launch does not stand in front of newer mail.
                 Status::Queued { hold: Some(reason) } if reason == STALE_HOLD => {}
-                // A hold that no later pass can clear - the mod refused the
-                // prompt, or it was too large, or its save was unconfirmed -
-                // does not stand in front of newer mail either: nothing would
-                // ever release it, so blocking would strand the room until a
-                // relaunch. The row keeps its reason and attempt and is never
-                // offered again. Pending mail is the exception: a retarget will
-                // still send it, so it must keep its place in line.
-                Status::Queued { hold: Some(reason) }
-                    if !is_retryable_hold(reason) && reason != PENDING_HOLD => {}
+                // A Claude hold that no later pass can clear - the mod refused
+                // the prompt, or the message was too large, or its save was
+                // unconfirmed - does not stand in front of newer mail either:
+                // nothing would release it, so blocking would strand the room
+                // until a relaunch. The row keeps its reason and attempt and is
+                // never offered again. Any other non-retryable hold (OpenCode
+                // and Codex reasons, routing failures, older unknown reasons)
+                // keeps blocking, and so does pending mail, which a retarget
+                // still sends.
+                Status::Queued { hold: Some(reason) } if is_final_hold(reason) => {}
                 // A message that may already have arrived is never resent, and
                 // it does not hold the room's later mail: nothing can settle it
                 // within a launch, so blocking would strand the room until a
