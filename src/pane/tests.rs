@@ -107,6 +107,23 @@ fn wait_for_file(path: &Path) -> String {
     }
 }
 
+// A pane whose guest has entered raw mode and does not read its input. The
+// guest writes a marker only after `stty` returns, so the caller never has to
+// guess how long the shell needs on a slow runner.
+#[cfg(unix)]
+fn raw_mode_pane(command: &str) -> Pane {
+    let marker = tempfile::tempdir().unwrap();
+    let ready = marker.path().join("raw");
+    let script = format!(
+        "stty raw -echo && printf ready > {}; exec {command}",
+        ready.display()
+    );
+    let spec = room_spec("sh", &["-c", &script]);
+    let pane = Pane::spawn(spec, whisper_test_size(), GuestEnvironment::new([])).unwrap();
+    wait_for_file(&ready);
+    pane
+}
+
 fn native_test_size() -> PtySize {
     PtySize {
         rows: 24,
@@ -5923,11 +5940,8 @@ fn whisper_test_size() -> PtySize {
 #[test]
 fn send_whisper_returns_promptly_when_the_child_never_reads_stdin() {
     let _state = session_state::StateRootGuard::isolated();
-    let spec = room_spec("sh", &["-c", "stty raw -echo; exec /bin/sleep 600"]);
-    let mut pane = Pane::spawn(spec, whisper_test_size(), GuestEnvironment::new([])).unwrap();
+    let mut pane = raw_mode_pane("/bin/sleep 600");
     let pid = pane.child.child.as_ref().unwrap().process_id();
-    // Let the child enter raw mode before the write is attempted.
-    thread::sleep(Duration::from_millis(300));
     let message = "x".repeat(64 * 1024);
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
@@ -5952,10 +5966,8 @@ fn send_whisper_returns_promptly_when_the_child_never_reads_stdin() {
 #[test]
 fn send_whisper_returns_when_the_child_drains_stdin() {
     let _state = session_state::StateRootGuard::isolated();
-    let spec = room_spec("sh", &["-c", "stty raw -echo; cat > /dev/null"]);
-    let mut pane = Pane::spawn(spec, whisper_test_size(), GuestEnvironment::new([])).unwrap();
+    let mut pane = raw_mode_pane("cat > /dev/null");
     let pid = pane.child.child.as_ref().unwrap().process_id();
-    thread::sleep(Duration::from_millis(300));
     let message = "x".repeat(64 * 1024);
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
@@ -5980,10 +5992,8 @@ fn send_whisper_returns_when_the_child_drains_stdin() {
 #[test]
 fn a_full_write_queue_returns_would_block_promptly() {
     let _state = session_state::StateRootGuard::isolated();
-    let spec = room_spec("sh", &["-c", "stty raw -echo; exec /bin/sleep 600"]);
-    let mut pane = Pane::spawn(spec, whisper_test_size(), GuestEnvironment::new([])).unwrap();
+    let mut pane = raw_mode_pane("/bin/sleep 600");
     let pid = pane.child.child.as_ref().unwrap().process_id();
-    thread::sleep(Duration::from_millis(300));
     let job = vec![b'x'; 16 * 1024];
     let start = Instant::now();
     let mut accepted = 0usize;
@@ -6112,9 +6122,7 @@ fn drain_output_stays_ok_when_the_writer_has_stopped() {
 #[test]
 fn dropping_a_pane_with_a_blocked_writer_completes() {
     let _state = session_state::StateRootGuard::isolated();
-    let spec = room_spec("sh", &["-c", "stty raw -echo; exec /bin/sleep 600"]);
-    let mut pane = Pane::spawn(spec, whisper_test_size(), GuestEnvironment::new([])).unwrap();
-    thread::sleep(Duration::from_millis(300));
+    let mut pane = raw_mode_pane("/bin/sleep 600");
     let job = vec![b'x'; 16 * 1024];
     for _ in 0..(WRITER_QUEUE_JOBS + 8) {
         if pane.write_bytes(&job).is_err() {
@@ -6122,6 +6130,10 @@ fn dropping_a_pane_with_a_blocked_writer_completes() {
         }
     }
     let finished = Arc::clone(&pane.writer.finished);
+    assert!(
+        !finished.load(Ordering::SeqCst),
+        "the setup must leave the writer blocked, not drained"
+    );
     let start = Instant::now();
     drop(pane);
     let drop_elapsed = start.elapsed();
@@ -6129,7 +6141,7 @@ fn dropping_a_pane_with_a_blocked_writer_completes() {
         drop_elapsed < Duration::from_secs(3),
         "drop took {drop_elapsed:?}"
     );
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while !finished.load(Ordering::SeqCst) {
         assert!(
             Instant::now() < deadline,
@@ -6142,10 +6154,7 @@ fn dropping_a_pane_with_a_blocked_writer_completes() {
 // A raw-mode pane whose guest never reads, with its write queue already full.
 #[cfg(unix)]
 fn saturated_raw_pane() -> Pane {
-    let spec = room_spec("sh", &["-c", "stty raw -echo; exec /bin/sleep 600"]);
-    let mut pane = Pane::spawn(spec, whisper_test_size(), GuestEnvironment::new([])).unwrap();
-    // Let the child enter raw mode before the writes are attempted.
-    thread::sleep(Duration::from_millis(300));
+    let mut pane = raw_mode_pane("/bin/sleep 600");
     let job = vec![b'x'; 16 * 1024];
     while pane.write_bytes(&job).is_ok() {}
     pane

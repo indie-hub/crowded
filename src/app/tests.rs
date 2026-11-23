@@ -233,6 +233,27 @@ fn pump_router(router: &mut NativeRouter, mailroom: &mut Mailroom, ms: u64) {
     }
 }
 
+/// Ticks the router until `done` holds, so a slow runner cannot fail a test
+/// that only needed more time to reach the expected state.
+#[cfg(all(test, unix))]
+fn pump_router_until(
+    router: &mut NativeRouter,
+    mailroom: &mut Mailroom,
+    done: impl Fn(&Mailroom) -> bool,
+    what: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done(mailroom) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}:\n{}",
+            mailroom.summary()
+        );
+        router.tick(Instant::now(), mailroom, false, false);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[cfg(all(test, unix))]
 pub(crate) fn report_test_opencode_room(
     root: &std::path::Path,
@@ -310,9 +331,16 @@ fn a_pending_report_holds_new_mail_without_sending_or_pasting() {
         None,
     )
     .unwrap();
-    pump_router(router.as_mut().unwrap(), &mut mailroom, 300);
-    let view = mailroom.summary();
-    assert!(view.contains("HELD: session pending after clear"), "{view}");
+    pump_router_until(
+        router.as_mut().unwrap(),
+        &mut mailroom,
+        |mailroom| {
+            mailroom
+                .summary()
+                .contains("HELD: session pending after clear")
+        },
+        "held mail after the pending report",
+    );
     assert!(
         fake.state.received.lock().unwrap().is_empty(),
         "nothing is sent while pending"
@@ -4500,8 +4528,9 @@ fn background_collection_does_not_block_main_thread() {
         |_, _, _| panic!("should not be called while pending"),
     );
     assert!(!scheduled2, "should not reschedule while pending");
-    thread::sleep(Duration::from_millis(300));
-    let (idx, detail) = rx.try_recv().expect("background should have completed");
+    let (idx, detail) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("background collection did not finish");
     assert_eq!(idx, 0);
     assert_eq!(detail.sub_agents[0].id, "slow");
     // Simulate main loop clearing pending after recv
