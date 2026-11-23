@@ -5779,14 +5779,17 @@ fn pane_with_capture(rows: u16, cols: u16) -> (Pane, Arc<Mutex<Vec<u8>>>) {
 /// Waits, up to a bounded time, for the writer thread to deliver exactly
 /// `expected`, so tests that read a capturing writer do not race the thread.
 fn wait_for_captured(captured: &Arc<Mutex<Vec<u8>>>, expected: &[u8]) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Each whisper's submit is a separate write RAW_SUBMIT_DELAY after its
+    // body, so the bound scales with that delay (1 s on Windows).
+    let budget = Duration::from_secs(2) + 4 * super::RAW_SUBMIT_DELAY;
+    let deadline = Instant::now() + budget;
     loop {
         if captured.lock().unwrap().as_slice() == expected {
             return;
         }
         if Instant::now() >= deadline {
             panic!(
-                "expected captured bytes {expected:?}, got {:?} after 2s",
+                "expected captured bytes {expected:?}, got {:?} after {budget:?}",
                 captured.lock().unwrap()
             );
         }
@@ -6607,7 +6610,9 @@ fn pane_with_gated_capture(
 }
 
 fn wait_for_no_unwritten_input(pane: &Pane) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Draining a whisper includes its delayed submit write, so this scales
+    // with RAW_SUBMIT_DELAY like wait_for_captured does.
+    let deadline = Instant::now() + Duration::from_secs(2) + 4 * super::RAW_SUBMIT_DELAY;
     while pane.has_unwritten_input() {
         if Instant::now() >= deadline {
             return false;
