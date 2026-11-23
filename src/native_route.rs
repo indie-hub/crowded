@@ -3464,9 +3464,9 @@ mod tests {
                     reason: None,
                 }])
                 .unwrap();
-            // Well under REPLY_WAIT (1.5 s, src/native_route.rs:41): the row
-            // must settle Uncertain before the sender's reply deadline, or a
-            // loaded machine answers "Queued" instead.
+            // Short enough that the claim's timeout settles the row soon after
+            // the mod refuses to receipt it; the sender's reply deadline is
+            // independent, so either reply form is accepted below.
             router
                 .claude_inbox(0)
                 .unwrap()
@@ -3502,9 +3502,34 @@ mod tests {
             router
                 .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), CLAUDE_A, 1)
                 .unwrap();
-            assert_eq!(
-                answered_with(&mut router, &mut mailroom, &log),
-                NativeReply::Uncertain
+            // The claim's own timeout settles the row Uncertain. The sender's
+            // reply runs on an independent deadline (REPLY_WAIT, 1.5 s), so a
+            // slow tick can answer Queued first: assert the row's state, and
+            // accept either reply form.
+            let mut reply = None;
+            let settled = Instant::now() + Duration::from_secs(10);
+            loop {
+                router.tick(Instant::now(), &mut mailroom, false, false);
+                if reply.is_none() {
+                    reply = log.borrow_mut().pop().map(|(_, outcome)| outcome);
+                }
+                let uncertain = router
+                    .messages
+                    .iter()
+                    .any(|message| message.id == claim.id && message.status == Status::Uncertain);
+                if uncertain && reply.is_some() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < settled,
+                    "round {round}: the row never settled Uncertain:\n{}",
+                    mailroom.summary()
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                matches!(reply, Some(NativeReply::Queued | NativeReply::Uncertain)),
+                "round {round}: unexpected reply {reply:?}"
             );
             let row = router
                 .messages
@@ -3513,6 +3538,11 @@ mod tests {
                 .cloned()
                 .expect("the sent row is in the snapshot");
             assert_eq!(row.binding.session, CLAUDE_A, "the row adopted the report");
+            assert_eq!(
+                row.status,
+                Status::Uncertain,
+                "the claim timed out under the adopted binding"
+            );
             assert_eq!(mod_.receipt(&claim, "started", ""), 200);
             let evidence = router.claude_inbox(0).unwrap().peek_late();
             assert_eq!(evidence.len(), 1);
