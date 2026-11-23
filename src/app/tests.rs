@@ -380,7 +380,12 @@ fn an_immediate_report_after_pending_delivers_once_paused() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(fake.state.received.lock().unwrap().is_empty());
-    pump_router(router.as_mut().unwrap(), &mut mailroom, 500);
+    pump_router_until(
+        router.as_mut().unwrap(),
+        &mut mailroom,
+        |mailroom| mailroom.summary().contains("ACCEPTED"),
+        "the native delivery to be accepted",
+    );
     let received = fake.state.received.lock().unwrap().clone();
     assert_eq!(received.len(), 1, "exactly one delivery: {received:?}");
     assert_eq!(received[0].1, "[whisper from Room X] held");
@@ -416,7 +421,12 @@ fn an_immediate_report_after_pending_delivers_once_fused() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(fake.state.received.lock().unwrap().is_empty());
-    pump_router(router.as_mut().unwrap(), &mut mailroom, 500);
+    pump_router_until(
+        router.as_mut().unwrap(),
+        &mut mailroom,
+        |mailroom| mailroom.summary().contains("ACCEPTED"),
+        "the native delivery to be accepted",
+    );
     let received = fake.state.received.lock().unwrap().clone();
     assert_eq!(received.len(), 1, "exactly one delivery: {received:?}");
     assert_eq!(received[0].1, "[whisper from Room X] held");
@@ -514,7 +524,16 @@ fn the_same_session_id_while_pending_releases_mail_without_a_new_generation() {
         None,
     )
     .unwrap();
-    pump_router(router.as_mut().unwrap(), &mut mailroom, 300);
+    pump_router_until(
+        router.as_mut().unwrap(),
+        &mut mailroom,
+        |mailroom| {
+            mailroom
+                .summary()
+                .contains("HELD: session pending after clear")
+        },
+        "the pending hold to be shown",
+    );
     assert!(
         mailroom
             .summary()
@@ -522,7 +541,12 @@ fn the_same_session_id_while_pending_releases_mail_without_a_new_generation() {
     );
     let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
     assert!(notice.contains("pending cleared"), "{notice}");
-    pump_router(router.as_mut().unwrap(), &mut mailroom, 300);
+    pump_router_until(
+        router.as_mut().unwrap(),
+        &mut mailroom,
+        |mailroom| mailroom.summary().contains("ACCEPTED by OpenCode"),
+        "the held mail to be accepted",
+    );
     let view = mailroom.summary();
     assert!(view.contains("ACCEPTED by OpenCode"), "{view}");
     assert_eq!(
@@ -1687,7 +1711,12 @@ fn a_pending_save_failure_is_reported_as_its_own_failure() {
     // The new message was really saved, so clearing the mark delivers it,
     // while the mail from before the mark stays held.
     apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
-    pump_router(router.as_mut().unwrap(), &mut mailroom, 500);
+    pump_router_until(
+        router.as_mut().unwrap(),
+        &mut mailroom,
+        |mailroom| mailroom.summary().contains("ACCEPTED"),
+        "the native delivery to be accepted",
+    );
     let received = fake.state.received.lock().unwrap().clone();
     assert_eq!(
         received.len(),
@@ -2879,7 +2908,12 @@ fn a_reported_id_rebinds_the_opencode_room_and_delivers_to_it() {
         None,
     )
     .unwrap();
-    pump_router(router.as_mut().unwrap(), &mut mailroom, 500);
+    pump_router_until(
+        router.as_mut().unwrap(),
+        &mut mailroom,
+        |mailroom| mailroom.summary().contains("ACCEPTED"),
+        "the native delivery to be accepted",
+    );
     let received = fake.state.received.lock().unwrap().clone();
     assert_eq!(
         received.len(),

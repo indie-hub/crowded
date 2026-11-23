@@ -2215,7 +2215,10 @@ mod tests {
         pump(&mut router, &mut mailroom, false, false, |_| {
             !log.borrow().is_empty()
         });
-        pump_for(&mut router, &mut mailroom, false, false, 300);
+        pump(&mut router, &mut mailroom, false, false, |mailroom| {
+            let view = mailroom.summary();
+            view.contains("ACCEPTED") && view.contains("HELD: sent for an earlier launch")
+        });
 
         assert_eq!(texts(&new), ["[whisper from Room B] for the new launch"]);
         assert!(texts(&old).is_empty());
@@ -2516,7 +2519,9 @@ mod tests {
         pump(&mut router, &mut mailroom, false, false, |_| {
             log.borrow().len() == 3
         });
-        pump_for(&mut router, &mut mailroom, false, false, 300);
+        pump(&mut router, &mut mailroom, false, false, |mailroom| {
+            mailroom.summary().matches("ACCEPTED").count() == 3
+        });
         assert_eq!(texts(&a), ["[whisper from Room X] to A"]);
         assert_eq!(texts(&b), ["[whisper from Room X] to B new"]);
         let arguments = args_log(&marker);
@@ -3459,11 +3464,13 @@ mod tests {
                     reason: None,
                 }])
                 .unwrap();
-            // Long enough to report the launch while the delivery is in flight.
+            // Well under REPLY_WAIT (1.5 s, src/native_route.rs:41): the row
+            // must settle Uncertain before the sender's reply deadline, or a
+            // loaded machine answers "Queued" instead.
             router
                 .claude_inbox(0)
                 .unwrap()
-                .set_test_timeout(Duration::from_secs(1));
+                .set_test_timeout(Duration::from_millis(50));
             let log = Log::default();
             // The mod is borrowed for the whole round: a scoped claim lets the
             // router keep ticking while it blocks.

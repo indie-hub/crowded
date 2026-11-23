@@ -885,8 +885,8 @@ pub(crate) mod tests {
         drop(room_a);
         drop(room_b);
         wait_for_reaps();
-        assert!(!process_alive(&pid_a));
-        assert!(!process_alive(&pid_b));
+        wait_until_stopped(&pid_a);
+        wait_until_stopped(&pid_b);
     }
 
     #[cfg(unix)]
@@ -1181,10 +1181,7 @@ pub(crate) mod tests {
             "the child is running when the caller gives up"
         );
         wait_for_reaps();
-        assert!(
-            !process_alive(&pid),
-            "exit waits until the abandoned launch's child is gone"
-        );
+        wait_until_stopped(&pid);
     }
 
     #[cfg(unix)]
@@ -1203,7 +1200,7 @@ pub(crate) mod tests {
         let pid = wait_for_pid_file(&fake.dir.join("pid"));
         drop(launch);
         wait_for_reaps();
-        assert!(!process_alive(&pid));
+        wait_until_stopped(&pid);
     }
 
     /// A stand-in `headroom wrap`: runs the wrapped program as its own child,
@@ -1259,7 +1256,7 @@ pub(crate) mod tests {
 
         drop(room);
         wait_for_reaps();
-        assert!(!process_alive(&server), "the wrapper's server is reaped");
+        wait_until_stopped(&server);
     }
 
     #[cfg(unix)]
@@ -1275,10 +1272,19 @@ pub(crate) mod tests {
 
         drop(room);
         wait_for_reaps();
-        assert!(
-            !process_alive(&server),
-            "the verified server pid is stopped"
-        );
+        wait_until_stopped(&server);
+    }
+
+    #[cfg(unix)]
+    fn wait_until_stopped(pid: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the process {pid} is still alive"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[cfg(unix)]

@@ -704,6 +704,9 @@ mod tests {
     fn a_failed_exec_reports_its_own_error_and_never_a_session() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path();
+        // Generous: every stub exits at once, so this only has to outlast a
+        // loaded runner. The bound itself has its own test below.
+        let bound = Duration::from_secs(30);
         for (name, body, expected) in [
             (
                 "failed",
@@ -727,7 +730,7 @@ mod tests {
                 &exec_arguments(&[], "prompt"),
                 dir,
                 &[],
-                Duration::from_secs(5),
+                bound,
             )
             .unwrap_err();
             assert!(error.contains(expected), "{name}: {error}");
@@ -745,7 +748,7 @@ mod tests {
             &exec_arguments(&[], "prompt"),
             dir,
             &[],
-            Duration::from_secs(5),
+            bound,
         )
         .unwrap_err();
         assert!(error.contains("turn failed"), "{error}");
