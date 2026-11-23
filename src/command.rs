@@ -552,10 +552,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "batch launcher grandchild never reports its pid on windows-latest CI; root cause open for T2b, which owns the launcher path"
-    )]
+    // TEMP-DIAG(T1-repair): ignore lifted to run diagnostics; final state
+    // restores a proven gate.
     fn process_tree_termination_reaps_a_batch_descendant() {
         use std::{io::Read, thread, time::Duration};
 
@@ -634,7 +632,7 @@ mod tests {
                 let debug = fs::read_to_string(directory.join("launcher-debug.log"))
                     .unwrap_or_else(|error| format!("<no debug log: {error}>"));
                 eprintln!("DIAG debug-log:\n{debug}");
-                eprintln!("DIAG shim exists: {}", shim.is_file());
+                eprintln!("DIAG shim exists: {}", directory.join("long-child.cmd").is_file());
                 // Keep watching past the timeout: distinguishes a slow
                 // powershell from a dead launcher.
                 let mut late = false;
