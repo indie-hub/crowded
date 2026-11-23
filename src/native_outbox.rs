@@ -22,7 +22,9 @@ use crate::native_session::{
     same_launch_placeholder,
 };
 #[cfg(test)]
-use crate::native_session::{UNCERTAIN_HOLD, is_unreported_placeholder, unreported_session};
+use crate::native_session::{
+    DISCONNECTED_HOLD, UNCERTAIN_HOLD, is_unreported_placeholder, unreported_session,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Binding {
@@ -405,14 +407,14 @@ mod tests {
         outbox
             .schedule(&startup_bindings, false, false, &[], Arc::clone(&adapter))
             .unwrap();
-        wait(&mut outbox, &startup_bindings);
         assert_eq!(hold_of(&mut outbox, &id), Some(CLAUDE_HOLD.to_owned()));
 
-        // While no mod is registered the held mail is not retried.
+        // While no mod is registered the held mail is not retried, and the
+        // first attempt is not spent on a room that cannot receive it.
         outbox
             .schedule(&startup_bindings, false, false, &[], Arc::clone(&adapter))
             .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
 
         // The mod registers in the same launch: the intro is offered once.
         ready.store(true, Ordering::SeqCst);
@@ -420,7 +422,7 @@ mod tests {
             .schedule(&startup_bindings, false, false, &[], Arc::clone(&adapter))
             .unwrap();
         wait(&mut outbox, &startup_bindings);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         let delivered = outbox
             .state
             .messages
@@ -434,7 +436,7 @@ mod tests {
         outbox
             .schedule(&startup_bindings, false, false, &[], adapter)
             .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// Mail held for one session or launch is never delivered to another: a
@@ -1721,6 +1723,18 @@ mod tests {
                 retryable: true,
                 stale: false,
             },
+            Row {
+                hold: Some(DISCONNECTED_HOLD),
+                retryable: true,
+                stale: false,
+            },
+            // A reason the mod supplied is namespaced, so it is never retried
+            // even when it spells an internal hold.
+            Row {
+                hold: Some("Claude mod: no Claude mod connected"),
+                retryable: false,
+                stale: false,
+            },
         ];
         for row in rows {
             let message = message_with_hold("a", 1, row.hold);
@@ -1916,28 +1930,197 @@ mod tests {
             .enqueue("source".into(), startup, "house rules".into())
             .unwrap()
             .id;
-        // No mod: one attempt, then held, never retried while missing.
+        // No mod: the first attempt is not spent, the mail is held, and it is
+        // never retried while the mod is missing.
         outbox
             .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
             .unwrap();
-        wait(&mut outbox, &bindings);
         assert_eq!(hold_of(&mut outbox, &id), Some(CLAUDE_HOLD.to_owned()));
         outbox
             .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
             .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         // The mod registers: offered exactly once more, then accepted.
         ready.store(true, Ordering::SeqCst);
         outbox
             .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
             .unwrap();
         wait(&mut outbox, &bindings);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         // ...and never re-sent afterwards.
         outbox
             .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
             .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// An adapter that drops its first attempt as disconnected and then
+    /// accepts, recording what it was asked to send.
+    struct WedgeFake {
+        attempted: AtomicUsize,
+        order: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Adapter for WedgeFake {
+        fn send(&self, message: Message) -> AdapterResult {
+            self.order.lock().unwrap().push(message.text);
+            if self.attempted.fetch_add(1, Ordering::SeqCst) == 0 {
+                return AdapterResult::Dropped(DISCONNECTED_HOLD.to_owned());
+            }
+            accepted()
+        }
+    }
+
+    /// A row wedged as disconnected is offered again once the room can take
+    /// mail, and the mail behind it follows in order.
+    #[test]
+    fn a_disconnected_head_is_reoffered_and_later_mail_follows_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let mut outbox = Outbox::open(&path, 4, 4, 4).unwrap();
+        let b = binding("a", 1);
+        let bindings = HashMap::from([("a".to_owned(), b.clone())]);
+        let adapter = Arc::new(WedgeFake {
+            attempted: AtomicUsize::new(0),
+            order: std::sync::Mutex::new(Vec::new()),
+        });
+        let as_adapter: Arc<dyn Adapter> = Arc::clone(&adapter) as Arc<dyn Adapter>;
+
+        let head = outbox
+            .enqueue("s".into(), b.clone(), "head".into())
+            .unwrap()
+            .id;
+        outbox
+            .schedule(&bindings, false, false, &[], Arc::clone(&as_adapter))
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(
+            hold_of(&mut outbox, &head),
+            Some(DISCONNECTED_HOLD.to_owned())
+        );
+
+        let later = outbox.enqueue("s".into(), b, "later".into()).unwrap().id;
+        outbox
+            .schedule(&bindings, false, false, &[], Arc::clone(&as_adapter))
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        outbox
+            .schedule(&bindings, false, false, &[], as_adapter)
+            .unwrap();
+        wait(&mut outbox, &bindings);
+
+        assert_eq!(
+            *adapter.order.lock().unwrap(),
+            vec!["head", "head", "later"]
+        );
+        assert_eq!(
+            outbox
+                .state
+                .messages
+                .iter()
+                .find(|message| message.id == head)
+                .unwrap()
+                .status,
+            Status::Accepted
+        );
+        assert_eq!(
+            outbox
+                .state
+                .messages
+                .iter()
+                .find(|message| message.id == later)
+                .unwrap()
+                .status,
+            Status::Accepted
+        );
+    }
+
+    /// An adapter for a room that has not registered its mod: nothing may be
+    /// attempted until it can receive.
+    struct NotReadyFake {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Adapter for NotReadyFake {
+        fn send(&self, _: Message) -> AdapterResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            accepted()
+        }
+
+        fn ready(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// The first attempt is never spent on a room that cannot take it.
+    #[test]
+    fn a_first_attempt_to_a_not_ready_room_is_not_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let mut outbox = Outbox::open(&path, 4, 4, 4).unwrap();
+        let b = binding("a", 1);
+        let bindings = HashMap::from([("a".to_owned(), b.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter: Arc<dyn Adapter> = Arc::new(NotReadyFake {
+            calls: Arc::clone(&calls),
+        });
+        let id = outbox.enqueue("s".into(), b, "hello".into()).unwrap().id;
+
+        outbox
+            .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(hold_of(&mut outbox, &id), Some(CLAUDE_HOLD.to_owned()));
+
+        // The visible hold is retried once the room is ready, not while it is
+        // not: no attempt is spent either way.
+        outbox
+            .schedule(&bindings, false, false, &[], adapter)
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Mail behind a room that cannot receive is never left queued with no
+    /// visible reason.
+    #[test]
+    fn later_mail_behind_a_not_ready_room_carries_a_visible_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let mut outbox = Outbox::open(&path, 4, 4, 4).unwrap();
+        let b = binding("a", 1);
+        let bindings = HashMap::from([("a".to_owned(), b.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter: Arc<dyn Adapter> = Arc::new(NotReadyFake {
+            calls: Arc::clone(&calls),
+        });
+        let first = outbox
+            .enqueue("s".into(), b.clone(), "one".into())
+            .unwrap()
+            .id;
+        let second = outbox.enqueue("s".into(), b, "two".into()).unwrap().id;
+        // Mail saved against this launch's own unreported placeholder is this
+        // room's mail too: it must not wait without a visible reason either.
+        let startup = Binding {
+            room: "a".to_owned(),
+            session: unreported_session("a", 1),
+            endpoint: "endpoint".to_owned(),
+            generation: 1,
+        };
+        let third = outbox
+            .enqueue("s".into(), startup, "three".into())
+            .unwrap()
+            .id;
+
+        outbox
+            .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
+            .unwrap();
+        for id in [&first, &second, &third] {
+            assert!(
+                hold_of(&mut outbox, id).is_some(),
+                "row {id} was left queued with no visible reason"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -2718,9 +2901,10 @@ impl Outbox {
         for mut message in self.state.messages.clone() {
             let room = &message.destination;
             if unready.contains(room) {
-                if matches!(&message.status, Status::Queued { hold: None })
-                    && bindings.get(room) == Some(&message.binding)
-                {
+                // Mail this room cannot take now still gets an answer: no row
+                // waits without a visible reason. A row of another launch is
+                // classified stale once the room is ready.
+                if matches!(&message.status, Status::Queued { hold: None }) {
                     self.set_hold(&message.id, CLAUDE_HOLD)?;
                 }
                 continue;
@@ -2794,6 +2978,16 @@ impl Outbox {
                     }
                     blocked.insert(room.clone());
                     if self.active.len() >= self.max_in_flight || self.active.contains(room) {
+                        continue;
+                    }
+                    // Never spend the first attempt on a room that cannot take
+                    // it: the room would look disconnected instead of busy, and
+                    // a wedged row would need a later retry to recover. The
+                    // hold is visible and retryable, and later mail waits
+                    // behind it instead of showing no reason at all.
+                    if !adapter.ready(room) {
+                        self.set_hold(&message.id, CLAUDE_HOLD)?;
+                        unready.insert(room.clone());
                         continue;
                     }
                     let mut next = self.state.clone();

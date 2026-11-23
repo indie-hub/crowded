@@ -18,7 +18,9 @@ use std::{
 
 use crate::{
     native_outbox::{AdapterResult, Binding, Message},
-    native_session::{CLAUDE_HOLD, STALE_HOLD, UNCOLLECTED_HOLD},
+    native_session::{
+        CLAUDE_HOLD, DISCONNECTED_HOLD, MOD_HOLD_PREFIX, STALE_HOLD, UNCOLLECTED_HOLD,
+    },
     pane::session_state::create_private_directory,
 };
 
@@ -29,8 +31,6 @@ const RECEIPT_WAIT: Duration = Duration::from_secs(2);
 const BODY_LIMIT: usize = 64 * 1024;
 const HEAD_LIMIT: usize = 8 * 1024;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
-/// The hold for a room whose registered mod stopped polling.
-pub(crate) const DISCONNECTED_HOLD: &str = "Claude mod disconnected";
 /// The hold for mail the mod could not receive inside its response limit.
 pub(crate) const TOO_LARGE_HOLD: &str = "the message is too large for the Claude mod";
 /// A whole request must arrive within this, so no client can hold the listener.
@@ -679,8 +679,11 @@ fn receipt(state: &mut State, body: &serde_json::Value) -> (u16, String) {
     // the same id can still settle it.
     let held = match state_name {
         "started" => None,
+        // A mod-supplied reason is namespaced: it must never equal an internal
+        // hold string, or a claimed message would look retryable and be sent
+        // twice.
         "held" => Some(match field("reason") {
-            Some(reason) if !reason.is_empty() => reason.to_owned(),
+            Some(reason) if !reason.is_empty() => format!("{MOD_HOLD_PREFIX}{reason}"),
             _ => "the Claude mod held the prompt".to_owned(),
         }),
         _ => {
@@ -904,6 +907,7 @@ pub(crate) fn mod_of(cwd: &Path, session: &str) -> FakeMod {
 mod tests {
     use super::*;
     use crate::native_outbox::Binding;
+    use crate::native_session::is_retryable_hold;
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -1027,8 +1031,27 @@ mod tests {
         assert_eq!(mod_.receipt(&claim, "held", "prompt is open"), 200);
         assert!(matches!(
             held.join().unwrap(),
-            AdapterResult::Dropped(reason) if reason == "prompt is open"
+            AdapterResult::Dropped(reason) if reason == "Claude mod: prompt is open"
         ));
+    }
+
+    /// A mod-supplied held reason that spells an internal hold is namespaced,
+    /// so the row it settles is not retryable and the claimed message is never
+    /// offered again.
+    #[test]
+    fn a_mod_reason_equal_to_an_internal_hold_is_namespaced_and_not_retryable() {
+        let inbox = inbox(Duration::from_secs(2));
+        let mod_ = FakeMod::register(&inbox.url, &inbox.token);
+        let held = delivered(Arc::clone(&inbox), message(1, "id-collide", "held"));
+        let claim = mod_.claim();
+        assert_eq!(mod_.receipt(&claim, "held", CLAUDE_HOLD), 200);
+        let reason = match held.join().unwrap() {
+            AdapterResult::Dropped(reason) => reason,
+            _ => panic!("a held receipt must drop the message"),
+        };
+        assert_ne!(reason, CLAUDE_HOLD);
+        assert_eq!(reason, format!("{MOD_HOLD_PREFIX}{CLAUDE_HOLD}"));
+        assert!(!is_retryable_hold(&reason));
     }
 
     /// Held mail waits for a registered mod: readiness follows registration
@@ -1135,7 +1158,7 @@ mod tests {
         assert_eq!(mod_.receipt(&claim, "held", "prompt is open"), 200);
         assert!(matches!(
             held.join().unwrap(),
-            AdapterResult::Dropped(reason) if reason == "prompt is open"
+            AdapterResult::Dropped(reason) if reason == "Claude mod: prompt is open"
         ));
         assert!(
             quick.peek_late().is_empty(),
@@ -1154,7 +1177,10 @@ mod tests {
         assert_eq!(mod_.receipt(&claim, "held", "prompt is open"), 200);
         let settled = inbox.peek_late();
         assert_eq!(settled.len(), 1);
-        assert_eq!(settled[0].held.as_deref(), Some("prompt is open"));
+        assert_eq!(
+            settled[0].held.as_deref(),
+            Some("Claude mod: prompt is open")
+        );
     }
 
     /// The timeout does not win when the outcome already arrived: abandon()

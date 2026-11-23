@@ -25,6 +25,12 @@ pub(crate) const UNCONFIRMED_HOLD: &str = "saving this message was not confirmed
 /// The hold for mail no mod collected in time. The mail never reached the
 /// room, so a later offer is a first send, not a resend.
 pub(crate) const UNCOLLECTED_HOLD: &str = "Claude mod did not collect the message";
+/// The hold for a room whose registered mod stopped polling. The mail was
+/// never queued for the mod, so a later offer is a first send, not a resend.
+pub(crate) const DISCONNECTED_HOLD: &str = "Claude mod disconnected";
+/// Prefixes a hold reason the Claude mod itself supplied, so it can never look
+/// like one of this crate's own hold strings and be retried.
+pub(crate) const MOD_HOLD_PREFIX: &str = "Claude mod: ";
 
 /// The session name a Claude room is bound to before its own hook reports the
 /// real session. It names one launch, never a session, and is never persisted.
@@ -79,5 +85,8 @@ pub(crate) fn is_stale_hold(message: &Message) -> bool {
 /// Holds retried once the room can receive again: the room could not take the
 /// mail, and the mail never reached it.
 pub(crate) fn is_retryable_hold(reason: &str) -> bool {
-    reason == CLAUDE_HOLD || reason == UNCERTAIN_HOLD || reason == UNCOLLECTED_HOLD
+    reason == CLAUDE_HOLD
+        || reason == UNCERTAIN_HOLD
+        || reason == UNCOLLECTED_HOLD
+        || reason == DISCONNECTED_HOLD
 }
