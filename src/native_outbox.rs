@@ -16,6 +16,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use crate::claude_inbox::TOO_LARGE_HOLD;
 /// Verbatim-moved session and hold rules, owned by [`crate::native_session`].
 use crate::native_session::{
     CLAUDE_HOLD, PENDING_HOLD, STALE_HOLD, UNCONFIRMED_HOLD, is_retryable_hold, is_stale_hold,
@@ -23,7 +25,8 @@ use crate::native_session::{
 };
 #[cfg(test)]
 use crate::native_session::{
-    DISCONNECTED_HOLD, UNCERTAIN_HOLD, is_unreported_placeholder, unreported_session,
+    DISCONNECTED_HOLD, MOD_HOLD_PREFIX, UNCERTAIN_HOLD, is_unreported_placeholder,
+    unreported_session,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -785,11 +788,12 @@ mod tests {
         outbox
             .schedule(&bindings, false, false, &[], fake(&calls, accepted))
             .unwrap();
-        assert_eq!(
-            outbox.state.messages[1].status,
-            Status::Queued { hold: None }
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // The dropped head is final: it stays visible and the lane moves on to
+        // its next message, still in order.
+        assert_eq!(outbox.state.messages[1].status, Status::Sending);
+        wait(&mut outbox, &bindings);
+        assert_eq!(outbox.state.messages[1].status, Status::Accepted);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -2123,6 +2127,156 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    /// An adapter that drops every message with one fixed reason.
+    struct DroppingFake {
+        calls: Arc<AtomicUsize>,
+        reason: String,
+    }
+
+    impl Adapter for DroppingFake {
+        fn send(&self, _: Message) -> AdapterResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            AdapterResult::Dropped(self.reason.clone())
+        }
+    }
+
+    /// A hold nothing can clear - the mod refused the prompt, the message was
+    /// too large, its save was unconfirmed - stays visible and is never tried
+    /// again, but it must not strand the mail behind it.
+    #[test]
+    fn a_final_held_head_does_not_block_later_mail() {
+        for reason in [
+            format!("{MOD_HOLD_PREFIX}prompt is open"),
+            TOO_LARGE_HOLD.to_owned(),
+            UNCONFIRMED_HOLD.to_owned(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("outbox.json");
+            let mut outbox = Outbox::open(&path, 4, 4, 2).unwrap();
+            let b = binding("a", 1);
+            let bindings = HashMap::from([("a".to_owned(), b.clone())]);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let head = outbox
+                .enqueue("s".into(), b.clone(), "head".into())
+                .unwrap()
+                .id;
+            outbox
+                .schedule(
+                    &bindings,
+                    false,
+                    false,
+                    &[],
+                    Arc::new(DroppingFake {
+                        calls: Arc::clone(&calls),
+                        reason: reason.clone(),
+                    }),
+                )
+                .unwrap();
+            wait(&mut outbox, &bindings);
+            assert_eq!(hold_of(&mut outbox, &head), Some(reason.clone()));
+
+            let later = outbox.enqueue("s".into(), b, "later".into()).unwrap().id;
+            outbox
+                .schedule(&bindings, false, false, &[], fake(&calls, accepted))
+                .unwrap();
+            wait(&mut outbox, &bindings);
+
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "hold {reason}");
+            let head_row = outbox
+                .state
+                .messages
+                .iter()
+                .find(|message| message.id == head)
+                .unwrap();
+            assert_eq!(head_row.attempts.len(), 1, "hold {reason}");
+            assert_eq!(
+                head_row.status,
+                Status::Queued {
+                    hold: Some(reason.clone())
+                },
+                "hold {reason}"
+            );
+            assert_eq!(
+                outbox
+                    .state
+                    .messages
+                    .iter()
+                    .find(|message| message.id == later)
+                    .unwrap()
+                    .status,
+                Status::Accepted,
+                "hold {reason}"
+            );
+        }
+    }
+
+    /// Pending mail is still sent by a retarget, so it keeps its place: later
+    /// mail must not overtake it.
+    #[test]
+    fn a_pending_held_head_still_blocks_later_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let mut outbox = Outbox::open(&path, 4, 4, 2).unwrap();
+        let b = binding("a", 1);
+        let bindings = HashMap::from([("a".to_owned(), b.clone())]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let head = outbox
+            .enqueue("s".into(), b.clone(), "head".into())
+            .unwrap()
+            .id;
+        let later = outbox.enqueue("s".into(), b, "later".into()).unwrap().id;
+        outbox.set_hold(&head, PENDING_HOLD).unwrap();
+
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&calls, accepted))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(hold_of(&mut outbox, &head), Some(PENDING_HOLD.to_owned()));
+        assert_eq!(
+            outbox
+                .state
+                .messages
+                .iter()
+                .find(|message| message.id == later)
+                .unwrap()
+                .status,
+            Status::Queued { hold: None }
+        );
+    }
+
+    /// Rows saved by an older build can hold an internal-looking reason
+    /// verbatim. They are never re-offered: their generation is older than the
+    /// launch that loads them, so they become stale instead.
+    #[test]
+    fn a_legacy_internal_looking_hold_at_an_older_generation_is_never_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let old = binding("a", 1);
+        let current = binding("a", 2);
+        let bindings = HashMap::from([("a".to_owned(), current)]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut outbox = Outbox::open(&path, 4, 4, 4).unwrap();
+        let wedge = outbox
+            .enqueue("s".into(), old.clone(), "wedge".into())
+            .unwrap()
+            .id;
+        let intro = outbox.enqueue("s".into(), old, "intro".into()).unwrap().id;
+        outbox.set_hold(&wedge, DISCONNECTED_HOLD).unwrap();
+        outbox.set_hold(&intro, CLAUDE_HOLD).unwrap();
+        drop(outbox);
+
+        // The rows are persisted; a new launch loads them at a newer
+        // generation of the same session.
+        let mut outbox = Outbox::open(&path, 4, 4, 4).unwrap();
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&calls, accepted))
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        for id in [&wedge, &intro] {
+            assert_eq!(hold_of(&mut outbox, id), Some(STALE_HOLD.to_owned()));
+        }
+    }
+
     #[test]
     fn room_number_reaches_mod_through_files_7245fc1() {
         // The Claude mod sandbox has no process global, so the mod resolves
@@ -3022,6 +3176,15 @@ impl Outbox {
                 }
                 // Held mail of an earlier launch does not stand in front of newer mail.
                 Status::Queued { hold: Some(reason) } if reason == STALE_HOLD => {}
+                // A hold that no later pass can clear - the mod refused the
+                // prompt, or it was too large, or its save was unconfirmed -
+                // does not stand in front of newer mail either: nothing would
+                // ever release it, so blocking would strand the room until a
+                // relaunch. The row keeps its reason and attempt and is never
+                // offered again. Pending mail is the exception: a retarget will
+                // still send it, so it must keep its place in line.
+                Status::Queued { hold: Some(reason) }
+                    if !is_retryable_hold(reason) && reason != PENDING_HOLD => {}
                 // A message that may already have arrived is never resent, and
                 // it does not hold the room's later mail: nothing can settle it
                 // within a launch, so blocking would strand the room until a
