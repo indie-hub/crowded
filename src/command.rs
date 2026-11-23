@@ -632,7 +632,10 @@ mod tests {
                 let debug = fs::read_to_string(directory.join("launcher-debug.log"))
                     .unwrap_or_else(|error| format!("<no debug log: {error}>"));
                 eprintln!("DIAG debug-log:\n{debug}");
-                eprintln!("DIAG shim exists: {}", directory.join("long-child.cmd").is_file());
+                eprintln!(
+                    "DIAG shim exists: {}",
+                    directory.join("long-child.cmd").is_file()
+                );
                 // Keep watching past the timeout: distinguishes a slow
                 // powershell from a dead launcher.
                 let mut late = false;
