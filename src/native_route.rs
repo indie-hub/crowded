@@ -3464,13 +3464,14 @@ mod tests {
                     reason: None,
                 }])
                 .unwrap();
-            // Short enough that the claim's timeout settles the row soon after
-            // the mod refuses to receipt it; the sender's reply deadline is
-            // independent, so either reply form is accepted below.
+            // Long enough that this round's report reaches the outbox before
+            // the claim times out, so the row adopts the reported session when
+            // it settles. The sender's reply runs on its own deadline and is
+            // not asserted below.
             router
                 .claude_inbox(0)
                 .unwrap()
-                .set_test_timeout(Duration::from_millis(50));
+                .set_test_timeout(Duration::from_secs(1));
             let log = Log::default();
             // The mod is borrowed for the whole round: a scoped claim lets the
             // router keep ticking while it blocks.
@@ -3497,15 +3498,25 @@ mod tests {
                 });
                 claiming.join().unwrap()
             });
+            // Let any schedule sent before the report finish, so the claim's
+            // timeout is collected by a pass that already has the new binding.
+            let drained = Instant::now() + Duration::from_secs(10);
+            while router.schedule_in_flight {
+                router.tick(Instant::now(), &mut mailroom, false, false);
+                assert!(
+                    Instant::now() < drained,
+                    "round {round}: the outbox never answered its schedule"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
             // The launch's first report keeps its generation: the row's binding
             // becomes the real session while the claim carries the placeholder.
             router
                 .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), CLAUDE_A, 1)
                 .unwrap();
-            // The claim's own timeout settles the row Uncertain. The sender's
-            // reply runs on an independent deadline (REPLY_WAIT, 1.5 s), so a
-            // slow tick can answer Queued first: assert the row's state, and
-            // accept either reply form.
+            // The claim's own timeout settles the row Uncertain under the
+            // adopted binding. The sender's reply runs on an independent
+            // deadline, so either reply form is accepted.
             let mut reply = None;
             let settled = Instant::now() + Duration::from_secs(10);
             loop {
@@ -3513,16 +3524,17 @@ mod tests {
                 if reply.is_none() {
                     reply = log.borrow_mut().pop().map(|(_, outcome)| outcome);
                 }
-                let uncertain = router
-                    .messages
-                    .iter()
-                    .any(|message| message.id == claim.id && message.status == Status::Uncertain);
-                if uncertain && reply.is_some() {
+                let settled_uncertain = router.messages.iter().any(|message| {
+                    message.id == claim.id
+                        && message.status == Status::Uncertain
+                        && message.binding.session == CLAUDE_A
+                });
+                if settled_uncertain && reply.is_some() {
                     break;
                 }
                 assert!(
                     Instant::now() < settled,
-                    "round {round}: the row never settled Uncertain:\n{}",
+                    "round {round}: the row never settled Uncertain under the adopted binding:\n{}",
                     mailroom.summary()
                 );
                 thread::sleep(Duration::from_millis(20));
