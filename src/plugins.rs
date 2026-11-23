@@ -1130,6 +1130,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "plugin file link assumes a POSIX symlink; no .mjs link appears on Windows"
+    )]
     fn local_plugin_is_shared_and_removed_without_touching_other_files() {
         let base = test_directory();
         let source = base.join("source");

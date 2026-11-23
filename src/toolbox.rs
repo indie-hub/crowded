@@ -2345,6 +2345,10 @@ export const CrowdedPulse = async () => {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "node --test is handed backslash Windows paths, which the ESM loader rejects; harness needs a file-URL path fix"
+    )]
     fn generated_tui_plugin_passes_node_checks_when_node_is_present() {
         use std::process::Command;
         if Command::new("node").arg("--version").output().is_err() {

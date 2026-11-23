@@ -415,6 +415,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "fixture setup commands use /bin/sh, absent on Windows"
+    )]
     fn init_creates_then_applies_config_once() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
