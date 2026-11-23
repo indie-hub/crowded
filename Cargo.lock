@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "crowded"
-version = "0.46.1"
+version = "0.47.0"
 dependencies = [
  "base64",
  "crossterm",

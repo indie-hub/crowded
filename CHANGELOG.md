@@ -7,6 +7,26 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-11-23
+
+### Added
+- An OpenCode native room can be cleared in place (`crowded control N clear`): its owned server stays up, a new session is created on it, the terminal reopens on that session and the room is rebound under a new launch generation. A failed restart rolls the room back to its previous session, and a double failure says to clear again or restart Crowded.
+- CI gates `cargo fmt`, `cargo clippy` (correctness group), the tests and the Claude mod delivery tests on every change, with a pinned toolchain and one script (`scripts/check.sh`) that runs the same commands locally.
+
+### Changed
+- A plain `crowded` launch starts native Codex and Claude rooms in a new conversation. Only `crowded resume` reopens a room's stored session, and a stored Codex session is reopened only when its rollout file is found under `~/.codex/sessions` for the same working directory; otherwise the room starts fresh with one notice. OpenCode native rooms already started fresh; reopening them on `crowded resume` is not supported yet.
+
+### Fixed
+- Mail to a native room is no longer held behind one uncertain message: an uncertain message stays visible and is never resent, and later mail is still delivered. An uncertain message from an earlier launch no longer holds the new launch either.
+- A Claude message whose receipt arrives after the 2 s wait (the room was busy) is settled from that authenticated receipt and shows `ACCEPTED (submitted)` instead of staying uncertain. A held receipt settles it as held. A restart before the receipt leaves it uncertain.
+- Mail to a busy Claude room no longer wedges. A message refused because the mod was not polling is offered again, in order, once it polls; a first attempt is not made while the mod cannot receive; and later mail shows a visible hold instead of a silent `QUEUED`. A message the mod itself held, a message too large for the mod and one whose save was not confirmed stay visible and no longer block later mail.
+- A reason sent by the Claude mod with a held prompt is shown as `Claude mod: ...`, so it can never be mistaken for one of Crowded's own retryable holds and a claimed prompt is never sent twice.
+- A Claude room whose live session differs from the id Crowded bound (for example after a resume) still connects: its per-room bootstrap connection file is kept for the whole launch.
+
+### Known limits
+- A busy Claude room shows `no Claude mod connected` while its own turn is running; Crowded cannot yet tell a busy mod from a stopped one.
+- Mail held by an earlier build before an upgrade is marked `sent for an earlier launch of this room; not delivered` after the restart, and is not delivered.
+
 ## [0.46.1] - 2026-11-20
 
 ### Fixed
