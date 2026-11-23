@@ -1,6 +1,6 @@
 # Crowded pins LF for code checkouts on every OS. Several tests read
 # their own source with include_str! and match on "\n" (for example the
 # router/terminal-writer guards in src/app/tests.rs); a CRLF checkout on
-# Windows breaks them. Added for the T1 windows-latest CI gate.
+# Windows breaks them.
 *.rs text eol=lf
 *.mjs text eol=lf
