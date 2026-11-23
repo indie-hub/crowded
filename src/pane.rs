@@ -30,6 +30,9 @@ use crate::{
 
 mod controls;
 
+#[cfg(target_os = "linux")]
+mod pty_io;
+
 pub(crate) mod session_state;
 
 pub(crate) use session_state::usage_cost;
@@ -444,10 +447,17 @@ struct PaneWriter {
     /// Jobs accepted but not yet fully written. Callers use it to avoid ageing
     /// a submit-tracking record while its whisper is still queued.
     unwritten: Arc<AtomicUsize>,
+    /// Set when the owning pane is dropped: a writer stuck on a guest that
+    /// stopped reading must not outlive its pane.
+    stopped: Arc<AtomicBool>,
 }
 
 impl PaneWriter {
-    fn spawn(mut inner: Box<dyn Write + Send>) -> Self {
+    fn spawn(inner: Box<dyn Write + Send>) -> Self {
+        Self::spawn_stoppable(inner, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn spawn_stoppable(mut inner: Box<dyn Write + Send>, stopped: Arc<AtomicBool>) -> Self {
         let (jobs, rx) = mpsc::sync_channel(WRITER_QUEUE_JOBS);
         let failed = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
@@ -472,6 +482,7 @@ impl PaneWriter {
             failed,
             finished,
             unwritten,
+            stopped,
         }
     }
 
@@ -508,6 +519,14 @@ impl PaneWriter {
         self.unwritten.load(Ordering::SeqCst) > 0
             && !self.failed.load(Ordering::SeqCst)
             && !self.finished.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for PaneWriter {
+    fn drop(&mut self) {
+        // The pane is going away; a writer waiting on a guest that stopped
+        // reading returns from its wait and ends the thread.
+        self.stopped.store(true, Ordering::SeqCst);
     }
 }
 
@@ -1874,9 +1893,31 @@ impl Pane {
         drop(pty.slave);
 
         // Input and output use separate master handles so reading can block
-        // on another thread while the UI remains responsive.
-        let writer = PaneWriter::spawn(pty.master.take_writer()?);
-        let mut reader = pty.master.try_clone_reader()?;
+        // on another thread while the UI remains responsive. Linux cannot end
+        // a write blocked on a guest that stopped reading, so there the writer
+        // waits on a non-blocking duplicate and stops with its pane.
+        #[cfg(target_os = "linux")]
+        let (writer, mut reader) = {
+            let fd = pty
+                .master
+                .as_raw_fd()
+                .ok_or_else(|| io::Error::other("the Linux pty master has no descriptor"))?;
+            let stopped = Arc::new(AtomicBool::new(false));
+            let writer_file = pty_io::nonblocking_dup(fd)?;
+            let reader_file = pty_io::nonblocking_dup(fd)?;
+            (
+                PaneWriter::spawn_stoppable(
+                    Box::new(pty_io::PtyWriter::new(writer_file, Arc::clone(&stopped))),
+                    stopped,
+                ),
+                Box::new(pty_io::PtyReader::new(reader_file)) as Box<dyn Read + Send>,
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (writer, mut reader) = (
+            PaneWriter::spawn(pty.master.take_writer()?),
+            pty.master.try_clone_reader()?,
+        );
         let (output_tx, output_rx) = mpsc::channel();
         // `move` transfers the reader and sender into the new thread.
         thread::spawn(move || {
