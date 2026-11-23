@@ -2270,6 +2270,127 @@ mod tests {
         }
     }
 
+    /// An adapter that hands mail to a room's real Claude inbox.
+    #[cfg(unix)]
+    struct InboxAdapter {
+        inbox: Arc<crate::claude_inbox::ClaudeInbox>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[cfg(unix)]
+    impl Adapter for InboxAdapter {
+        fn send(&self, message: Message) -> AdapterResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inbox.deliver(&message)
+        }
+
+        fn ready(&self, _: &str) -> bool {
+            self.inbox.open_for_delivery()
+        }
+    }
+
+    /// End to end through a real Claude inbox: a message the mod claimed and
+    /// held with a reason that spells an internal hold is stored namespaced, is
+    /// never offered again across passes and a reopen, and later mail to the
+    /// same room is delivered.
+    #[cfg(unix)]
+    #[test]
+    fn a_claimed_mod_held_row_is_never_reoffered_end_to_end() {
+        use crate::claude_inbox::{ClaudeInbox, FakeMod, bootstrap_file};
+
+        for held_reason in [CLAUDE_HOLD, DISCONNECTED_HOLD] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("outbox.json");
+            let inbox = Arc::new(ClaudeInbox::start().unwrap());
+            inbox.prepare(dir.path(), 1, 1).unwrap();
+            let raw = std::fs::read(bootstrap_file(dir.path(), 1).unwrap()).unwrap();
+            let connection: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            let mod_ = FakeMod::register(
+                connection["url"].as_str().unwrap(),
+                connection["token"].as_str().unwrap(),
+            );
+            let b = binding("1", 1);
+            let bindings = HashMap::from([("1".to_owned(), b.clone())]);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let adapter: Arc<dyn Adapter> = Arc::new(InboxAdapter {
+                inbox: Arc::clone(&inbox),
+                calls: Arc::clone(&calls),
+            });
+            let mut outbox = Outbox::open(&path, 4, 4, 1).unwrap();
+
+            let head = outbox
+                .enqueue("s".into(), b.clone(), "head".into())
+                .unwrap()
+                .id;
+            outbox
+                .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
+                .unwrap();
+            let claim = mod_.claim();
+            assert_eq!(claim.text, "head");
+            assert_eq!(mod_.receipt(&claim, "held", held_reason), 200);
+            wait(&mut outbox, &bindings);
+            assert_eq!(
+                hold_of(&mut outbox, &head),
+                Some(format!("{MOD_HOLD_PREFIX}{held_reason}")),
+                "held reason {held_reason}"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            // Later passes never offer the claimed message again.
+            for _ in 0..2 {
+                assert!(mod_.next_claim().is_none());
+                outbox
+                    .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
+                    .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(
+                    mod_.next_claim().is_none(),
+                    "the claimed head was offered again: {held_reason}"
+                );
+            }
+
+            // A later message to the same room is delivered.
+            let later = outbox
+                .enqueue("s".into(), b.clone(), "later".into())
+                .unwrap()
+                .id;
+            assert!(mod_.next_claim().is_none());
+            outbox
+                .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
+                .unwrap();
+            let claim = mod_.claim();
+            assert_eq!(claim.text, "later");
+            assert_eq!(mod_.receipt(&claim, "started", ""), 200);
+            wait(&mut outbox, &bindings);
+            assert_eq!(
+                outbox
+                    .state
+                    .messages
+                    .iter()
+                    .find(|message| message.id == later)
+                    .unwrap()
+                    .status,
+                Status::Accepted
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+            // Neither does a reopen.
+            drop(outbox);
+            let mut outbox = Outbox::open(&path, 4, 4, 1).unwrap();
+            for _ in 0..2 {
+                assert!(mod_.next_claim().is_none());
+                outbox
+                    .schedule(&bindings, false, false, &[], Arc::clone(&adapter))
+                    .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                assert!(
+                    mod_.next_claim().is_none(),
+                    "a reopen offered the claimed head again: {held_reason}"
+                );
+            }
+        }
+    }
+
     /// Pending mail is still sent by a retarget, so it keeps its place: later
     /// mail must not overtake it.
     #[test]
