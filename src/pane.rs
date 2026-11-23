@@ -232,8 +232,9 @@ pub(crate) fn spec_uses_headroom(spec: &RoomSpec) -> bool {
 pub(crate) fn resume_supported_specs(specs: &mut [RoomSpec]) -> Vec<bool> {
     // Runs across the whole slate first: which OpenCode session belongs to
     // which room cannot be decided from one room's view alone.
-    // Native-delivery rooms always start a fresh explicit session, so they
-    // neither take part in the repair nor receive resume arguments.
+    // Native-delivery rooms choose their own session before their terminal
+    // starts, so they neither take part in the repair nor receive resume
+    // arguments here.
     let slate: Vec<RoomSpec> = specs
         .iter()
         .filter(|spec| !spec.native_delivery)
@@ -694,8 +695,14 @@ pub(crate) fn start_native_router(
 
 /// What the launch phase knows about a native Codex room's session.
 pub(crate) enum CodexMint {
-    /// A session Crowded minted earlier for this room; resume it.
-    Ready(String),
+    /// A session exists for this room, either reopened from the store or
+    /// freshly minted.
+    Ready {
+        uuid: String,
+        /// True when the stored session was reopened, false for a new session.
+        #[allow(dead_code)] // Production binds either way; tests assert which path ran.
+        reused: bool,
+    },
     /// The exec phase is running; its result arrives on this channel.
     Pending(mpsc::Receiver<Result<Minted, String>>),
     /// No session was created, so the room must not start.
@@ -1007,11 +1014,12 @@ pub(crate) enum ClaudeStart {
     Failed(String),
 }
 
-/// Chooses each native Claude room's session before its terminal starts: resume
-/// a session the room's hook reported, otherwise start fresh and learn it from
-/// the hook.
+/// Chooses each native Claude room's session before its terminal starts: with
+/// `resume`, reopen a session the room's hook reported; otherwise start fresh
+/// and learn the session from the hook. A plain launch never reads the store.
 pub(crate) fn start_claude_sessions(
     specs: &mut [RoomSpec],
+    resume: bool,
 ) -> (Vec<Option<ClaudeStart>>, Vec<String>) {
     let mut starts = (0..specs.len()).map(|_| None).collect::<Vec<_>>();
     let mut notices = Vec::new();
@@ -1023,13 +1031,16 @@ pub(crate) fn start_claude_sessions(
             refuse_claude_session_args(spec)?;
             let cwd = working_directory(spec.cwd.as_deref())?;
             controls::clear_resume_args(spec)?;
-            let start =
-                if let Some(stored) = stored_claude_session(&cwd, &spec.title, &spec.variables) {
+            let start = match resume
+                .then(|| stored_claude_session(&cwd, &spec.title, &spec.variables))
+                .flatten()
+            {
+                Some(stored) => {
                     controls::set_resume_session(spec, &stored)?;
                     ClaudeStart::Resume(stored)
-                } else {
-                    ClaudeStart::Fresh
-                };
+                }
+                None => ClaudeStart::Fresh,
+            };
             equip_claude_mod(spec, &cwd)?;
             Ok(start)
         })();
@@ -1187,17 +1198,20 @@ const CODEX_MINT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Starts each native Codex room's session without waiting for any of them.
 ///
-/// A room with a session this program minted for its own directory and title is
-/// ready at once and runs no exec. Every other room (including one with a
-/// legacy generic capture) spawns a worker that creates a session with
-/// `codex exec` and its initial prompt, saves it durably, and reports the UUID.
-/// Each mint is bounded on its own worker, so a slow room never delays another.
+/// With `resume`, a room whose stored session (minted, or reported by the
+/// room's hook) still has its rollout on disk reopens it and runs no exec. A
+/// plain launch never reads the store, so it always starts a new conversation.
+/// Every other room spawns a worker that creates a session with `codex exec`
+/// and its initial prompt, saves it durably, and reports the UUID. Each mint is
+/// bounded on its own worker, so a slow room never delays another.
 pub(crate) fn start_codex_mints(
     specs: &mut [RoomSpec],
     environments: &[GuestEnvironment],
     prompts: &[Option<String>],
-) -> Vec<Option<CodexMint>> {
+    resume: bool,
+) -> (Vec<Option<CodexMint>>, Vec<String>) {
     let mut results: Vec<Option<CodexMint>> = (0..specs.len()).map(|_| None).collect();
+    let mut notices = Vec::new();
     for (index, spec) in specs.iter_mut().enumerate() {
         if !codex_native_spec(spec) {
             continue;
@@ -1214,20 +1228,31 @@ pub(crate) fn start_codex_mints(
         };
         // Only a session Crowded minted itself or the room's own hook reported
         // may be resumed; a generic capture from an older build is not proof
-        // of ownership.
-        let stored = session_state::lookup_minted("codex", &cwd, &spec.title)
-            .or_else(|| session_state::lookup_reported("codex", &cwd, &spec.title))
+        // of ownership. Only a rollout still on disk makes it resumable.
+        let stored = resume
+            .then(|| {
+                session_state::lookup_minted("codex", &cwd, &spec.title)
+                    .or_else(|| session_state::lookup_reported("codex", &cwd, &spec.title))
+            })
+            .flatten()
             .filter(|id| codex_native::valid_uuid(id));
         if let Some(uuid) = stored {
-            if controls::set_resume_session(spec, &uuid).is_ok() {
-                results[index] = Some(CodexMint::Ready(uuid));
-            } else {
-                results[index] = Some(CodexMint::Failed(format!(
-                    "{}: could not prepare the stored session",
-                    spec.title
-                )));
+            if controls::codex_rollout_verified(&cwd, &uuid) {
+                results[index] = match controls::set_resume_session(spec, &uuid) {
+                    Ok(()) => Some(CodexMint::Ready { uuid, reused: true }),
+                    Err(_) => Some(CodexMint::Failed(format!(
+                        "{}: could not prepare the stored session",
+                        spec.title
+                    ))),
+                };
+                continue;
             }
-            continue;
+            // The stored entry stays until a successful mint replaces it, so a
+            // failed exec still leaves the last good session to resume later.
+            notices.push(format!(
+                "{}: stored session {uuid} has no rollout on disk; starting a new session",
+                spec.title
+            ));
         }
         let prompt = match prompts.get(index).and_then(|prompt| prompt.clone()) {
             Some(prompt) => prompt,
@@ -1245,7 +1270,7 @@ pub(crate) fn start_codex_mints(
         }
         results[index] = Some(start_codex_mint(spec, cwd, &environments[index], prompt));
     }
-    results
+    (results, notices)
 }
 
 /// Runs one room's `codex exec` mint on its own worker. The result is saved by
@@ -1288,7 +1313,10 @@ pub(crate) fn poll_codex_mints(mints: &mut [Option<CodexMint>]) -> Vec<CodexUpda
                     &minted.uuid,
                 ) {
                     Ok(()) => {
-                        *slot = Some(CodexMint::Ready(minted.uuid));
+                        *slot = Some(CodexMint::Ready {
+                            uuid: minted.uuid,
+                            reused: false,
+                        });
                         updates.push(CodexUpdate::Minted { index });
                     }
                     Err(error) => {
@@ -1327,7 +1355,7 @@ pub(crate) fn bind_codex_room(
     // launch can never match this binding.
     let generation = GenerationAllocator::new(session_state::state_directory()).next()?;
     let (room, reason) = match mint {
-        CodexMint::Ready(uuid) => {
+        CodexMint::Ready { uuid, .. } => {
             panes[index].record_session(uuid);
             let room = crate::codex_native::room(
                 panes[index].spec.program.clone(),
@@ -2336,7 +2364,7 @@ impl Pane {
         };
         if let Some(uuid) = session {
             controls::set_resume_session(&mut spec, &uuid)?;
-            return Ok((spec, CodexMint::Ready(uuid)));
+            return Ok((spec, CodexMint::Ready { uuid, reused: true }));
         }
         controls::clear_resume_args(&mut spec)?;
         let mint = start_codex_mint(

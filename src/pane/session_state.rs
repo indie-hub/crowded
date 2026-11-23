@@ -336,7 +336,7 @@ fn codex_cost(home: &Path, session_id: &str, pricing: &[TokenPricing]) -> Option
     )
 }
 
-fn find_codex_rollout(directory: &Path, session_id: &str) -> Option<PathBuf> {
+pub(super) fn find_codex_rollout(directory: &Path, session_id: &str) -> Option<PathBuf> {
     for entry in fs::read_dir(directory).ok()?.flatten() {
         let path = entry.path();
         if path.is_dir() {

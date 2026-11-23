@@ -2727,9 +2727,10 @@ fn a_report_rebinds_only_the_reporting_room() {
         report_test_pane(
             specs.remove(0),
             None,
-            Some(&pane::CodexMint::Ready(
-                "11111111-1111-4111-8111-111111111111".to_owned(),
-            )),
+            Some(&pane::CodexMint::Ready {
+                uuid: "11111111-1111-4111-8111-111111111111".to_owned(),
+                reused: true,
+            }),
         ),
     ];
     router
@@ -2883,7 +2884,10 @@ fn a_codex_report_rebinds_persists_and_delivers_to_the_new_thread() {
     let specs = vec![report_test_spec(&program, cwd.path(), "Codex · 1", true)];
     let mut router =
         pane::start_native_router(&specs, &[None]).expect("native rooms start a router");
-    let mint = pane::CodexMint::Ready("11111111-1111-4111-8111-111111111111".to_owned());
+    let mint = pane::CodexMint::Ready {
+        uuid: "11111111-1111-4111-8111-111111111111".to_owned(),
+        reused: true,
+    };
     let mut panes = vec![report_test_pane(
         specs.into_iter().next().unwrap(),
         None,
@@ -2997,7 +3001,10 @@ fn an_unsavable_codex_report_holds_the_room_and_keeps_the_corrupt_file() {
     let program = report_test_stub(root.path(), "codex", &root.path().join("calls"));
     let specs = vec![report_test_spec(&program, cwd.path(), "Codex · 1", true)];
     let mut router = pane::start_native_router(&specs, &[None]).expect("router starts");
-    let mint = pane::CodexMint::Ready("11111111-1111-4111-8111-111111111111".to_owned());
+    let mint = pane::CodexMint::Ready {
+        uuid: "11111111-1111-4111-8111-111111111111".to_owned(),
+        reused: true,
+    };
     let mut panes = vec![report_test_pane(
         specs.into_iter().next().unwrap(),
         None,

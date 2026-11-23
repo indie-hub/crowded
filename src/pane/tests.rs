@@ -732,12 +732,19 @@ fn resume_runs_native_rooms_fresh_and_hands_the_notice_to_the_run() {
         token_pricing: Vec::new(),
     };
     let mut seen = None;
-    crate::app::resume_with(resolved, |specs, resumed, fuse, _pricing, notice| {
-        seen = Some((specs, resumed, fuse, notice));
-        Ok(())
-    })
+    crate::app::resume_with(
+        resolved,
+        |specs, resumed, resume, fuse, _pricing, notice| {
+            seen = Some((specs, resumed, resume, fuse, notice));
+            Ok(())
+        },
+    )
     .unwrap();
-    let (specs, resumed, fuse, notice) = seen.expect("the run was started");
+    let (specs, resumed, resume, fuse, notice) = seen.expect("the run was started");
+    assert!(
+        resume,
+        "the resume entry point must ask the rooms to resume"
+    );
     assert_eq!(fuse, 7);
     // The native room is not resumed and keeps its arguments; another is.
     assert_eq!(resumed, [false, true]);
@@ -755,7 +762,7 @@ fn resume_runs_native_rooms_fresh_and_hands_the_notice_to_the_run() {
         token_pricing: Vec::new(),
     };
     let mut plain_notice = Some("unset".to_owned());
-    crate::app::resume_with(plain, |_, _, _, _, notice| {
+    crate::app::resume_with(plain, |_, _, _, _, _, notice| {
         plain_notice = notice;
         Ok(())
     })
@@ -2213,7 +2220,10 @@ impl IterationHarness {
             small_size(),
             GuestEnvironment::new([]),
             None,
-            Some(&CodexMint::Ready(resume.to_owned())),
+            Some(&CodexMint::Ready {
+                uuid: resume.to_owned(),
+                reused: true,
+            }),
             None,
         )
         .unwrap();
@@ -2470,6 +2480,21 @@ fn unrelated_rollout(home: &Path, cwd: &Path, id: &str) {
     .unwrap();
 }
 
+/// A rollout for `id` under `home`, as Codex writes it, naming `cwd`.
+#[cfg(unix)]
+fn codex_rollout(home: &Path, cwd: &Path, id: &str) {
+    let day = home.join(".codex/sessions/2026/08/07");
+    fs::create_dir_all(&day).unwrap();
+    fs::write(
+        day.join(format!("rollout-2026-08-07T00-00-00-{id}.jsonl")),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{}\"}}}}\n",
+            cwd.display()
+        ),
+    )
+    .unwrap();
+}
+
 #[cfg(unix)]
 fn args_after<'a>(args: &'a [OsString], flag: &str) -> &'a [OsString] {
     let index = args.iter().position(|arg| arg == flag).unwrap();
@@ -2482,8 +2507,9 @@ fn mint_all(
     specs: &mut [RoomSpec],
     environments: &[GuestEnvironment],
     prompts: &[Option<String>],
+    resume: bool,
 ) -> Vec<Option<CodexMint>> {
-    let mut mints = start_codex_mints(specs, environments, prompts);
+    let (mut mints, _) = start_codex_mints(specs, environments, prompts, resume);
     let deadline = Instant::now() + Duration::from_secs(9);
     while mints
         .iter()
@@ -2499,7 +2525,7 @@ fn mint_all(
 #[cfg(unix)]
 fn ready(mint: &Option<CodexMint>) -> Option<&str> {
     match mint {
-        Some(CodexMint::Ready(uuid)) => Some(uuid),
+        Some(CodexMint::Ready { uuid, .. }) => Some(uuid),
         _ => None,
     }
 }
@@ -2740,7 +2766,7 @@ fn a_native_claude_room_never_resumes_a_minted_session() {
     session_state::upsert_minted("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
     let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
 
-    let (starts, notices) = start_claude_sessions(&mut specs);
+    let (starts, notices) = start_claude_sessions(&mut specs, true);
     assert!(notices.is_empty(), "{notices:?}");
     assert!(
         matches!(&starts[0], Some(ClaudeStart::Fresh)),
@@ -2759,6 +2785,43 @@ fn a_native_claude_room_never_resumes_a_minted_session() {
     );
 }
 
+/// A plain launch never reads the stored Claude session: even a reported id
+/// with its session file on disk starts a new conversation.
+#[cfg(unix)]
+#[test]
+fn a_plain_claude_launch_starts_a_new_conversation_from_a_stored_session() {
+    let _state = session_state::StateRootGuard::isolated();
+    let _claude_config = ClaudeConfigDirGuard::new();
+    let cwd = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
+    session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
+    materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
+    let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
+    let (starts, notices) = start_claude_sessions(&mut specs, false);
+    assert!(notices.is_empty(), "{notices:?}");
+    assert!(
+        matches!(&starts[0], Some(ClaudeStart::Fresh)),
+        "{:?}",
+        starts[0]
+    );
+    assert!(
+        !specs[0].args.iter().any(|a| a == "--resume"),
+        "{:?}",
+        specs[0].args
+    );
+    assert!(
+        !specs[0].args.iter().any(|a| a == "--session-id"),
+        "{:?}",
+        specs[0].args
+    );
+    assert_eq!(
+        session_state::lookup_reported("claude", cwd.path(), "Claude · 1"),
+        Some(MINTED_A.to_owned()),
+        "a plain launch does not touch the stored id"
+    );
+}
+
 /// A reported Claude session is resumed only when its exact session file
 /// exists for this cwd; a missing/unverifiable session starts fresh.
 #[cfg(unix)]
@@ -2773,7 +2836,7 @@ fn a_reported_claude_session_resumes_only_when_its_session_file_exists() {
     // Reported id with no session file: never pass --resume/--session-id.
     session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
     let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
-    let (starts, notices) = start_claude_sessions(&mut specs);
+    let (starts, notices) = start_claude_sessions(&mut specs, true);
     assert!(notices.is_empty(), "{notices:?}");
     assert!(
         matches!(&starts[0], Some(ClaudeStart::Fresh)),
@@ -2800,7 +2863,7 @@ fn a_reported_claude_session_resumes_only_when_its_session_file_exists() {
     session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
     materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
     let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
-    let (starts, notices) = start_claude_sessions(&mut specs);
+    let (starts, notices) = start_claude_sessions(&mut specs, true);
     assert!(notices.is_empty(), "{notices:?}");
     assert!(
         matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A),
@@ -2839,7 +2902,7 @@ fn a_room_own_config_dir_is_checked_for_the_session_file() {
         OsString::from("CLAUDE_CONFIG_DIR"),
         room_config.path().as_os_str().to_owned(),
     ));
-    let (starts, notices) = start_claude_sessions(std::slice::from_mut(&mut spec));
+    let (starts, notices) = start_claude_sessions(std::slice::from_mut(&mut spec), true);
     assert!(notices.is_empty(), "{notices:?}");
     assert!(
         matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A),
@@ -2881,7 +2944,7 @@ fn claude_projects_encode_dotted_and_underscored_cwds() {
         session_state::upsert_reported("claude", &cwd, "Claude · 1", MINTED_A).unwrap();
         materialize_claude_session(_claude_config.path(), &cwd, MINTED_A);
         let mut specs = vec![claude_native_spec_for(&stub, &cwd, "Claude · 1")];
-        let (starts, notices) = start_claude_sessions(&mut specs);
+        let (starts, notices) = start_claude_sessions(&mut specs, true);
         assert!(notices.is_empty(), "{notices:?}");
         assert!(
             matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A),
@@ -2895,7 +2958,7 @@ fn claude_projects_encode_dotted_and_underscored_cwds() {
     fs::create_dir_all(&absent).unwrap();
     session_state::upsert_reported("claude", &absent, "Claude · 1", MINTED_A).unwrap();
     let mut specs = vec![claude_native_spec_for(&stub, &absent, "Claude · 1")];
-    let (starts, notices) = start_claude_sessions(&mut specs);
+    let (starts, notices) = start_claude_sessions(&mut specs, true);
     assert!(notices.is_empty(), "{notices:?}");
     assert!(
         matches!(&starts[0], Some(ClaudeStart::Fresh)),
@@ -2916,7 +2979,7 @@ fn a_native_claude_start_starts_fresh_and_waits_for_report() {
     let stub = codex_stub_for_pane(root.path(), "claude", "exec sleep 30");
     let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
 
-    let (mut sessions, notices) = start_claude_sessions(&mut specs);
+    let (mut sessions, notices) = start_claude_sessions(&mut specs, false);
     assert!(notices.is_empty(), "{notices:?}");
     assert!(
         matches!(&sessions[0], Some(ClaudeStart::Fresh)),
@@ -2967,7 +3030,7 @@ fn a_native_claude_start_starts_fresh_and_waits_for_report() {
     session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
     materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
     let mut again = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
-    let (again_starts, _) = start_claude_sessions(&mut again);
+    let (again_starts, _) = start_claude_sessions(&mut again, true);
     assert!(
         matches!(&again_starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A),
         "{again_starts:?}"
@@ -2994,7 +3057,7 @@ fn two_fresh_claude_rooms_in_one_cwd_have_distinct_bootstrap_inboxes() {
         claude_native_spec_for(&stub, cwd.path(), "Claude · 2"),
     ];
 
-    let (mut sessions, notices) = start_claude_sessions(&mut specs);
+    let (mut sessions, notices) = start_claude_sessions(&mut specs, false);
     assert!(notices.is_empty(), "{notices:?}");
     assert!(
         matches!(&sessions[0], Some(ClaudeStart::Fresh)),
@@ -3076,7 +3139,7 @@ fn every_message_to_a_claude_room_is_held() {
     session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
     materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
     let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
-    let (starts, _) = start_claude_sessions(std::slice::from_mut(&mut spec));
+    let (starts, _) = start_claude_sessions(std::slice::from_mut(&mut spec), true);
     assert!(
         matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A),
         "{:?}",
@@ -3379,7 +3442,7 @@ fn a_native_claude_room_refuses_a_user_resume_form() {
     let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
     spec.args = vec!["--resume".into(), MINTED_A.into()];
 
-    let (starts, notices) = start_claude_sessions(std::slice::from_mut(&mut spec));
+    let (starts, notices) = start_claude_sessions(std::slice::from_mut(&mut spec), true);
     assert!(
         matches!(&starts[0], Some(ClaudeStart::Failed(_))),
         "{starts:?}"
@@ -3414,7 +3477,7 @@ fn a_failed_claude_preparation_starts_no_process() {
     );
     let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
     spec.args = vec!["--resume".into(), MINTED_A.into()];
-    let (starts, notices) = start_claude_sessions(std::slice::from_mut(&mut spec));
+    let (starts, notices) = start_claude_sessions(std::slice::from_mut(&mut spec), true);
     assert!(
         matches!(&starts[0], Some(ClaudeStart::Failed(_))),
         "{starts:?}"
@@ -4464,7 +4527,7 @@ fn two_codex_rooms_in_one_directory_mint_and_resume_only_their_own_session() {
             Some("House rules".to_owned()),
             Some("House rules".to_owned()),
         ];
-        let mints = mint_all(&mut specs, &environments, &prompts);
+        let mints = mint_all(&mut specs, &environments, &prompts, false);
 
         for (index, token) in order.iter().enumerate() {
             assert_eq!(ready(&mints[index]), Some(*token), "room {index}");
@@ -4487,7 +4550,7 @@ fn two_codex_rooms_in_one_directory_mint_and_resume_only_their_own_session() {
             .count();
         assert_eq!(execs, 2, "one exec per room");
         for mint in mints.iter().flatten() {
-            if let CodexMint::Ready(uuid) = mint {
+            if let CodexMint::Ready { uuid, .. } = mint {
                 assert_ne!(uuid, UNRELATED);
             }
         }
@@ -4517,7 +4580,7 @@ fn a_legacy_generic_mapping_is_not_trusted_and_the_room_mints_a_new_session() {
     );
     let mut specs = vec![codex_mint_spec(&stub, cwd.path(), "Codex · 1", MINTED_A)];
     let prompts = vec![Some("House rules".to_owned())];
-    let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts);
+    let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts, false);
     assert_eq!(ready(&mints[0]), Some(MINTED_A));
     assert!(marker.exists(), "a legacy entry must not skip the exec");
     assert_eq!(
@@ -4544,7 +4607,7 @@ fn a_failed_exec_leaves_the_room_not_started_and_unbound() {
     );
     let mut specs = vec![codex_mint_spec(&failing, cwd.path(), "Codex · 1", MINTED_A)];
     let prompts = vec![Some("House rules".to_owned())];
-    let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts);
+    let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts, false);
     let reason = failed(&mints[0])
         .expect("the room must not be started")
         .to_owned();
@@ -4578,8 +4641,9 @@ fn a_failed_exec_leaves_the_room_not_started_and_unbound() {
 
 #[cfg(unix)]
 #[test]
-fn a_restart_resumes_the_minted_session_without_another_exec() {
+fn a_resume_launch_reuses_the_minted_session_without_another_exec() {
     let _state = session_state::StateRootGuard::isolated();
+    let home = controls::HomeDirGuard::isolated();
     let cwd = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let marker = root.path().join("exec-ran");
@@ -4592,11 +4656,18 @@ fn a_restart_resumes_the_minted_session_without_another_exec() {
         ),
     );
     session_state::upsert_minted("codex", cwd.path(), "Codex · 1", MINTED_A).unwrap();
+    codex_rollout(home.path(), cwd.path(), MINTED_A);
     let mut specs = vec![codex_mint_spec(&stub, cwd.path(), "Codex · 1", MINTED_B)];
     let prompts = vec![Some("House rules".to_owned())];
-    let mints = start_codex_mints(&mut specs, &[GuestEnvironment::new([])], &prompts);
+    let (mints, notices) =
+        start_codex_mints(&mut specs, &[GuestEnvironment::new([])], &prompts, true);
+    assert!(notices.is_empty(), "{notices:?}");
     assert_eq!(ready(&mints[0]), Some(MINTED_A));
-    assert!(!marker.exists(), "a restart must not run exec again");
+    assert!(matches!(
+        mints[0],
+        Some(CodexMint::Ready { reused: true, .. })
+    ));
+    assert!(!marker.exists(), "resume must not run exec again");
     assert_eq!(
         args_after(&specs[0].args, "resume"),
         [OsString::from(MINTED_A)]
@@ -4605,8 +4676,9 @@ fn a_restart_resumes_the_minted_session_without_another_exec() {
 
 #[cfg(unix)]
 #[test]
-fn a_restart_resumes_the_reported_session_without_another_exec() {
+fn a_resume_launch_reuses_the_reported_session_without_another_exec() {
     let _state = session_state::StateRootGuard::isolated();
+    let home = controls::HomeDirGuard::isolated();
     let cwd = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let marker = root.path().join("exec-ran");
@@ -4618,24 +4690,138 @@ fn a_restart_resumes_the_reported_session_without_another_exec() {
             marker = marker.display()
         ),
     );
-    session_state::upsert_reported(
-        "codex",
-        cwd.path(),
-        "Codex · 1",
-        "33333333-3333-4333-8333-333333333333",
-    )
-    .unwrap();
+    const REPORTED: &str = "33333333-3333-4333-8333-333333333333";
+    session_state::upsert_reported("codex", cwd.path(), "Codex · 1", REPORTED).unwrap();
+    codex_rollout(home.path(), cwd.path(), REPORTED);
     let mut specs = vec![codex_mint_spec(&stub, cwd.path(), "Codex · 1", MINTED_B)];
     let prompts = vec![Some("House rules".to_owned())];
-    let mints = start_codex_mints(&mut specs, &[GuestEnvironment::new([])], &prompts);
-    assert_eq!(
-        ready(&mints[0]),
-        Some("33333333-3333-4333-8333-333333333333")
-    );
-    assert!(!marker.exists(), "a restart must not run exec again");
+    let (mints, notices) =
+        start_codex_mints(&mut specs, &[GuestEnvironment::new([])], &prompts, true);
+    assert!(notices.is_empty(), "{notices:?}");
+    assert_eq!(ready(&mints[0]), Some(REPORTED));
+    assert!(matches!(
+        mints[0],
+        Some(CodexMint::Ready { reused: true, .. })
+    ));
+    assert!(!marker.exists(), "resume must not run exec again");
     assert_eq!(
         args_after(&specs[0].args, "resume"),
-        [OsString::from("33333333-3333-4333-8333-333333333333")]
+        [OsString::from(REPORTED)]
+    );
+}
+
+/// A plain launch starts a new conversation even when a stored session and
+/// its rollout are both present.
+#[cfg(unix)]
+#[test]
+fn a_plain_launch_mints_a_new_codex_session_instead_of_resuming_the_stored_one() {
+    let _state = session_state::StateRootGuard::isolated();
+    let home = controls::HomeDirGuard::isolated();
+    let cwd = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("exec-ran");
+    let stub = codex_stub_for_pane(
+        root.path(),
+        "codex",
+        &format!(
+            "if [ \"$1\" = resume ]; then exec sleep 30; fi\ntouch '{marker}'\nprintf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$CROWDED_TEST_MINT\"",
+            marker = marker.display()
+        ),
+    );
+    session_state::upsert_minted("codex", cwd.path(), "Codex · 1", MINTED_A).unwrap();
+    codex_rollout(home.path(), cwd.path(), MINTED_A);
+    let mut specs = vec![codex_mint_spec(&stub, cwd.path(), "Codex · 1", MINTED_B)];
+    let prompts = vec![Some("House rules".to_owned())];
+    let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts, false);
+    assert_eq!(ready(&mints[0]), Some(MINTED_B));
+    assert!(matches!(
+        mints[0],
+        Some(CodexMint::Ready { reused: false, .. })
+    ));
+    assert!(marker.exists(), "a plain launch must mint");
+    assert!(
+        !specs[0].args.iter().any(|arg| arg == "resume"),
+        "{:?}",
+        specs[0].args
+    );
+    assert_eq!(
+        session_state::lookup_minted("codex", cwd.path(), "Codex · 1").as_deref(),
+        Some(MINTED_B),
+        "the new session supersedes the stored one"
+    );
+}
+
+/// `crowded resume` falls back to a fresh mint when the stored session has no
+/// rollout, tells the user once, and leaves the stored entry until the mint.
+#[cfg(unix)]
+#[test]
+fn a_resume_launch_without_a_rollout_mints_and_keeps_the_stored_id_until_the_upsert() {
+    let _state = session_state::StateRootGuard::isolated();
+    let _home = controls::HomeDirGuard::isolated();
+    let cwd = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let stub = mint_stub(root.path(), &root.path().join("exec.log"), "sleep 0");
+    session_state::upsert_minted("codex", cwd.path(), "Codex · 1", MINTED_A).unwrap();
+    let mut specs = vec![codex_mint_spec(&stub, cwd.path(), "Codex · 1", MINTED_B)];
+    let prompts = vec![Some("House rules".to_owned())];
+    let (mut mints, notices) =
+        start_codex_mints(&mut specs, &[GuestEnvironment::new([])], &prompts, true);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains(MINTED_A), "{notices:?}");
+    assert!(notices[0].contains("no rollout"), "{notices:?}");
+    assert!(
+        !specs[0].args.iter().any(|arg| arg == "resume"),
+        "the unverifiable stored id must not be resumed: {:?}",
+        specs[0].args
+    );
+    assert_eq!(
+        session_state::lookup_minted("codex", cwd.path(), "Codex · 1").as_deref(),
+        Some(MINTED_A),
+        "the stored entry stays until the mint's upsert replaces it"
+    );
+    let deadline = Instant::now() + Duration::from_secs(9);
+    while mints[0]
+        .as_ref()
+        .is_some_and(|mint| matches!(mint, CodexMint::Pending(_)))
+    {
+        let _ = poll_codex_mints(&mut mints);
+        assert!(Instant::now() < deadline, "the mint never finished");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(ready(&mints[0]), Some(MINTED_B));
+    assert!(matches!(
+        mints[0],
+        Some(CodexMint::Ready { reused: false, .. })
+    ));
+    assert_eq!(
+        session_state::lookup_minted("codex", cwd.path(), "Codex · 1").as_deref(),
+        Some(MINTED_B)
+    );
+}
+
+/// A resume launch whose fallback mint fails keeps the last good stored id.
+#[cfg(unix)]
+#[test]
+fn a_failed_resume_mint_keeps_the_stored_codex_id() {
+    let _state = session_state::StateRootGuard::isolated();
+    let _home = controls::HomeDirGuard::isolated();
+    let cwd = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let failing = codex_stub_for_pane(
+        root.path(),
+        "codex",
+        "printf 'Error: model unavailable\\n' >&2\nexit 1",
+    );
+    session_state::upsert_minted("codex", cwd.path(), "Codex · 1", MINTED_A).unwrap();
+    let mut specs = vec![codex_mint_spec(&failing, cwd.path(), "Codex · 1", MINTED_B)];
+    let prompts = vec![Some("House rules".to_owned())];
+    let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts, true);
+    let reason = failed(&mints[0]).expect("the room must not be started");
+    assert!(reason.contains("model unavailable"), "{reason}");
+    assert_eq!(
+        session_state::lookup_minted("codex", cwd.path(), "Codex · 1").as_deref(),
+        Some(MINTED_A),
+        "a failed mint must not erase the last good session"
     );
 }
 
@@ -4669,7 +4855,7 @@ fn the_mint_command_keeps_interactive_options_out_of_exec_and_on_resume() {
         "workspace-write".into(),
     ];
     let prompts = vec![Some("House rules".to_owned())];
-    let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts);
+    let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts, false);
     assert_eq!(ready(&mints[0]), Some(MINTED_A), "{:?}", failed(&mints[0]));
     // Exec received the accepted options only.
     let executed = fs::read_to_string(&log).unwrap();
@@ -4732,7 +4918,7 @@ fn a_mint_that_cannot_be_saved_leaves_the_room_not_started() {
     fs::write(state.path().join(".crowded"), b"in the way").unwrap();
     let mut specs = vec![codex_mint_spec(&stub, cwd.path(), "Codex · 1", MINTED_A)];
     let prompts = vec![Some("House rules".to_owned())];
-    let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts);
+    let mints = mint_all(&mut specs, &[GuestEnvironment::new([])], &prompts, false);
     drop(state);
     let reason = failed(&mints[0])
         .expect("an unsaved session must not be ready")
@@ -4793,7 +4979,7 @@ fn a_hung_mint_does_not_delay_the_rooms_whose_mints_finished() {
         Some("House rules".to_owned()),
     ];
     let started = Instant::now();
-    let mut mints = start_codex_mints(&mut specs, &environments, &prompts);
+    let (mut mints, _) = start_codex_mints(&mut specs, &environments, &prompts, false);
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "minting blocked startup"
@@ -4912,7 +5098,10 @@ fn startup_starts_an_interactive_codex_only_for_a_completed_mint() {
     let codex = vec![
         Some(CodexMint::Pending(receiver)),
         Some(CodexMint::Failed("`codex exec` failed".to_owned())),
-        Some(CodexMint::Ready(MINTED_B.to_owned())),
+        Some(CodexMint::Ready {
+            uuid: MINTED_B.to_owned(),
+            reused: true,
+        }),
         None,
     ];
     let mut factory = RecordingPanes::default();
@@ -5000,7 +5189,10 @@ fn the_headroom_lane_never_waits_on_a_placeholder_room() {
     let codex = vec![
         Some(CodexMint::Pending(receiver)),
         Some(CodexMint::Failed("`codex exec` failed".to_owned())),
-        Some(CodexMint::Ready(MINTED_B.to_owned())),
+        Some(CodexMint::Ready {
+            uuid: MINTED_B.to_owned(),
+            reused: true,
+        }),
     ];
     assert!(
         headroom_startup_finishes(codex, Duration::from_secs(5), Duration::from_millis(5)),
@@ -5366,7 +5558,7 @@ fn the_mint_runs_through_the_same_headroom_wrapper_as_the_terminal() {
     spec.variables
         .push((OsString::from("PATH"), bin.as_os_str().to_owned()));
     let prompts = vec![Some("House rules".to_owned())];
-    let mints = mint_all(&mut [spec], &[GuestEnvironment::new([])], &prompts);
+    let mints = mint_all(&mut [spec], &[GuestEnvironment::new([])], &prompts, false);
     assert_eq!(ready(&mints[0]), Some(MINTED_A));
     let wrapped = fs::read_to_string(&log).expect("the mint ran without Headroom");
     let lines: Vec<&str> = wrapped.lines().collect();
@@ -6563,7 +6755,7 @@ fn a_claude_launch_writes_its_inbox_file_and_a_clean_environment() {
         ),
     );
     let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
-    let (mut starts, _) = start_claude_sessions(&mut specs);
+    let (mut starts, _) = start_claude_sessions(&mut specs, false);
     let mut router = crate::native_route::NativeRouter::start(
         session_state::state_directory().join("native-outbox.json"),
         Vec::new(),
@@ -6614,7 +6806,7 @@ fn a_claude_clear_moves_the_inbox_file_and_holds_old_mail() {
     session_state::upsert_reported("claude", cwd.path(), "Claude · 1", MINTED_A).unwrap();
     materialize_claude_session(_claude_config.path(), cwd.path(), MINTED_A);
     let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
-    let (mut starts, _) = start_claude_sessions(&mut specs);
+    let (mut starts, _) = start_claude_sessions(&mut specs, true);
     assert!(
         matches!(&starts[0], Some(ClaudeStart::Resume(id)) if id == MINTED_A),
         "{:?}",
@@ -6701,7 +6893,7 @@ fn claude_started_spec(
     session_state::upsert_reported("claude", cwd, title, MINTED_A).unwrap();
     materialize_claude_session(config_dir, cwd, MINTED_A);
     let mut specs = vec![claude_native_spec_for(&stub, cwd, title)];
-    let (starts, notices) = start_claude_sessions(&mut specs);
+    let (starts, notices) = start_claude_sessions(&mut specs, true);
     assert!(notices.is_empty(), "{notices:?}");
     let session = match &starts[0] {
         Some(ClaudeStart::Resume(session)) => session.clone(),
@@ -6774,7 +6966,7 @@ fn a_claude_spawn_passes_plugin_dir_once() {
     let body = format!("echo \"$*\" >> '{0}'\nexec sleep 30", marker.display());
     let stub = codex_stub_for_pane(root.path(), "claude", &body);
     let mut specs = vec![claude_native_spec_for(&stub, cwd.path(), "Claude · 1")];
-    let (starts, notices) = start_claude_sessions(&mut specs);
+    let (starts, notices) = start_claude_sessions(&mut specs, false);
     assert!(notices.is_empty(), "{notices:?}");
     let pane = crate::app::spawn_room(
         &mut crate::app::LivePanes,
@@ -6857,7 +7049,7 @@ fn a_user_plugin_dir_is_left_alone() {
     let mut spec = claude_native_spec_for(&stub, cwd.path(), "Claude · 1");
     spec.args = vec!["--plugin-dir".into(), "/user/mod".into()];
     let mut specs = vec![spec];
-    let (starts, notices) = start_claude_sessions(&mut specs);
+    let (starts, notices) = start_claude_sessions(&mut specs, false);
     assert!(notices.is_empty(), "{notices:?}");
     assert!(matches!(&starts[0], Some(ClaudeStart::Fresh)));
     let mut plugin_dirs = 0;
@@ -6874,7 +7066,7 @@ fn a_user_plugin_dir_is_left_alone() {
     fs::create_dir_all(stuck.path().join(".crowded")).unwrap();
     fs::write(stuck.path().join(".crowded").join("claude-mod"), "blocked").unwrap();
     let mut specs = vec![claude_native_spec_for(&stub, stuck.path(), "Claude · 2")];
-    let (starts, notices) = start_claude_sessions(&mut specs);
+    let (starts, notices) = start_claude_sessions(&mut specs, false);
     assert!(matches!(&starts[0], Some(ClaudeStart::Failed(_))));
     assert!(notices.iter().any(|n| n.contains("was not started")));
 }
@@ -7008,7 +7200,7 @@ fn two_fresh_claude_rooms_deliver_end_to_end_in_one_cwd() {
         claude_native_spec_for(&stub, cwd.path(), "Claude · 1"),
         claude_native_spec_for(&stub, cwd.path(), "Claude · 2"),
     ];
-    let (mut starts, notices) = start_claude_sessions(&mut specs);
+    let (mut starts, notices) = start_claude_sessions(&mut specs, false);
     assert!(notices.is_empty(), "{notices:?}");
     let mut router = crate::native_route::NativeRouter::start(
         session_state::state_directory().join("native-outbox.json"),
@@ -7204,7 +7396,7 @@ fn a_resumed_claude_room_with_a_phantom_bound_id_connects_via_its_bootstrap() {
         claude_native_spec_for(&stub, cwd.path(), "Claude · 1"),
         claude_native_spec_for(&stub, cwd.path(), "Claude · 2"),
     ];
-    let (mut starts, notices) = start_claude_sessions(&mut specs);
+    let (mut starts, notices) = start_claude_sessions(&mut specs, true);
     assert!(notices.is_empty(), "{notices:?}");
     assert!(
         matches!(&starts[1], Some(ClaudeStart::Resume(id)) if id == MINTED_A),

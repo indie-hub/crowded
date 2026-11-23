@@ -1501,6 +1501,7 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     run_with(
         resolved.specs,
         resumed,
+        false,
         resolved.fuse_size,
         resolved.token_pricing,
         None,
@@ -1521,6 +1522,7 @@ pub(crate) fn resume_with(
     run: impl FnOnce(
         Vec<RoomSpec>,
         Vec<bool>,
+        bool,
         usize,
         Vec<TokenPricing>,
         Option<String>,
@@ -1531,6 +1533,7 @@ pub(crate) fn resume_with(
     run(
         resolved.specs,
         resumed,
+        true,
         resolved.fuse_size,
         resolved.token_pricing,
         notice,
@@ -1649,7 +1652,7 @@ pub(crate) fn spawn_room(
             factory.unavailable(spec, size, environment, reason)
         }
         Some(pane::CodexMint::Pending(_)) => factory.pending(spec, size, environment),
-        Some(pane::CodexMint::Ready(uuid)) => {
+        Some(pane::CodexMint::Ready { uuid, .. }) => {
             let mut spec = spec;
             pane::resume_session(&mut spec, uuid)?;
             factory.interactive(spec, size, environment, native)
@@ -2602,13 +2605,21 @@ pub(crate) fn doorbell_reply(envelope: crate::doorbell::DoorbellEnvelope) -> nat
 fn run_with(
     specs: Vec<RoomSpec>,
     resumed: Vec<bool>,
+    resume: bool,
     fuse_size: usize,
     token_pricing: Vec<TokenPricing>,
     startup_notice: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // A hang-up or a kill from outside ends the loop below like Ctrl+Q does.
     crate::shutdown::install();
-    let result = run_rooms(specs, resumed, fuse_size, token_pricing, startup_notice);
+    let result = run_rooms(
+        specs,
+        resumed,
+        resume,
+        fuse_size,
+        token_pricing,
+        startup_notice,
+    );
     crate::native_launch::wait_for_reaps();
     result
 }
@@ -4118,6 +4129,7 @@ where
 fn run_rooms(
     mut specs: Vec<RoomSpec>,
     resumed: Vec<bool>,
+    resume: bool,
     fuse_size: usize,
     token_pricing: Vec<TokenPricing>,
     startup_notice: Option<String>,
@@ -4137,7 +4149,8 @@ fn run_rooms(
     }
     // A native Codex room's session is created before its terminal starts, so
     // its binding is known instead of discovered. That is one model turn per
-    // such room, run in parallel and bounded.
+    // such room, run in parallel and bounded, unless `crowded resume` reopens
+    // a stored session whose rollout is still on disk.
     let codex_prompts: Vec<Option<String>> = {
         let roster = welcome_roster_specs(&specs);
         specs
@@ -4151,24 +4164,29 @@ fn run_rooms(
     if codex_prompts.iter().any(Option::is_some) {
         eprintln!("Creating native Codex sessions (one model turn per room)...");
     }
-    let mut codex = pane::start_codex_mints(&mut specs, &environments, &codex_prompts);
-    let mut mint_notices: Vec<String> = codex
-        .iter()
-        .enumerate()
-        .filter_map(|(index, mint)| match mint {
-            Some(pane::CodexMint::Failed(reason)) => Some(format!(
-                "{}: {reason}; the room was not started",
-                specs[index].title
-            )),
-            _ => None,
-        })
+    let (mut codex, codex_notices) =
+        pane::start_codex_mints(&mut specs, &environments, &codex_prompts, resume);
+    let mut mint_notices: Vec<String> = codex_notices
+        .into_iter()
+        .chain(
+            codex
+                .iter()
+                .enumerate()
+                .filter_map(|(index, mint)| match mint {
+                    Some(pane::CodexMint::Failed(reason)) => Some(format!(
+                        "{}: {reason}; the room was not started",
+                        specs[index].title
+                    )),
+                    _ => None,
+                }),
+        )
         .collect();
     for message in &mint_notices {
         eprintln!("{message}");
     }
     // A native Claude room's session id is Crowded's to choose, so it is fixed
     // and saved before the terminal starts: no model turn is involved.
-    let (mut claude_starts, mut claude_notices) = pane::start_claude_sessions(&mut specs);
+    let (mut claude_starts, mut claude_notices) = pane::start_claude_sessions(&mut specs, resume);
     for message in &claude_notices {
         eprintln!("{message}");
     }

@@ -602,6 +602,19 @@ fn codex_session_meta_id(path: &Path, cwd: &Path) -> Option<String> {
     payload.id.or(payload.session_id)
 }
 
+/// Whether Codex's own session directory holds a rollout for this exact
+/// session id and room directory. `crowded resume` reopens a stored Codex
+/// session only when its rollout is verified; a stored id with no rollout is
+/// not resumable and the room mints a new session instead.
+pub(super) fn codex_rollout_verified(cwd: &Path, session_id: &str) -> bool {
+    let Some(home) = home_dir() else {
+        return false;
+    };
+    let sessions = home.join(".codex").join("sessions");
+    super::session_state::find_codex_rollout(&sessions, session_id)
+        .is_some_and(|path| codex_session_meta_id(&path, cwd).as_deref() == Some(session_id))
+}
+
 /// Read the newest session row for `cwd` from OpenCode's sqlite database via
 /// the system `sqlite3` CLI. `time_created` is milliseconds since the Unix
 /// epoch. Live evidence (OpenCode 1.18.15 under Headroom, this repo, 2026-08-08)
