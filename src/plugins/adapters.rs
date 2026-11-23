@@ -519,11 +519,19 @@ fn collect_adapter_links(
         }
         links.push(AdapterLink {
             path: Path::new(relative_directory).join(&file),
-            target: PathBuf::from("../../")
-                .join(INSTALLS_DIRECTORY)
-                .join(name)
-                .join(relative_directory)
-                .join(file),
+            // Symlink targets are parsed literally by the kernel: the mixed
+            // separators left by joining multi-level literals ("../../a/b\c")
+            // do not resolve on Windows (ERROR_INVALID_NAME, os error 123).
+            // Extending component-wise normalizes to one separator per
+            // platform; a no-op on Unix.
+            target: {
+                let mut target = PathBuf::from("../..");
+                for part in [INSTALLS_DIRECTORY, name, relative_directory] {
+                    target.extend(Path::new(part).components());
+                }
+                target.push(&file);
+                target
+            },
             copied: false,
         });
     }

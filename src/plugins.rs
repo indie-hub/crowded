@@ -1130,8 +1130,6 @@ mod tests {
     }
 
     #[test]
-    // TEMP-DIAG(T1-repair): ignore lifted to run diagnostics; final state
-    // restores a proven gate.
     fn local_plugin_is_shared_and_removed_without_touching_other_files() {
         let base = test_directory();
         let source = base.join("source");
@@ -1265,18 +1263,6 @@ mod tests {
                 .unwrap()
                 .replace('\\', "/")
                 .contains(".crowded/plugins/greetings/hooks/activate.js")
-        );
-        // TEMP-DIAG(T1-repair): removed before the final commit.
-        let mjs = project.join(".opencode/plugins/greetings.mjs");
-        eprintln!(
-            "DIAG mjs metadata={:?} symlink={:?} link_target={:?} dir={:?} state={:?}",
-            fs::metadata(&mjs),
-            fs::symlink_metadata(&mjs),
-            fs::read_link(&mjs),
-            fs::read_dir(project.join(".opencode/plugins")).map(|entries| entries
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .collect::<Vec<_>>()),
-            fs::read_to_string(project.join(".crowded/plugins/greetings/.crowded-adapters.json"))
         );
         assert!(project.join(".opencode/plugins/greetings.mjs").is_file());
 

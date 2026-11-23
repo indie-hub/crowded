@@ -523,8 +523,6 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    // TEMP-DIAG(T1-repair): ignore lifted to run diagnostics; final state
-    // restores a proven gate.
     fn process_tree_termination_reaps_a_batch_descendant() {
         use std::{io::Read, thread, time::Duration};
 
@@ -587,8 +585,7 @@ mod tests {
         drop(pty.slave);
 
         // Windows powershell cold start on CI exceeds the fast 5 s budget;
-        // the launch itself is healthy (proven by run 45250798634 DIAG: the
-        // pid file appears when given more time).
+        // the launch itself is healthy.
         #[cfg(windows)]
         let tries = 300;
         #[cfg(not(windows))]
