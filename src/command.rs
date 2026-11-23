@@ -497,7 +497,36 @@ mod tests {
     #[test]
     fn windows_launcher_test_entry() {
         if env::var_os("CROWDED_TEST_LAUNCHER").is_some() {
-            std::process::exit(run_internal_launcher().unwrap());
+            // TEMP-DIAG(T1-repair): removed before the final commit.
+            let diag = |mark: String| {
+                if let Some(path) = env::var_os("CROWDED_TEST_DEBUG_FILE") {
+                    use std::io::Write as _;
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        let _ = writeln!(
+                            file,
+                            "{mark} program={:?} pid_file={:?}",
+                            env::var_os("CROWDED_INTERNAL_LAUNCH_PROGRAM"),
+                            env::var_os("CROWDED_TEST_PID_FILE")
+                        );
+                    }
+                }
+            };
+            diag("entry".to_owned());
+            let code = match run_internal_launcher() {
+                Ok(code) => {
+                    diag("status-ok".to_owned());
+                    code
+                }
+                Err(error) => {
+                    diag(format!("status-err:{error}"));
+                    99
+                }
+            };
+            std::process::exit(code);
         }
     }
 
@@ -558,6 +587,11 @@ mod tests {
         ]);
         command.env("CROWDED_TEST_LAUNCHER", "1");
         command.env("CROWDED_TEST_PID_FILE", &pid_file);
+        // TEMP-DIAG(T1-repair): removed before the final commit.
+        command.env(
+            "CROWDED_TEST_DEBUG_FILE",
+            directory.join("launcher-debug.log"),
+        );
 
         let pty = native_pty_system()
             .openpty(PtySize {
@@ -596,6 +630,22 @@ mod tests {
         }
         let pid: u32 = fs::read_to_string(&pid_file)
             .unwrap_or_else(|error| {
+                // TEMP-DIAG(T1-repair): removed before the final commit.
+                let debug = fs::read_to_string(directory.join("launcher-debug.log"))
+                    .unwrap_or_else(|error| format!("<no debug log: {error}>"));
+                eprintln!("DIAG debug-log:\n{debug}");
+                eprintln!("DIAG shim exists: {}", shim.is_file());
+                // Keep watching past the timeout: distinguishes a slow
+                // powershell from a dead launcher.
+                let mut late = false;
+                for _ in 0..200 {
+                    thread::sleep(Duration::from_millis(100));
+                    if pid_file.is_file() {
+                        late = true;
+                        break;
+                    }
+                }
+                eprintln!("DIAG pid file appeared late: {late}");
                 panic!(
                     "batch descendant did not report its PID ({error}); launcher status: {:?}",
                     child.try_wait()

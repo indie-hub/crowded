@@ -1245,6 +1245,15 @@ mod tests {
             assert!(link.join("SKILL.md").is_file());
         }
 
+        // TEMP-DIAG(T1-repair): removed before the final commit.
+        eprintln!(
+            "DIAG mjs metadata: {:?}; dir: {:?}",
+            fs::symlink_metadata(project.join(".opencode/plugins/greetings.mjs")),
+            fs::read_dir(project.join(".opencode/plugins")).map(|entries| entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .collect::<Vec<_>>())
+        );
+
         let (skills, adapters) = enable_plugin(&project, "greetings").unwrap();
         assert_eq!(skills, 0);
         let adapters = adapters.unwrap();
