@@ -120,11 +120,12 @@ impl ResolvedCommand {
     #[cfg(windows)]
     pub(crate) fn in_job(&self) -> io::Result<(Command, ProcessTree)> {
         let tree = ProcessTree::new()?;
-        // TEMP-MUTATION(T2b-repair): spawn the program directly, skipping
-        // the launcher; the assembly test must fail. Reverted before the
-        // final push.
-        let mut command = Command::new(&self.program);
-        command.args(&self.args);
+        let (program, envs) = self.launcher_invocation(&tree)?;
+        let mut command = Command::new(program);
+        command.arg(INTERNAL_LAUNCH_ARGUMENT);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
         Ok((command, tree))
     }
 
