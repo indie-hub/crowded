@@ -632,6 +632,12 @@ mod tests {
         use std::process::Stdio;
         use std::{thread, time::Duration};
 
+        // TEMP-DIAG5: always report; removed before final.
+        eprintln!(
+            "DIAG5 entry alive: launch_job={:?} pid_file={:?}",
+            std::env::var_os("CROWDED_INTERNAL_LAUNCH_JOB"),
+            std::env::var_os("CROWDED_TEST_PID_FILE")
+        );
         if let (Some(job), Some(pid_file)) = (
             env::var_os("CROWDED_INTERNAL_LAUNCH_JOB"),
             env::var_os("CROWDED_TEST_PID_FILE"),
