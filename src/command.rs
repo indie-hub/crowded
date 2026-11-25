@@ -681,30 +681,12 @@ mod tests {
                 OsStr::new("--nocapture"),
             ])
             .env("CROWDED_INTERNAL_LAUNCH_JOB", tree.name())
+            .env("CROWDED_INTERNAL_LAUNCH_JOB", tree.name())
             .env("CROWDED_TEST_PID_FILE", &pid_file)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut wrapper = command.spawn().unwrap();
         let wrapper_pid = wrapper.id();
-        // TEMP-DIAG3(T2b): drain both streams; removed before final.
-        let logged_out = thread::spawn({
-            let stdout = wrapper.stdout.take().unwrap();
-            move || {
-                use std::io::Read as _;
-                let mut text = String::new();
-                let _ = std::io::BufReader::new(stdout).read_to_string(&mut text);
-                text
-            }
-        });
-        let logged_err = thread::spawn({
-            let stderr = wrapper.stderr.take().unwrap();
-            move || {
-                use std::io::Read as _;
-                let mut text = String::new();
-                let _ = std::io::BufReader::new(stderr).read_to_string(&mut text);
-                text
-            }
-        });
 
         // Joining happens after the re-exec starts, so poll for membership.
         let mut joined = false;
@@ -715,16 +697,7 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        if !joined {
-            // TEMP-DIAG3(T2b): removed before final.
-            let status = wrapper.try_wait().unwrap();
-            let _ = wrapper.kill();
-            let _ = wrapper.wait();
-            eprintln!("DIAG3 wrapper status at timeout: {status:?}");
-            eprintln!("DIAG3 wrapper stdout:\n{}", logged_out.join().unwrap());
-            eprintln!("DIAG3 wrapper stderr:\n{}", logged_err.join().unwrap());
-            panic!("wrapper never joined its job");
-        }
+        assert!(joined, "wrapper never joined its job");
 
         let mut server_pid = None;
         for _ in 0..300 {
