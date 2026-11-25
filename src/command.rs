@@ -632,29 +632,40 @@ mod tests {
         use std::process::Stdio;
         use std::{thread, time::Duration};
 
-        // TEMP-DIAG5: always report; removed before final.
-        eprintln!(
-            "DIAG5 entry alive: launch_job={:?} pid_file={:?}",
-            std::env::var_os("CROWDED_INTERNAL_LAUNCH_JOB"),
-            std::env::var_os("CROWDED_TEST_PID_FILE")
-        );
-        if let (Some(job), Some(pid_file)) = (
+        // TEMP-DIAG6: milestone tracing; removed before final.
+        eprintln!("DIAG6 entry start");
+        let (Some(job), Some(pid_file)) = (
             env::var_os("CROWDED_INTERNAL_LAUNCH_JOB"),
             env::var_os("CROWDED_TEST_PID_FILE"),
-        ) {
-            // Child run: join first, then prove a grandchild inherits the job.
-            // The job name comes from the launcher protocol itself.
-            ProcessTree::join_current(job.as_os_str()).unwrap();
-            let mut grandchild = std::process::Command::new("timeout.exe")
-                .args(["/t", "60"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap();
-            std::fs::write(&pid_file, grandchild.id().to_string()).unwrap();
-            let _ = grandchild.wait();
-            std::process::exit(0);
+        ) else {
+            eprintln!("DIAG6 entry missing env, noop");
+            return;
+        };
+        eprintln!("DIAG6 joining job");
+        if let Err(error) = ProcessTree::join_current(job.as_os_str()) {
+            eprintln!("DIAG6 join failed: {error}");
+            std::process::exit(2);
         }
+        eprintln!("DIAG6 joined, spawning grandchild");
+        let mut grandchild = match std::process::Command::new("timeout.exe")
+            .args(["/t", "60"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(grandchild) => grandchild,
+            Err(error) => {
+                eprintln!("DIAG6 spawn failed: {error}");
+                std::process::exit(3);
+            }
+        };
+        if let Err(error) = std::fs::write(&pid_file, grandchild.id().to_string()) {
+            eprintln!("DIAG6 pid write failed: {error}");
+            std::process::exit(4);
+        }
+        eprintln!("DIAG6 waiting on grandchild {}", grandchild.id());
+        let _ = grandchild.wait();
+        std::process::exit(0);
     }
 
     /// Membership, outsiders, exited pids, and the stop path, through the
