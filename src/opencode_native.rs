@@ -1245,7 +1245,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_join_self_entry() {
-        if let Some(name) = env::var_os("CROWDED_TEST_JOB_NAME") {
+        if let Some(name) = std::env::var_os("CROWDED_TEST_JOB_NAME") {
             ProcessTree::join_current(name.as_os_str()).unwrap();
             thread::sleep(Duration::from_secs(60));
             std::process::exit(0);
