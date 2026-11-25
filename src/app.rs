@@ -3208,9 +3208,11 @@ where
                             NoticeSeverity::Info,
                         );
                         // A clear starts a new conversation, so the room must
-                        // be taught the house rules again. An owned OpenCode
-                        // room takes them through the router, never as a paste.
-                        if panes[control.to].opencode_native()
+                        // be taught the house rules again. A native room takes
+                        // them through the router, never as a paste. Codex is
+                        // excluded: its rules ride in as the exec prompt.
+                        if panes[control.to].is_native()
+                            && !panes[control.to].codex_native()
                             && matches!(&control.action, ControlAction::ClearContext)
                             && let Some(router) = router.as_mut()
                         {

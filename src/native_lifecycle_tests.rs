@@ -631,3 +631,40 @@ fn a_cleared_opencode_room_is_reintroduced_to_its_new_session() {
     );
     fake.shutdown();
 }
+
+/// The same rule for a native Claude room: the clear drops the conversation,
+/// so the house rules must be delivered again. The intro is saved while the
+/// room still has its unreported placeholder and must reach the session the
+/// mod serves once it registers, exactly once.
+#[cfg(unix)]
+#[test]
+fn a_cleared_claude_room_is_reintroduced_to_its_new_launch() {
+    use crate::doorbell::ControlAction;
+
+    let mut fx = Fixture::fresh(&["Claude · 1"]);
+    let launch = fx.binding(0);
+
+    fx.rig.push_control(0, ControlAction::ClearContext);
+    fx.rig.dispatch_keep();
+
+    let cleared = fx.binding(0);
+    assert!(cleared.generation > launch.generation);
+    assert!(is_unreported_placeholder(&cleared));
+    // The intro was saved for the new launch while no mod could take it.
+    settle(&mut fx.rig, "HELD: no Claude mod connected");
+
+    fx.refresh_conn(0);
+    let (url, token) = fx.conn(0);
+    let mod_ = FakeMod::register(&url, &token);
+    let claim = claim_next(&mut fx.rig, &mod_).expect("the intro was never offered");
+    assert!(
+        claim.text.contains("House rules: you are Room 1"),
+        "{}",
+        claim.text
+    );
+    assert_eq!(mod_.receipt(&claim, "started", ""), 200);
+    settle(&mut fx.rig, "ACCEPTED by Claude");
+    // Settled: the intro is not offered a second time.
+    let again = mod_.resumed();
+    fx.assert_quiet_then_marker(&again, 0, "marker-after-claude-clear", "the intro repeated");
+}
