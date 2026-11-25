@@ -7,6 +7,22 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.48.0] - 2026-11-25
+
+### Added
+- CI runs the test suite and the Claude mod delivery tests on Windows (`windows-latest`) as well as Linux and macOS. Tests that cannot run on Windows are skipped one by one with a stated reason.
+- On Windows, closing the console window, logging off, shutting down or pressing Ctrl+Break makes Crowded exit the same way as Ctrl+Q, so its owned servers are stopped. Ctrl+C stays a key for the guest and never quits Crowded.
+
+### Changed
+- On Windows an OpenCode native room's server, and the Headroom wrapper when there is one, run inside Crowded's Job Object. Crowded accepts the server only when its process is in that job and still running, stops the server by ending the job, and reports a failed stop. The job closes when Crowded exits, even abruptly, so no OpenCode or Headroom process is left behind. The job is named, so membership proves the process belongs to this Crowded's lifecycle, not that no other program of the same user could join it.
+- OpenCode native rooms with Headroom are no longer refused on Windows.
+- The CI actions run on Node 24 (`actions/checkout`, `actions/setup-node` and `actions/upload-artifact` v7); GitHub no longer warns about Node 20.
+
+### Fixed
+- On Linux, closing a pane whose guest had stopped reading no longer leaks a writer thread and a terminal descriptor: the writer stops within 200 ms. This happened, for example, on every restart of a busy or wedged room.
+- On Windows, an OpenCode plugin file link pointed at a relative path that Windows could not follow; links now use the absolute path.
+- Several timing-sensitive tests that failed at random on slow CI runners now wait for the state they check instead of a fixed time.
+
 ## [0.47.0] - 2026-11-23
 
 ### Added
