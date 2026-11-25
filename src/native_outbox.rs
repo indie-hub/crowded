@@ -2537,6 +2537,74 @@ mod tests {
             reason: "old failure".into()
         }));
     }
+
+    /// A relaunch makes old mail dead; it becomes a visible terminal row once,
+    /// while a newer message to the new launch still goes out.
+    #[test]
+    fn stale_rows_are_retired_once_and_newer_mail_still_delivers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let old = binding("a", 1);
+        let next = pending_binding("a", 2);
+        let next_bindings = HashMap::from([("a".to_owned(), next.clone())]);
+        let mut outbox = Outbox::open(&path, 4, 4, 1).unwrap();
+        let old_id = outbox
+            .enqueue("s".into(), old, "old mail".into())
+            .unwrap()
+            .id;
+        let unused = Arc::new(AtomicUsize::new(0));
+        outbox
+            .schedule(&next_bindings, false, false, &[], fake(&unused, accepted))
+            .unwrap();
+        assert_eq!(hold_of(&mut outbox, &old_id), Some(STALE_HOLD.to_owned()));
+        assert_eq!(unused.load(Ordering::SeqCst), 0);
+
+        let new_id = outbox
+            .enqueue("s".into(), next.clone(), "new mail".into())
+            .unwrap()
+            .id;
+        let delivered = Arc::new(AtomicUsize::new(0));
+        outbox
+            .schedule(
+                &next_bindings,
+                false,
+                false,
+                &[],
+                fake(&delivered, accepted),
+            )
+            .unwrap();
+        wait(&mut outbox, &next_bindings);
+        let row = |id: &str| {
+            outbox
+                .state
+                .messages
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .status
+                .clone()
+        };
+        assert_eq!(
+            row(&old_id),
+            Status::Failed {
+                reason: STALE_HOLD.to_owned()
+            }
+        );
+        assert_eq!(row(&new_id), Status::Accepted);
+        assert_eq!(delivered.load(Ordering::SeqCst), 1);
+        assert_eq!(outbox.state.counters.stale_retired, 1);
+        assert_eq!(outbox.state.counters.failed, 1);
+        assert_eq!(outbox.retire_stale(&next_bindings).unwrap(), 0);
+
+        drop(outbox);
+        let reopened = Outbox::open(&path, 4, 4, 1).unwrap();
+        assert_eq!(reopened.state.counters.stale_retired, 1);
+        assert!(reopened.state.messages.iter().any(|m| m.id == old_id
+            && m.status
+                == Status::Failed {
+                    reason: STALE_HOLD.to_owned()
+                }));
+    }
 }
 
 /// Mail held for an earlier launch never counts toward the live capacity, so
@@ -3327,6 +3395,7 @@ impl Outbox {
             return Err(io::Error::other("injected schedule failure"));
         }
         self.collect(bindings)?;
+        self.retire_stale(bindings)?;
         self.set_pending(pending)?;
         if paused || fused {
             return Ok(());
@@ -3589,6 +3658,32 @@ impl Outbox {
         }
         self.trim_history(&mut next);
         self.update(next, id)
+    }
+
+    /// Rows held because their launch is gone can never be adopted or sent.
+    /// Make that terminal in one save, after completions have been drained, so
+    /// an answer still in flight wins over retirement.
+    pub(crate) fn retire_stale(
+        &mut self,
+        bindings: &HashMap<String, Binding>,
+    ) -> io::Result<usize> {
+        let mut next = self.state.clone();
+        let mut retired = 0;
+        for message in next.messages.iter_mut() {
+            if bindings.contains_key(&message.destination) && is_stale_hold(message) {
+                message.status = Status::Failed {
+                    reason: STALE_HOLD.to_owned(),
+                };
+                next.counters.stale_retired += 1;
+                next.counters.failed += 1;
+                retired += 1;
+            }
+        }
+        if retired > 0 {
+            self.trim_history(&mut next);
+            self.update(next, "stale mail")?;
+        }
+        Ok(retired)
     }
 
     pub fn acknowledge(&mut self, id: &str, binding: &Binding, hash: &str) -> io::Result<()> {

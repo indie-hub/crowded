@@ -24,7 +24,7 @@ use crate::{
         Adapter, AdapterResult, BackgroundOutbox, Binding, Command, Event, Message, Resolution,
         Status, TaggedEvent,
     },
-    native_session::{is_retryable_hold, same_launch_placeholder},
+    native_session::{STALE_HOLD, is_retryable_hold, same_launch_placeholder},
     opencode_native::{Delivery, Server},
     opencode_outbox::{OpenCodeAdapter, native_id},
     pane::{session_state::create_private_directory, whisper_note},
@@ -1359,7 +1359,19 @@ impl NativeRouter {
 
     fn sync_mailroom(&mut self, mailroom: &mut Mailroom) {
         let messages = std::mem::take(&mut self.messages);
+        let previous = messages.clone();
+        let mut retired: HashMap<String, usize> = HashMap::new();
         for message in &messages {
+            // One batch notice per room: a row already Failed before this
+            // snapshot must not announce itself again after a restart.
+            let newly_retired = previous
+                .iter()
+                .find(|old| old.id == message.id)
+                .is_some_and(|old| matches!(&old.status, Status::Queued { .. }))
+                && matches!(&message.status, Status::Failed { reason } if reason == STALE_HOLD);
+            if newly_retired {
+                *retired.entry(self.label(message)).or_insert(0) += 1;
+            }
             let text = self.status_text(message);
             if self.shown.get(&message.id) == Some(&text) {
                 continue;
@@ -1378,6 +1390,16 @@ impl NativeRouter {
                 }
             }
             self.shown.insert(message.id.clone(), text);
+        }
+        for (room, count) in retired {
+            mailroom.record_native(
+                "native delivery".into(),
+                room,
+                format!(
+                    "{count} messages from an earlier launch were not delivered; they may have arrived; not resent"
+                ),
+                "NOTICE".to_owned(),
+            );
         }
         self.messages = messages;
     }
