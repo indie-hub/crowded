@@ -3207,6 +3207,21 @@ where
                             format!("{source} told {target} to {label}"),
                             NoticeSeverity::Info,
                         );
+                        // A clear starts a new conversation, so the room must
+                        // be taught the house rules again. An owned OpenCode
+                        // room takes them through the router, never as a paste.
+                        if panes[control.to].opencode_native()
+                            && matches!(&control.action, ControlAction::ClearContext)
+                            && let Some(router) = router.as_mut()
+                        {
+                            let roster = welcome_roster(panes, room_pulses, now);
+                            let message = house_rules(control.to + 1, &roster, fuse_size);
+                            let title = panes[control.to].title().to_owned();
+                            let (text, severity) = reintroduce_native_room(
+                                &title, router, mailroom, control.to, &message,
+                            );
+                            append_notice(notice, text, severity);
+                        }
                     }
                     Err(error) => {
                         control.reply_failed(error.to_string());

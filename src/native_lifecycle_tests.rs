@@ -598,3 +598,36 @@ fn clearing_an_opencode_room_keeps_old_mail_stale_and_serves_each_new_session() 
     assert!(seen.iter().all(|text| !text.contains("M1")), "{seen:?}");
     fake.shutdown();
 }
+
+/// A clear starts a new conversation, so the room must be taught the house
+/// rules again. An owned OpenCode room cannot take them as a terminal paste,
+/// so they travel through the router like every other native message.
+#[cfg(unix)]
+#[test]
+fn a_cleared_opencode_room_is_reintroduced_to_its_new_session() {
+    use crate::doorbell::ControlAction;
+
+    let _state = StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let (panes, router, fake) = report_test_opencode_room(root.path(), cwd.path(), "ses_old");
+    let mut rig = ReportDispatch::new(panes, router);
+
+    rig.push_control(0, ControlAction::ClearContext);
+    rig.dispatch_keep();
+
+    pump_opencode_until(&mut rig, |_| {
+        opencode_received(&fake)
+            .iter()
+            .any(|text| text.contains("House rules: you are Room 1"))
+    });
+    let seen = opencode_received(&fake);
+    assert_eq!(
+        seen.iter()
+            .filter(|text| text.contains("House rules: you are Room 1"))
+            .count(),
+        1,
+        "{seen:?}"
+    );
+    fake.shutdown();
+}
