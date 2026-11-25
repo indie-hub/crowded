@@ -630,42 +630,30 @@ mod tests {
     #[test]
     fn windows_join_self_entry() {
         use std::process::Stdio;
-        use std::{thread, time::Duration};
 
-        // TEMP-DIAG6: milestone tracing; removed before final.
-        eprintln!("DIAG6 entry start");
-        let (Some(job), Some(pid_file)) = (
+        if let (Some(job), Some(pid_file)) = (
             env::var_os("CROWDED_INTERNAL_LAUNCH_JOB"),
             env::var_os("CROWDED_TEST_PID_FILE"),
-        ) else {
-            eprintln!("DIAG6 entry missing env, noop");
-            return;
-        };
-        eprintln!("DIAG6 joining job");
-        if let Err(error) = ProcessTree::join_current(job.as_os_str()) {
-            eprintln!("DIAG6 join failed: {error}");
-            std::process::exit(2);
+        ) {
+            // Child run: join first, then prove a grandchild inherits the
+            // job. PowerShell (not timeout.exe, which exits at once without
+            // a console) sleeps so the tree stays alive for the stop check.
+            ProcessTree::join_current(job.as_os_str()).unwrap();
+            let mut grandchild = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$PID | Set-Content -NoNewline -Path $env:CROWDED_TEST_PID_FILE; Start-Sleep -Seconds 60",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            std::fs::write(&pid_file, grandchild.id().to_string()).unwrap();
+            let _ = grandchild.wait();
+            std::process::exit(0);
         }
-        eprintln!("DIAG6 joined, spawning grandchild");
-        let mut grandchild = match std::process::Command::new("timeout.exe")
-            .args(["/t", "60"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(grandchild) => grandchild,
-            Err(error) => {
-                eprintln!("DIAG6 spawn failed: {error}");
-                std::process::exit(3);
-            }
-        };
-        if let Err(error) = std::fs::write(&pid_file, grandchild.id().to_string()) {
-            eprintln!("DIAG6 pid write failed: {error}");
-            std::process::exit(4);
-        }
-        eprintln!("DIAG6 waiting on grandchild {}", grandchild.id());
-        let _ = grandchild.wait();
-        std::process::exit(0);
     }
 
     /// Membership, outsiders, exited pids, and the stop path, through the
@@ -699,23 +687,10 @@ mod tests {
             ])
             .env("CROWDED_INTERNAL_LAUNCH_JOB", tree.name())
             .env("CROWDED_TEST_PID_FILE", &pid_file)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         let mut wrapper = command.spawn().unwrap();
         let wrapper_pid = wrapper.id();
-        // TEMP-DIAG4: drain streams; removed before final.
-        let logged = thread::spawn({
-            use std::io::Read as _;
-            let mut err = wrapper.stderr.take().unwrap();
-            let mut out = wrapper.stdout.take().unwrap();
-            move || {
-                let mut err_text = String::new();
-                let mut out_text = String::new();
-                let _ = std::io::BufReader::new(&mut err).read_to_string(&mut err_text);
-                let _ = std::io::BufReader::new(&mut out).read_to_string(&mut out_text);
-                (out_text, err_text)
-            }
-        });
 
         // Joining happens after the re-exec starts, so poll for membership.
         let mut joined = false;
@@ -726,17 +701,7 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        if !joined {
-            // TEMP-DIAG4: removed before final.
-            let status = wrapper.try_wait().unwrap();
-            let _ = wrapper.kill();
-            let _ = wrapper.wait();
-            let (out_text, err_text) = logged.join().unwrap();
-            eprintln!(
-                "DIAG4 status: {status:?}\nDIAG4 stdout:\n{out_text}\nDIAG4 stderr:\n{err_text}"
-            );
-            panic!("wrapper never joined its job");
-        }
+        assert!(joined, "wrapper never joined its job");
 
         let mut server_pid = None;
         for _ in 0..300 {
