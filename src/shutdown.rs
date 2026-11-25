@@ -21,6 +21,27 @@ extern "C" fn on_signal(_: i32) {
     REQUESTED.store(true, Ordering::SeqCst);
 }
 
+/// Console control events that ask for a clean exit. Ctrl+C is deliberately
+/// not handled: in a raw console it arrives as a guest key (see
+/// pane::key_bytes), and returning FALSE keeps the default Ctrl+C behaviour
+/// for a non-raw console.
+#[cfg(windows)]
+unsafe extern "system" fn on_console_event(event: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    match event {
+        CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
+            // Same contract as the Unix handler: only set the flag and
+            // return at once; the event loop does the cleanup. Never block
+            // here: the OS kills a slow handler.
+            REQUESTED.store(true, Ordering::SeqCst);
+            1 // TRUE
+        }
+        _ => 0, // FALSE, including CTRL_C_EVENT.
+    }
+}
+
 /// Routes the three signals to the flag. Without this the first of them ends the
 /// process on the spot and leaves its OpenCode servers running. SIGKILL cannot
 /// be caught and is not covered.
@@ -32,10 +53,50 @@ pub(crate) fn install() {
             signal(number, on_signal as *const () as usize);
         }
     }
+    #[cfg(windows)]
+    {
+        // SAFETY: `on_console_event` only stores to an atomic and returns
+        // without blocking. A zero return means no handler is installed,
+        // which is today's behaviour; keep running either way.
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(on_console_event), 1);
+        }
+    }
 }
 
 pub(crate) fn requested() -> bool {
     REQUESTED.load(Ordering::SeqCst)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+
+    #[test]
+    fn break_close_logoff_and_shutdown_ask_for_a_clean_exit_while_ctrl_c_is_left_alone() {
+        for event in [
+            CTRL_BREAK_EVENT,
+            CTRL_CLOSE_EVENT,
+            CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        ] {
+            REQUESTED.store(false, Ordering::SeqCst);
+            assert!(!requested());
+            // SAFETY: direct call of the flag-setting handler.
+            let handled = unsafe { on_console_event(event) };
+            assert_eq!(handled, 1);
+            assert!(requested(), "event {event} did not set the flag");
+        }
+        REQUESTED.store(false, Ordering::SeqCst);
+        // SAFETY: direct call of the handler.
+        let handled = unsafe { on_console_event(CTRL_C_EVENT) };
+        assert_eq!(handled, 0);
+        assert!(!requested());
+        REQUESTED.store(false, Ordering::SeqCst);
+    }
 }
 
 #[cfg(all(test, unix))]
