@@ -633,10 +633,11 @@ mod tests {
         use std::{thread, time::Duration};
 
         if let (Some(job), Some(pid_file)) = (
-            env::var_os("CROWDED_TEST_JOIN_SELF"),
+            env::var_os("CROWDED_INTERNAL_LAUNCH_JOB"),
             env::var_os("CROWDED_TEST_PID_FILE"),
         ) {
             // Child run: join first, then prove a grandchild inherits the job.
+            // The job name comes from the launcher protocol itself.
             ProcessTree::join_current(job.as_os_str()).unwrap();
             let mut grandchild = std::process::Command::new("timeout.exe")
                 .args(["/t", "60"])
@@ -677,7 +678,6 @@ mod tests {
             command.env(key, value);
         }
         command
-            .env("CROWDED_TEST_JOIN_SELF", "1")
             .env("CROWDED_TEST_PID_FILE", &pid_file)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
