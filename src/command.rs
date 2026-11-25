@@ -328,6 +328,15 @@ pub(crate) struct ProcessTree {
     name: OsString,
 }
 
+// SAFETY: the handle is an owned job object created by this process and
+// closed exactly once in `Drop`. The kernel serializes concurrent calls on
+// a job handle, and every use borrows through the owning `Server`, which
+// never touches the handle after dropping it.
+#[cfg(windows)]
+unsafe impl Send for ProcessTree {}
+#[cfg(windows)]
+unsafe impl Sync for ProcessTree {}
+
 #[cfg(windows)]
 impl ProcessTree {
     fn new() -> io::Result<Self> {
