@@ -32,11 +32,9 @@ unsafe extern "system" fn on_console_event(event: u32) -> i32 {
     };
     match event {
         CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => {
-            // Same contract as the Unix handler: only set the flag and
-            // return at once; the event loop does the cleanup. Never block
-            // here: the OS kills a slow handler.
-            REQUESTED.store(true, Ordering::SeqCst);
-            1 // TRUE
+            // TEMP-MUTATION(T2a-repair): ignores the event; the new test
+            // must go red on windows-latest. Reverted before the final push.
+            0 // FALSE
         }
         _ => 0, // FALSE, including CTRL_C_EVENT.
     }
