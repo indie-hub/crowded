@@ -602,7 +602,13 @@ mod tests {
             std::process::exit(0);
         }
         let directory = test_directory();
-        let sentinel = directory.join("must-not-run.marker");
+        let marker = directory.join("must-not-run.marker");
+        let shim = directory.join("must-not-run.cmd");
+        std::fs::write(
+            &shim,
+            format!("@echo off\r\necho RAN > \"{}\"\r\n", marker.display()),
+        )
+        .unwrap();
         let status = std::process::Command::new(env::current_exe().unwrap())
             .args([
                 OsStr::new("--exact"),
@@ -614,12 +620,13 @@ mod tests {
                 "CROWDED_INTERNAL_LAUNCH_JOB",
                 "Local\\CrowdedNoSuchJobForJoinTest",
             )
-            .env("CROWDED_INTERNAL_LAUNCH_PROGRAM", sentinel.as_os_str())
+            .env("CROWDED_INTERNAL_LAUNCH_PROGRAM", shim.as_os_str())
             .env("CROWDED_INTERNAL_LAUNCH_ARG_COUNT", "0")
             .status()
             .unwrap();
         assert!(status.success());
-        assert!(!sentinel.is_file());
+        // The launcher errored before spawning: the script never ran.
+        assert!(!marker.is_file());
         fs::remove_dir_all(directory).unwrap();
     }
 
