@@ -1217,7 +1217,17 @@ mod tests {
         command.stdout(Stdio::null()).stderr(Stdio::null());
         let child = command.spawn().unwrap();
         let pid = child.id();
-        assert!(tree.contains(pid));
+        // Joining happens after the re-exec starts, so the fresh process
+        // is not a member the instant spawn returns; poll briefly instead.
+        let mut joined = false;
+        for _ in 0..200 {
+            if tree.contains(pid) {
+                joined = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(joined, "launcher never joined its job");
         (pid, child, tree)
     }
 
@@ -1843,12 +1853,22 @@ mod tests {
         let (mut command, tree) = resolved.in_job().unwrap();
         command
             .env("CROWDED_TEST_PID_FILE", &pid_file)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut launcher = command.spawn().unwrap();
         let launcher_pid = launcher.id();
-        // TEMP-DIAG(T2b): drain launcher stderr; removed before final.
-        let logged = thread::spawn({
+        // TEMP-DIAG2(T2b): capture both streams and exit timing; removed
+        // before final.
+        let logged_out = thread::spawn({
+            let stdout = launcher.stdout.take().unwrap();
+            move || {
+                use std::io::Read as _;
+                let mut text = String::new();
+                let _ = std::io::BufReader::new(stdout).read_to_string(&mut text);
+                text
+            }
+        });
+        let logged_err = thread::spawn({
             let stderr = launcher.stderr.take().unwrap();
             move || {
                 use std::io::Read as _;
@@ -1861,7 +1881,13 @@ mod tests {
         // PowerShell cold start is slow on CI runners; the launch is healthy
         // while the pid file is merely late.
         let mut server_pid = None;
-        for _ in 0..600 {
+        let mut exited_at = None;
+        for i in 0..600 {
+            if exited_at.is_none() {
+                if let Ok(Some(status)) = launcher.try_wait() {
+                    exited_at = Some((i, status));
+                }
+            }
             if let Ok(text) = std::fs::read_to_string(&pid_file) {
                 server_pid = text.trim().parse::<u32>().ok();
                 if server_pid.is_some() {
@@ -1871,12 +1897,11 @@ mod tests {
             thread::sleep(Duration::from_millis(100));
         }
         let server_pid = server_pid.unwrap_or_else(|| {
-            // TEMP-DIAG(T2b): removed before final.
-            let alive = launcher.try_wait().unwrap();
-            eprintln!("DIAG launcher status at timeout: {alive:?}");
+            eprintln!("DIAG2 launcher exit (iteration, status): {exited_at:?}");
             let _ = launcher.kill();
             let _ = launcher.wait();
-            eprintln!("DIAG launcher stderr:\n{}", logged.join().unwrap());
+            eprintln!("DIAG2 launcher stdout:\n{}", logged_out.join().unwrap());
+            eprintln!("DIAG2 launcher stderr:\n{}", logged_err.join().unwrap());
             panic!("server grandchild never reported its pid");
         });
         assert_ne!(server_pid, launcher_pid);
