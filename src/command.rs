@@ -302,7 +302,9 @@ pub(crate) fn run_internal_launcher() -> io::Result<i32> {
         ))?);
     }
 
-    ProcessTree::join_current(&job)?;
+    // TEMP-MUTATION(T2b-repair): run the program even when the join
+    // fails; reverted before the final push.
+    let _ = ProcessTree::join_current(&job);
     let mut command = Command::new(program);
     command.args(&args);
     command

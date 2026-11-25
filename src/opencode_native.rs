@@ -405,7 +405,10 @@ fn owned_by(spawned: u32, reported: u32, job: Option<&ProcessTree>) -> bool {
     #[cfg(not(unix))]
     {
         let _ = spawned;
-        job.is_some_and(|job| job.contains(reported))
+        // TEMP-MUTATION(T2b-repair): accept any pid; reverted before the
+        // final push.
+        let _ = job;
+        true
     }
 }
 
