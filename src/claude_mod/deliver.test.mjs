@@ -5,6 +5,12 @@ import { createHash, randomUUID } from "node:crypto";
 
 const sha = (text) => createHash("sha256").update(text).digest("hex");
 const flush = () => new Promise((r) => setImmediate(r));
+// Real-time bound for the mod's async work: a fixed number of microtask turns
+// is not a bound when the runner is busy with other files.
+const waitFor = async (predicate, timeoutMs = 5000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) await flush();
+};
 
 async function readBody(req) {
   const chunks = [];
@@ -129,14 +135,14 @@ test("FIFO and no overlapping poll", async (t) => {
   let resolveSubmit;
   const ctx = await startMod({ inbox, submitImpl: (_i, n) => n === 1 ? new Promise((ok) => { resolveSubmit = ok; }) : {} });
   const p1 = ctx.timers[0].cb();
-  for (let i = 0; i < 50 && inbox.calls.next === 0; i++) await flush();
+  await waitFor(() => inbox.calls.next === 1);
   assert.equal(inbox.calls.next, 1);
   await ctx.timers[0].cb(); await ctx.timers[0].cb(); await flush();
   assert.equal(inbox.calls.next, 1); assert.equal(ctx.submits.length, 1);
   resolveSubmit({});
   await p1;
   await ctx.timers[0].cb();
-  for (let i = 0; i < 50 && ctx.submits.length < 2; i++) await flush();
+  await waitFor(() => ctx.submits.length >= 2);
   assert.deepEqual(ctx.submits.map((s) => s.text), ["one", "two"]);
 });
 

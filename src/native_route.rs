@@ -1817,13 +1817,20 @@ mod tests {
             let view = view.summary();
             view.contains("SENDING") && view.contains("QUEUED")
         });
-        pump(&mut router, &mut mailroom, false, false, |_| {
-            log.borrow().len() == 3
+        // The accepted rows are the record this test is about. A sender's reply
+        // has its own deadline (REPLY_WAIT, 1.5 s), so under load the last reply
+        // may be "Queued" while its row still becomes Accepted; wait for the
+        // rows and accept either reply form.
+        pump(&mut router, &mut mailroom, false, false, |mailroom| {
+            mailroom.summary().matches("ACCEPTED").count() == 3
         });
+        assert_eq!(log.borrow().len(), 3, "each send is answered once");
         assert!(
             log.borrow()
                 .iter()
-                .all(|(_, outcome)| *outcome == NativeReply::Accepted)
+                .all(|(_, outcome)| matches!(outcome, NativeReply::Accepted | NativeReply::Queued)),
+            "every send is accepted or still queued: {:?}",
+            log.borrow()
         );
         let order: Vec<String> = texts(&a);
         assert_eq!(
