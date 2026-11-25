@@ -772,6 +772,24 @@ fn a_failed_pending_save_keeps_old_mail_held_through_the_handler() {
     assert!(!view.contains("ACCEPTED"), "{view}");
 }
 
+/// Status of one mailroom row, found by its body. Each row is a header followed
+/// by its indented body, so this never guesses status from a blanket substring.
+#[cfg(all(test, unix))]
+fn row_status<'a>(view: &'a str, body: &str) -> Option<&'a str> {
+    for block in view.split("\n\n") {
+        let mut lines = block.lines();
+        let Some(header) = lines.next() else {
+            continue;
+        };
+        if lines.next().is_some_and(|line| line.trim() == body) {
+            return header
+                .split_once('[')
+                .and_then(|(_, status)| status.strip_suffix(']'));
+        }
+    }
+    None
+}
+
 /// Ticks until the outbox has answered every command sent so far, which
 /// is when nothing is still saving, collecting notices on the way.
 #[cfg(all(test, unix))]
@@ -1755,10 +1773,38 @@ fn a_pending_save_failure_is_reported_as_its_own_failure() {
     .unwrap();
 
     let notices = drain_answered(&mut router, &mut mailroom);
+    pump_router_until(
+        router.as_mut().unwrap(),
+        &mut mailroom,
+        |mailroom| {
+            let view = mailroom.summary();
+            row_status(&view, "old")
+                == Some("FAILED: sent for an earlier launch of this room; not delivered")
+        },
+        "the stale row to settle",
+    );
     let view = mailroom.summary();
+    assert_eq!(
+        view.lines()
+            .filter(|line| line.contains("[FAILED:"))
+            .count(),
+        1,
+        "only the stale row is failed: {view}"
+    );
+    assert_eq!(
+        row_status(&view, "old"),
+        Some("FAILED: sent for an earlier launch of this room; not delivered"),
+        "{view}"
+    );
+    assert_eq!(
+        view.matches("sent for an earlier launch of this room; not delivered")
+            .count(),
+        1,
+        "the stale reason appears once: {view}"
+    );
     assert!(
-        !view.contains("FAILED"),
-        "both messages keep their own result: {view}"
+        row_status(&view, "new").is_some_and(|status| !status.contains("FAILED")),
+        "the new mail keeps its own result: {view}"
     );
     assert!(
         notices
@@ -1830,10 +1876,38 @@ fn two_pending_reports_with_one_failing_are_each_accounted_for() {
     .unwrap();
 
     let notices = drain_answered(&mut router, &mut mailroom);
+    pump_router_until(
+        router.as_mut().unwrap(),
+        &mut mailroom,
+        |mailroom| {
+            let view = mailroom.summary();
+            row_status(&view, "old")
+                == Some("FAILED: sent for an earlier launch of this room; not delivered")
+        },
+        "the stale row to settle",
+    );
     let view = mailroom.summary();
+    assert_eq!(
+        view.lines()
+            .filter(|line| line.contains("[FAILED:"))
+            .count(),
+        1,
+        "only the stale row is failed: {view}"
+    );
+    assert_eq!(
+        row_status(&view, "old"),
+        Some("FAILED: sent for an earlier launch of this room; not delivered"),
+        "{view}"
+    );
+    assert_eq!(
+        view.matches("sent for an earlier launch of this room; not delivered")
+            .count(),
+        1,
+        "the stale reason appears once: {view}"
+    );
     assert!(
-        !view.contains("FAILED"),
-        "the second report and the later mail keep their own result: {view}"
+        row_status(&view, "later").is_some_and(|status| !status.contains("FAILED")),
+        "the later mail keeps its own result: {view}"
     );
     assert_eq!(
         notices
