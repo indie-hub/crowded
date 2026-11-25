@@ -181,10 +181,10 @@ discard held mail from inside Crowded.
 When Crowded is hung up on, interrupted or terminated (SIGHUP, SIGINT,
 SIGTERM) it leaves the same way as after Ctrl+Q, and its owned servers go with
 it. SIGKILL cannot be caught, so `kill -9` on Crowded (or a crash) leaves its
-OpenCode servers running. On Windows the same exit runs when the console
-window is closed, on logoff or shutdown, or on Ctrl+Break; Ctrl+C stays a
-guest key and never quits Crowded. They are the `opencode serve --hostname 127.0.0.1
+OpenCode servers running. They are the `opencode serve --hostname 127.0.0.1
 --port 0` processes and can be stopped by hand; the next start never reuses them.
+On Windows the same exit runs when the console window is closed, on logoff or
+shutdown, or on Ctrl+Break; Ctrl+C stays a guest key and never quits Crowded.
 
 ```toml
 [[rooms]]
