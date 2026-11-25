@@ -510,11 +510,9 @@ impl Drop for Server {
 #[cfg(windows)]
 fn stop_owned(child: &mut Child, tree: Option<ProcessTree>, server_pid: Option<u32>) {
     let spawned = child.id();
-    if let Some(tree) = tree {
-        if let Err(error) = tree.terminate() {
-            eprintln!("crowded: failed to terminate the owned server job: {error}");
-        }
-    }
+    // TEMP-MUTATION(T2b-repair): no terminate; the drop test must time out.
+    // Reverted before the final push.
+    let _ = tree;
     let _ = child.wait();
     if let Some(server) = server_pid.filter(|server| *server != spawned) {
         stop_process(server);
