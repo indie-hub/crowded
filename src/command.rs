@@ -656,6 +656,16 @@ mod tests {
     /// at birth and the grandchild inherits the job.
     #[cfg(windows)]
     #[test]
+    /// Membership, outsiders, exited pids, and the stop path. The wrapper
+    /// joins on entry and the grandchild inherits the job.
+    ///
+    /// NOTE: the launcher re-exec (`__crowded-launch`) cannot run here: in
+    /// a unit-test binary main is libtest's, not Crowded's, so a re-exec
+    /// just filters tests. The entry therefore joins the job itself; the
+    /// re-exec contract is covered by `launcher_invocation_carries_job_...`
+    /// below and by `run_internal_launcher` in the launcher tests.
+    #[cfg(windows)]
+    #[test]
     fn windows_job_membership_and_stop_cover_only_the_live_tree() {
         use std::process::Stdio;
         use std::{thread, time::Duration};
@@ -663,21 +673,14 @@ mod tests {
         let directory = test_directory();
         let pid_file = directory.join("server.pid");
         let tree = ProcessTree::new().unwrap();
-        let launch = ResolvedCommand {
-            program: env::current_exe().unwrap().into_os_string().into(),
-            args: vec![
-                OsString::from("--exact"),
-                OsString::from("command::tests::windows_join_self_entry"),
-                OsString::from("--nocapture"),
-            ],
-        };
-        let (program, envs) = launch.launcher_invocation(&tree).unwrap();
-        let mut command = std::process::Command::new(program);
-        command.arg(INTERNAL_LAUNCH_ARGUMENT);
-        for (key, value) in envs {
-            command.env(key, value);
-        }
+        let mut command = std::process::Command::new(env::current_exe().unwrap());
         command
+            .args([
+                OsStr::new("--exact"),
+                OsStr::new("command::tests::windows_join_self_entry"),
+                OsStr::new("--nocapture"),
+            ])
+            .env("CROWDED_INTERNAL_LAUNCH_JOB", tree.name())
             .env("CROWDED_TEST_PID_FILE", &pid_file)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -729,6 +732,40 @@ mod tests {
         }
         assert!(!tree.contains(server_pid));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The re-exec contract both launchers share: this executable plus the
+    /// job name, program, and numbered arguments as environment.
+    #[cfg(windows)]
+    #[test]
+    fn launcher_invocation_carries_job_program_and_args() {
+        let tree = ProcessTree::new().unwrap();
+        let launch = ResolvedCommand {
+            program: PathBuf::from("C:\\Tools\\opencode.cmd"),
+            args: vec![OsString::from("--port"), OsString::from("0")],
+        };
+        let (program, envs) = launch.launcher_invocation(&tree).unwrap();
+        assert_eq!(program, env::current_exe().unwrap().into_os_string());
+        let get = |key: &str| {
+            envs.iter()
+                .find(|(name, _)| name.as_os_str() == OsStr::new(key))
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(get(LAUNCH_JOB).unwrap(), tree.name());
+        assert_eq!(
+            get(LAUNCH_PROGRAM).unwrap(),
+            OsString::from("C:\\Tools\\opencode.cmd")
+        );
+        assert_eq!(get(LAUNCH_ARG_COUNT).unwrap(), OsString::from("2"));
+        assert_eq!(
+            get("CROWDED_INTERNAL_LAUNCH_ARG_0").unwrap(),
+            OsString::from("--port")
+        );
+        assert_eq!(
+            get("CROWDED_INTERNAL_LAUNCH_ARG_1").unwrap(),
+            OsString::from("0")
+        );
+        assert_eq!(envs.len(), 5);
     }
 
     #[cfg(windows)]
