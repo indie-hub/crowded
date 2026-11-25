@@ -1202,20 +1202,32 @@ mod tests {
         }
     }
 
-    /// A live member of a job this test holds: the launcher itself, which
-    /// joins before running `timeout`. The child and tree must stay alive
-    /// while the pid is checked; dropping the tree kills the job.
+    /// A live member of a job this test holds: a child test process that
+    /// joins the job on entry and sleeps until reaped. The child and the
+    /// tree must stay alive while the pid is checked; dropping the tree
+    /// kills the job.
     #[cfg(windows)]
     fn live_job_member() -> (u32, std::process::Child, ProcessTree) {
+        // in_job is the tree factory here; its command is unused because a
+        // test binary cannot run the launcher path (libtest owns main).
         let resolved = ResolvedCommand::resolve(
             OsStr::new("timeout.exe"),
             &["/t".into(), "60".into()],
             &std::env::temp_dir(),
         )
         .expect("timeout.exe must resolve on PATH");
-        let (mut command, tree) = resolved.in_job().unwrap();
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-        let child = command.spawn().unwrap();
+        let (_command, tree) = resolved.in_job().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "opencode_native::tests::windows_join_self_entry",
+                "--nocapture",
+            ])
+            .env("CROWDED_TEST_JOB_NAME", tree.name())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = child.spawn().unwrap();
         let pid = child.id();
         // Joining happens after the re-exec starts, so the fresh process
         // is not a member the instant spawn returns; poll briefly instead.
@@ -1227,8 +1239,20 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        assert!(joined, "launcher never joined its job");
+        assert!(joined, "child never joined its job");
         (pid, child, tree)
+    }
+
+    /// Child entry for the job tests below: join the job named in the
+    /// environment, then sleep until reaped.
+    #[cfg(windows)]
+    #[test]
+    fn windows_join_self_entry() {
+        if let Some(name) = env::var_os("CROWDED_TEST_JOB_NAME") {
+            ProcessTree::join_current(name.as_os_str()).unwrap();
+            thread::sleep(Duration::from_secs(60));
+            std::process::exit(0);
+        }
     }
 
     fn bound_server(client: &Arc<Client>, room: &str, generation: u64, session: &str) -> Server {
@@ -1832,84 +1856,20 @@ mod tests {
             .status();
     }
 
-    /// Windows ownership is job membership, not parentage: the launcher is
-    /// the spawned pid, so `reported == spawned` must not apply. The chain
-    /// here is launcher -> wrapper (.cmd) -> server (powershell), and only
-    /// the live grandchild passes the check an exited pid and an outsider
-    /// fail, and terminating the job reaps the tree.
+    /// Windows ownership is job membership, not parentage: the spawned pid
+    /// is a launcher, so `reported == spawned` must not apply. Only the
+    /// live member passes; an outsider, an exited pid, and a missing job
+    /// all fail closed. Terminating the job reaps the tree.
     #[cfg(windows)]
     #[test]
     fn windows_job_membership_proves_only_the_live_server_tree() {
-        let directory = tempfile::tempdir().unwrap();
-        let pid_file = directory.path().join("server.pid");
-        let shim = directory.path().join("server.cmd");
-        std::fs::write(
-            &shim,
-            "@echo off\r\npowershell.exe -NoProfile -NonInteractive -Command \"$PID | Set-Content -NoNewline -Path $env:CROWDED_TEST_PID_FILE; Start-Sleep -Seconds 30\"\r\n",
-        )
-        .unwrap();
+        let (mut member, tree, member_pid) = live_job_member();
 
-        let resolved = ResolvedCommand::resolve(shim.as_os_str(), &[], directory.path()).unwrap();
-        let (mut command, tree) = resolved.in_job().unwrap();
-        command
-            .env("CROWDED_TEST_PID_FILE", &pid_file)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut launcher = command.spawn().unwrap();
-        let launcher_pid = launcher.id();
-        // TEMP-DIAG2(T2b): capture both streams and exit timing; removed
-        // before final.
-        let logged_out = thread::spawn({
-            let stdout = launcher.stdout.take().unwrap();
-            move || {
-                use std::io::Read as _;
-                let mut text = String::new();
-                let _ = std::io::BufReader::new(stdout).read_to_string(&mut text);
-                text
-            }
-        });
-        let logged_err = thread::spawn({
-            let stderr = launcher.stderr.take().unwrap();
-            move || {
-                use std::io::Read as _;
-                let mut text = String::new();
-                let _ = std::io::BufReader::new(stderr).read_to_string(&mut text);
-                text
-            }
-        });
-
-        // PowerShell cold start is slow on CI runners; the launch is healthy
-        // while the pid file is merely late.
-        let mut server_pid = None;
-        let mut exited_at = None;
-        for i in 0..600 {
-            if exited_at.is_none() {
-                if let Ok(Some(status)) = launcher.try_wait() {
-                    exited_at = Some((i, status));
-                }
-            }
-            if let Ok(text) = std::fs::read_to_string(&pid_file) {
-                server_pid = text.trim().parse::<u32>().ok();
-                if server_pid.is_some() {
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        let server_pid = server_pid.unwrap_or_else(|| {
-            eprintln!("DIAG2 launcher exit (iteration, status): {exited_at:?}");
-            let _ = launcher.kill();
-            let _ = launcher.wait();
-            eprintln!("DIAG2 launcher stdout:\n{}", logged_out.join().unwrap());
-            eprintln!("DIAG2 launcher stderr:\n{}", logged_err.join().unwrap());
-            panic!("server grandchild never reported its pid");
-        });
-        assert_ne!(server_pid, launcher_pid);
-
-        assert!(tree.contains(server_pid));
-        assert!(owned_by(launcher_pid, server_pid, Some(&tree)));
+        assert!(tree.contains(member_pid));
+        assert!(owned_by(0, member_pid, Some(&tree)));
         assert!(!tree.contains(std::process::id()));
-        assert!(!owned_by(launcher_pid, std::process::id(), Some(&tree)));
+        assert!(!owned_by(0, std::process::id(), Some(&tree)));
+        assert!(!owned_by(member_pid, member_pid, None));
 
         let mut quick = std::process::Command::new("cmd")
             .args(["/c", "exit", "0"])
@@ -1918,16 +1878,18 @@ mod tests {
         let quick_pid = quick.id();
         quick.wait().unwrap();
         assert!(!tree.contains(quick_pid));
+        assert!(!owned_by(quick_pid, quick_pid, Some(&tree)));
 
         tree.terminate().unwrap();
-        launcher.wait().unwrap();
+        member.wait().unwrap();
         for _ in 0..200 {
-            if !tree.contains(server_pid) {
+            if !tree.contains(member_pid) {
                 break;
             }
             thread::sleep(Duration::from_millis(50));
         }
-        assert!(!tree.contains(server_pid));
+        assert!(!tree.contains(member_pid));
+        assert!(!owned_by(member_pid, member_pid, Some(&tree)));
     }
 
     #[cfg(unix)]

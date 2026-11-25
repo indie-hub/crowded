@@ -381,11 +381,13 @@ impl ProcessTree {
         Ok(Self { handle: job, name })
     }
 
-    fn name(&self) -> &OsStr {
+    pub(crate) fn name(&self) -> &OsStr {
         &self.name
     }
 
-    fn join_current(name: &OsStr) -> io::Result<()> {
+    /// Joins the calling process to the named job. Public within the crate
+    /// so tests can place a child in a job they hold.
+    pub(crate) fn join_current(name: &OsStr) -> io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::{
             Foundation::CloseHandle,
@@ -618,6 +620,112 @@ mod tests {
             .unwrap();
         assert!(status.success());
         assert!(!sentinel.is_file());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Child entry for [`ProcessTree`] membership tests: join the job named
+    /// in the environment, spawn a grandchild sleeper that inherits the job,
+    /// report its pid through the pid file, then wait to be reaped.
+    #[cfg(windows)]
+    #[test]
+    fn windows_join_self_entry() {
+        use std::process::Stdio;
+
+        if let (Some(job), Some(pid_file)) = (
+            env::var_os("CROWDED_TEST_JOIN_SELF"),
+            env::var_os("CROWDED_TEST_PID_FILE"),
+        ) {
+            // Child run: join first, then prove a grandchild inherits the job.
+            ProcessTree::join_current(job.as_os_str()).unwrap();
+            let mut grandchild = std::process::Command::new("timeout.exe")
+                .args(["/t", "60"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            std::fs::write(&pid_file, grandchild.id().to_string()).unwrap();
+            let _ = grandchild.wait();
+            std::process::exit(0);
+        }
+    }
+
+    /// Membership, outsiders, exited pids, and the stop path, through the
+    /// same launcher environment the owned server uses: the wrapper joins
+    /// at birth and the grandchild inherits the job.
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_membership_and_stop_cover_only_the_live_tree() {
+        use std::process::Stdio;
+
+        let directory = test_directory();
+        let pid_file = directory.join("server.pid");
+        let tree = ProcessTree::new().unwrap();
+        let launch = ResolvedCommand {
+            program: env::current_exe().unwrap().into_os_string().into(),
+            args: vec![
+                OsString::from("--exact"),
+                OsString::from("command::tests::windows_join_self_entry"),
+                OsString::from("--nocapture"),
+            ],
+        };
+        let (program, envs) = launch.launcher_invocation(&tree).unwrap();
+        let mut command = std::process::Command::new(program);
+        command.arg(INTERNAL_LAUNCH_ARGUMENT);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command
+            .env("CROWDED_TEST_JOIN_SELF", "1")
+            .env("CROWDED_TEST_PID_FILE", &pid_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut wrapper = command.spawn().unwrap();
+        let wrapper_pid = wrapper.id();
+
+        // Joining happens after the re-exec starts, so poll for membership.
+        let mut joined = false;
+        for _ in 0..200 {
+            if tree.contains(wrapper_pid) {
+                joined = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(joined, "wrapper never joined its job");
+
+        let mut server_pid = None;
+        for _ in 0..300 {
+            if let Ok(text) = fs::read_to_string(&pid_file) {
+                server_pid = text.trim().parse::<u32>().ok();
+                if server_pid.is_some() {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let server_pid = server_pid.expect("server grandchild never reported its pid");
+        assert_ne!(server_pid, wrapper_pid);
+
+        assert!(tree.contains(server_pid));
+        assert!(!tree.contains(std::process::id()));
+
+        let mut quick = std::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let quick_pid = quick.id();
+        quick.wait().unwrap();
+        assert!(!tree.contains(quick_pid));
+
+        tree.terminate().unwrap();
+        wrapper.wait().unwrap();
+        for _ in 0..200 {
+            if !tree.contains(server_pid) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!tree.contains(server_pid));
         fs::remove_dir_all(directory).unwrap();
     }
 
