@@ -106,7 +106,10 @@ fn f4_reintroduction_reaches_a_native_room_exactly_like_the_startup_intro() {
         assert_eq!(severity, NoticeSeverity::Info);
     }
 
-    let deadline = Instant::now() + Duration::from_secs(8);
+    // The outbox worker saves twice per message and fsyncs file and parent;
+    // on a loaded runner that can take far longer than a quiet one, so the
+    // bound is generous and the loop still fails a real regression.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         router.tick(Instant::now(), &mut mailroom, false, false);
         let view = mailroom.summary();

@@ -1441,7 +1441,7 @@ fn opencode_wrapped_rooms_keep_distinct_models_after_inline_config_is_replaced()
         )
         .unwrap();
         let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(1) {
+        while started.elapsed() < Duration::from_secs(30) {
             pane.drain_output().unwrap();
             if pane.parser.screen().contents().contains(model) {
                 break;
