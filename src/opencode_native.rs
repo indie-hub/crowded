@@ -516,7 +516,7 @@ fn stop_owned(child: &mut Child, tree: Option<ProcessTree>, server_pid: Option<u
         }
     }
     let _ = child.wait();
-    if let Some(server) = server_pid.filter(|server| server != spawned) {
+    if let Some(server) = server_pid.filter(|server| *server != spawned) {
         stop_process(server);
     }
 }
@@ -782,7 +782,7 @@ impl Server {
                 .map_err(|_| io::Error::other("server startup timed out"))??;
             let client = Arc::new(Client::new(&url, &password)?);
             #[cfg(windows)]
-            let server_pid = client.verify_pid(child.id(), tree.as_ref())?;
+            let server_pid = client.verify_pid(child.id(), Some(&tree))?;
             #[cfg(not(windows))]
             let server_pid = client.verify_pid(child.id(), None)?;
             verified = Some(server_pid);
