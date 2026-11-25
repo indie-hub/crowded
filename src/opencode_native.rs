@@ -1171,18 +1171,54 @@ mod tests {
 
     #[test]
     fn verified_pid_and_explicit_session_create() {
-        let client = fake(2, |i, headers, _| match i {
+        // On Windows the fake server must report a live member of a job
+        // this test holds; on Unix any named pid passes the direct check.
+        #[cfg(windows)]
+        let (mut member, tree, reported) = {
+            let (pid, member, tree) = live_job_member();
+            (member, tree, pid)
+        };
+        #[cfg(not(windows))]
+        let reported: u32 = 42;
+        let client = fake(2, move |i, headers, _| match i {
             0 => {
                 assert!(headers.starts_with("GET /api/info "));
-                Some(response(200, &json!({"pid": 42})))
+                Some(response(200, &json!({"pid": reported})))
             }
             _ => {
                 assert!(headers.starts_with("POST /api/session "));
                 Some(response(200, &json!({"data": {"id": "ses_explicit"}})))
             }
         });
+        #[cfg(windows)]
+        client.verify_pid(0, Some(&tree)).unwrap();
+        #[cfg(not(windows))]
         client.verify_pid(42, None).unwrap();
         assert_eq!(client.create_session().unwrap(), "ses_explicit");
+        #[cfg(windows)]
+        {
+            tree.terminate().unwrap();
+            let _ = member.wait();
+        }
+    }
+
+    /// A live member of a job this test holds: the launcher itself, which
+    /// joins before running `timeout`. The child and tree must stay alive
+    /// while the pid is checked; dropping the tree kills the job.
+    #[cfg(windows)]
+    fn live_job_member() -> (u32, std::process::Child, ProcessTree) {
+        let resolved = ResolvedCommand::resolve(
+            OsStr::new("timeout.exe"),
+            &["/t".into(), "60".into()],
+            &std::env::temp_dir(),
+        )
+        .expect("timeout.exe must resolve on PATH");
+        let (mut command, tree) = resolved.in_job().unwrap();
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        assert!(tree.contains(pid));
+        (pid, child, tree)
     }
 
     fn bound_server(client: &Arc<Client>, room: &str, generation: u64, session: &str) -> Server {
@@ -1808,9 +1844,19 @@ mod tests {
         command
             .env("CROWDED_TEST_PID_FILE", &pid_file)
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let mut launcher = command.spawn().unwrap();
         let launcher_pid = launcher.id();
+        // TEMP-DIAG(T2b): drain launcher stderr; removed before final.
+        let logged = thread::spawn({
+            let stderr = launcher.stderr.take().unwrap();
+            move || {
+                use std::io::Read as _;
+                let mut text = String::new();
+                let _ = std::io::BufReader::new(stderr).read_to_string(&mut text);
+                text
+            }
+        });
 
         // PowerShell cold start is slow on CI runners; the launch is healthy
         // while the pid file is merely late.
@@ -1824,7 +1870,15 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(100));
         }
-        let server_pid = server_pid.expect("server grandchild never reported its pid");
+        let server_pid = server_pid.unwrap_or_else(|| {
+            // TEMP-DIAG(T2b): removed before final.
+            let alive = launcher.try_wait().unwrap();
+            eprintln!("DIAG launcher status at timeout: {alive:?}");
+            let _ = launcher.kill();
+            let _ = launcher.wait();
+            eprintln!("DIAG launcher stderr:\n{}", logged.join().unwrap());
+            panic!("server grandchild never reported its pid");
+        });
         assert_ne!(server_pid, launcher_pid);
 
         assert!(tree.contains(server_pid));
