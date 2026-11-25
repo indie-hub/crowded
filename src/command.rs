@@ -681,12 +681,24 @@ mod tests {
                 OsStr::new("--nocapture"),
             ])
             .env("CROWDED_INTERNAL_LAUNCH_JOB", tree.name())
-            .env("CROWDED_INTERNAL_LAUNCH_JOB", tree.name())
             .env("CROWDED_TEST_PID_FILE", &pid_file)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut wrapper = command.spawn().unwrap();
         let wrapper_pid = wrapper.id();
+        // TEMP-DIAG4: drain streams; removed before final.
+        let logged = thread::spawn({
+            use std::io::Read as _;
+            let mut err = wrapper.stderr.take().unwrap();
+            let mut out = wrapper.stdout.take().unwrap();
+            move || {
+                let mut err_text = String::new();
+                let mut out_text = String::new();
+                let _ = std::io::BufReader::new(&mut err).read_to_string(&mut err_text);
+                let _ = std::io::BufReader::new(&mut out).read_to_string(&mut out_text);
+                (out_text, err_text)
+            }
+        });
 
         // Joining happens after the re-exec starts, so poll for membership.
         let mut joined = false;
@@ -697,7 +709,17 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        assert!(joined, "wrapper never joined its job");
+        if !joined {
+            // TEMP-DIAG4: removed before final.
+            let status = wrapper.try_wait().unwrap();
+            let _ = wrapper.kill();
+            let _ = wrapper.wait();
+            let (out_text, err_text) = logged.join().unwrap();
+            eprintln!(
+                "DIAG4 status: {status:?}\nDIAG4 stdout:\n{out_text}\nDIAG4 stderr:\n{err_text}"
+            );
+            panic!("wrapper never joined its job");
+        }
 
         let mut server_pid = None;
         for _ in 0..300 {
