@@ -2699,6 +2699,41 @@ pub(crate) fn fail_next_schedule_at(path: &Path) {
     *guard = Some(path.to_path_buf());
 }
 
+/// Test-only: an outbox path whose delivery completions are held in the queue
+/// instead of being applied, so a test can put a launch report in the outbox
+/// before a claim's outcome settles its row. Keyed by path; release builds
+/// compile none of this.
+#[cfg(test)]
+static COLLECTION_PAUSED: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn collection_paused(path: &Path) -> bool {
+    let guard = COLLECTION_PAUSED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.as_deref() == Some(path)
+}
+
+/// Test-only: holds this outbox's completion collection until resumed.
+#[cfg(test)]
+pub(crate) fn pause_collection_at(path: &Path) {
+    let mut guard = COLLECTION_PAUSED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(path.to_path_buf());
+}
+
+/// Test-only: lets a paused outbox collect again.
+#[cfg(test)]
+pub(crate) fn resume_collection_at(path: &Path) {
+    let mut guard = COLLECTION_PAUSED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.as_deref() == Some(path) {
+        *guard = None;
+    }
+}
+
 /// Disk and adapter work run outside the terminal thread. A full command
 /// channel rejects intake instead of blocking the caller.
 pub(crate) struct BackgroundOutbox {
@@ -3383,6 +3418,10 @@ impl Outbox {
     }
 
     pub fn collect(&mut self, bindings: &HashMap<String, Binding>) -> io::Result<()> {
+        #[cfg(test)]
+        if collection_paused(&self.path) {
+            return Ok(());
+        }
         while let Ok(completion) = self.rx.try_recv() {
             self.active.remove(&completion.binding.room);
             let mut next = self.state.clone();

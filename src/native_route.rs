@@ -3464,11 +3464,14 @@ mod tests {
                     reason: None,
                 }])
                 .unwrap();
-            // Long enough to report the launch while the delivery is in flight.
+            // The claim's outcome must not settle the row before this round's
+            // report is in the outbox. Holding completion collection makes the
+            // order a decision of the test, not of which clock fires first.
+            crate::native_outbox::pause_collection_at(&state_path(root.path()));
             router
                 .claude_inbox(0)
                 .unwrap()
-                .set_test_timeout(Duration::from_secs(1));
+                .set_test_timeout(Duration::from_millis(50));
             let log = Log::default();
             // The mod is borrowed for the whole round: a scoped claim lets the
             // router keep ticking while it blocks.
@@ -3500,9 +3503,46 @@ mod tests {
             router
                 .rebind_claude(0, "Claude · 1".to_owned(), cwd.path(), CLAUDE_A, 1)
                 .unwrap();
-            assert_eq!(
-                answered_with(&mut router, &mut mailroom, &log),
-                NativeReply::Uncertain
+            // Drain the schedules sent before the report while collection is
+            // still held, so the first pass that collects has the new binding.
+            let drained = Instant::now() + Duration::from_secs(10);
+            while router.schedule_in_flight {
+                router.tick(Instant::now(), &mut mailroom, false, false);
+                assert!(
+                    Instant::now() < drained,
+                    "round {round}: the outbox never answered its schedule"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            crate::native_outbox::resume_collection_at(&state_path(root.path()));
+            // The held completion settles the row Uncertain under the adopted
+            // binding. The sender's reply has its own deadline, so either reply
+            // form is accepted.
+            let mut reply = None;
+            let settled = Instant::now() + Duration::from_secs(10);
+            loop {
+                router.tick(Instant::now(), &mut mailroom, false, false);
+                if reply.is_none() {
+                    reply = log.borrow_mut().pop().map(|(_, outcome)| outcome);
+                }
+                let settled_uncertain = router.messages.iter().any(|message| {
+                    message.id == claim.id
+                        && message.status == Status::Uncertain
+                        && message.binding.session == CLAUDE_A
+                });
+                if settled_uncertain && reply.is_some() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < settled,
+                    "round {round}: the row never settled Uncertain under the adopted binding:\n{}",
+                    mailroom.summary()
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                matches!(reply, Some(NativeReply::Queued | NativeReply::Uncertain)),
+                "round {round}: unexpected reply {reply:?}"
             );
             let row = router
                 .messages
@@ -3511,6 +3551,11 @@ mod tests {
                 .cloned()
                 .expect("the sent row is in the snapshot");
             assert_eq!(row.binding.session, CLAUDE_A, "the row adopted the report");
+            assert_eq!(
+                row.status,
+                Status::Uncertain,
+                "the claim timed out under the adopted binding"
+            );
             assert_eq!(mod_.receipt(&claim, "started", ""), 200);
             let evidence = router.claude_inbox(0).unwrap().peek_late();
             assert_eq!(evidence.len(), 1);
