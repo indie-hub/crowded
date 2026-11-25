@@ -579,6 +579,18 @@ fn mail_saved_before_the_pending_signal_is_never_released_by_a_same_id_report() 
     .unwrap();
     apply_test_report(&mut panes, router.as_mut(), 0, None, true);
     apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+    pump_router_until(
+        router.as_mut().unwrap(),
+        &mut mailroom,
+        |mailroom| {
+            mailroom
+                .summary()
+                .contains("HELD: sent for an earlier launch")
+        },
+        "the old mail to be shown held",
+    );
+    // A fixed window after the held state, so a stray delivery has time to
+    // land before the negative assertion.
     pump_router(router.as_mut().unwrap(), &mut mailroom, 400);
     let received = fake.state.received.lock().unwrap().clone();
     assert!(
@@ -613,6 +625,18 @@ fn mail_saved_before_two_pending_reports_stays_held_when_the_room_returns() {
     apply_test_report(&mut panes, router.as_mut(), 0, None, true);
     apply_test_report(&mut panes, router.as_mut(), 0, None, true);
     apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+    pump_router_until(
+        router.as_mut().unwrap(),
+        &mut mailroom,
+        |mailroom| {
+            mailroom
+                .summary()
+                .contains("HELD: sent for an earlier launch")
+        },
+        "the old mail to be shown held",
+    );
+    // A fixed window after the held state, so a stray delivery has time to
+    // land before the negative assertion.
     pump_router(router.as_mut().unwrap(), &mut mailroom, 400);
     let received = fake.state.received.lock().unwrap().clone();
     assert!(
@@ -651,6 +675,18 @@ fn mail_saved_before_a_pending_signal_stays_held_when_a_new_session_arrives() {
         notice.contains("now follows reported session ses_b"),
         "{notice}"
     );
+    pump_router_until(
+        router.as_mut().unwrap(),
+        &mut mailroom,
+        |mailroom| {
+            mailroom
+                .summary()
+                .contains("HELD: sent for an earlier launch")
+        },
+        "the old mail to be shown held",
+    );
+    // A fixed window after the held state, so a stray delivery has time to
+    // land before the negative assertion.
     pump_router(router.as_mut().unwrap(), &mut mailroom, 400);
     let received = fake.state.received.lock().unwrap().clone();
     assert!(
@@ -702,6 +738,14 @@ fn a_failed_pending_save_keeps_old_mail_held_through_the_handler() {
     std::fs::write(&state_dir, b"not a directory").unwrap();
     apply_test_report(&mut panes, router.as_mut(), 0, None, true);
     apply_test_report(&mut panes, router.as_mut(), 0, Some("ses_b"), false);
+    pump_router_until(
+        router.as_mut().unwrap(),
+        &mut mailroom,
+        |mailroom| mailroom.summary().contains("HELD"),
+        "the old mail to be shown held",
+    );
+    // A fixed window after the held state, so a stray delivery has time to
+    // land before the negative assertion.
     pump_router(router.as_mut().unwrap(), &mut mailroom, 400);
     let received = fake.state.received.lock().unwrap().clone();
     assert!(
