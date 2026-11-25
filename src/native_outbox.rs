@@ -3183,6 +3183,18 @@ impl Drop for Outbox {
 }
 
 impl Outbox {
+    /// The persisted rows before this process settles any of them. The router
+    /// uses them as the prior snapshot so a transition during startup still
+    /// produces one notice instead of looking like a first sighting.
+    pub(crate) fn startup_messages(path: &Path) -> Vec<Message> {
+        match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice::<State>(&bytes)
+                .map(|state| state.messages)
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn open(
         path: &Path,
         capacity: usize,
@@ -3543,10 +3555,8 @@ impl Outbox {
             return Err(io::Error::other("injected schedule failure"));
         }
         self.collect(bindings)?;
-        if !paused && !fused {
-            self.retire_stale(bindings)?;
-            self.expire_uncertain(now()?)?;
-        }
+        self.retire_stale(bindings)?;
+        self.expire_uncertain(now()?)?;
         self.set_pending(pending)?;
         if paused || fused {
             return Ok(());
