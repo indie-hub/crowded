@@ -24,7 +24,10 @@ use crate::{
         Adapter, AdapterResult, BackgroundOutbox, Binding, Command, Event, Message, Resolution,
         Status, TaggedEvent,
     },
-    native_session::{STALE_HOLD, is_retryable_hold, same_launch_placeholder},
+    native_session::{
+        STALE_HOLD, UNCONFIRMED_FAILED, is_correctable_unconfirmed, is_retryable_hold,
+        same_launch_placeholder,
+    },
     opencode_native::{Delivery, Server},
     opencode_outbox::{OpenCodeAdapter, native_id},
     pane::{session_state::create_private_directory, whisper_note},
@@ -988,7 +991,9 @@ impl NativeRouter {
                 continue;
             };
             match &message.status {
-                Status::Uncertain => {
+                Status::Uncertain | Status::Failed { .. }
+                    if is_correctable_unconfirmed(&message.status) =>
+                {
                     if message.hash != event.sha256 {
                         to_ack.push((
                             event.id.clone(),
@@ -1026,7 +1031,7 @@ impl NativeRouter {
                         "the outbox row is already acknowledged",
                     ));
                 }
-                Status::Accepted | Status::Failed { .. } => {
+                Status::Uncertain | Status::Accepted | Status::Failed { .. } => {
                     let same_outcome = match (&message.status, &expected) {
                         (Status::Accepted, Resolution::Accepted(receipt)) => {
                             message.receipt.as_ref() == receipt.as_ref()
@@ -1343,6 +1348,9 @@ impl NativeRouter {
             Status::Uncertain => {
                 "UNCERTAIN: may have been accepted; it will not be resent".to_owned()
             }
+            Status::Failed { reason } if reason == STALE_HOLD => {
+                "HELD: sent for an earlier launch of this room; not delivered".to_owned()
+            }
             Status::Failed { reason } => format!("FAILED: {reason}"),
         }
     }
@@ -1359,18 +1367,21 @@ impl NativeRouter {
 
     fn sync_mailroom(&mut self, mailroom: &mut Mailroom) {
         let messages = std::mem::take(&mut self.messages);
-        let previous = messages.clone();
         let mut retired: HashMap<String, usize> = HashMap::new();
+        let mut unconfirmed: HashMap<String, usize> = HashMap::new();
         for message in &messages {
-            // One batch notice per room: a row already Failed before this
-            // snapshot must not announce itself again after a restart.
-            let newly_retired = previous
-                .iter()
-                .find(|old| old.id == message.id)
-                .is_some_and(|old| matches!(&old.status, Status::Queued { .. }))
+            // Announce a terminal row once when it first reaches the view,
+            // including rows left by an earlier run; later snapshots stay quiet.
+            let fresh = !self.shown.contains_key(&message.id);
+            let newly_retired = fresh
                 && matches!(&message.status, Status::Failed { reason } if reason == STALE_HOLD);
             if newly_retired {
                 *retired.entry(self.label(message)).or_insert(0) += 1;
+            }
+            let newly_unconfirmed = fresh
+                && matches!(&message.status, Status::Failed { reason } if reason == UNCONFIRMED_FAILED);
+            if newly_unconfirmed {
+                *unconfirmed.entry(self.label(message)).or_insert(0) += 1;
             }
             let text = self.status_text(message);
             if self.shown.get(&message.id) == Some(&text) {
@@ -1400,6 +1411,12 @@ impl NativeRouter {
                 ),
                 "NOTICE".to_owned(),
             );
+        }
+        for (room, count) in unconfirmed {
+            let text = format!(
+                "{count} messages to {room} were not confirmed; they may have arrived; not resent"
+            );
+            mailroom.record_native("native delivery".into(), room, text, "NOTICE".to_owned());
         }
         self.messages = messages;
     }
@@ -3852,5 +3869,163 @@ mod tests {
             mailroom.summary().contains("ACCEPTED")
         });
         assert!(router.claude_inbox(0).unwrap().peek_late().is_empty());
+    }
+
+    /// A receipt that arrives after its row has been trimmed is dropped with
+    /// one notice; it never recreates a row or loops on the retained evidence.
+    #[test]
+    fn a_late_receipt_after_history_trim_is_dropped_once() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let binding = {
+            let router = claude_router(root.path(), cwd.path());
+            router.rooms[&0].1.clone()
+        };
+        let id = "trimmed-uncertain";
+        let hash = format!("{:x}", Sha256::digest(b"old"));
+        let bound = serde_json::to_value(&binding).unwrap();
+        let destination = binding.room.clone();
+        let row = |id: String, status: serde_json::Value| {
+            serde_json::json!({
+                "id": id,
+                "source": "Sender",
+                "destination": destination,
+                "binding": bound,
+                "text": "old",
+                "hash": hash,
+                "created_ms": 1u128,
+                "sequence": 1u64,
+                "attempts": [],
+                "receipt": null,
+                "status": status,
+            })
+        };
+        let mut messages = vec![row(
+            id.to_owned(),
+            serde_json::json!({"Failed": {"reason": UNCONFIRMED_FAILED}}),
+        )];
+        for number in 0..100 {
+            messages.push(row(
+                format!("done-{number}"),
+                serde_json::Value::String("Accepted".into()),
+            ));
+        }
+        let seeded = serde_json::json!({
+            "messages": messages,
+            "sequences": {},
+            "counters": {"accepted": 100, "failed": 1},
+        });
+        fs::write(
+            state_path(root.path()),
+            serde_json::to_vec(&seeded).unwrap(),
+        )
+        .unwrap();
+
+        let mut router = claude_router(root.path(), cwd.path());
+        let mut mailroom = Mailroom::new(50);
+        router
+            .send(&mut mailroom, "Sender", 0, "new", None)
+            .unwrap();
+        for _ in 0..20 {
+            router.tick(Instant::now(), &mut mailroom, false, false);
+            thread::sleep(Duration::from_millis(20));
+        }
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(state_path(root.path())).unwrap()).unwrap();
+        assert!(
+            saved["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["id"] != id)
+        );
+
+        router
+            .claude_inbox(0)
+            .unwrap()
+            .inject_late(crate::claude_inbox::LateReceipt {
+                id: id.to_owned(),
+                sha256: hash.clone(),
+                binding: binding.clone(),
+                held: None,
+            });
+        let mut notices = Vec::new();
+        for _ in 0..20 {
+            notices.extend(
+                router
+                    .tick(Instant::now(), &mut mailroom, false, false)
+                    .into_iter()
+                    .map(|(text, _)| text),
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let dropped = notices
+            .iter()
+            .filter(|text| text.contains("dropped a late Claude receipt"))
+            .count();
+        assert_eq!(
+            dropped, 1,
+            "one notice, then the evidence is gone: {notices:?}"
+        );
+        assert!(router.claude_inbox(0).unwrap().peek_late().is_empty());
+    }
+
+    /// End to end through tick: a row old by its persisted attempt clock gets
+    /// one batch notice and a truthful Failed line, and is never sent again.
+    #[test]
+    fn an_expired_uncertain_row_reports_one_batch_notice_through_tick() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let binding = {
+            let router = claude_router(root.path(), cwd.path());
+            router.rooms[&0].1.clone()
+        };
+        let hash = format!("{:x}", Sha256::digest(b"old"));
+        let seeded = serde_json::json!({
+            "messages": [{
+                "id": "old-uncertain",
+                "source": "Sender",
+                "destination": binding.room,
+                "binding": binding,
+                "text": "old",
+                "hash": hash,
+                "created_ms": 1u128,
+                "sequence": 1u64,
+                "attempts": [{"number": 1, "started_ms": 1u128}],
+                "receipt": null,
+                "status": "Uncertain",
+            }],
+            "sequences": {},
+        });
+        fs::write(
+            state_path(root.path()),
+            serde_json::to_vec(&seeded).unwrap(),
+        )
+        .unwrap();
+
+        let mut router = claude_router(root.path(), cwd.path());
+        let mut mailroom = Mailroom::new(50);
+        for _ in 0..20 {
+            router.tick(Instant::now(), &mut mailroom, false, false);
+            thread::sleep(Duration::from_millis(20));
+        }
+        let view = mailroom.summary();
+        assert!(
+            view.contains("were not confirmed; they may have arrived; not resent"),
+            "{view}"
+        );
+        assert_eq!(
+            view.matches("were not confirmed; they may have arrived; not resent")
+                .count(),
+            1,
+            "one notice per batch: {view}"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(state_path(root.path())).unwrap()).unwrap();
+        let row = &saved["messages"][0];
+        assert_eq!(row["status"]["Failed"]["reason"], UNCONFIRMED_FAILED);
+        assert_eq!(row["attempts"].as_array().unwrap().len(), 1);
     }
 }

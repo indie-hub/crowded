@@ -33,6 +33,38 @@ pub(crate) const DISCONNECTED_HOLD: &str = "Claude mod disconnected";
 /// Prefixes a hold reason the Claude mod itself supplied, so it can never look
 /// like one of this crate's own hold strings and be retried.
 pub(crate) const MOD_HOLD_PREFIX: &str = "Claude mod: ";
+/// The terminal state of an unconfirmed delivery. It does not claim the mail
+/// was lost, and a later authenticated receipt may still correct it.
+pub(crate) const UNCONFIRMED_FAILED: &str =
+    "delivery was not confirmed; it may have arrived; not resent";
+/// How long an unconfirmed row gets after its last attempt. Provisional: a
+/// per-guest bound needs a measured late-receipt distribution.
+pub(crate) const UNCERTAIN_BOUND_MS: u128 = 600_000;
+
+/// Whether a row is the terminal unconfirmed state that evidence may correct.
+pub(crate) fn is_unconfirmed_failed(status: &Status) -> bool {
+    matches!(status, Status::Failed { reason } if reason == UNCONFIRMED_FAILED)
+}
+
+/// The only statuses a late authenticated receipt may settle.
+pub(crate) fn is_correctable_unconfirmed(status: &Status) -> bool {
+    matches!(status, Status::Uncertain) || is_unconfirmed_failed(status)
+}
+
+/// Whether an unconfirmed row is past its bound. The clock comes from the
+/// persisted attempt, so it survives a restart; a backwards clock never
+/// expires a row.
+pub(crate) fn uncertain_expired(message: &Message, now_ms: u128) -> bool {
+    if !matches!(message.status, Status::Uncertain) {
+        return false;
+    }
+    let since = message
+        .attempts
+        .last()
+        .map(|attempt| attempt.started_ms)
+        .unwrap_or(message.created_ms);
+    now_ms >= since && now_ms - since >= UNCERTAIN_BOUND_MS
+}
 
 /// The session name a Claude room is bound to before its own hook reports the
 /// real session. It names one launch, never a session, and is never persisted.
