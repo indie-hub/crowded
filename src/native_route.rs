@@ -290,6 +290,9 @@ pub(crate) struct NativeRouter {
     envelope_of: HashMap<String, u64>,
     shown: HashMap<String, String>,
     messages: Vec<Message>,
+    /// Rows read before the worker's first settle, used as the prior snapshot
+    /// for the startup update so a transition there is still announced once.
+    startup_prior: Vec<Message>,
     paused: bool,
     unavailable: Option<String>,
 }
@@ -352,6 +355,7 @@ impl NativeRouter {
             })?;
         }
         let adapter = Arc::new(SwitchAdapter::new(rooms.clone())?);
+        let startup_prior = crate::native_outbox::Outbox::startup_messages(&path);
         let outbox = BackgroundOutbox::start(
             path.clone(),
             OUTBOX_CAPACITY,
@@ -418,6 +422,7 @@ impl NativeRouter {
             envelope_of: HashMap::new(),
             shown: HashMap::new(),
             messages: Vec::new(),
+            startup_prior,
             paused: true,
             unavailable: None,
         };
@@ -1260,6 +1265,11 @@ impl NativeRouter {
                         Some(Waiting::Enqueue { .. }) | None => {}
                     }
                     let prior = std::mem::take(&mut self.messages);
+                    let prior = if self.startup_prior.is_empty() {
+                        prior
+                    } else {
+                        std::mem::take(&mut self.startup_prior)
+                    };
                     self.messages = messages;
                     self.snapshot_seq += 1;
                     self.sync_mailroom(mailroom, &prior);
@@ -4010,17 +4020,18 @@ mod tests {
 
         let mut router = claude_router(root.path(), cwd.path());
         let mut mailroom = Mailroom::new(50);
-        // Show the row as Uncertain before it expires: the notice must report
-        // a transition, not a first sighting of an already terminal row.
+        // Settlement now runs in the startup paused schedule, so the prior
+        // state is the snapshot read before the worker settled the row.
+        assert!(
+            router
+                .startup_prior
+                .iter()
+                .any(|m| matches!(m.status, Status::Uncertain))
+        );
         for _ in 0..6 {
             router.tick(Instant::now(), &mut mailroom, true, false);
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(
-            mailroom.summary().contains("UNCERTAIN"),
-            "{}",
-            mailroom.summary()
-        );
         for _ in 0..20 {
             router.tick(Instant::now(), &mut mailroom, false, false);
             thread::sleep(Duration::from_millis(20));
@@ -4089,17 +4100,16 @@ mod tests {
         );
         let mut router = claude_router(root.path(), cwd.path());
         let mut mailroom = Mailroom::new(50);
+        assert!(router.startup_prior.iter().any(|m| matches!(
+            m.status,
+            Status::Queued {
+                hold: Some(ref reason)
+            } if reason == STALE_HOLD
+        )));
         for _ in 0..6 {
             router.tick(Instant::now(), &mut mailroom, true, false);
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(
-            mailroom
-                .summary()
-                .contains("HELD: sent for an earlier launch"),
-            "{}",
-            mailroom.summary()
-        );
         for _ in 0..20 {
             router.tick(Instant::now(), &mut mailroom, false, false);
             thread::sleep(Duration::from_millis(20));
@@ -4136,11 +4146,16 @@ mod tests {
         );
         let mut router = claude_router(root.path(), cwd.path());
         let mut mailroom = Mailroom::new(50);
+        assert!(
+            router
+                .startup_prior
+                .iter()
+                .any(|m| matches!(m.status, Status::Uncertain))
+        );
         for _ in 0..6 {
             router.tick(Instant::now(), &mut mailroom, true, false);
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(mailroom.summary().contains("UNCERTAIN"));
         for _ in 0..20 {
             router.tick(Instant::now(), &mut mailroom, false, false);
             thread::sleep(Duration::from_millis(20));
@@ -4178,5 +4193,89 @@ mod tests {
         assert_eq!(row["status"], "Accepted");
         assert_eq!(row["receipt"], "submitted");
         assert_eq!(row["attempts"].as_array().unwrap().len(), 1);
+    }
+
+    fn settlement_runs_while(paused: bool, fused: bool) {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let binding = {
+            let router = claude_router(root.path(), cwd.path());
+            router.rooms[&0].1.clone()
+        };
+        let hash = format!("{:x}", Sha256::digest(b"old"));
+        let bound = serde_json::to_value(&binding).unwrap();
+        let destination = binding.room.clone();
+        let row = |id: &str, status: serde_json::Value| {
+            serde_json::json!({
+                "id": id,
+                "source": "Sender",
+                "destination": destination,
+                "binding": bound,
+                "text": "old",
+                "hash": hash,
+                "created_ms": 1u128,
+                "sequence": 1u64,
+                "attempts": [{"number": 1, "started_ms": 1u128}],
+                "receipt": null,
+                "status": status,
+            })
+        };
+        let seeded = serde_json::json!({
+            "messages": [
+                row("paused-uncertain", serde_json::Value::String("Uncertain".into())),
+                row("paused-stale", serde_json::json!({"Queued": {"hold": STALE_HOLD}})),
+            ],
+            "sequences": {},
+        });
+        fs::write(
+            state_path(root.path()),
+            serde_json::to_vec(&seeded).unwrap(),
+        )
+        .unwrap();
+
+        let mut router = claude_router(root.path(), cwd.path());
+        let mut mailroom = Mailroom::new(50);
+        for _ in 0..20 {
+            router.tick(Instant::now(), &mut mailroom, paused, fused);
+            thread::sleep(Duration::from_millis(20));
+        }
+        let view = mailroom.summary();
+        assert!(
+            view.contains("FAILED: delivery was not confirmed"),
+            "{paused} {fused}: {view}"
+        );
+        assert!(
+            view.contains("FAILED: sent for an earlier launch"),
+            "{paused} {fused}: {view}"
+        );
+        assert_eq!(
+            view.matches("were not confirmed; they may have arrived; not resent")
+                .count(),
+            1,
+            "one unconfirmed notice: {view}"
+        );
+        assert_eq!(
+            view.matches("were not delivered; not resent").count(),
+            1,
+            "one stale notice: {view}"
+        );
+        assert!(!view.contains("ACCEPTED"), "nothing was sent: {view}");
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(state_path(root.path())).unwrap()).unwrap();
+        for row in saved["messages"].as_array().unwrap() {
+            assert!(row["status"]["Failed"].is_object(), "{row}");
+            assert_eq!(row["attempts"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn settlement_runs_while_paused() {
+        settlement_runs_while(true, false);
+    }
+
+    #[test]
+    fn settlement_runs_while_fused() {
+        settlement_runs_while(false, true);
     }
 }
