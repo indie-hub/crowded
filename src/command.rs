@@ -663,11 +663,6 @@ mod tests {
         }
     }
 
-    /// Membership, outsiders, exited pids, and the stop path, through the
-    /// same launcher environment the owned server uses: the wrapper joins
-    /// at birth and the grandchild inherits the job.
-    #[cfg(windows)]
-    #[test]
     /// Membership, outsiders, exited pids, and the stop path. The wrapper
     /// joins on entry and the grandchild inherits the job.
     ///
@@ -743,6 +738,22 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         assert!(!tree.contains(server_pid));
+        // Independent of job membership: the processes themselves are dead.
+        // (`contains` alone also passes for a live outsider.)
+        for _ in 0..200 {
+            if !process_is_running(server_pid) && !process_is_running(wrapper_pid) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !process_is_running(server_pid),
+            "server grandchild survived the job terminate"
+        );
+        assert!(
+            !process_is_running(wrapper_pid),
+            "wrapper survived the job terminate"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -778,6 +789,31 @@ mod tests {
             OsString::from("0")
         );
         assert_eq!(envs.len(), 5);
+    }
+
+    /// `in_job` must spawn this binary with the launcher argument, never
+    /// the program directly: spawning the program would skip the join and
+    /// the descendants would never become job members.
+    #[cfg(windows)]
+    #[test]
+    fn in_job_spawns_the_launcher_reexec_not_the_program() {
+        let tree = ProcessTree::new().unwrap();
+        let resolved = ResolvedCommand {
+            program: PathBuf::from("C:\\Tools\\opencode.cmd"),
+            args: vec![OsString::from("--port")],
+        };
+        let (command, _tree) = resolved.in_job().unwrap();
+        assert_eq!(
+            command.get_program(),
+            env::current_exe().unwrap().as_os_str()
+        );
+        let argv: Vec<&OsStr> = command.get_args().collect();
+        assert_eq!(argv, [OsStr::new(INTERNAL_LAUNCH_ARGUMENT)]);
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, _)| key == OsStr::new(LAUNCH_JOB))
+        );
     }
 
     #[cfg(windows)]

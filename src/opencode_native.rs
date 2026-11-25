@@ -1252,6 +1252,62 @@ mod tests {
         }
     }
 
+    /// Independent liveness probe: OpenProcess plus the exit code.
+    /// (`!contains` alone also passes for a live outsider, so it cannot
+    /// prove a process died.)
+    #[cfg(windows)]
+    fn process_is_running(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::STILL_ACTIVE;
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{
+                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        };
+
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return false;
+        }
+        let mut code = 0;
+        let running =
+            unsafe { GetExitCodeProcess(process, &mut code) } != 0 && code == STILL_ACTIVE as u32;
+        unsafe { CloseHandle(process) };
+        running
+    }
+
+    /// Dropping a Server with a live joined member terminates the job and
+    /// reaps the child: the same stop_owned path production uses. The
+    /// member's death is checked independently of job membership.
+    #[cfg(windows)]
+    #[test]
+    fn dropping_server_with_a_joined_member_reaps_the_tree() {
+        let (member_pid, member, tree) = live_job_member();
+        assert!(tree.contains(member_pid));
+        let client = fake(0, |_, _, _| None);
+        let server = Server {
+            child: Some(member),
+            #[cfg(windows)]
+            tree: Some(tree),
+            client,
+            session: Mutex::new("ses_a".into()),
+            url: "http://127.0.0.1:1234".into(),
+            binding: Mutex::new(None),
+            server_pid: Some(member_pid),
+        };
+        drop(server);
+        for _ in 0..200 {
+            if !process_is_running(member_pid) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !process_is_running(member_pid),
+            "joined member survived the Server drop"
+        );
+    }
+
     fn bound_server(client: &Arc<Client>, room: &str, generation: u64, session: &str) -> Server {
         let mut launch = LaunchBinding::new(room.into(), generation, 42).unwrap();
         launch
@@ -1887,6 +1943,17 @@ mod tests {
         }
         assert!(!tree.contains(member_pid));
         assert!(!owned_by(member_pid, member_pid, Some(&tree)));
+        // Independent of job membership: the member itself is dead.
+        for _ in 0..200 {
+            if !process_is_running(member_pid) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !process_is_running(member_pid),
+            "joined member survived the job terminate"
+        );
     }
 
     #[cfg(unix)]
