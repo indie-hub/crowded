@@ -504,7 +504,10 @@ fn rapid_consecutive_reports_rebind_once_and_deliver_once() {
     assert_eq!(received.len(), 1, "exactly one delivery: {received:?}");
     assert_eq!(received[0].1, "[whisper from Room X] new");
     let view = mailroom.summary();
-    assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
+    assert!(
+        view.contains("FAILED: sent for an earlier launch"),
+        "{view}"
+    );
 }
 
 #[cfg(all(test, unix))]
@@ -588,9 +591,9 @@ fn mail_saved_before_the_pending_signal_is_never_released_by_a_same_id_report() 
         |mailroom| {
             mailroom
                 .summary()
-                .contains("HELD: sent for an earlier launch")
+                .contains("FAILED: sent for an earlier launch")
         },
-        "the old mail to be shown held",
+        "the old mail to be shown failed",
     );
     // A fixed window after the held state, so a stray delivery has time to
     // land before the negative assertion.
@@ -601,7 +604,10 @@ fn mail_saved_before_the_pending_signal_is_never_released_by_a_same_id_report() 
         "mail saved before the pending signal is never delivered: {received:?}"
     );
     let view = mailroom.summary();
-    assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
+    assert!(
+        view.contains("FAILED: sent for an earlier launch"),
+        "{view}"
+    );
 }
 
 /// Two pending signals in a row still leave earlier mail held: the
@@ -634,9 +640,9 @@ fn mail_saved_before_two_pending_reports_stays_held_when_the_room_returns() {
         |mailroom| {
             mailroom
                 .summary()
-                .contains("HELD: sent for an earlier launch")
+                .contains("FAILED: sent for an earlier launch")
         },
-        "the old mail to be shown held",
+        "the old mail to be shown failed",
     );
     // A fixed window after the held state, so a stray delivery has time to
     // land before the negative assertion.
@@ -647,7 +653,10 @@ fn mail_saved_before_two_pending_reports_stays_held_when_the_room_returns() {
         "mail saved before the pending signal is never delivered: {received:?}"
     );
     let view = mailroom.summary();
-    assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
+    assert!(
+        view.contains("FAILED: sent for an earlier launch"),
+        "{view}"
+    );
 }
 
 /// A pending signal followed by a different session keeps earlier mail
@@ -684,9 +693,9 @@ fn mail_saved_before_a_pending_signal_stays_held_when_a_new_session_arrives() {
         |mailroom| {
             mailroom
                 .summary()
-                .contains("HELD: sent for an earlier launch")
+                .contains("FAILED: sent for an earlier launch")
         },
-        "the old mail to be shown held",
+        "the old mail to be shown failed",
     );
     // A fixed window after the held state, so a stray delivery has time to
     // land before the negative assertion.
@@ -697,7 +706,10 @@ fn mail_saved_before_a_pending_signal_stays_held_when_a_new_session_arrives() {
         "mail saved before the pending signal is never delivered: {received:?}"
     );
     let view = mailroom.summary();
-    assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
+    assert!(
+        view.contains("FAILED: sent for an earlier launch"),
+        "{view}"
+    );
 }
 
 /// The pending report through the production handler while the outbox
@@ -745,7 +757,7 @@ fn a_failed_pending_save_keeps_old_mail_held_through_the_handler() {
         router.as_mut().unwrap(),
         &mut mailroom,
         |mailroom| mailroom.summary().contains("HELD"),
-        "the old mail to be shown held",
+        "the old mail to be shown failed",
     );
     // A fixed window after the held state, so a stray delivery has time to
     // land before the negative assertion.
@@ -1772,7 +1784,10 @@ fn a_pending_save_failure_is_reported_as_its_own_failure() {
     );
     assert!(received[0].1.contains("new"), "{received:?}");
     let view = mailroom.summary();
-    assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
+    assert!(
+        view.contains("FAILED: sent for an earlier launch"),
+        "{view}"
+    );
 }
 
 /// Two pending reports with one failing write: the failure is reported
@@ -2969,7 +2984,10 @@ fn a_reported_id_rebinds_the_opencode_room_and_delivers_to_it() {
     );
     assert!(received[0].1.contains("new"), "{received:?}");
     let view = mailroom.summary();
-    assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
+    assert!(
+        view.contains("FAILED: sent for an earlier launch"),
+        "{view}"
+    );
     assert!(view.contains("ACCEPTED by OpenCode"), "{view}");
 }
 

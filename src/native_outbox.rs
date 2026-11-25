@@ -66,6 +66,17 @@ mod tests {
             result,
         })
     }
+
+    struct Recording {
+        ids: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Adapter for Recording {
+        fn send(&self, message: Message) -> AdapterResult {
+            self.ids.lock().unwrap().push(message.id);
+            accepted()
+        }
+    }
     fn accepted() -> AdapterResult {
         AdapterResult::Accepted(Some("receipt".into()))
     }
@@ -99,6 +110,17 @@ mod tests {
                         reason: STALE_HOLD.to_owned(),
                     }
         })
+    }
+
+    fn status_of(outbox: &Outbox, id: &str) -> Status {
+        outbox
+            .state
+            .messages
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("message {id} is missing"))
+            .status
+            .clone()
     }
 
     #[test]
@@ -812,13 +834,15 @@ mod tests {
         let new = binding("a", 2);
         let current = HashMap::from([(new.room.clone(), new.clone())]);
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut outbox = Outbox::open(&path, 2, 2, 2).unwrap();
-        outbox
+        let mut outbox = Outbox::open(&path, 2, 4, 2).unwrap();
+        let stale_one = outbox
             .enqueue("s".into(), old.clone(), "stale one".into())
-            .unwrap();
-        outbox
+            .unwrap()
+            .id;
+        let stale_two = outbox
             .enqueue("s".into(), old.clone(), "stale two".into())
-            .unwrap();
+            .unwrap()
+            .id;
         // The outbox is full of live work until the launch changes.
         assert!(
             outbox
@@ -832,8 +856,8 @@ mod tests {
         let held = Status::Queued {
             hold: Some(STALE_HOLD.to_owned()),
         };
-        assert_eq!(outbox.state.messages[0].status, held);
-        assert_eq!(outbox.state.messages[1].status, held);
+        assert_eq!(status_of(&outbox, &stale_one), held);
+        assert_eq!(status_of(&outbox, &stale_two), held);
 
         // Two stale messages and a capacity of two: fresh mail is still taken.
         let fresh = outbox
@@ -857,23 +881,29 @@ mod tests {
         wait(&mut outbox, &current);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // The terminal state survives a restart and the mail is still not sent.
-        drop(outbox);
-        let mut outbox = Outbox::open(&path, 4, 2, 2).unwrap();
         let retired = Status::Failed {
             reason: STALE_HOLD.to_owned(),
         };
-        assert!(
-            outbox.state.messages.iter().any(|m| m.status == retired),
-            "a retired row keeps its state through a restart"
-        );
+        assert_eq!(status_of(&outbox, &stale_one), retired);
+        assert_eq!(status_of(&outbox, &stale_two), retired);
+
+        // Both rows keep their terminal state across a restart and a schedule;
+        // neither is offered again, even though live mail still can be.
+        drop(outbox);
+        let mut outbox = Outbox::open(&path, 4, 4, 2).unwrap();
+        assert_eq!(status_of(&outbox, &stale_one), retired);
+        assert_eq!(status_of(&outbox, &stale_two), retired);
+        let after_restart = Arc::new(Recording {
+            ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
         outbox
-            .schedule(&current, false, false, &[], fake(&calls, accepted))
+            .schedule(&current, false, false, &[], after_restart.clone())
             .unwrap();
-        assert!(
-            outbox.state.messages.iter().any(|m| m.status == retired),
-            "retirement is stable across passes and restarts"
-        );
+        assert_eq!(status_of(&outbox, &stale_one), retired);
+        assert_eq!(status_of(&outbox, &stale_two), retired);
+        let sent_ids = after_restart.ids.lock().unwrap();
+        assert!(!sent_ids.contains(&stale_one), "stale row one was sent");
+        assert!(!sent_ids.contains(&stale_two), "stale row two was sent");
     }
 
     #[test]
@@ -3513,8 +3543,10 @@ impl Outbox {
             return Err(io::Error::other("injected schedule failure"));
         }
         self.collect(bindings)?;
-        self.retire_stale(bindings)?;
-        self.expire_uncertain(now()?)?;
+        if !paused && !fused {
+            self.retire_stale(bindings)?;
+            self.expire_uncertain(now()?)?;
+        }
         self.set_pending(pending)?;
         if paused || fused {
             return Ok(());
