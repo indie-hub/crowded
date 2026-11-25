@@ -83,13 +83,11 @@ impl ResolvedCommand {
         #[cfg(windows)]
         {
             let tree = ProcessTree::new()?;
-            let mut command = CommandBuilder::new(env::current_exe()?);
+            let (program, envs) = self.launcher_invocation(&tree)?;
+            let mut command = CommandBuilder::new(program);
             command.arg(INTERNAL_LAUNCH_ARGUMENT);
-            command.env(LAUNCH_JOB, tree.name());
-            command.env(LAUNCH_PROGRAM, self.program.as_os_str());
-            command.env(LAUNCH_ARG_COUNT, self.args.len().to_string());
-            for (index, argument) in self.args.iter().enumerate() {
-                command.env(format!("{LAUNCH_ARG_PREFIX}{index}"), argument);
+            for (key, value) in envs {
+                command.env(key, value);
             }
             Ok(PortableCommand {
                 command,
@@ -113,6 +111,50 @@ impl ResolvedCommand {
         let mut process = Command::new(&self.program);
         process.args(&self.args);
         process
+    }
+
+    /// A std-command variant of [`portable`](Self::portable) for callers that
+    /// need piped stdio: the launcher joins the job before running the
+    /// program, so every descendant is a job member from birth. The returned
+    /// tree must outlive every descendant it should reap.
+    #[cfg(windows)]
+    pub(crate) fn in_job(&self) -> io::Result<(Command, ProcessTree)> {
+        let tree = ProcessTree::new()?;
+        let (program, envs) = self.launcher_invocation(&tree)?;
+        let mut command = Command::new(program);
+        command.arg(INTERNAL_LAUNCH_ARGUMENT);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        Ok((command, tree))
+    }
+
+    /// The re-exec invocation for one launcher run: this executable plus the
+    /// job name, program and arguments as environment. Shared by [`portable`](Self::portable)
+    /// and [`in_job`](Self::in_job) so the join-before-spawn order has a
+    /// single definition.
+    #[cfg(windows)]
+    fn launcher_invocation(
+        &self,
+        job: &ProcessTree,
+    ) -> io::Result<(OsString, Vec<(OsString, OsString)>)> {
+        let mut envs = Vec::with_capacity(self.args.len() + 3);
+        envs.push((OsString::from(LAUNCH_JOB), job.name().to_os_string()));
+        envs.push((
+            OsString::from(LAUNCH_PROGRAM),
+            self.program.as_os_str().to_os_string(),
+        ));
+        envs.push((
+            OsString::from(LAUNCH_ARG_COUNT),
+            OsString::from(self.args.len().to_string()),
+        ));
+        for (index, argument) in self.args.iter().enumerate() {
+            envs.push((
+                OsString::from(format!("{LAUNCH_ARG_PREFIX}{index}")),
+                argument.clone(),
+            ));
+        }
+        Ok((env::current_exe()?.into_os_string(), envs))
     }
 }
 
@@ -286,6 +328,15 @@ pub(crate) struct ProcessTree {
     name: OsString,
 }
 
+// SAFETY: the handle is an owned job object created by this process and
+// closed exactly once in `Drop`. The kernel serializes concurrent calls on
+// a job handle, and every use borrows through the owning `Server`, which
+// never touches the handle after dropping it.
+#[cfg(windows)]
+unsafe impl Send for ProcessTree {}
+#[cfg(windows)]
+unsafe impl Sync for ProcessTree {}
+
 #[cfg(windows)]
 impl ProcessTree {
     fn new() -> io::Result<Self> {
@@ -330,11 +381,13 @@ impl ProcessTree {
         Ok(Self { handle: job, name })
     }
 
-    fn name(&self) -> &OsStr {
+    pub(crate) fn name(&self) -> &OsStr {
         &self.name
     }
 
-    fn join_current(name: &OsStr) -> io::Result<()> {
+    /// Joins the calling process to the named job. Public within the crate
+    /// so tests can place a child in a job they hold.
+    pub(crate) fn join_current(name: &OsStr) -> io::Result<()> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::{
             Foundation::CloseHandle,
@@ -359,8 +412,45 @@ impl ProcessTree {
         Ok(())
     }
 
-    pub(crate) fn terminate(&self) {
-        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle, 1) };
+    pub(crate) fn terminate(&self) -> io::Result<()> {
+        if unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.handle, 1) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.handle
+    }
+
+    /// True when `pid` names a live member of this job. An exited pid, an
+    /// inaccessible process, or an outsider all fail closed; the opened
+    /// process handle is held only for the check, so a reused pid cannot
+    /// pass after its owner died.
+    pub(crate) fn contains(&self, pid: u32) -> bool {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, STILL_ACTIVE},
+            System::{
+                JobObjects::IsProcessInJob,
+                Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+            },
+        };
+
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return false;
+        }
+        let mut code = 0;
+        let alive =
+            unsafe { GetExitCodeProcess(process, &mut code) } != 0 && code == STILL_ACTIVE as u32;
+        let mut member = 0;
+        let inside = alive
+            && unsafe { IsProcessInJob(process, self.handle, &mut member) } != 0
+            && member != 0;
+        unsafe { CloseHandle(process) };
+        inside
     }
 }
 
@@ -501,6 +591,231 @@ mod tests {
         }
     }
 
+    /// A failed join must surface before any program runs: the child
+    /// re-exec joins a job that does not exist, so the launcher errors and
+    /// the sentinel program is never spawned.
+    #[cfg(windows)]
+    #[test]
+    fn launcher_failed_join_never_runs_the_program() {
+        if env::var_os("CROWDED_TEST_JOIN_CHILD").is_some() {
+            assert!(run_internal_launcher().is_err());
+            std::process::exit(0);
+        }
+        let directory = test_directory();
+        let marker = directory.join("must-not-run.marker");
+        let shim = directory.join("must-not-run.cmd");
+        std::fs::write(
+            &shim,
+            format!("@echo off\r\necho RAN > \"{}\"\r\n", marker.display()),
+        )
+        .unwrap();
+        let status = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                OsStr::new("--exact"),
+                OsStr::new("command::tests::launcher_failed_join_never_runs_the_program"),
+                OsStr::new("--nocapture"),
+            ])
+            .env("CROWDED_TEST_JOIN_CHILD", "1")
+            .env(
+                "CROWDED_INTERNAL_LAUNCH_JOB",
+                "Local\\CrowdedNoSuchJobForJoinTest",
+            )
+            .env("CROWDED_INTERNAL_LAUNCH_PROGRAM", shim.as_os_str())
+            .env("CROWDED_INTERNAL_LAUNCH_ARG_COUNT", "0")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // The launcher errored before spawning: the script never ran.
+        assert!(!marker.is_file());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Child entry for [`ProcessTree`] membership tests: join the job named
+    /// in the environment, spawn a grandchild sleeper that inherits the job,
+    /// report its pid through the pid file, then wait to be reaped.
+    #[cfg(windows)]
+    #[test]
+    fn windows_join_self_entry() {
+        use std::process::Stdio;
+
+        if let (Some(job), Some(pid_file)) = (
+            env::var_os("CROWDED_INTERNAL_LAUNCH_JOB"),
+            env::var_os("CROWDED_TEST_PID_FILE"),
+        ) {
+            // Child run: join first, then prove a grandchild inherits the
+            // job. PowerShell (not timeout.exe, which exits at once without
+            // a console) sleeps so the tree stays alive for the stop check.
+            ProcessTree::join_current(job.as_os_str()).unwrap();
+            let mut grandchild = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$PID | Set-Content -NoNewline -Path $env:CROWDED_TEST_PID_FILE; Start-Sleep -Seconds 60",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            std::fs::write(&pid_file, grandchild.id().to_string()).unwrap();
+            let _ = grandchild.wait();
+            std::process::exit(0);
+        }
+    }
+
+    /// Membership, outsiders, exited pids, and the stop path. The wrapper
+    /// joins on entry and the grandchild inherits the job.
+    ///
+    /// NOTE: the launcher re-exec (`__crowded-launch`) cannot run here: in
+    /// a unit-test binary main is libtest's, not Crowded's, so a re-exec
+    /// just filters tests. The entry therefore joins the job itself; the
+    /// re-exec contract is covered by `launcher_invocation_carries_job_...`
+    /// below and by `run_internal_launcher` in the launcher tests.
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_membership_and_stop_cover_only_the_live_tree() {
+        use std::process::Stdio;
+        use std::{thread, time::Duration};
+
+        let directory = test_directory();
+        let pid_file = directory.join("server.pid");
+        let tree = ProcessTree::new().unwrap();
+        let mut command = std::process::Command::new(env::current_exe().unwrap());
+        command
+            .args([
+                OsStr::new("--exact"),
+                OsStr::new("command::tests::windows_join_self_entry"),
+                OsStr::new("--nocapture"),
+            ])
+            .env("CROWDED_INTERNAL_LAUNCH_JOB", tree.name())
+            .env("CROWDED_TEST_PID_FILE", &pid_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut wrapper = command.spawn().unwrap();
+        let wrapper_pid = wrapper.id();
+
+        // Joining happens after the re-exec starts, so poll for membership.
+        let mut joined = false;
+        for _ in 0..200 {
+            if tree.contains(wrapper_pid) {
+                joined = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(joined, "wrapper never joined its job");
+
+        let mut server_pid = None;
+        for _ in 0..300 {
+            if let Ok(text) = fs::read_to_string(&pid_file) {
+                server_pid = text.trim().parse::<u32>().ok();
+                if server_pid.is_some() {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let server_pid = server_pid.expect("server grandchild never reported its pid");
+        assert_ne!(server_pid, wrapper_pid);
+
+        assert!(tree.contains(server_pid));
+        assert!(!tree.contains(std::process::id()));
+
+        let mut quick = std::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let quick_pid = quick.id();
+        quick.wait().unwrap();
+        assert!(!tree.contains(quick_pid));
+
+        tree.terminate().unwrap();
+        wrapper.wait().unwrap();
+        for _ in 0..200 {
+            if !tree.contains(server_pid) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!tree.contains(server_pid));
+        // Independent of job membership: the processes themselves are dead.
+        // (`contains` alone also passes for a live outsider.)
+        for _ in 0..200 {
+            if !process_is_running(server_pid) && !process_is_running(wrapper_pid) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !process_is_running(server_pid),
+            "server grandchild survived the job terminate"
+        );
+        assert!(
+            !process_is_running(wrapper_pid),
+            "wrapper survived the job terminate"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The re-exec contract both launchers share: this executable plus the
+    /// job name, program, and numbered arguments as environment.
+    #[cfg(windows)]
+    #[test]
+    fn launcher_invocation_carries_job_program_and_args() {
+        let tree = ProcessTree::new().unwrap();
+        let launch = ResolvedCommand {
+            program: PathBuf::from("C:\\Tools\\opencode.cmd"),
+            args: vec![OsString::from("--port"), OsString::from("0")],
+        };
+        let (program, envs) = launch.launcher_invocation(&tree).unwrap();
+        assert_eq!(program, env::current_exe().unwrap().into_os_string());
+        let get = |key: &str| {
+            envs.iter()
+                .find(|(name, _)| name.as_os_str() == OsStr::new(key))
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(get(LAUNCH_JOB).unwrap(), tree.name());
+        assert_eq!(
+            get(LAUNCH_PROGRAM).unwrap(),
+            OsString::from("C:\\Tools\\opencode.cmd")
+        );
+        assert_eq!(get(LAUNCH_ARG_COUNT).unwrap(), OsString::from("2"));
+        assert_eq!(
+            get("CROWDED_INTERNAL_LAUNCH_ARG_0").unwrap(),
+            OsString::from("--port")
+        );
+        assert_eq!(
+            get("CROWDED_INTERNAL_LAUNCH_ARG_1").unwrap(),
+            OsString::from("0")
+        );
+        assert_eq!(envs.len(), 5);
+    }
+
+    /// `in_job` must spawn this binary with the launcher argument, never
+    /// the program directly: spawning the program would skip the join and
+    /// the descendants would never become job members.
+    #[cfg(windows)]
+    #[test]
+    fn in_job_spawns_the_launcher_reexec_not_the_program() {
+        let tree = ProcessTree::new().unwrap();
+        let resolved = ResolvedCommand {
+            program: PathBuf::from("C:\\Tools\\opencode.cmd"),
+            args: vec![OsString::from("--port")],
+        };
+        let (command, _tree) = resolved.in_job().unwrap();
+        assert_eq!(
+            command.get_program(),
+            env::current_exe().unwrap().as_os_str()
+        );
+        let argv: Vec<&OsStr> = command.get_args().collect();
+        assert_eq!(argv, [OsStr::new(INTERNAL_LAUNCH_ARGUMENT)]);
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, _)| key == OsStr::new(LAUNCH_JOB))
+        );
+    }
+
     #[cfg(windows)]
     fn process_is_running(pid: u32) -> bool {
         use windows_sys::Win32::{
@@ -607,7 +922,7 @@ mod tests {
             .unwrap();
         assert!(process_is_running(pid));
 
-        tree.terminate();
+        tree.terminate().unwrap();
         child.wait().unwrap();
         for _ in 0..20 {
             if !process_is_running(pid) {
