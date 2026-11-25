@@ -1174,10 +1174,7 @@ mod tests {
         // On Windows the fake server must report a live member of a job
         // this test holds; on Unix any named pid passes the direct check.
         #[cfg(windows)]
-        let (mut member, tree, reported) = {
-            let (pid, member, tree) = live_job_member();
-            (member, tree, pid)
-        };
+        let (reported, mut member, tree) = live_job_member();
         #[cfg(not(windows))]
         let reported: u32 = 42;
         let client = fake(2, move |i, headers, _| match i {
@@ -1863,7 +1860,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_job_membership_proves_only_the_live_server_tree() {
-        let (mut member, tree, member_pid) = live_job_member();
+        let (member_pid, mut member, tree) = live_job_member();
 
         assert!(tree.contains(member_pid));
         assert!(owned_by(0, member_pid, Some(&tree)));

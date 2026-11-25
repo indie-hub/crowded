@@ -630,6 +630,7 @@ mod tests {
     #[test]
     fn windows_join_self_entry() {
         use std::process::Stdio;
+        use std::{thread, time::Duration};
 
         if let (Some(job), Some(pid_file)) = (
             env::var_os("CROWDED_TEST_JOIN_SELF"),
@@ -656,6 +657,7 @@ mod tests {
     #[test]
     fn windows_job_membership_and_stop_cover_only_the_live_tree() {
         use std::process::Stdio;
+        use std::{thread, time::Duration};
 
         let directory = test_directory();
         let pid_file = directory.join("server.pid");
