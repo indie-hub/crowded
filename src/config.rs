@@ -359,13 +359,6 @@ fn validate_native_delivery(
         // The delivery mod ships inside the binary, so no server options apply.
         return Ok(());
     }
-    // The wrapped server is owned by proving it is the wrapper's direct child;
-    // that check is not implemented on Windows.
-    if use_headroom && cfg!(windows) {
-        return Err(invalid(
-            "native_delivery with use_headroom is not supported on Windows",
-        ));
-    }
     const OWNED: [&str; 8] = [
         "--standalone",
         "--server",
@@ -900,23 +893,10 @@ transport = "raw"
         assert!(!codex[0].use_headroom);
 
         // Headroom is allowed in a native room wherever the wrapped server's
-        // parent can be checked.
+        // membership in Crowded's job can be checked.
         let headroom = "[[rooms]]\ncommand = \"opencode\"\ntransport = \"raw\"\nnative_delivery = true\nuse_headroom = true\n\n[[rooms]]\ncommand = \"claude\"\ntransport = \"raw\"";
-        #[cfg(unix)]
-        {
-            let rooms = room_specs_from_toml(headroom).unwrap().specs;
-            assert!(rooms[0].native_delivery && rooms[0].use_headroom);
-        }
-        #[cfg(not(unix))]
-        {
-            // `unwrap_err` would need `Debug` on the config; match instead so
-            // no product-code derive is required for this Windows-only arm.
-            let error = match room_specs_from_toml(headroom) {
-                Ok(_) => panic!("headroom refusal expected on Windows"),
-                Err(error) => error,
-            };
-            assert!(error.to_string().contains("Windows"), "{error}");
-        }
+        let rooms = room_specs_from_toml(headroom).unwrap().specs;
+        assert!(rooms[0].native_delivery && rooms[0].use_headroom);
 
         // A Claude room carries Crowded's own delivery mod, so it is accepted.
         let claude = room_specs_from_toml(

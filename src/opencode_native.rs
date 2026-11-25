@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::command::ResolvedCommand;
+use crate::command::{ProcessTree, ResolvedCommand};
 use crate::native_binding::{LaunchBinding, OwnershipEvidence};
 use crate::native_outbox::Binding;
 
@@ -143,7 +143,7 @@ impl Client {
         parse_response(&bytes).ok_or(RequestError::Uncertain)
     }
 
-    fn verify_pid(&self, child_pid: u32) -> io::Result<u32> {
+    fn verify_pid(&self, child_pid: u32, job: Option<&ProcessTree>) -> io::Result<u32> {
         let response = self
             .request("GET", "/api/info", None)
             .map_err(|_| io::Error::other("server info unavailable"))?;
@@ -153,7 +153,7 @@ impl Client {
             .as_u64()
             .and_then(|pid| u32::try_from(pid).ok())
             .ok_or_else(|| io::Error::other("invalid server identity"))?;
-        if response.status != 200 || !owned_by(child_pid, reported) {
+        if response.status != 200 || !owned_by(child_pid, reported, job) {
             return Err(io::Error::other("server identity mismatch"));
         }
         Ok(reported)
@@ -392,10 +392,21 @@ pub(crate) struct Handoff {
 /// is killed outright.
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The server is ours when it is the process Crowded spawned, or a direct
-/// child of it: `headroom wrap` starts OpenCode as its own child.
-fn owned_by(spawned: u32, reported: u32) -> bool {
-    reported == spawned || process_parent(reported) == Some(spawned)
+/// The server is ours on Unix when it is the process Crowded spawned, or a
+/// direct child of it: `headroom wrap` starts OpenCode as its own child.
+/// On Windows the spawned pid is the launcher, so ownership is membership
+/// of the launch's job instead; `job` is always `Some` there.
+fn owned_by(spawned: u32, reported: u32, job: Option<&ProcessTree>) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = job;
+        reported == spawned || process_parent(reported) == Some(spawned)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = spawned;
+        job.is_some_and(|job| job.contains(reported))
+    }
 }
 
 #[cfg(unix)]
@@ -460,6 +471,10 @@ fn stop_process(pid: u32) {
 /// Own and drop the server on a background thread because reaping may block.
 pub(crate) struct Server {
     child: Option<Child>,
+    /// The Windows job every server descendant joins at birth. It outlives
+    /// all of them: dropping it first would orphan the processes it owns.
+    #[cfg(windows)]
+    tree: Option<ProcessTree>,
     client: Arc<Client>,
     session: Mutex<String>,
     url: String,
@@ -473,11 +488,36 @@ impl Drop for Server {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let spawned = child.id();
-            terminate(&mut child);
-            if let Some(server) = self.server_pid.filter(|server| *server != spawned) {
-                stop_process(server);
+            #[cfg(windows)]
+            {
+                if let Some(tree) = self.tree.take() {
+                    stop_owned(&mut child, Some(tree), self.server_pid);
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                terminate(&mut child);
+                if let Some(server) = self.server_pid.filter(|server| *server != spawned) {
+                    stop_process(server);
+                }
             }
         }
+    }
+}
+
+/// Stops an owned server's processes at once through its job. A failed
+/// terminate is reported; the closed job handle stays the backstop.
+#[cfg(windows)]
+fn stop_owned(child: &mut Child, tree: Option<ProcessTree>, server_pid: Option<u32>) {
+    let spawned = child.id();
+    if let Some(tree) = tree {
+        if let Err(error) = tree.terminate() {
+            eprintln!("crowded: failed to terminate the owned server job: {error}");
+        }
+    }
+    let _ = child.wait();
+    if let Some(server) = server_pid.filter(|server| server != spawned) {
+        stop_process(server);
     }
 }
 
@@ -532,7 +572,10 @@ impl Server {
         if child.try_wait()?.is_some() {
             return Err(io::Error::other("server has exited"));
         }
-        let reported_pid = self.client.verify_pid(child.id())?;
+        #[cfg(windows)]
+        let reported_pid = self.client.verify_pid(child.id(), self.tree.as_ref())?;
+        #[cfg(not(windows))]
+        let reported_pid = self.client.verify_pid(child.id(), None)?;
         self.server_pid = Some(reported_pid);
         // The binding identifies the verified server process, which is a
         // wrapper's child when Headroom launches OpenCode for us.
@@ -702,6 +745,11 @@ impl Server {
         );
         let resolved = ResolvedCommand::resolve(program, &args, cwd)?;
         // Inherit OpenCode login settings; its descendants can also inherit this password.
+        // On Windows the server starts inside a job through the launcher, so
+        // the wrapper and its OpenCode child are members from birth.
+        #[cfg(windows)]
+        let (mut command, tree) = resolved.in_job()?;
+        #[cfg(not(windows))]
         let mut command = resolved.standard();
         command.current_dir(cwd);
         command.env("PWD", cwd);
@@ -733,7 +781,10 @@ impl Server {
                 .recv_timeout(STARTUP_TIMEOUT)
                 .map_err(|_| io::Error::other("server startup timed out"))??;
             let client = Arc::new(Client::new(&url, &password)?);
-            let server_pid = client.verify_pid(child.id())?;
+            #[cfg(windows)]
+            let server_pid = client.verify_pid(child.id(), tree.as_ref())?;
+            #[cfg(not(windows))]
+            let server_pid = client.verify_pid(child.id(), None)?;
             verified = Some(server_pid);
             let session = client.create_session()?;
             Ok((client, session, url, server_pid))
@@ -741,6 +792,8 @@ impl Server {
         match result {
             Ok((client, session, url, server_pid)) => Ok(Self {
                 child: Some(child),
+                #[cfg(windows)]
+                tree: Some(tree),
                 client,
                 session: Mutex::new(session),
                 url,
@@ -748,12 +801,20 @@ impl Server {
                 server_pid: Some(server_pid),
             }),
             Err(error) => {
-                let spawned = child.id();
-                terminate(&mut child);
-                if let Some(server) = verified.filter(|server| *server != spawned) {
-                    stop_process(server);
+                #[cfg(windows)]
+                {
+                    stop_owned(&mut child, Some(tree), verified);
+                    Err(error)
                 }
-                Err(error)
+                #[cfg(not(windows))]
+                {
+                    let spawned = child.id();
+                    terminate(&mut child);
+                    if let Some(server) = verified.filter(|server| *server != spawned) {
+                        stop_process(server);
+                    }
+                    Err(error)
+                }
             }
         }
     }
@@ -975,7 +1036,7 @@ mod tests {
             client.queue("ses_a", "msg_a", "hello"),
             Delivery::Rejected(_)
         ));
-        assert!(client.verify_pid(5).is_err());
+        assert!(client.verify_pid(5, None).is_err());
         assert_eq!(client.queue("ses_a", "msg_a", "hello"), Delivery::Uncertain);
     }
 
@@ -1022,7 +1083,7 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         let client = fake(1, |_, _, _| Some(response(401, &json!({"pid": 42}))));
-        assert!(client.verify_pid(42).is_err());
+        assert!(client.verify_pid(42, None).is_err());
     }
 
     #[test]
@@ -1120,7 +1181,7 @@ mod tests {
                 Some(response(200, &json!({"data": {"id": "ses_explicit"}})))
             }
         });
-        client.verify_pid(42).unwrap();
+        client.verify_pid(42, None).unwrap();
         assert_eq!(client.create_session().unwrap(), "ses_explicit");
     }
 
@@ -1137,6 +1198,8 @@ mod tests {
             .unwrap();
         Server {
             child: None,
+            #[cfg(windows)]
+            tree: None,
             client: Arc::clone(client),
             session: Mutex::new(session.into()),
             url: format!("http://{}", client.address),
@@ -1424,6 +1487,8 @@ mod tests {
         });
         let mut server = Server {
             child: Some(child),
+            #[cfg(windows)]
+            tree: None,
             client,
             session: Mutex::new("ses_a".into()),
             url: "http://127.0.0.1:1234".into(),
@@ -1509,6 +1574,8 @@ mod tests {
         });
         let mut server = Server {
             child: Some(child),
+            #[cfg(windows)]
+            tree: None,
             client,
             session: Mutex::new("ses_a".into()),
             url: "http://127.0.0.1:1234".into(),
@@ -1585,6 +1652,8 @@ mod tests {
             });
             let mut server = Server {
                 child: Some(child),
+                #[cfg(windows)]
+                tree: None,
                 client,
                 session: Mutex::new("ses_a".into()),
                 url: "http://127.0.0.1:1234".into(),
@@ -1680,6 +1749,8 @@ mod tests {
         });
         let mut server = Server {
             child: Some(child),
+            #[cfg(windows)]
+            tree: None,
             client,
             session: Mutex::new("ses_a".into()),
             url: "http://127.0.0.1:1234".into(),
@@ -1704,15 +1775,80 @@ mod tests {
             .unwrap();
         let grandchild: u32 = line.trim().parse().unwrap();
 
-        assert!(owned_by(wrapper.id(), grandchild));
-        assert!(!owned_by(std::process::id(), grandchild));
-        assert!(!owned_by(grandchild, wrapper.id()));
+        assert!(owned_by(wrapper.id(), grandchild, None));
+        assert!(!owned_by(std::process::id(), grandchild, None));
+        assert!(!owned_by(grandchild, wrapper.id(), None));
 
         let _ = wrapper.kill();
         let _ = wrapper.wait();
         let _ = std::process::Command::new("kill")
             .args(["-9", &grandchild.to_string()])
             .status();
+    }
+
+    /// Windows ownership is job membership, not parentage: the launcher is
+    /// the spawned pid, so `reported == spawned` must not apply. The chain
+    /// here is launcher -> wrapper (.cmd) -> server (powershell), and only
+    /// the live grandchild passes the check an exited pid and an outsider
+    /// fail, and terminating the job reaps the tree.
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_membership_proves_only_the_live_server_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("server.pid");
+        let shim = directory.path().join("server.cmd");
+        std::fs::write(
+            &shim,
+            "@echo off\r\npowershell.exe -NoProfile -NonInteractive -Command \"$PID | Set-Content -NoNewline -Path $env:CROWDED_TEST_PID_FILE; Start-Sleep -Seconds 30\"\r\n",
+        )
+        .unwrap();
+
+        let resolved = ResolvedCommand::resolve(shim.as_os_str(), &[], directory.path()).unwrap();
+        let (mut command, tree) = resolved.in_job().unwrap();
+        command
+            .env("CROWDED_TEST_PID_FILE", &pid_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut launcher = command.spawn().unwrap();
+        let launcher_pid = launcher.id();
+
+        // PowerShell cold start is slow on CI runners; the launch is healthy
+        // while the pid file is merely late.
+        let mut server_pid = None;
+        for _ in 0..600 {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                server_pid = text.trim().parse::<u32>().ok();
+                if server_pid.is_some() {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let server_pid = server_pid.expect("server grandchild never reported its pid");
+        assert_ne!(server_pid, launcher_pid);
+
+        assert!(tree.contains(server_pid));
+        assert!(owned_by(launcher_pid, server_pid, Some(&tree)));
+        assert!(!tree.contains(std::process::id()));
+        assert!(!owned_by(launcher_pid, std::process::id(), Some(&tree)));
+
+        let mut quick = std::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let quick_pid = quick.id();
+        quick.wait().unwrap();
+        assert!(!tree.contains(quick_pid));
+
+        tree.terminate().unwrap();
+        launcher.wait().unwrap();
+        for _ in 0..200 {
+            if !tree.contains(server_pid) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!tree.contains(server_pid));
     }
 
     #[cfg(unix)]
@@ -1726,6 +1862,8 @@ mod tests {
         let client = fake(0, |_, _, _| None);
         let server = Server {
             child: Some(child),
+            #[cfg(windows)]
+            tree: None,
             client,
             session: Mutex::new("ses_a".into()),
             url: "http://127.0.0.1:1234".into(),

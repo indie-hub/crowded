@@ -138,9 +138,12 @@ rewrites the OpenCode configuration file it is given (it adds its provider and a
 `.headroom-backup` file), exactly as it already does for other Headroom rooms, so
 the room's own configuration is handed to it as a private file. Crowded still
 verifies the server: the authenticated `/api/info` must report a loopback
-server, and its pid must be the process Crowded spawned or its direct child (the
-wrapper is the parent in that case). This combination is refused on Windows,
-where the parent of the reported pid cannot be checked.
+server, and its pid must belong to Crowded's launch — on Unix the process Crowded
+spawned or its direct child (the wrapper is the parent in that case), on Windows a
+member of Crowded's own job object, which every server descendant joins at birth.
+Membership proves the server's lifecycle is owned by this Crowded, not its identity
+against another process of the same user (which could join the same named job, but
+can already read the server's password file).
 
 When a Headroom native room stops, Crowded sends SIGTERM to the wrapper (which
 stops OpenCode) and then stops the server pid if it survived; the Headroom proxy

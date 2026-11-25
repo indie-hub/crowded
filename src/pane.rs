@@ -403,7 +403,9 @@ impl ChildGuard {
         // Taking the handle makes explicit cleanup and Drop safe to repeat.
         #[cfg(windows)]
         if let Some(tree) = self.tree.take() {
-            tree.terminate();
+            if let Err(error) = tree.terminate() {
+                eprintln!("crowded: failed to terminate the Windows job: {error}");
+            }
         }
         if let Some(mut child) = self.child.take() {
             match child.try_wait() {
