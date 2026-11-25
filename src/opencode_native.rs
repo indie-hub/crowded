@@ -1277,8 +1277,10 @@ mod tests {
     }
 
     /// Dropping a Server with a live joined member terminates the job and
-    /// reaps the child: the same stop_owned path production uses. The
-    /// member's death is checked independently of job membership.
+    /// reaps the child: the same stop_owned path production uses. Without
+    /// the terminate call the drop would hang in `wait` on the 60 s
+    /// sleeper, so the drop itself is time-bounded; the member's death is
+    /// then checked independently of job membership.
     #[cfg(windows)]
     #[test]
     fn dropping_server_with_a_joined_member_reaps_the_tree() {
@@ -1295,7 +1297,15 @@ mod tests {
             binding: Mutex::new(None),
             server_pid: Some(member_pid),
         };
-        drop(server);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(server);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(20)).is_ok(),
+            "Server drop hung: the job terminate must reap the tree promptly"
+        );
         for _ in 0..200 {
             if !process_is_running(member_pid) {
                 break;
