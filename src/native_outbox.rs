@@ -2484,6 +2484,59 @@ mod tests {
             std::fs::read(crate::claude_inbox::bootstrap_file(cwd.path(), 2).unwrap()).unwrap();
         assert_ne!(first, second, "each room gets its own connection");
     }
+
+    /// Counters are additive state: an outbox written before they existed must
+    /// still open, with every row intact and zero counts.
+    #[test]
+    fn an_old_outbox_file_loads_with_zero_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let bound = serde_json::to_value(binding("a", 1)).unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"old"));
+        let row = |id: &str, status: serde_json::Value| {
+            serde_json::json!({
+                "id": id,
+                "source": "sender",
+                "destination": "a",
+                "binding": bound,
+                "text": "old",
+                "hash": hash,
+                "created_ms": 1u128,
+                "sequence": 1u64,
+                "attempts": [],
+                "receipt": null,
+                "status": status,
+            })
+        };
+        let old = serde_json::json!({
+            "messages": [
+                row("queued", serde_json::json!({"Queued": {"hold": null}})),
+                row("sending", serde_json::Value::String("Sending".into())),
+                row("accepted", serde_json::Value::String("Accepted".into())),
+                row("acknowledged", serde_json::Value::String("Acknowledged".into())),
+                row("uncertain", serde_json::Value::String("Uncertain".into())),
+                row("failed", serde_json::json!({"Failed": {"reason": "old failure"}})),
+            ],
+            "sequences": {"a": 1},
+        });
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let outbox = Outbox::open(&path, 10, 10, 4).unwrap();
+        assert_eq!(outbox.state.counters, Counters::default());
+        let statuses = outbox
+            .state
+            .messages
+            .iter()
+            .map(|m| m.status.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(statuses.len(), 6);
+        assert_eq!(statuses[1], Status::Uncertain, "Sending recovers on open");
+        assert!(statuses.contains(&Status::Accepted));
+        assert!(statuses.contains(&Status::Acknowledged));
+        assert!(statuses.contains(&Status::Failed {
+            reason: "old failure".into()
+        }));
+    }
 }
 
 /// Mail held for an earlier launch never counts toward the live capacity, so
@@ -2530,10 +2583,25 @@ pub(crate) struct Message {
     pub status: Status,
 }
 
+/// Lifetime outcome counts. They stay after history trimming, so a rate can be
+/// computed without keeping every finished row. Categories are separate from
+/// `failed`: they say why a row failed, not whether it did.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct Counters {
+    accepted: u64,
+    failed: u64,
+    stale_retired: u64,
+    unconfirmed_failed: u64,
+    late_corrected: u64,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct State {
     messages: Vec<Message>,
     sequences: HashMap<String, u64>,
+    #[serde(default)]
+    counters: Counters,
 }
 
 fn now() -> io::Result<u128> {
@@ -3444,15 +3512,24 @@ impl Outbox {
                 if let Some(current) = current {
                     item.binding = current.clone();
                 }
-                item.status = match completion.result {
+                let (status, accepted, failed) = match completion.result {
                     AdapterResult::Accepted(receipt) => {
                         item.receipt = receipt;
-                        Status::Accepted
+                        (Status::Accepted, true, false)
                     }
-                    AdapterResult::Dropped(reason) => Status::Queued { hold: Some(reason) },
-                    AdapterResult::Uncertain => Status::Uncertain,
-                    AdapterResult::Failed(reason) => Status::Failed { reason },
+                    AdapterResult::Dropped(reason) => {
+                        (Status::Queued { hold: Some(reason) }, false, false)
+                    }
+                    AdapterResult::Uncertain => (Status::Uncertain, false, false),
+                    AdapterResult::Failed(reason) => (Status::Failed { reason }, false, true),
                 };
+                item.status = status;
+                if accepted {
+                    next.counters.accepted += 1;
+                }
+                if failed {
+                    next.counters.failed += 1;
+                }
             }
             self.trim_history(&mut next);
             self.update(next, &completion.id)?;
@@ -3496,13 +3573,20 @@ impl Outbox {
                 "evidence does not match an uncertain message",
             ));
         }
-        item.status = match outcome {
+        let (status, accepted, failed) = match outcome {
             Resolution::Accepted(receipt) => {
                 item.receipt = receipt;
-                Status::Accepted
+                (Status::Accepted, true, false)
             }
-            Resolution::Failed(reason) => Status::Failed { reason },
+            Resolution::Failed(reason) => (Status::Failed { reason }, false, true),
         };
+        item.status = status;
+        if accepted {
+            next.counters.accepted += 1;
+        }
+        if failed {
+            next.counters.failed += 1;
+        }
         self.trim_history(&mut next);
         self.update(next, id)
     }
