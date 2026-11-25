@@ -1259,9 +1259,10 @@ impl NativeRouter {
                         }
                         Some(Waiting::Enqueue { .. }) | None => {}
                     }
+                    let prior = std::mem::take(&mut self.messages);
                     self.messages = messages;
                     self.snapshot_seq += 1;
-                    self.sync_mailroom(mailroom);
+                    self.sync_mailroom(mailroom, &prior);
                 }
                 // A hold command answers for itself, with the rooms it was
                 // about: it never consumes a waiter belonging to another
@@ -1348,9 +1349,6 @@ impl NativeRouter {
             Status::Uncertain => {
                 "UNCERTAIN: may have been accepted; it will not be resent".to_owned()
             }
-            Status::Failed { reason } if reason == STALE_HOLD => {
-                "HELD: sent for an earlier launch of this room; not delivered".to_owned()
-            }
             Status::Failed { reason } => format!("FAILED: {reason}"),
         }
     }
@@ -1365,22 +1363,26 @@ impl NativeRouter {
         }
     }
 
-    fn sync_mailroom(&mut self, mailroom: &mut Mailroom) {
+    fn sync_mailroom(&mut self, mailroom: &mut Mailroom, previous: &[Message]) {
         let messages = std::mem::take(&mut self.messages);
         let mut retired: HashMap<String, usize> = HashMap::new();
         let mut unconfirmed: HashMap<String, usize> = HashMap::new();
         for message in &messages {
-            // Announce a terminal row once when it first reaches the view,
-            // including rows left by an earlier run; later snapshots stay quiet.
-            let fresh = !self.shown.contains_key(&message.id);
-            let newly_retired = fresh
-                && matches!(&message.status, Status::Failed { reason } if reason == STALE_HOLD);
-            if newly_retired {
+            // Announce a transition into a terminal state, not a first sighting:
+            // a row displayed as Uncertain or held must report its settle.
+            let was_terminal = previous
+                .iter()
+                .find(|old| old.id == message.id)
+                .is_some_and(|old| matches!(&old.status, Status::Failed { .. }));
+            let now_terminal = |reason| {
+                !was_terminal
+                    && previous.iter().any(|old| old.id == message.id)
+                    && matches!(&message.status, Status::Failed { reason: actual } if actual == reason)
+            };
+            if now_terminal(STALE_HOLD) {
                 *retired.entry(self.label(message)).or_insert(0) += 1;
             }
-            let newly_unconfirmed = fresh
-                && matches!(&message.status, Status::Failed { reason } if reason == UNCONFIRMED_FAILED);
-            if newly_unconfirmed {
+            if now_terminal(UNCONFIRMED_FAILED) {
                 *unconfirmed.entry(self.label(message)).or_insert(0) += 1;
             }
             let text = self.status_text(message);
@@ -1406,9 +1408,7 @@ impl NativeRouter {
             mailroom.record_native(
                 "native delivery".into(),
                 room,
-                format!(
-                    "{count} messages from an earlier launch were not delivered; they may have arrived; not resent"
-                ),
+                format!("{count} messages from an earlier launch were not delivered; not resent"),
                 "NOTICE".to_owned(),
             );
         }
@@ -1596,7 +1596,7 @@ mod tests {
         answered(&mut router, &mut mailroom, &mut notices);
         let view = mailroom.summary();
         assert!(
-            !view.contains("FAILED"),
+            !view.contains("FAILED: injected"),
             "the schedule failure is not the message's: {view}"
         );
         assert!(
@@ -2576,7 +2576,10 @@ mod tests {
             ["queue", "--thread", "thread-a", "--message"]
         );
         let view = mailroom.summary();
-        assert!(view.contains("HELD: sent for an earlier launch"), "{view}");
+        assert!(
+            view.contains("FAILED: sent for an earlier launch"),
+            "{view}"
+        );
         let binding = router.binding_for(1).expect("B stays bound");
         assert_eq!(binding.session, "ses_b");
         assert_eq!(binding.generation, 2);
@@ -2748,8 +2751,8 @@ mod tests {
             "{view}"
         );
         assert!(
-            view.contains("HELD: sent for an earlier launch"),
-            "the mail saved before the mark stays held: {view}"
+            view.contains("FAILED: sent for an earlier launch"),
+            "the mail saved before the mark stays terminal: {view}"
         );
         assert_eq!(texts(&b), ["[whisper from Room X] held mail"]);
     }
@@ -3003,7 +3006,7 @@ mod tests {
         assert!(
             mailroom
                 .summary()
-                .contains("HELD: sent for an earlier launch")
+                .contains("FAILED: sent for an earlier launch")
         );
     }
 
@@ -3052,7 +3055,7 @@ mod tests {
         assert!(
             mailroom
                 .summary()
-                .contains("HELD: sent for an earlier launch")
+                .contains("FAILED: sent for an earlier launch")
         );
     }
 
@@ -4007,6 +4010,17 @@ mod tests {
 
         let mut router = claude_router(root.path(), cwd.path());
         let mut mailroom = Mailroom::new(50);
+        // Show the row as Uncertain before it expires: the notice must report
+        // a transition, not a first sighting of an already terminal row.
+        for _ in 0..6 {
+            router.tick(Instant::now(), &mut mailroom, true, false);
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            mailroom.summary().contains("UNCERTAIN"),
+            "{}",
+            mailroom.summary()
+        );
         for _ in 0..20 {
             router.tick(Instant::now(), &mut mailroom, false, false);
             thread::sleep(Duration::from_millis(20));
@@ -4026,6 +4040,143 @@ mod tests {
             serde_json::from_slice(&fs::read(state_path(root.path())).unwrap()).unwrap();
         let row = &saved["messages"][0];
         assert_eq!(row["status"]["Failed"]["reason"], UNCONFIRMED_FAILED);
+        assert_eq!(row["attempts"].as_array().unwrap().len(), 1);
+    }
+
+    fn seed_router_row(
+        root: &Path,
+        cwd: &Path,
+        id: &str,
+        status: serde_json::Value,
+    ) -> (Binding, String) {
+        use sha2::{Digest, Sha256};
+        let binding = {
+            let router = claude_router(root, cwd);
+            router.rooms[&0].1.clone()
+        };
+        let hash = format!("{:x}", Sha256::digest(b"old"));
+        let seeded = serde_json::json!({
+            "messages": [{
+                "id": id,
+                "source": "Sender",
+                "destination": binding.room,
+                "binding": binding,
+                "text": "old",
+                "hash": hash,
+                "created_ms": 1u128,
+                "sequence": 1u64,
+                "attempts": [{"number": 1, "started_ms": 1u128}],
+                "receipt": null,
+                "status": status,
+            }],
+            "sequences": {},
+        });
+        fs::write(state_path(root), serde_json::to_vec(&seeded).unwrap()).unwrap();
+        (binding, hash)
+    }
+
+    /// A row shown held before it is retired must report the transition with
+    /// terminal wording; the notice never claims the mail may have arrived.
+    #[test]
+    fn a_displayed_stale_row_reports_a_failed_notice_without_may_have_arrived() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        seed_router_row(
+            root.path(),
+            cwd.path(),
+            "old-stale",
+            serde_json::json!({"Queued": {"hold": STALE_HOLD}}),
+        );
+        let mut router = claude_router(root.path(), cwd.path());
+        let mut mailroom = Mailroom::new(50);
+        for _ in 0..6 {
+            router.tick(Instant::now(), &mut mailroom, true, false);
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            mailroom
+                .summary()
+                .contains("HELD: sent for an earlier launch"),
+            "{}",
+            mailroom.summary()
+        );
+        for _ in 0..20 {
+            router.tick(Instant::now(), &mut mailroom, false, false);
+            thread::sleep(Duration::from_millis(20));
+        }
+        let view = mailroom.summary();
+        assert!(
+            view.contains("FAILED: sent for an earlier launch"),
+            "{view}"
+        );
+        assert!(view.contains("were not delivered; not resent"), "{view}");
+        assert_eq!(
+            view.matches("were not delivered; not resent").count(),
+            1,
+            "one transition notice: {view}"
+        );
+        assert!(
+            !view.contains(
+                "messages from an earlier launch were not delivered; they may have arrived"
+            )
+        );
+    }
+
+    /// An expired row corrected by a matching late receipt through the real
+    /// tick ends Accepted with one attempt and one late-correction count.
+    #[test]
+    fn a_late_receipt_corrects_an_expired_row_through_tick() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (binding, hash) = seed_router_row(
+            root.path(),
+            cwd.path(),
+            "expired-then-corrected",
+            serde_json::Value::String("Uncertain".into()),
+        );
+        let mut router = claude_router(root.path(), cwd.path());
+        let mut mailroom = Mailroom::new(50);
+        for _ in 0..6 {
+            router.tick(Instant::now(), &mut mailroom, true, false);
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(mailroom.summary().contains("UNCERTAIN"));
+        for _ in 0..20 {
+            router.tick(Instant::now(), &mut mailroom, false, false);
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            mailroom
+                .summary()
+                .contains("FAILED: delivery was not confirmed"),
+            "{}",
+            mailroom.summary()
+        );
+        router
+            .claude_inbox(0)
+            .unwrap()
+            .inject_late(crate::claude_inbox::LateReceipt {
+                id: "expired-then-corrected".to_owned(),
+                sha256: hash,
+                binding,
+                held: None,
+            });
+        for _ in 0..20 {
+            router.tick(Instant::now(), &mut mailroom, false, false);
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            mailroom
+                .summary()
+                .contains("ACCEPTED by Claude (submitted; not proof it was acted on)"),
+            "{}",
+            mailroom.summary()
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(state_path(root.path())).unwrap()).unwrap();
+        let row = &saved["messages"][0];
+        assert_eq!(row["status"], "Accepted");
+        assert_eq!(row["receipt"], "submitted");
         assert_eq!(row["attempts"].as_array().unwrap().len(), 1);
     }
 }
