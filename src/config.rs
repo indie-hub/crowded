@@ -335,7 +335,7 @@ fn validate_native_delivery(
     program: &OsStr,
     transport: Transport,
     args: &[String],
-    use_headroom: bool,
+    _use_headroom: bool,
 ) -> io::Result<()> {
     let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_owned());
     let guest = Path::new(program).file_name().unwrap_or(program);
