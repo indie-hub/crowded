@@ -343,6 +343,15 @@ impl ClaudeInbox {
         }
     }
 
+    /// Retains authenticated evidence without a live mod, to test the router's
+    /// handling of a receipt that arrives after its outbox row was trimmed.
+    #[cfg(test)]
+    pub(crate) fn inject_late(&self, receipt: LateReceipt) {
+        if let Ok(mut state) = self.state.lock() {
+            state.late.insert(receipt.id.clone(), receipt);
+        }
+    }
+
     fn receiver_is_live(&self, registered: &Receiver) -> bool {
         (self.now)()
             .checked_duration_since(registered.last_poll)

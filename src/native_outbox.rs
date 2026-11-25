@@ -18,8 +18,9 @@ use std::{
 
 /// Verbatim-moved session and hold rules, owned by [`crate::native_session`].
 use crate::native_session::{
-    CLAUDE_HOLD, PENDING_HOLD, STALE_HOLD, UNCONFIRMED_HOLD, is_final_hold, is_retryable_hold,
-    is_stale_hold, same_launch_placeholder,
+    CLAUDE_HOLD, PENDING_HOLD, STALE_HOLD, UNCONFIRMED_FAILED, UNCONFIRMED_HOLD,
+    is_correctable_unconfirmed, is_final_hold, is_retryable_hold, is_stale_hold,
+    is_unconfirmed_failed, same_launch_placeholder, uncertain_expired,
 };
 #[cfg(test)]
 use crate::native_session::{
@@ -88,6 +89,16 @@ mod tests {
                 Status::Queued { hold } => hold.clone(),
                 _ => None,
             })
+    }
+
+    fn stale_is_failed(outbox: &Outbox, id: &str) -> bool {
+        outbox.state.messages.iter().any(|m| {
+            m.id == id
+                && m.status
+                    == Status::Failed {
+                        reason: STALE_HOLD.to_owned(),
+                    }
+        })
     }
 
     #[test]
@@ -211,7 +222,7 @@ mod tests {
             .schedule(&bindings, false, false, &[], fake(&calls, accepted))
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0, "old mail is never adopted");
-        assert_eq!(hold_of(&mut outbox, &id), Some(STALE_HOLD.to_owned()));
+        assert!(stale_is_failed(&outbox, &id));
     }
 
     /// The pending command itself holds the mail that is already queued: with
@@ -241,7 +252,7 @@ mod tests {
             .schedule(&bindings, false, false, &[], fake(&calls, accepted))
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0, "old mail is never sent");
-        assert_eq!(hold_of(&mut outbox, &id), Some(STALE_HOLD.to_owned()));
+        assert!(stale_is_failed(&outbox, &id));
     }
 
     /// A hold that cannot reach disk still blocks the mail in memory: the
@@ -285,7 +296,7 @@ mod tests {
             Status::Accepted,
             "old mail is never marked accepted"
         );
-        assert_eq!(hold_of(&mut outbox, &id), Some(STALE_HOLD.to_owned()));
+        assert!(stale_is_failed(&outbox, &id));
     }
 
     #[test]
@@ -846,16 +857,23 @@ mod tests {
         wait(&mut outbox, &current);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // The hold survives a restart and the mail is still not sent.
+        // The terminal state survives a restart and the mail is still not sent.
         drop(outbox);
         let mut outbox = Outbox::open(&path, 4, 2, 2).unwrap();
-        assert_eq!(outbox.state.messages[0].status, held);
-        assert_eq!(outbox.state.messages[1].status, held);
+        let retired = Status::Failed {
+            reason: STALE_HOLD.to_owned(),
+        };
+        assert!(
+            outbox.state.messages.iter().any(|m| m.status == retired),
+            "a retired row keeps its state through a restart"
+        );
         outbox
             .schedule(&current, false, false, &[], fake(&calls, accepted))
             .unwrap();
-        assert_eq!(outbox.state.messages[0].status, held);
-        assert_eq!(outbox.state.messages[1].status, held);
+        assert!(
+            outbox.state.messages.iter().any(|m| m.status == retired),
+            "retirement is stable across passes and restarts"
+        );
     }
 
     #[test]
@@ -1600,10 +1618,14 @@ mod tests {
 
         // An adapter that panics leaves the message uncertain, and the mail
         // behind it still goes out.
-        outbox
+        let second = outbox
             .enqueue("s".into(), current.clone(), "second".into())
-            .unwrap();
-        outbox.enqueue("s".into(), current, "third".into()).unwrap();
+            .unwrap()
+            .id;
+        let third = outbox
+            .enqueue("s".into(), current, "third".into())
+            .unwrap()
+            .id;
         outbox
             .schedule(
                 &bindings,
@@ -1614,13 +1636,23 @@ mod tests {
             )
             .unwrap();
         wait(&mut outbox, &bindings);
-        assert_eq!(outbox.state.messages[1].status, Status::Uncertain);
+        let status_of = |outbox: &Outbox, id: &str| {
+            outbox
+                .state
+                .messages
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .status
+                .clone()
+        };
+        assert_eq!(status_of(&outbox, &second), Status::Uncertain);
         outbox
             .schedule(&bindings, false, false, &[], fake(&calls, accepted))
             .unwrap();
-        assert_eq!(outbox.state.messages[2].status, Status::Sending);
+        assert_eq!(status_of(&outbox, &third), Status::Sending);
         wait(&mut outbox, &bindings);
-        assert_eq!(outbox.state.messages[2].status, Status::Accepted);
+        assert_eq!(status_of(&outbox, &third), Status::Accepted);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -1864,20 +1896,23 @@ mod tests {
         // A new generation adopts only the pending-held mail.
         let next = pending_binding("a", 2);
         outbox.retarget("a", &next).unwrap();
-        for (id, hold, want) in [(&old, Some(STALE_HOLD), &current), (&new, None, &next)] {
+        for (id, expected, want) in [
+            (
+                &old,
+                Status::Failed {
+                    reason: STALE_HOLD.to_owned(),
+                },
+                &current,
+            ),
+            (&new, Status::Queued { hold: None }, &next),
+        ] {
             let message = outbox
                 .state
                 .messages
                 .iter()
                 .find(|message| &message.id == id)
                 .unwrap();
-            assert_eq!(
-                message.status,
-                Status::Queued {
-                    hold: hold.map(str::to_owned)
-                },
-                "hold for {id}"
-            );
+            assert_eq!(message.status, expected, "status for {id}");
             assert_eq!(&message.binding, want, "binding for {id}");
         }
         // ...and the stale mail is never sent: only the adopted mail goes out.
@@ -2604,6 +2639,89 @@ mod tests {
                 == Status::Failed {
                     reason: STALE_HOLD.to_owned()
                 }));
+    }
+
+    /// The persisted attempt clock settles an old row, the reason stays
+    /// truthful, and an authenticated late receipt can still correct it.
+    #[test]
+    fn unconfirmed_rows_fail_after_the_bound_and_a_late_receipt_corrects_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outbox.json");
+        let b = binding("a", 1);
+        let bindings = HashMap::from([(b.room.clone(), b.clone())]);
+        let mut outbox = Outbox::open(&path, 4, 4, 1).unwrap();
+        let sent = Arc::new(AtomicUsize::new(0));
+        let id = outbox
+            .enqueue("s".into(), b.clone(), "old".into())
+            .unwrap()
+            .id;
+        let hash = format!("{:x}", Sha256::digest(b"old"));
+        outbox
+            .schedule(
+                &bindings,
+                false,
+                false,
+                &[],
+                fake(&sent, || AdapterResult::Uncertain),
+            )
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(outbox.state.messages[0].status, Status::Uncertain);
+        assert!(!crate::native_session::uncertain_expired(
+            &outbox.state.messages[0],
+            0
+        ));
+        outbox.state.messages[0].attempts[0].started_ms = 1;
+        assert_eq!(outbox.expire_uncertain(now().unwrap()).unwrap(), 1);
+        assert_eq!(sent.load(Ordering::SeqCst), 1, "never resent");
+        let status = |outbox: &Outbox, id: &str| {
+            outbox
+                .state
+                .messages
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .status
+                .clone()
+        };
+        assert_eq!(
+            status(&outbox, &id),
+            Status::Failed {
+                reason: UNCONFIRMED_FAILED.to_owned()
+            }
+        );
+        assert_eq!(outbox.state.counters.unconfirmed_failed, 1);
+        assert_eq!(outbox.state.counters.failed, 1);
+
+        let new_id = outbox
+            .enqueue("s".into(), b.clone(), "new".into())
+            .unwrap()
+            .id;
+        let delivered = Arc::new(AtomicUsize::new(0));
+        outbox
+            .schedule(&bindings, false, false, &[], fake(&delivered, accepted))
+            .unwrap();
+        wait(&mut outbox, &bindings);
+        assert_eq!(status(&outbox, &new_id), Status::Accepted);
+
+        outbox
+            .resolve(&id, &b, &hash, Resolution::Accepted(Some("receipt".into())))
+            .unwrap();
+        assert_eq!(status(&outbox, &id), Status::Accepted);
+        assert_eq!(outbox.state.counters.late_corrected, 1);
+        assert_eq!(outbox.state.counters.accepted, 2);
+        outbox
+            .resolve(&id, &b, &hash, Resolution::Accepted(Some("receipt".into())))
+            .unwrap();
+        assert_eq!(
+            outbox.state.counters.late_corrected, 1,
+            "replay is idempotent"
+        );
+
+        drop(outbox);
+        let reopened = Outbox::open(&path, 4, 4, 1).unwrap();
+        assert_eq!(reopened.state.counters.late_corrected, 1);
+        assert_eq!(status(&reopened, &id), Status::Accepted);
     }
 }
 
@@ -3396,6 +3514,7 @@ impl Outbox {
         }
         self.collect(bindings)?;
         self.retire_stale(bindings)?;
+        self.expire_uncertain(now()?)?;
         self.set_pending(pending)?;
         if paused || fused {
             return Ok(());
@@ -3606,11 +3725,12 @@ impl Outbox {
         Ok(())
     }
 
-    /// Only an uncertain message with the same binding and content hash can be
-    /// settled, and only to accepted or failed: nothing is ever resent. A row
-    /// already settled with the same outcome is re-saved and reported Ok, so a
-    /// resolve whose directory sync failed after the rename can replay and
-    /// the caller drops its evidence only after a successful save.
+    /// Only an uncertain message, or one failed only because it was
+    /// unconfirmed, can be settled with matching binding and hash; nothing is
+    /// ever resent. A row already settled with the same outcome is re-saved
+    /// and reported Ok, so a resolve whose directory sync failed after the
+    /// rename can replay and the caller drops its evidence only after a
+    /// successful save.
     pub fn resolve(
         &mut self,
         id: &str,
@@ -3637,7 +3757,8 @@ impl Outbox {
         if same_outcome {
             return self.update(self.state.clone(), id);
         }
-        if item.status != Status::Uncertain {
+        let correcting = is_unconfirmed_failed(&item.status);
+        if !is_correctable_unconfirmed(&item.status) {
             return Err(io::Error::other(
                 "evidence does not match an uncertain message",
             ));
@@ -3655,6 +3776,9 @@ impl Outbox {
         }
         if failed {
             next.counters.failed += 1;
+        }
+        if correcting {
+            next.counters.late_corrected += 1;
         }
         self.trim_history(&mut next);
         self.update(next, id)
@@ -3684,6 +3808,28 @@ impl Outbox {
             self.update(next, "stale mail")?;
         }
         Ok(retired)
+    }
+
+    /// A row past its bound is terminal, never resent. Its reason leaves room
+    /// for a late authenticated receipt to correct it through `resolve`.
+    pub(crate) fn expire_uncertain(&mut self, now_ms: u128) -> io::Result<usize> {
+        let mut next = self.state.clone();
+        let mut expired = 0;
+        for message in next.messages.iter_mut() {
+            if uncertain_expired(message, now_ms) {
+                message.status = Status::Failed {
+                    reason: UNCONFIRMED_FAILED.to_owned(),
+                };
+                next.counters.unconfirmed_failed += 1;
+                next.counters.failed += 1;
+                expired += 1;
+            }
+        }
+        if expired > 0 {
+            self.trim_history(&mut next);
+            self.update(next, "unconfirmed mail")?;
+        }
+        Ok(expired)
     }
 
     pub fn acknowledge(&mut self, id: &str, binding: &Binding, hash: &str) -> io::Result<()> {
