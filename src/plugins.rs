@@ -512,10 +512,124 @@ fn native_opencode_package(installed: &Path) -> io::Result<Option<(String, Strin
 }
 
 fn opencode_package_notices(
-    _root: &Path,
-    _installed: &[InstallRecord],
-    _declared: &[String],
+    root: &Path,
+    installed: &[InstallRecord],
+    declared: &[String],
 ) -> Vec<String> {
+    let mut natives = Vec::new();
+    for plugin in installed {
+        let directory = root.join(INSTALLS_DIRECTORY).join(&plugin.name);
+        if let Ok(Some(native)) = native_opencode_package(&directory) {
+            natives.push(native);
+        }
+    }
+    package_notices(
+        &natives,
+        declared,
+        &local_plugin_imports(root, declared),
+        &global_opencode_listings(declared),
+    )
+}
+
+fn package_notices(
+    natives: &[(String, String)],
+    declared: &[String],
+    local: &[(String, String)],
+    global: &[(String, String)],
+) -> Vec<String> {
+    let mut notices = Vec::new();
+    for (name, version) in natives {
+        if !declared
+            .iter()
+            .any(|package| package_matches(package, name))
+        {
+            notices.push(format!(
+                "{name} {version} is a native OpenCode package; declare [[opencode_plugin]] package = \"{name}@{version}\""
+            ));
+        }
+    }
+    for (source, package) in local.iter().chain(global) {
+        notices.push(format!(
+            "OpenCode loads {package} twice: [[opencode_plugin]] and {source}"
+        ));
+    }
+    notices
+}
+
+fn package_name(package: &str) -> &str {
+    match package.rfind('@') {
+        Some(index) if index > 0 => &package[..index],
+        _ => package,
+    }
+}
+
+fn package_matches(package: &str, name: &str) -> bool {
+    package_name(package) == name
+}
+
+fn local_plugin_imports(root: &Path, declared: &[String]) -> Vec<(String, String)> {
+    let mut imports = Vec::new();
+    let Ok(files) = fs::read_dir(root.join(".opencode/plugins")) else {
+        return imports;
+    };
+    for file in files.flatten() {
+        let path = file.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for package in declared {
+            let name = package_name(package);
+            // shortcut: substring import matching, enough for a notice; parse
+            // imports if a comment or an unrelated literal causes false positives.
+            if text.contains(&format!("\"{name}\""))
+                || text.contains(&format!("'{name}'"))
+                || text.contains(&format!("\"{name}/"))
+                || text.contains(&format!("'{name}/"))
+            {
+                let source = path.strip_prefix(root).unwrap_or(&path).display();
+                imports.push((source.to_string(), package.clone()));
+            }
+        }
+    }
+    imports
+}
+
+fn global_opencode_listings(declared: &[String]) -> Vec<(String, String)> {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    let Some(base) = base else {
+        return Vec::new();
+    };
+    for file in ["opencode.json", "opencode.jsonc"] {
+        let path = base.join("opencode").join(file);
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(document) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let mut listings = Vec::new();
+        for key in ["plugin", "plugins"] {
+            let Some(entries) = document.get(key).and_then(Value::as_array) else {
+                continue;
+            };
+            for package in declared {
+                let name = package.split('@').next().unwrap_or(package);
+                if entries.iter().any(|entry| {
+                    entry
+                        .as_str()
+                        .is_some_and(|entry| entry == package || entry == name)
+                }) {
+                    listings.push((path.display().to_string(), package.clone()));
+                }
+            }
+        }
+        return listings;
+    }
     Vec::new()
 }
 
@@ -1548,6 +1662,93 @@ mod tests {
 
         let lines = opencode_load_lines("native", &native).unwrap();
         assert_eq!(lines, ["opencode native: native package"]);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn native_package_without_a_declaration_is_reported() {
+        let notices = package_notices(
+            &[("context-mode".to_owned(), "2.2.4".to_owned())],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(
+            notices,
+            [
+                "context-mode 2.2.4 is a native OpenCode package; declare [[opencode_plugin]] package = \"context-mode@2.2.4\""
+            ]
+        );
+    }
+
+    #[test]
+    fn local_plugin_import_reports_a_double_load() {
+        let notices = package_notices(
+            &[],
+            &["context-mode@2.2.4".to_owned()],
+            &[(
+                ".opencode/plugins/context-mode.js".to_owned(),
+                "context-mode@2.2.4".to_owned(),
+            )],
+            &[],
+        );
+        assert_eq!(
+            notices,
+            [
+                "OpenCode loads context-mode@2.2.4 twice: [[opencode_plugin]] and .opencode/plugins/context-mode.js"
+            ]
+        );
+    }
+
+    #[test]
+    fn user_config_listing_reports_a_double_load() {
+        let notices = package_notices(
+            &[],
+            &["context-mode@2.2.4".to_owned()],
+            &[],
+            &[(
+                "/home/user/.config/opencode/opencode.json".to_owned(),
+                "context-mode@2.2.4".to_owned(),
+            )],
+        );
+        assert_eq!(
+            notices,
+            [
+                "OpenCode loads context-mode@2.2.4 twice: [[opencode_plugin]] and /home/user/.config/opencode/opencode.json"
+            ]
+        );
+    }
+
+    #[test]
+    fn declared_native_package_alone_has_no_notice() {
+        let notices = package_notices(
+            &[("context-mode".to_owned(), "2.2.4".to_owned())],
+            &["context-mode@2.2.4".to_owned()],
+            &[],
+            &[],
+        );
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn local_plugin_importing_a_declared_package_is_found() {
+        let base = test_directory();
+        fs::create_dir_all(base.join(".opencode/plugins")).unwrap();
+        fs::write(
+            base.join(".opencode/plugins/context-mode.js"),
+            "import { server } from 'context-mode/server'\n",
+        )
+        .unwrap();
+
+        let imports = local_plugin_imports(&base, &["context-mode@2.2.4".to_owned()]);
+
+        assert_eq!(
+            imports,
+            [(
+                ".opencode/plugins/context-mode.js".to_owned(),
+                "context-mode@2.2.4".to_owned()
+            )]
+        );
         fs::remove_dir_all(base).unwrap();
     }
 
