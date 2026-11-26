@@ -623,6 +623,12 @@ pub(crate) mod tests {
         /// How many sessions this stand-in has created, and the current one.
         pub(crate) sessions: std::sync::atomic::AtomicUsize,
         pub(crate) session: Mutex<String>,
+        /// Session ids whose interrupt was requested, in arrival order.
+        pub(crate) interrupts: Mutex<Vec<String>>,
+        /// Answer interrupt requests with HTTP 500 instead of accepting them.
+        pub(crate) interrupt_failure: AtomicBool,
+        /// Answer session creation with HTTP 500 instead of creating one.
+        pub(crate) session_failure: AtomicBool,
     }
 
     /// The session the stand-in currently serves. The first one keeps the
@@ -704,6 +710,8 @@ pub(crate) mod tests {
                     request.starts_with("POST /api/session/") && request.contains("/prompt ");
                 let is_inbox =
                     request.starts_with("GET /api/session/") && request.contains("/inbox ");
+                let is_interrupt =
+                    request.starts_with("POST /api/session/") && request.contains("/interrupt ");
                 let mode = *server_state.mode.lock().unwrap();
                 if is_prompt && mode == FakeMode::Drop {
                     continue;
@@ -764,21 +772,38 @@ pub(crate) mod tests {
                         })
                         .collect();
                     (200, serde_json::json!({"data": items}).to_string())
+                } else if is_interrupt {
+                    if server_state.interrupt_failure.load(Ordering::SeqCst) {
+                        (500, "{}".to_owned())
+                    } else {
+                        let id = request
+                            .trim_start_matches("POST /api/session/")
+                            .split('/')
+                            .next()
+                            .unwrap_or_default()
+                            .to_owned();
+                        server_state.interrupts.lock().unwrap().push(id);
+                        (200, "{\"interrupted\":false}".to_owned())
+                    }
                 } else if request.starts_with("GET /api/info") {
                     let pid = fs::read_to_string(&pid_file).unwrap_or_default();
                     (200, format!("{{\"pid\":{}}}", pid.trim()))
                 } else if request.starts_with("POST /api/session ") {
-                    let created = server_state
-                        .sessions
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                        + 1;
-                    let id = if created == 1 {
-                        format!("ses_{tag}")
+                    if server_state.session_failure.load(Ordering::SeqCst) {
+                        (500, "{}".to_owned())
                     } else {
-                        format!("ses_{tag}_{created}")
-                    };
-                    *server_state.session.lock().unwrap() = id.clone();
-                    (200, format!("{{\"data\":{{\"id\":\"{id}\"}}}}"))
+                        let created = server_state
+                            .sessions
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            + 1;
+                        let id = if created == 1 {
+                            format!("ses_{tag}")
+                        } else {
+                            format!("ses_{tag}_{created}")
+                        };
+                        *server_state.session.lock().unwrap() = id.clone();
+                        (200, format!("{{\"data\":{{\"id\":\"{id}\"}}}}"))
+                    }
                 } else {
                     (404, "{}".to_owned())
                 };

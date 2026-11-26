@@ -1969,12 +1969,13 @@ pub(crate) fn relaunch_opencode_room(
     spawned_at: &mut [Instant],
     room_pulses: &mut [Option<PulseSample>],
     now: Instant,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let title = panes[index].title().to_owned();
     let generation =
         pane::next_generation().map_err(|error| launch_failure(&title, index + 1, error))?;
-    // A failed clear changes nothing, so the room keeps its old session.
-    let binding = panes[index]
+    // A failed clear changes nothing, so the room keeps its old session and
+    // the old run keeps going.
+    let (binding, abort) = panes[index]
         .clear_opencode_session(size, generation)
         .map_err(|error| launch_failure(&title, index + 1, error))?;
     // The pane already runs a new terminal on the new session, so its gate,
@@ -1997,15 +1998,18 @@ pub(crate) fn relaunch_opencode_room(
             None => Err(io::Error::other("that room has no owned OpenCode server")),
         };
         if let Err(error) = outcome {
+            let warning = abort
+                .map(|warning| format!("; also {warning}"))
+                .unwrap_or_default();
             return Err(io::Error::other(format!(
-                "{title}: the room now runs session {} but the router could not follow it ({error}); the mail is held, so run `control {} clear` again",
+                "{title}: the room now runs session {} but the router could not follow it ({error}); the mail is held, so run `control {} clear` again{warning}",
                 binding.session,
                 index + 1
             ))
             .into());
         }
     }
-    Ok(())
+    Ok(abort)
 }
 
 /// Revives one room after F5 or an offline Ctrl+R. A native Codex room comes
@@ -3086,7 +3090,7 @@ where
                     );
                     continue;
                 }
-                let result = (|| -> Result<bool, Box<dyn std::error::Error>> {
+                let result = (|| -> Result<(bool, Option<String>), Box<dyn std::error::Error>> {
                     let size = match terminal.as_mut() {
                         Some(term) => {
                             term.autoresize()?;
@@ -3121,7 +3125,7 @@ where
                             environments,
                             now,
                         )
-                        .map(|()| false),
+                        .map(|()| (false, None)),
                         ControlAction::Resume if claude_native => relaunch_claude_room(
                             pane::ClaudeRelaunch::Resume,
                             control.to,
@@ -3135,7 +3139,7 @@ where
                             environments,
                             now,
                         )
-                        .map(|()| true),
+                        .map(|()| (true, None)),
                         ControlAction::ClearContext if codex_native => relaunch_codex_room(
                             pane::CodexRelaunch::Clear,
                             control.to,
@@ -3151,7 +3155,7 @@ where
                             environments,
                             now,
                         )
-                        .map(|()| false),
+                        .map(|()| (false, None)),
                         ControlAction::Resume if codex_native => relaunch_codex_room(
                             pane::CodexRelaunch::Resume,
                             control.to,
@@ -3167,7 +3171,7 @@ where
                             environments,
                             now,
                         )
-                        .map(|()| true),
+                        .map(|()| (true, None)),
                         ControlAction::ClearContext if opencode_native => relaunch_opencode_room(
                             control.to,
                             size,
@@ -3179,18 +3183,20 @@ where
                             room_pulses,
                             now,
                         )
-                        .map(|()| false),
-                        ControlAction::ClearContext => {
-                            panes[control.to].clear_context(size).map(|_| false)
-                        }
-                        ControlAction::Resume => panes[control.to].resume_context(size),
+                        .map(|warning| (false, warning)),
+                        ControlAction::ClearContext => panes[control.to]
+                            .clear_context(size)
+                            .map(|()| (false, None)),
+                        ControlAction::Resume => panes[control.to]
+                            .resume_context(size)
+                            .map(|resumed| (resumed, None)),
                         ControlAction::Configure { model, effort } => panes[control.to]
                             .configure(model.as_deref(), effort.as_ref().map(|e| e.label()), size)
-                            .map(|_| false),
+                            .map(|()| (false, None)),
                     }
                 })();
                 match result {
-                    Ok(resumed) => {
+                    Ok((resumed, warning)) => {
                         delivery_gates[control.to] =
                             gate_after_control(panes[control.to].needs_intro(), resumed);
                         last_output[control.to] = None;
@@ -3207,6 +3213,11 @@ where
                             format!("{source} told {target} to {label}"),
                             NoticeSeverity::Info,
                         );
+                        // The clear succeeded and the room works; the warning
+                        // only says the old run may still be going.
+                        if let Some(warning) = warning {
+                            append_notice(notice, warning, NoticeSeverity::Failure);
+                        }
                         // A clear starts a new conversation, so the room must
                         // be taught the house rules again. A native room takes
                         // them through the router, never as a paste. Codex is

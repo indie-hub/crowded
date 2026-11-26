@@ -2449,19 +2449,22 @@ impl Pane {
     }
 
     /// Clears an owned OpenCode room: the durable fresh-state marker, a new
-    /// session on the same server, then a TUI respawn that attaches to it.
+    /// session on the same server, then a TUI respawn that attaches to it, and
+    /// finally an abort of the old session's in-flight run.
     ///
     /// Each failure path is defined: a marker that cannot be saved or a session
     /// that cannot be created changes nothing; a respawn that fails puts the
     /// old binding back on the server and the room, so the old terminal, its
-    /// arguments and `binding()` are as before. The marker deliberately stays
-    /// written once set, even if the clear fails later: a stale session id must
-    /// never be resumed.
+    /// arguments and `binding()` are as before, and the old run is not aborted.
+    /// The abort runs last so a failed abort can never leave the room with no
+    /// working session; its failure is returned as a warning, because the clear
+    /// itself succeeded. The marker deliberately stays written once set, even
+    /// if the clear fails later: a stale session id must never be resumed.
     pub(crate) fn clear_opencode_session(
         &mut self,
         size: PtySize,
         generation: u64,
-    ) -> Result<crate::native_outbox::Binding, Box<dyn std::error::Error>> {
+    ) -> Result<(crate::native_outbox::Binding, Option<String>), Box<dyn std::error::Error>> {
         if !self.opencode_native() {
             return Err(io::Error::other(
                 "only a room on an owned OpenCode server can start a new session this way",
@@ -2510,7 +2513,23 @@ impl Pane {
         self.cleanup();
         *self = replacement;
         self.native = native;
-        Ok(binding)
+        // The clear is complete before the old run is stopped, so a failed
+        // abort can never leave the room without a working session.
+        let abort = self
+            .native
+            .as_ref()
+            .expect("open code native room keeps its server")
+            .server()
+            .interrupt_session(&previous.session)
+            .err()
+            .map(|error| {
+                format!(
+                    "{}: the previous OpenCode session {} could not be interrupted \
+                     ({error}); it may still be running",
+                    self.spec.title, previous.session
+                )
+            });
+        Ok((binding, abort))
     }
 
     /// Returns whether a conversation was actually resumed. A room whose

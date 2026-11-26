@@ -2495,7 +2495,7 @@ fn clearing_an_opencode_native_room_rebinds_the_router_to_the_new_session() {
     rig.gates[0] = DeliveryGate::MessageSent;
     let old = rig.router.as_ref().unwrap().binding_for(0).unwrap();
 
-    relaunch_opencode_room(
+    let warning = relaunch_opencode_room(
         0,
         size,
         &mut rig.panes,
@@ -2507,6 +2507,7 @@ fn clearing_an_opencode_native_room_rebinds_the_router_to_the_new_session() {
         Instant::now(),
     )
     .unwrap();
+    assert!(warning.is_none(), "{warning:?}");
 
     let new = rig.router.as_ref().unwrap().binding_for(0).unwrap();
     assert_ne!(new.session, old.session);

@@ -175,6 +175,26 @@ impl Client {
         Ok(id.into())
     }
 
+    /// Aborts the session's in-flight run. OpenCode 2.3.2 serves this as
+    /// `POST /api/session/{id}/interrupt`; the v1 `/abort` path returns 404.
+    fn interrupt(&self, session: &str) -> io::Result<()> {
+        if !valid_id(session) {
+            return Err(io::Error::other("invalid session identity"));
+        }
+        let path = format!("/api/session/{session}/interrupt");
+        let response = self
+            .request("POST", &path, None)
+            .map_err(|_| io::Error::other("session interrupt uncertain"))?;
+        if response.status == 200 {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "OpenCode returned HTTP {}",
+                response.status
+            )))
+        }
+    }
+
     fn queue(&self, session: &str, message_id: &str, text: &str) -> Delivery {
         if !valid_id(session) || !valid_id(message_id) {
             return Delivery::NotSent;
@@ -618,6 +638,12 @@ impl Server {
         Ok(binding)
     }
 
+    /// Aborts whatever the given session is running, without changing this
+    /// server's binding or session.
+    pub(crate) fn interrupt_session(&self, session: &str) -> io::Result<()> {
+        self.client.interrupt(session)
+    }
+
     pub fn claim_async(
         mut self,
         room: String,
@@ -907,6 +933,25 @@ mod tests {
 
     fn item(id: &str, text: &str) -> Value {
         json!({"id": id, "sessionID": "ses_a", "payload": {"text": text}, "delivery": "queue"})
+    }
+
+    #[test]
+    fn interrupt_posts_the_v2_path_and_reports_failure() {
+        let client = fake(2, |index, headers, body| {
+            assert!(
+                headers.starts_with("POST /api/session/ses_a/interrupt "),
+                "{headers}"
+            );
+            assert!(headers.contains("Authorization: Basic "));
+            assert!(body.is_empty());
+            Some(response(
+                if index == 0 { 200 } else { 500 },
+                &json!({"interrupted": false}),
+            ))
+        });
+        assert!(client.interrupt("ses_a").is_ok());
+        let error = client.interrupt("ses_a").unwrap_err().to_string();
+        assert!(error.contains("HTTP 500"), "{error}");
     }
 
     #[test]

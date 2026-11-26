@@ -181,7 +181,10 @@ fn clearing_an_opencode_room_attaches_the_tui_to_a_new_session_on_the_same_serve
     );
     let title = pane.spec.title.clone();
     let old = pane.native.as_ref().unwrap().binding().clone();
-    let binding = pane.clear_opencode_session(native_test_size(), 9).unwrap();
+    let binding = pane
+        .clear_opencode_session(native_test_size(), 9)
+        .unwrap()
+        .0;
 
     assert_ne!(binding.session, old.session);
     assert_eq!(binding.generation, 9);
@@ -227,6 +230,89 @@ fn clearing_an_opencode_room_attaches_the_tui_to_a_new_session_on_the_same_serve
         .recv_timeout(Duration::from_secs(5))
         .unwrap();
     assert_ne!(accepted, crate::opencode_native::Delivery::NotSent);
+    fake.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn clearing_an_opencode_room_interrupts_the_previous_session_once() {
+    let _state = session_state::StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let (mut pane, fake) = spawn_native_pane(
+        root.path(),
+        cwd.path(),
+        "clear-abort",
+        &["--model", "provider/alpha"],
+        "token-abort",
+    );
+    let old = pane.native.as_ref().unwrap().binding().clone();
+
+    let (binding, warning) = pane.clear_opencode_session(native_test_size(), 9).unwrap();
+
+    assert!(warning.is_none(), "{warning:?}");
+    assert_ne!(binding.session, old.session);
+    assert_eq!(
+        *fake.state.interrupts.lock().unwrap(),
+        [old.session.clone()],
+        "the old session is aborted exactly once"
+    );
+    fake.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_clear_does_not_interrupt_the_previous_session() {
+    let _state = session_state::StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let (mut pane, fake) = spawn_native_pane(
+        root.path(),
+        cwd.path(),
+        "clear-no-abort",
+        &["--model", "provider/alpha"],
+        "token-no-abort",
+    );
+    fake.state
+        .session_failure
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let error = pane
+        .clear_opencode_session(native_test_size(), 9)
+        .unwrap_err();
+
+    assert!(error.to_string().contains("session"), "{error}");
+    // The server that refused the new session would still have served an
+    // interrupt, so an empty list proves a failed clear never aborts.
+    assert!(fake.state.interrupts.lock().unwrap().is_empty());
+    fake.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_interrupt_is_reported_without_undoing_the_clear() {
+    let _state = session_state::StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let (mut pane, fake) = spawn_native_pane(
+        root.path(),
+        cwd.path(),
+        "clear-abort-fail",
+        &["--model", "provider/alpha"],
+        "token-abort-fail",
+    );
+    fake.state
+        .interrupt_failure
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let old = pane.native.as_ref().unwrap().binding().clone();
+
+    let (binding, warning) = pane.clear_opencode_session(native_test_size(), 9).unwrap();
+
+    assert_ne!(binding.session, old.session);
+    let warning = warning.expect("a failed abort must be reported");
+    assert!(warning.contains("could not be interrupted"), "{warning}");
+    assert!(warning.contains("HTTP 500"), "{warning}");
+    assert_eq!(pane.native.as_ref().unwrap().binding(), &binding);
     fake.shutdown();
 }
 
