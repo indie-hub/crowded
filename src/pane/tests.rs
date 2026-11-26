@@ -398,11 +398,11 @@ fn a_failed_new_session_leaves_the_opencode_pane_untouched() {
     assert!(error.to_string().contains("session"), "{error}");
     assert_eq!(pane.spec.args, old_args);
     assert_eq!(pane.native.as_ref().unwrap().binding(), &old);
-    // The marker was written first and stays: a stale id must never be
-    // resumed, even though no new session was created.
+    // Nothing started, so nothing is persisted: the marker is written only
+    // after a successful spawn, and the previous stored session is kept.
     assert_eq!(
         session_state::lookup("opencode", cwd.path(), &title).as_deref(),
-        Some(session_state::FRESH_STATE_MARKER)
+        None
     );
 }
 
@@ -441,9 +441,11 @@ fn a_failed_terminal_restart_puts_the_old_session_back() {
             .load(std::sync::atomic::Ordering::SeqCst),
         created + 1
     );
+    // The respawn never ran, so the marker is untouched: the previous stored
+    // session is kept instead of being replaced by a room that did not start.
     assert_eq!(
         session_state::lookup("opencode", cwd.path(), &title).as_deref(),
-        Some(session_state::FRESH_STATE_MARKER)
+        None
     );
     // The room and the server agree on the old session again.
     let native = pane.native.as_ref().unwrap();
