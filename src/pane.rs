@@ -2606,15 +2606,31 @@ impl Pane {
         Ok((binding, abort))
     }
 
-    /// Revives an owned OpenCode room on a new server after its old server
-    /// died. The new server already holds a fresh session for this launch
-    /// lane; this only writes the durable fresh-state marker, respawns the
-    /// TUI against it, and moves the room onto it. A spawn failure changes
-    /// nothing: the room stays offline on its old (dead) binding, so a failed
-    /// revive leaves the room offline with its reason.
-    pub(crate) fn revive_opencode_session(
-        &mut self,
+    /// Builds the replacement TUI for a revived owned OpenCode room without
+    /// touching the pane: no swap, no persisted state. Any failure changes
+    /// nothing; the caller drops the new server by its recorded processes.
+    pub(crate) fn prepare_revived_tui(
+        &self,
         size: PtySize,
+        room: &crate::native_launch::NativeRoom,
+    ) -> Result<Pane, Box<dyn std::error::Error>> {
+        if !self.opencode_native() {
+            return Err(io::Error::other(
+                "only a room on an owned OpenCode server can be revived this way",
+            )
+            .into());
+        }
+        Self::spawn_attached(&self.spec, size, self.environment.clone(), Some(room))
+    }
+
+    /// Commits a prepared replacement TUI: saves the durable fresh-state
+    /// marker, then swaps the pane onto the new server. The marker goes
+    /// first, so a failure leaves the pane on its previous binding with its
+    /// stored session; the caller drops the prepared terminal and the new
+    /// server by their recorded processes.
+    pub(crate) fn commit_revived_tui(
+        &mut self,
+        replacement: Pane,
         room: crate::native_launch::NativeRoom,
     ) -> Result<crate::native_outbox::Binding, Box<dyn std::error::Error>> {
         if !self.opencode_native() {
@@ -2623,11 +2639,6 @@ impl Pane {
             )
             .into());
         }
-        // Build the replacement before touching persisted state or giving
-        // up the old server, so a failed spawn changes nothing: the room
-        // stays offline on its previous binding with its stored session.
-        let replacement =
-            Self::spawn_attached(&self.spec, size, self.environment.clone(), Some(&room))?;
         let vendor = controls::cli_vendor(&self.spec)?;
         let cwd = working_directory(self.spec.cwd.as_deref())?;
         session_state::clear_room(vendor.key(), &cwd, &self.spec.title)?;

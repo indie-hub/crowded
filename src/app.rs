@@ -2098,32 +2098,6 @@ pub(crate) fn detect_dead_opencode_servers(
 /// outbox keeps the lane's mail held. Only the revived server's recorded
 /// processes are ever affected, via its own drop on failure.
 /// Restores the previous server in the lane map when the rebind fails.
-pub(crate) fn rebind_revived_room(
-    router: &mut NativeRouter,
-    index: usize,
-    title: &str,
-    binding: &crate::native_outbox::Binding,
-    server: &std::sync::Arc<crate::opencode_native::Server>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let previous = router.server_for(index);
-    router.replace_opencode_server(&binding.room, std::sync::Arc::clone(server));
-    if let Err(error) = router.rebind_room(crate::native_route::RoomEntry {
-        index,
-        title: title.to_owned(),
-        binding: binding.clone(),
-        backend: crate::native_route::Backend::OpenCode(std::sync::Arc::clone(server)),
-    }) {
-        if let Some(previous) = previous {
-            router.replace_opencode_server(&binding.room, previous);
-        }
-        return Err(io::Error::other(format!(
-            "{title}: the revived server could not be bound ({error}); the room stays offline and its mail stays held"
-        ))
-        .into());
-    }
-    Ok(())
-}
-
 /// Revives one offline owned-OpenCode room on a new server through the same
 /// launch path as startup, then rebinds the router under a new generation
 /// like a clear. Held mail for the room's lane is adopted onto the new
@@ -2135,7 +2109,7 @@ pub(crate) fn revive_opencode_room(
     index: usize,
     size: portable_pty::PtySize,
     panes: &mut [Pane],
-    router: Option<&mut NativeRouter>,
+    mut router: Option<&mut NativeRouter>,
     delivery_gates: &mut [DeliveryGate],
     last_output: &mut [Option<Instant>],
     spawned_at: &mut [Instant],
@@ -2176,18 +2150,57 @@ pub(crate) fn revive_opencode_room(
     let room = crate::native_launch::begin(launch)
         .wait(crate::native_launch::LAUNCH_TIMEOUT)
         .map_err(|error| launch_failure(&title, index + 1, error))?;
+    // (1) The new owned server above is already running. (2) Prepare the
+    // replacement TUI without touching the pane: any failure drops the new
+    // server by its recorded processes and leaves the room offline on its
+    // previous binding.
+    let prepared = panes[index]
+        .prepare_revived_tui(size, &room)
+        .map_err(|error| launch_failure(&title, index + 1, error))?;
     let server = room.server();
     let binding = room.binding().clone();
-    // Bind the router before touching the pane: a failed rebind drops the
-    // new server and leaves the room offline on its previous binding with
-    // its mail still held, instead of stranding a live terminal off-router.
-    if let Some(router) = router {
-        rebind_revived_room(router, index, &title, &binding, &server)
+    // (3) Rebind the router with the hold kept: the lane stays pending, so a
+    // failure drops the prepared terminal and the new server and leaves the
+    // room offline on its previous binding with its mail still held.
+    if let Some(router) = router.as_deref_mut() {
+        router
+            .rebind_revived_room_keep_pending(crate::native_route::RoomEntry {
+                index,
+                title: title.clone(),
+                binding: binding.clone(),
+                backend: crate::native_route::Backend::OpenCode(server.clone()),
+            })
             .map_err(|error| launch_failure(&title, index + 1, error))?;
     }
-    panes[index]
-        .revive_opencode_session(size, room)
-        .map_err(|error| launch_failure(&title, index + 1, error))?;
+    // (4) Commit: marker then pane swap. A failure reports that the router
+    // follows the new session but the room could not start; the hold is kept
+    // so the mail stays held.
+    let binding = panes[index]
+        .commit_revived_tui(prepared, room)
+        .map_err(|error| {
+            launch_failure(
+                &title,
+                index + 1,
+                format!(
+                    "the router follows session {} but the room could not start ({error}); press Ctrl+R again",
+                    binding.session
+                ),
+            )
+        })?;
+    if let Some(router) = router.as_deref_mut() {
+        router.release_revived_hold(index).map_err(|error| {
+            launch_failure(
+                &title,
+                index + 1,
+                format!(
+                    "the room now runs session {} but its hold could not be released ({}); the mail is held, run control {} clear again",
+                    binding.session,
+                    error,
+                    index + 1
+                ),
+            )
+        })?;
+    }
     delivery_gates[index] = DeliveryGate::new(false);
     last_output[index] = None;
     spawned_at[index] = now;
