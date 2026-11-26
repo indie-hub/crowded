@@ -3,6 +3,7 @@
 mod adapters;
 
 use std::{
+    collections::BTreeSet,
     env, fs, io,
     path::{Path, PathBuf},
     process::Command,
@@ -534,7 +535,7 @@ fn opencode_package_notices(
         &natives,
         declared,
         &local_plugin_imports(root, declared),
-        &global_opencode_listings(declared),
+        &opencode_config_listings(root, declared),
     )
 }
 
@@ -542,7 +543,7 @@ fn package_notices(
     natives: &[(String, String)],
     declared: &[String],
     local: &[(String, String)],
-    global: &[(String, String)],
+    configs: &[(String, String)],
 ) -> Vec<String> {
     let mut notices = Vec::new();
     for (name, version) in natives {
@@ -555,7 +556,7 @@ fn package_notices(
             ));
         }
     }
-    for (source, package) in local.iter().chain(global) {
+    for (source, package) in local.iter().chain(configs) {
         notices.push(format!(
             "OpenCode loads {package} twice: [[opencode_plugin]] and {source}"
         ));
@@ -608,40 +609,134 @@ fn local_plugin_imports(root: &Path, declared: &[String]) -> Vec<(String, String
     imports
 }
 
-fn global_opencode_listings(declared: &[String]) -> Vec<(String, String)> {
-    let base = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
-    let Some(base) = base else {
-        return Vec::new();
-    };
+fn opencode_config_listings(root: &Path, declared: &[String]) -> Vec<(String, String)> {
+    config_listings(&config_sources(root), declared)
+}
+
+fn config_sources(root: &Path) -> Vec<(PathBuf, bool)> {
+    let mut sources = Vec::new();
+    if let Some(base) = config_home() {
+        for file in ["opencode.json", "opencode.jsonc"] {
+            sources.push((base.join("opencode").join(file), false));
+        }
+    }
     for file in ["opencode.json", "opencode.jsonc"] {
-        let path = base.join("opencode").join(file);
-        let Ok(text) = fs::read_to_string(&path) else {
+        sources.push((root.join(file), true));
+    }
+    sources
+}
+
+fn config_home() -> Option<PathBuf> {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".config")))
+}
+
+/// Lists every user/project config source that names a declared package. A
+/// project config entry that is the exact declaration is Crowded's own write
+/// and is not a second load; any other spelling (different version, bare name)
+/// is.
+fn config_listings(sources: &[(PathBuf, bool)], declared: &[String]) -> Vec<(String, String)> {
+    let declared_specs: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
+    let mut listings = Vec::new();
+    for (path, project) in sources {
+        let Ok(text) = fs::read_to_string(path) else {
             continue;
         };
-        let Ok(document) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        let mut listings = Vec::new();
-        for key in ["plugin", "plugins"] {
-            let Some(entries) = document.get(key).and_then(Value::as_array) else {
-                continue;
-            };
-            for package in declared {
-                let name = package.split('@').next().unwrap_or(package);
-                if entries.iter().any(|entry| {
-                    entry
-                        .as_str()
-                        .is_some_and(|entry| entry == package || entry == name)
-                }) {
-                    listings.push((path.display().to_string(), package.clone()));
-                }
+        let specs = opencode_config_specs(&text);
+        for package in declared {
+            let name = package_name(package);
+            let matched = specs.iter().any(|spec| {
+                package_name(spec) == name && !(*project && declared_specs.contains(spec.as_str()))
+            });
+            if matched {
+                listings.push((path.to_string_lossy().replace('\\', "/"), package.clone()));
             }
         }
-        return listings;
     }
-    Vec::new()
+    listings
+}
+
+/// Reads `plugin`/`plugins` from an OpenCode config. JSONC comments and
+/// trailing commas are tolerated because users edit these files by hand.
+fn opencode_config_specs(text: &str) -> Vec<String> {
+    let Ok(document) = serde_json::from_str::<Value>(&strip_jsonc(text)) else {
+        return Vec::new();
+    };
+    let mut specs = Vec::new();
+    for key in ["plugin", "plugins"] {
+        let Some(entries) = document.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            let spec = entry
+                .as_str()
+                .or_else(|| entry.get("package").and_then(Value::as_str));
+            if let Some(spec) = spec {
+                specs.push(spec.to_owned());
+            }
+        }
+    }
+    specs
+}
+
+fn strip_jsonc(text: &str) -> String {
+    let characters: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < characters.len() {
+        let character = characters[index];
+        if in_string {
+            output.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if character == '"' {
+            in_string = true;
+            output.push(character);
+            index += 1;
+            continue;
+        }
+        if character == '/' && characters.get(index + 1) == Some(&'/') {
+            while index < characters.len() && characters[index] != '\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if character == '/' && characters.get(index + 1) == Some(&'*') {
+            index += 2;
+            while index + 1 < characters.len()
+                && !(characters[index] == '*' && characters[index + 1] == '/')
+            {
+                index += 1;
+            }
+            index = (index + 2).min(characters.len());
+            continue;
+        }
+        if character == ',' {
+            let mut next = index + 1;
+            while next < characters.len() && characters[next].is_whitespace() {
+                next += 1;
+            }
+            if matches!(characters.get(next), Some('}' | ']')) {
+                index += 1;
+                continue;
+            }
+        }
+        output.push(character);
+        index += 1;
+    }
+    output
 }
 
 fn installed_record(root: &Path, name: &str) -> io::Result<(PathBuf, InstallRecord)> {
@@ -1377,6 +1472,9 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
     #[cfg(windows)]
     #[test]
@@ -1842,6 +1940,65 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
+    #[test]
+    fn config_listings_read_every_jsonc_source_and_match_any_version() {
+        let base = test_directory();
+        let global = base.join("global/opencode/opencode.jsonc");
+        let project = base.join("project/opencode.json");
+        fs::create_dir_all(global.parent().unwrap()).unwrap();
+        fs::create_dir_all(project.parent().unwrap()).unwrap();
+        fs::write(
+            &global,
+            r#"{
+                // a hand-edited config
+                "plugin": ["@scope/pkg@2.0.0",],
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            &project,
+            r#"{
+                "plugins": [{"package": "@scope/pkg@0.9.0"}],
+            }"#,
+        )
+        .unwrap();
+
+        let listings = config_listings(
+            &[(global.clone(), false), (project.clone(), true)],
+            &["@scope/pkg@1.0.0".to_owned()],
+        );
+
+        assert_eq!(listings.len(), 2);
+        assert!(
+            listings
+                .iter()
+                .any(|(source, package)| source.ends_with("opencode.jsonc")
+                    && package == "@scope/pkg@1.0.0")
+        );
+        assert!(listings.iter().any(
+            |(source, package)| source.ends_with("project/opencode.json")
+                && package == "@scope/pkg@1.0.0"
+        ));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_project_config_listing_the_declaration_is_not_a_second_load() {
+        let base = test_directory();
+        let project = base.join("opencode.json");
+        fs::write(&project, r#"{"plugin":["context-mode@2.2.4"]}"#).unwrap();
+
+        let listings = config_listings(
+            &[(project.clone(), true)],
+            &["context-mode@2.2.4".to_owned()],
+        );
+        assert!(listings.is_empty());
+
+        let listings = config_listings(&[(project, false)], &["context-mode@2.2.4".to_owned()]);
+        assert_eq!(listings.len(), 1);
+        fs::remove_dir_all(base).unwrap();
+    }
+
     fn git(directory: &Path, args: &[&str]) {
         assert!(
             Command::new("git")
@@ -1860,8 +2017,9 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = env::temp_dir().join(format!(
-            "crowded-plugin-test-{}-{nonce}",
-            std::process::id()
+            "crowded-plugin-test-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&path).unwrap();
         path
