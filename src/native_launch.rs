@@ -625,8 +625,13 @@ pub(crate) mod tests {
         pub(crate) session: Mutex<String>,
         /// Session ids whose interrupt was requested, in arrival order.
         pub(crate) interrupts: Mutex<Vec<String>>,
+        /// The `interrupted` flag the stand-in returns for an accepted
+        /// interrupt: false models an idle session, true a stopped run.
+        pub(crate) interrupt_interrupted: AtomicBool,
         /// Answer interrupt requests with HTTP 500 instead of accepting them.
         pub(crate) interrupt_failure: AtomicBool,
+        /// Answer interrupt requests with 200 and no `interrupted` flag.
+        pub(crate) interrupt_malformed: AtomicBool,
         /// Answer session creation with HTTP 500 instead of creating one.
         pub(crate) session_failure: AtomicBool,
     }
@@ -783,7 +788,13 @@ pub(crate) mod tests {
                             .unwrap_or_default()
                             .to_owned();
                         server_state.interrupts.lock().unwrap().push(id);
-                        (200, "{\"interrupted\":false}".to_owned())
+                        if server_state.interrupt_malformed.load(Ordering::SeqCst) {
+                            (200, "{}".to_owned())
+                        } else {
+                            let interrupted =
+                                server_state.interrupt_interrupted.load(Ordering::SeqCst);
+                            (200, format!("{{\"interrupted\":{interrupted}}}"))
+                        }
                     }
                 } else if request.starts_with("GET /api/info") {
                     let pid = fs::read_to_string(&pid_file).unwrap_or_default();

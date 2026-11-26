@@ -175,9 +175,13 @@ impl Client {
         Ok(id.into())
     }
 
-    /// Aborts the session's in-flight run. OpenCode 2.3.2 serves this as
-    /// `POST /api/session/{id}/interrupt`; the v1 `/abort` path returns 404.
-    fn interrupt(&self, session: &str) -> io::Result<()> {
+    /// Aborts the session's in-flight run and reports whether one was stopped.
+    /// OpenCode 2.3.2 serves this as `POST /api/session/{id}/interrupt`; the v1
+    /// `/abort` path returns 404. A successful response carries
+    /// `{"interrupted": bool}`: `true` means an active run was interrupted,
+    /// `false` is the idle no-op (nothing to stop). A 200 without that flag
+    /// cannot prove the run stopped, so it is an error.
+    fn interrupt(&self, session: &str) -> io::Result<bool> {
         if !valid_id(session) {
             return Err(io::Error::other("invalid session identity"));
         }
@@ -185,14 +189,17 @@ impl Client {
         let response = self
             .request("POST", &path, None)
             .map_err(|_| io::Error::other("session interrupt uncertain"))?;
-        if response.status == 200 {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
+        if response.status != 200 {
+            return Err(io::Error::other(format!(
                 "OpenCode returned HTTP {}",
                 response.status
-            )))
+            )));
         }
+        let data: Value = serde_json::from_slice(&response.body)
+            .map_err(|_| io::Error::other("invalid session interrupt response"))?;
+        data["interrupted"]
+            .as_bool()
+            .ok_or_else(|| io::Error::other("invalid session interrupt response"))
     }
 
     fn queue(&self, session: &str, message_id: &str, text: &str) -> Delivery {
@@ -639,8 +646,9 @@ impl Server {
     }
 
     /// Aborts whatever the given session is running, without changing this
-    /// server's binding or session.
-    pub(crate) fn interrupt_session(&self, session: &str) -> io::Result<()> {
+    /// server's binding or session. Returns whether a run was interrupted;
+    /// `false` is the idle no-op.
+    pub(crate) fn interrupt_session(&self, session: &str) -> io::Result<bool> {
         self.client.interrupt(session)
     }
 
@@ -936,20 +944,28 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_posts_the_v2_path_and_reports_failure() {
-        let client = fake(2, |index, headers, body| {
+    fn interrupt_posts_the_v2_path_and_reads_the_flag() {
+        let client = fake(4, |index, headers, body| {
             assert!(
                 headers.starts_with("POST /api/session/ses_a/interrupt "),
                 "{headers}"
             );
             assert!(headers.contains("Authorization: Basic "));
             assert!(body.is_empty());
-            Some(response(
-                if index == 0 { 200 } else { 500 },
-                &json!({"interrupted": false}),
-            ))
+            Some(match index {
+                0 => response(200, &json!({"interrupted": true})),
+                1 => response(200, &json!({"interrupted": false})),
+                2 => response(200, &json!({})),
+                _ => response(500, &json!({"interrupted": true})),
+            })
         });
-        assert!(client.interrupt("ses_a").is_ok());
+        assert_eq!(client.interrupt("ses_a").unwrap(), true);
+        assert_eq!(client.interrupt("ses_a").unwrap(), false);
+        let malformed = client.interrupt("ses_a").unwrap_err().to_string();
+        assert!(
+            malformed.contains("invalid session interrupt response"),
+            "{malformed}"
+        );
         let error = client.interrupt("ses_a").unwrap_err().to_string();
         assert!(error.contains("HTTP 500"), "{error}");
     }

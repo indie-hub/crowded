@@ -235,7 +235,9 @@ fn clearing_an_opencode_room_attaches_the_tui_to_a_new_session_on_the_same_serve
 
 #[cfg(unix)]
 #[test]
-fn clearing_an_opencode_room_interrupts_the_previous_session_once() {
+fn clearing_an_idle_opencode_room_aborts_without_a_warning() {
+    // The stand-in answers {"interrupted":false}, the idle no-op: nothing was
+    // running, which is still a successful abort and not a warning.
     let _state = session_state::StateRootGuard::isolated();
     let root = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
@@ -313,6 +315,62 @@ fn a_failed_interrupt_is_reported_without_undoing_the_clear() {
     assert!(warning.contains("could not be interrupted"), "{warning}");
     assert!(warning.contains("HTTP 500"), "{warning}");
     assert_eq!(pane.native.as_ref().unwrap().binding(), &binding);
+    fake.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn clearing_a_busy_opencode_room_interrupts_its_run_without_a_warning() {
+    let _state = session_state::StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let (mut pane, fake) = spawn_native_pane(
+        root.path(),
+        cwd.path(),
+        "clear-abort-busy",
+        &["--model", "provider/alpha"],
+        "token-abort-busy",
+    );
+    fake.state
+        .interrupt_interrupted
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let old = pane.native.as_ref().unwrap().binding().clone();
+
+    let (binding, warning) = pane.clear_opencode_session(native_test_size(), 9).unwrap();
+
+    assert!(warning.is_none(), "{warning:?}");
+    assert_ne!(binding.session, old.session);
+    assert_eq!(*fake.state.interrupts.lock().unwrap(), [old.session]);
+    fake.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_interrupt_response_is_reported() {
+    let _state = session_state::StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let (mut pane, fake) = spawn_native_pane(
+        root.path(),
+        cwd.path(),
+        "clear-abort-unreadable",
+        &["--model", "provider/alpha"],
+        "token-abort-unreadable",
+    );
+    fake.state
+        .interrupt_malformed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let old = pane.native.as_ref().unwrap().binding().clone();
+
+    let (binding, warning) = pane.clear_opencode_session(native_test_size(), 9).unwrap();
+
+    assert_ne!(binding.session, old.session);
+    let warning = warning.expect("a response without the flag must be reported");
+    assert!(warning.contains("could not be interrupted"), "{warning}");
+    assert!(
+        warning.contains("invalid session interrupt response"),
+        "{warning}"
+    );
     fake.shutdown();
 }
 
