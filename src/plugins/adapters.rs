@@ -273,7 +273,9 @@ pub(super) fn loaded_opencode_files(root: &Path, name: &str) -> io::Result<Vec<P
                 _ => false,
             }
         } else {
-            fs::read_link(&path).is_ok_and(|target| target == link.target)
+            // `read_link` succeeds for a dangling link; OpenCode cannot load a
+            // target that no longer exists, so the link is missing.
+            fs::read_link(&path).is_ok_and(|target| target == link.target) && path.exists()
         };
         if linked {
             present.push(link.path.clone());
@@ -928,6 +930,43 @@ mod tests {
         ));
         fs::create_dir_all(root.join(".claude")).unwrap();
         root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_opencode_link_is_not_reported_as_loaded() {
+        // Windows cannot create a dangling file symlink without a privilege the
+        // suite does not hold, so this case is Unix-only.
+        let root = fixture_root();
+        let installed = root.join(INSTALLS_DIRECTORY).join("example");
+        fs::create_dir_all(installed.join("hooks")).unwrap();
+        fs::write(installed.join("hooks/activate.js"), "export default {}").unwrap();
+        fs::create_dir_all(root.join(".opencode/plugins")).unwrap();
+        let target = PathBuf::from("../../.crowded/plugins/example/hooks/activate.js");
+        symlink(&target, root.join(".opencode/plugins/example.js")).unwrap();
+        let state = AdapterState {
+            version: ADAPTER_VERSION,
+            links: vec![AdapterLink {
+                path: PathBuf::from(".opencode/plugins/example.js"),
+                target,
+                copied: false,
+            }],
+            hooks: Vec::new(),
+        };
+        fs::write(
+            installed.join(ADAPTER_FILE),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            loaded_opencode_files(&root, "example").unwrap(),
+            [PathBuf::from(".opencode/plugins/example.js")]
+        );
+
+        fs::remove_file(installed.join("hooks/activate.js")).unwrap();
+        assert!(loaded_opencode_files(&root, "example").unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn adapted_entry(root: &Path, script: &str) -> Value {
