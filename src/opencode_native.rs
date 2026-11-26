@@ -475,6 +475,10 @@ fn terminate(child: &mut Child) {
 /// Kills a server the wrapper did not reap. It is only ever the pid the
 /// authenticated server reported and Crowded proved it owns.
 fn stop_process(pid: u32) {
+    #[cfg(test)]
+    if let Ok(mut recorded) = RECORDED_STOPS.lock() {
+        recorded.push(pid);
+    }
     #[cfg(unix)]
     {
         let alive = std::process::Command::new("kill")
@@ -508,30 +512,65 @@ pub(crate) struct Server {
     binding: Mutex<Option<LaunchBinding>>,
     /// The authenticated server's own pid; when it differs from the spawned
     /// child (a wrapper sits in between), it is stopped explicitly on drop.
+    /// It is never signalled when it equals a reaped wrapper pid, which the
+    /// kernel may already have reused for an unrelated process.
     server_pid: Option<u32>,
+    /// Wrapper pid reaped by `poll_exit`. It is never signalled again.
+    reaped_pid: Mutex<Option<u32>>,
     /// Last endpoint liveness probe, so a hot event loop checks the port at
     /// most once a second; the wrapper exit check above it runs every pass.
     last_probe: Mutex<Instant>,
 }
 
+#[cfg(test)]
+static RECORDED_STOPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Pids `stop_process` was asked to stop, in order. Tests assert Crowded
+/// only ever signals processes it recorded.
+#[cfg(test)]
+pub(crate) fn recorded_stops() -> Vec<u32> {
+    RECORDED_STOPS
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+/// Clears the recorded stop list. Tests call this before dropping a server.
+#[cfg(test)]
+pub(crate) fn clear_recorded_stops() {
+    if let Ok(mut guard) = RECORDED_STOPS.lock() {
+        guard.clear();
+    }
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
-        // The wrapper may already be reaped by `poll_exit`; the recorded
-        // server pid is kept regardless and stopped below, so a live owned
-        // server is never orphaned on replacement or drop. Only recorded
-        // pids are ever signalled, never a pattern.
         let taken = self.child.lock().ok().and_then(|mut guard| guard.take());
         let spawned = taken.as_ref().map(|child| child.id());
+        let reaped = self
+            .reaped_pid
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        // Only a recorded pid is ever signalled, and never one equal to a
+        // live wrapper child (terminate handles it) or to a reaped wrapper
+        // pid (the kernel may have reused it for an unrelated process).
+        let server_to_stop = match self.server_pid {
+            Some(pid) if Some(pid) == spawned => None,
+            Some(pid) if Some(pid) == reaped => None,
+            other => other,
+        };
         #[cfg(windows)]
         {
             if let Some(tree) = self.tree.take() {
-                if taken.is_some() || self.server_pid.is_some() {
-                    if let Some(mut child) = taken {
-                        stop_owned(&mut child, Some(tree), self.server_pid);
-                    } else {
-                        let _ = tree.terminate();
-                        if let Some(server) = self.server_pid {
-                            stop_process(server);
+                if taken.is_some() || server_to_stop.is_some() {
+                    match taken {
+                        Some(mut child) => stop_owned(&mut child, Some(tree), server_to_stop),
+                        None => {
+                            let _ = tree.terminate();
+                            if let Some(pid) = server_to_stop {
+                                stop_process(pid);
+                            }
                         }
                     }
                 }
@@ -544,8 +583,8 @@ impl Drop for Server {
             if let Some(mut child) = taken {
                 terminate(&mut child);
             }
-            if let Some(server) = self.server_pid.filter(|server| Some(*server) != spawned) {
-                stop_process(server);
+            if let Some(pid) = server_to_stop {
+                stop_process(pid);
             }
         }
     }
@@ -565,6 +604,13 @@ fn stop_owned(child: &mut Child, tree: Option<ProcessTree>, server_pid: Option<u
     if let Some(server) = server_pid.filter(|server| *server != spawned) {
         stop_process(server);
     }
+}
+
+/// Whether a failed endpoint probe means the owned server is gone. Only a
+/// refused connection does: the listener is closed. A timeout or any other
+/// error leaves a healthy busy room alone.
+fn endpoint_dead(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::ConnectionRefused
 }
 
 impl Server {
@@ -614,7 +660,12 @@ impl Server {
                 return Ok(true);
             };
             if child.try_wait()?.is_some() {
+                let pid = child.id();
                 guard.take();
+                *self
+                    .reaped_pid
+                    .lock()
+                    .map_err(|_| io::Error::other("server child state is poisoned"))? = Some(pid);
                 return Ok(true);
             }
         }
@@ -633,13 +684,13 @@ impl Server {
         // Only a refused connection (or the reaped wrapper above) counts
         // as death. A timeout or any other error leaves a healthy busy
         // room alone: it is counted by the throttle above, never acted on.
+        // See `endpoint_dead` for the rule and its proof.
         match std::net::TcpStream::connect_timeout(
             &std::net::SocketAddr::V4(self.client.address),
             PROBE_TIMEOUT,
         ) {
             Ok(_) => Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => Ok(true),
-            Err(_) => Ok(false),
+            Err(error) => Ok(endpoint_dead(&error)),
         }
     }
 
@@ -906,6 +957,7 @@ impl Server {
         match result {
             Ok((client, session, url, server_pid)) => Ok(Self {
                 child: Mutex::new(Some(child)),
+                reaped_pid: Mutex::new(None),
                 #[cfg(windows)]
                 tree: Some(tree),
                 client,
@@ -957,6 +1009,29 @@ fn startup_url(reader: &mut impl BufRead) -> io::Result<String> {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn only_a_refused_endpoint_counts_as_dead() {
+        assert!(endpoint_dead(&io::Error::from(
+            io::ErrorKind::ConnectionRefused
+        )));
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            assert!(
+                !endpoint_dead(&io::Error::from(kind)),
+                "a {kind:?} probe must never mark a busy room dead"
+            );
+        }
+        assert!(
+            !endpoint_dead(&io::Error::other("boom")),
+            "any other probe error must never mark a busy room dead"
+        );
+    }
+
     use std::{
         net::TcpListener,
         sync::{
@@ -1438,6 +1513,7 @@ mod tests {
             url: "http://127.0.0.1:1234".into(),
             binding: Mutex::new(None),
             server_pid: Some(member_pid),
+            reaped_pid: Mutex::new(None),
             last_probe: Mutex::new(Instant::now()),
         };
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -1480,6 +1556,7 @@ mod tests {
             session: Mutex::new(session.into()),
             url: format!("http://{}", client.address),
             binding: Mutex::new(Some(launch)),
+            reaped_pid: Mutex::new(None),
             server_pid: Some(42),
             last_probe: Mutex::new(Instant::now()),
         }
@@ -1769,6 +1846,7 @@ mod tests {
             client,
             session: Mutex::new("ses_a".into()),
             url: "http://127.0.0.1:1234".into(),
+            reaped_pid: Mutex::new(None),
             binding: Mutex::new(None),
             server_pid: None,
             last_probe: Mutex::new(Instant::now()),
@@ -1856,6 +1934,7 @@ mod tests {
             tree: None,
             client,
             session: Mutex::new("ses_a".into()),
+            reaped_pid: Mutex::new(None),
             url: "http://127.0.0.1:1234".into(),
             binding: Mutex::new(None),
             server_pid: None,
@@ -1934,6 +2013,7 @@ mod tests {
                 #[cfg(windows)]
                 tree: None,
                 client,
+                reaped_pid: Mutex::new(None),
                 session: Mutex::new("ses_a".into()),
                 url: "http://127.0.0.1:1234".into(),
                 binding: Mutex::new(None),
@@ -2031,6 +2111,7 @@ mod tests {
             child: Mutex::new(Some(child)),
             #[cfg(windows)]
             tree: None,
+            reaped_pid: Mutex::new(None),
             client,
             session: Mutex::new("ses_a".into()),
             url: "http://127.0.0.1:1234".into(),
@@ -2133,6 +2214,7 @@ mod tests {
             binding: Mutex::new(None),
             server_pid: None,
             last_probe: Mutex::new(Instant::now()),
+            reaped_pid: Mutex::new(None),
         };
         drop(server);
         let status = std::process::Command::new("kill")
