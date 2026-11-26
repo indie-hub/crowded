@@ -5519,18 +5519,22 @@ fn failed_rebind_leaves_room_offline_with_mail_held() {
         generation: other_generation,
     };
     let title = rig.panes[0].title().to_owned();
-    let error = rebind_revived_room(
-        rig.router.as_mut().unwrap(),
-        0,
-        &title,
-        &bad,
-        &other_native.server(),
-    )
-    .unwrap_err();
+    let error = rig
+        .router
+        .as_mut()
+        .unwrap()
+        .rebind_revived_room_keep_pending(crate::native_route::RoomEntry {
+            index: 0,
+            title: title.clone(),
+            binding: bad,
+            backend: crate::native_route::Backend::OpenCode(other_native.server()),
+        })
+        .unwrap_err();
     assert!(!error.to_string().is_empty(), "a reason is reported");
 
-    // The pane is untouched and still offline on its previous binding, and
-    // the lane's server in the map is restored.
+    // The pane is untouched and still offline on its previous binding, the
+    // lane map still points at the old server, and the candidate server was
+    // never adopted.
     assert!(!rig.panes[0].is_online());
     assert_eq!(rig.router.as_ref().unwrap().binding_for(0).unwrap(), old);
     assert_eq!(
@@ -5543,18 +5547,50 @@ fn failed_rebind_leaves_room_offline_with_mail_held() {
             .unwrap()
             .url,
         old.endpoint,
-        "the lane map is restored"
+        "the lane map is unchanged"
     );
-    pump_router_until(
-        rig.router.as_mut().unwrap(),
-        &mut rig.mailroom,
-        |mailroom| mailroom.summary().contains("HELD"),
-        "mail stays held after a failed rebind",
-    );
+
+    // The candidate replacement is stopped by its recorded pid on drop.
+    let other_wrapper = other_native
+        .server()
+        .wrapper_pid()
+        .expect("candidate wrapper pid is recorded");
+    drop(other_native);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while native_launch::tests::process_alive(&other_wrapper.to_string())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(
-        rig.mailroom.summary().contains("HELD"),
-        "held with a held status: {}",
-        rig.mailroom.summary()
+        !native_launch::tests::process_alive(&other_wrapper.to_string()),
+        "the discarded candidate server is stopped"
+    );
+
+    // Drain every queued operation, then read the persisted outbox: the row
+    // is still HELD there, never delivered anywhere.
+    let outbox_path = root.path().join("outbox.json");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let persisted = loop {
+        rig.router
+            .as_mut()
+            .unwrap()
+            .tick(Instant::now(), &mut rig.mailroom, false, false);
+        if let Some(held) = persisted_held_row(&outbox_path, "rebind-proof-held") {
+            break held;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the persisted held row: {}",
+            rig.mailroom.summary()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(persisted, "the persisted row stays HELD");
+    assert_eq!(
+        persisted_hold_reason(&outbox_path, "rebind-proof-held").as_deref(),
+        Some(crate::native_session::PENDING_HOLD),
+        "the hold stays pending, never converted"
     );
     assert!(
         !fake
@@ -5578,6 +5614,44 @@ fn failed_rebind_leaves_room_offline_with_mail_held() {
     );
     fake.shutdown();
     other.shutdown();
+}
+
+/// Reads the persisted native outbox and reports the hold reason stored on
+/// the row carrying `marker`, if any.
+#[cfg(all(test, unix))]
+fn persisted_hold_reason(path: &std::path::Path, marker: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let saved: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let messages = saved.get("messages")?.as_array()?;
+    for message in messages {
+        if message.get("text")?.as_str()?.contains(marker) {
+            return message
+                .get("status")?
+                .get("Queued")?
+                .get("hold")?
+                .as_str()
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
+/// Reads the persisted native outbox and reports whether the row carrying
+/// `marker` is stored with a held status (`Queued` with a hold reason).
+#[cfg(all(test, unix))]
+fn persisted_held_row(path: &std::path::Path, marker: &str) -> Option<bool> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let saved: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let messages = saved.get("messages")?.as_array()?;
+    for message in messages {
+        let text = message.get("text")?.as_str()?;
+        if !text.contains(marker) {
+            continue;
+        }
+        let hold = message.get("status")?.get("Queued")?.get("hold")?;
+        return Some(hold.is_string());
+    }
+    None
 }
 
 /// A clear whose terminal cannot respawn leaves the stored session alone:
@@ -5633,6 +5707,149 @@ fn failed_clear_spawn_leaves_stored_session_unchanged() {
     assert_eq!(pane.opencode_binding().unwrap(), old_binding);
 }
 
+/// A commit that fails after a successful rebind reports that the router
+/// follows the new session but the room could not start: the pane is
+/// untouched and offline, the hold is kept, and the mail stays HELD.
+#[cfg(all(test, unix))]
+#[test]
+fn failed_commit_after_rebind_reports_press_ctrl_r_again_with_mail_held() {
+    use crate::native_launch::{self, tests::fake_room};
+    use crate::native_route::{Backend, NativeRouter, RoomEntry};
+    use std::time::{Duration, Instant};
+
+    let _state = crate::pane::session_state::StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let fake = fake_room(root.path(), "revive-commit", "v2.2.5");
+    let size = PtySize {
+        rows: 6,
+        cols: 60,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let spec = report_test_spec(&fake.program, cwd.path(), "Opencode \u{b7} 1", true);
+    let launch_generation =
+        native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+            .next()
+            .unwrap();
+    let native = native_launch::start(native_launch::NativeLaunch::direct(
+        fake.program.as_os_str(),
+        cwd.path(),
+        "1.1".to_owned(),
+        launch_generation,
+        &[],
+    ))
+    .unwrap();
+    let router = NativeRouter::start(
+        root.path().join("outbox.json"),
+        vec![RoomEntry {
+            index: 0,
+            title: spec.title.clone(),
+            binding: native.binding().clone(),
+            backend: Backend::OpenCode(native.server()),
+        }],
+    )
+    .unwrap();
+    let pane =
+        Pane::spawn_with_native(spec, size, pane::GuestEnvironment::new([]), Some(native)).unwrap();
+    let mut rig = ReportDispatch::new(vec![pane], Some(router));
+    let old = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+
+    // Kill the server, mark the room offline with a pending hold, and hold
+    // mail for the lane.
+    let wrapper = rig
+        .router
+        .as_ref()
+        .unwrap()
+        .server_for(0)
+        .unwrap()
+        .wrapper_pid()
+        .unwrap();
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &wrapper.to_string()])
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while native_launch::tests::process_alive(&wrapper.to_string()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        let _ = rig.panes[0].poll_opencode_server_exit();
+    }
+    detect_dead_opencode_servers(&mut rig.panes, rig.router.as_mut(), &mut rig.notice);
+    assert!(!rig.panes[0].is_online());
+    rig.router
+        .as_mut()
+        .unwrap()
+        .send(&mut rig.mailroom, "Room X", 0, "commit-proof-held", None)
+        .unwrap();
+
+    // Break the marker save: load fails, so the commit fails after the
+    // router already follows the new session.
+    let path = crate::pane::session_state::state_path();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"not state file").unwrap();
+
+    let error = revive_opencode_room(
+        0,
+        size,
+        &mut rig.panes,
+        rig.router.as_mut(),
+        &mut rig.gates,
+        &mut rig.last_output,
+        &mut rig.spawned_at,
+        &mut rig.pulses,
+        &rig.environments,
+        Instant::now(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("could not start"), "{error}");
+    assert!(error.to_string().contains("press Ctrl+R again"), "{error}");
+
+    // The pane is untouched and offline on its previous binding, while the
+    // router already follows the new session.
+    assert!(!rig.panes[0].is_online());
+    assert_eq!(rig.panes[0].opencode_binding().as_ref(), Some(&old));
+    let new = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    assert_eq!(new.room, old.room);
+    assert!(new.generation > old.generation);
+    assert_ne!(new.session, old.session);
+
+    // The hold was never released, so the mail stays HELD in memory and in
+    // the persisted outbox, and nothing is delivered.
+    let outbox_path = root.path().join("outbox.json");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let persisted = loop {
+        rig.router
+            .as_mut()
+            .unwrap()
+            .tick(Instant::now(), &mut rig.mailroom, false, false);
+        if let Some(held) = persisted_held_row(&outbox_path, "commit-proof-held") {
+            break held;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the persisted held row: {}",
+            rig.mailroom.summary()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(persisted, "the persisted row stays HELD");
+    assert!(
+        rig.mailroom.summary().contains("HELD"),
+        "held with a held status: {}",
+        rig.mailroom.summary()
+    );
+    assert!(
+        !fake
+            .state
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, text)| text.contains("commit-proof-held")),
+        "nothing is delivered after a failed commit"
+    );
+    fake.shutdown();
+}
+
 /// A revive whose terminal cannot respawn leaves the stored session alone
 /// and keeps the previous binding: nothing new started.
 #[cfg(all(test, unix))]
@@ -5664,7 +5881,7 @@ fn failed_revive_spawn_leaves_stored_session_unchanged() {
     ))
     .unwrap();
     let title = spec.title.clone();
-    let mut pane =
+    let pane =
         Pane::spawn_with_native(spec, size, pane::GuestEnvironment::new([]), Some(native)).unwrap();
     let new_generation =
         native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
@@ -5682,7 +5899,10 @@ fn failed_revive_spawn_leaves_stored_session_unchanged() {
 
     // No program, no respawn: the failure must change nothing persisted.
     std::fs::remove_file(&fake.program).unwrap();
-    let error = pane.revive_opencode_session(size, fresh).unwrap_err();
+    let error = match pane.prepare_revived_tui(size, &fresh) {
+        Ok(_) => panic!("a respawn without a program must fail"),
+        Err(error) => error,
+    };
     assert!(!error.to_string().is_empty());
     assert!(
         crate::pane::session_state::lookup("opencode", cwd.path(), &title).is_none(),
@@ -5800,7 +6020,185 @@ fn dropping_a_server_stops_only_its_recorded_processes() {
         crate::native_launch::tests::process_alive(&other_pid),
         "an unrelated process is never touched"
     );
+    assert!(
+        !crate::opencode_native::recorded_stops()
+            .iter()
+            .any(|pid| pid.to_string() == owned),
+        "no signal is sent while the wrapper is alive"
+    );
+
+    // A reaped wrapper pid is never signalled again, even though the
+    // recorded server pid equals it: the kernel may have reused it.
+    let server =
+        crate::opencode_native::Server::start(fake.program.as_os_str(), cwd.path()).unwrap();
+    let wrapper = server.wrapper_pid().expect("wrapper pid is recorded");
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &wrapper.to_string()])
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while crate::native_launch::tests::process_alive(&wrapper.to_string())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+        let _ = server.poll_exit();
+    }
+    assert!(server.poll_exit().unwrap(), "the wrapper exit is reaped");
+    crate::opencode_native::clear_recorded_stops();
+    drop(server);
+    assert!(
+        !crate::opencode_native::recorded_stops()
+            .iter()
+            .any(|pid| pid.to_string() == wrapper.to_string()),
+        "a reaped wrapper pid is never signalled, even for the recorded server pid"
+    );
+    assert!(
+        crate::native_launch::tests::process_alive(&other_pid),
+        "an unrelated process is still never touched"
+    );
     let _ = other.kill();
     let _ = other.wait();
     fake.shutdown();
+}
+
+// A retarget or adopt failure inside rebind_room leaves the pending hold in
+// place: later mail is still held, the binding is unchanged, and nothing is
+// delivered anywhere.
+#[cfg(all(test, unix))]
+#[test]
+fn failed_rebind_room_keeps_the_pending_hold() {
+    use crate::native_launch::{self, tests::fake_room};
+    use crate::native_route::{Backend, NativeRouter, RoomEntry};
+    use std::time::{Duration, Instant};
+
+    let _state = crate::pane::session_state::StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let fake = fake_room(root.path(), "revive-r1", "v2.2.5");
+    let size = PtySize {
+        rows: 6,
+        cols: 60,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let spec = report_test_spec(&fake.program, cwd.path(), "Opencode \u{b7} 1", true);
+    let launch_generation =
+        native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+            .next()
+            .unwrap();
+    let native = native_launch::start(native_launch::NativeLaunch::direct(
+        fake.program.as_os_str(),
+        cwd.path(),
+        "1.1".to_owned(),
+        launch_generation,
+        &[],
+    ))
+    .unwrap();
+    let router = NativeRouter::start(
+        root.path().join("outbox.json"),
+        vec![RoomEntry {
+            index: 0,
+            title: spec.title.clone(),
+            binding: native.binding().clone(),
+            backend: Backend::OpenCode(native.server()),
+        }],
+    )
+    .unwrap();
+    let pane =
+        Pane::spawn_with_native(spec, size, pane::GuestEnvironment::new([]), Some(native)).unwrap();
+    let mut rig = ReportDispatch::new(vec![pane], Some(router));
+    let old = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+
+    rig.router.as_mut().unwrap().mark_pending(0).unwrap();
+    rig.router
+        .as_mut()
+        .unwrap()
+        .send(&mut rig.mailroom, "Room X", 0, "r1-proof-held", None)
+        .unwrap();
+
+    // A rebinding aimed at another endpoint: the adopt fails.
+    let other = fake_room(root.path(), "revive-r1-other", "v2.2.5");
+    let other_generation =
+        native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+            .next()
+            .unwrap();
+    let other_native = native_launch::start(native_launch::NativeLaunch::direct(
+        other.program.as_os_str(),
+        cwd.path(),
+        "9.9".to_owned(),
+        other_generation,
+        &[],
+    ))
+    .unwrap();
+    let bad = crate::native_outbox::Binding {
+        room: old.room.clone(),
+        session: other_native.binding().session.clone(),
+        endpoint: old.endpoint.clone(),
+        generation: other_generation,
+    };
+    let title = rig.panes[0].title().to_owned();
+    let error = rig
+        .router
+        .as_mut()
+        .unwrap()
+        .rebind_room(crate::native_route::RoomEntry {
+            index: 0,
+            title,
+            binding: bad,
+            backend: crate::native_route::Backend::OpenCode(other_native.server()),
+        })
+        .unwrap_err();
+    assert!(!error.to_string().is_empty(), "a reason is reported");
+
+    // The hold is kept: the lane is still pending, the binding is unchanged,
+    // later mail is still held instead of sent, and the earlier mail stays
+    // HELD in the persisted outbox.
+    assert!(rig.router.as_ref().unwrap().is_pending(0));
+    assert_eq!(rig.router.as_ref().unwrap().binding_for(0).unwrap(), old);
+    rig.router
+        .as_mut()
+        .unwrap()
+        .send(&mut rig.mailroom, "Room X", 0, "r1-proof-after", None)
+        .unwrap();
+    // Drain every queued operation, then read the persisted outbox: both
+    // rows keep the pending hold there, and nothing is delivered.
+    let outbox_path = root.path().join("outbox.json");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        rig.router
+            .as_mut()
+            .unwrap()
+            .tick(Instant::now(), &mut rig.mailroom, false, false);
+        let first = persisted_hold_reason(&outbox_path, "r1-proof-held");
+        let second = persisted_hold_reason(&outbox_path, "r1-proof-after");
+        if first.as_deref() == Some(crate::native_session::PENDING_HOLD)
+            && second.as_deref() == Some(crate::native_session::PENDING_HOLD)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the persisted pending rows: {}",
+            rig.mailroom.summary()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        rig.mailroom
+            .summary()
+            .contains(crate::native_session::PENDING_HOLD),
+        "later mail is still held with its pending hold: {}",
+        rig.mailroom.summary()
+    );
+    assert!(
+        !fake
+            .state
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, text)| text.contains("r1-proof-held") || text.contains("r1-proof-after")),
+        "nothing is delivered after a failed rebind"
+    );
+    fake.shutdown();
+    other.shutdown();
 }
