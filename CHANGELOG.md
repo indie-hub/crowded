@@ -7,6 +7,19 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-11-26
+
+### Added
+- The native outbox keeps outcome counters (accepted, failed, retired stale mail, unconfirmed, late-corrected) that survive the 100-row history limit, so a delivery success rate can be measured.
+
+### Changed
+- A native message whose delivery stays unconfirmed for 10 minutes now ends as `FAILED: delivery was not confirmed; it may have arrived; not resent`, with one notice, instead of staying uncertain forever. It is never resent. A late authenticated receipt still corrects it to accepted.
+- Mail saved for an earlier launch of a room, which can never be delivered, now ends as `FAILED: sent for an earlier launch of this room; not delivered` instead of piling up as held. Existing rows are settled the first time the new version runs.
+- Settling runs while delivery is paused or fused, and each change of state gives exactly one notice.
+
+### Fixed
+- A cleared native OpenCode or Claude room is taught the house rules again. Before, only the first launch and F4 sent them. Codex rooms already received them as the new session prompt.
+
 ## [0.48.0] - 2026-11-25
 
 ### Added
