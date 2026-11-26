@@ -649,17 +649,15 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     pub(crate) fn fake_room(root: &Path, name: &str, version: &str) -> FakeRoom {
-        fake_room_with_delay(root, name, version, 0)
+        fake_room_with_delays(root, name, version, 0, false)
     }
 
+    /// A stand-in that never announces its server: the announcement waits for
+    /// an `announce` file in its directory, which no test creates, so the
+    /// launch it belongs to can only be ended by the caller.
     #[cfg(unix)]
-    pub(crate) fn fake_room_with_delay(
-        root: &Path,
-        name: &str,
-        version: &str,
-        delay: u64,
-    ) -> FakeRoom {
-        fake_room_with_delays(root, name, version, 0, delay)
+    pub(crate) fn fake_room_held(root: &Path, name: &str, version: &str) -> FakeRoom {
+        fake_room_with_delays(root, name, version, 0, true)
     }
 
     #[cfg(unix)]
@@ -668,7 +666,7 @@ pub(crate) mod tests {
         name: &str,
         version: &str,
         version_delay: u64,
-        delay: u64,
+        hold_announcement: bool,
     ) -> FakeRoom {
         use std::os::unix::fs::PermissionsExt;
         let dir = root.join(name);
@@ -832,8 +830,13 @@ pub(crate) mod tests {
         fs::write(
             &program,
             format!(
-                "#!/bin/sh\ncase \"$1\" in\n--version) printf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{dir}/version_config'; printf '%s' \"$PWD\" > '{dir}/version_pwd'; sleep {version_delay}; echo {version}; exit 0;;\nserve) ;;\n*)\nprintf '%s' \"$*\" > '{dir}/tui_argv'\nprintf '%s' \"$OPENCODE_PASSWORD\" > '{dir}/tui_password'\nprintf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{dir}/tui_config'\nprintf '%s' \"$CROWDED_TEST_TOKEN\" > '{dir}/tui_token'\nIFS= read -r line\nprintf '%s' \"$line\" > '{dir}/tui_stdin'\nexec sleep 30;;\nesac\nprintf '%s' \"$$\" > '{dir}/pid'\nprintf '%s' \"$OPENCODE_PASSWORD\" > '{dir}/password'\nprintf '%s' \"$HOME\" > '{dir}/home'\nprintf '%s' \"$PWD\" > '{dir}/pwd'\nprintf '%s' \"$*\" > '{dir}/argv'\nprintf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{dir}/config'\nprintf '%s' \"$OPENCODE_CONFIG\" > '{dir}/config_path'\nprintf '%s' \"$CROWDED_TEST_TOKEN\" > '{dir}/token'\nsleep {delay}\nprintf 'server listening on http://{address}\\n'\nexec sleep 30\n",
-                dir = dir.display()
+                "#!/bin/sh\ncase \"$1\" in\n--version) printf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{dir}/version_config'; printf '%s' \"$PWD\" > '{dir}/version_pwd'; sleep {version_delay}; echo {version}; exit 0;;\nserve) ;;\n*)\nprintf '%s' \"$*\" > '{dir}/tui_argv'\nprintf '%s' \"$OPENCODE_PASSWORD\" > '{dir}/tui_password'\nprintf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{dir}/tui_config'\nprintf '%s' \"$CROWDED_TEST_TOKEN\" > '{dir}/tui_token'\nIFS= read -r line\nprintf '%s' \"$line\" > '{dir}/tui_stdin'\nexec sleep 30;;\nesac\nprintf '%s' \"$$\" > '{dir}/pid'\nprintf '%s' \"$OPENCODE_PASSWORD\" > '{dir}/password'\nprintf '%s' \"$HOME\" > '{dir}/home'\nprintf '%s' \"$PWD\" > '{dir}/pwd'\nprintf '%s' \"$*\" > '{dir}/argv'\nprintf '%s' \"$OPENCODE_CONFIG_CONTENT\" > '{dir}/config'\nprintf '%s' \"$OPENCODE_CONFIG\" > '{dir}/config_path'\nprintf '%s' \"$CROWDED_TEST_TOKEN\" > '{dir}/token'\n{gate}printf 'server listening on http://{address}\\n'\nexec sleep 30\n",
+                dir = dir.display(),
+                gate = if hold_announcement {
+                    format!("while [ ! -e '{}/announce' ]; do sleep 0.05; done\n", dir.display())
+                } else {
+                    String::new()
+                }
             ),
         )
         .unwrap();
@@ -1071,7 +1074,7 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         // This stand-in takes 3 s to print its version.
-        let fake = fake_room_with_delays(root.path(), "slow-version", "v2.2.5", 3, 0);
+        let fake = fake_room_with_delays(root.path(), "slow-version", "v2.2.5", 3, false);
         let started = Instant::now();
         let error = check_version(
             fake.program.as_os_str(),
@@ -1199,9 +1202,9 @@ pub(crate) mod tests {
     fn a_launch_that_times_out_kills_and_waits_for_its_child_before_exit_waits_finish() {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        // The stand-in never announces its server within the test: the caller
-        // gives up and the launch kills it, so the delay costs nothing.
-        let fake = fake_room_with_delay(root.path(), "slow", "v2.2.5", 30);
+        // The stand-in never announces its server: the caller gives up and the
+        // launch kills it.
+        let fake = fake_room_held(root.path(), "slow", "v2.2.5");
         let launch = begin(NativeLaunch::direct(
             fake.program.as_os_str(),
             cwd.path(),
@@ -1226,7 +1229,7 @@ pub(crate) mod tests {
     fn dropping_a_launch_cancels_it_and_reaps_its_child() {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let fake = fake_room_with_delay(root.path(), "slow", "v2.2.5", 1);
+        let fake = fake_room_held(root.path(), "slow", "v2.2.5");
         let launch = begin(NativeLaunch::direct(
             fake.program.as_os_str(),
             cwd.path(),
@@ -1384,7 +1387,7 @@ pub(crate) mod tests {
     fn a_launch_dropped_during_the_version_check_never_starts_a_server() {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let fake = fake_room_with_delays(root.path(), "slow-version", "v2.2.5", 1, 0);
+        let fake = fake_room_with_delays(root.path(), "slow-version", "v2.2.5", 1, false);
         let launch = begin(NativeLaunch::direct(
             fake.program.as_os_str(),
             cwd.path(),
