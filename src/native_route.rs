@@ -765,14 +765,9 @@ impl NativeRouter {
         {
             return Err(io::Error::other("that room has no owned OpenCode server"));
         }
-        let rooms: Vec<String> = self
-            .pending_rooms
-            .iter()
-            .filter(|room| *room != &destination)
-            .cloned()
-            .collect();
-        self.send_pending(&rooms)?;
-        self.send_retarget(&destination, &entry.binding)?;
+        // A retarget or adopt failure leaves the pending hold in place: the
+        // lane stays pending, so later mail is still held rather than sent
+        // somewhere the room no longer owns.
         if let Backend::OpenCode(server) = &entry.backend {
             server.adopt(&entry.binding).map_err(|error| {
                 io::Error::new(
@@ -781,6 +776,14 @@ impl NativeRouter {
                 )
             })?;
         }
+        self.send_retarget(&destination, &entry.binding)?;
+        let rooms: Vec<String> = self
+            .pending_rooms
+            .iter()
+            .filter(|room| *room != &destination)
+            .cloned()
+            .collect();
+        self.send_pending(&rooms)?;
         self.rooms
             .insert(index, (entry.title.clone(), entry.binding.clone()));
         self.bindings
@@ -803,6 +806,86 @@ impl NativeRouter {
         self.unbound.remove(&index);
         self.pending_rooms.remove(&destination);
         self.adapter.get().rebind(self.entries())?;
+        Ok(())
+    }
+
+    /// Moves one lane onto its revived server without releasing its pending
+    /// hold: the lane server is swapped, the binding adopted, and the room
+    /// rebound, but no pending set is sent and no held mail is retargeted.
+    /// The caller releases the hold only after the pane commit succeeds. Any
+    /// failure restores the lane server and the bound rooms first, so the
+    /// room keeps its previous binding and its mail stays held.
+    pub(crate) fn rebind_revived_room_keep_pending(&mut self, entry: RoomEntry) -> io::Result<()> {
+        if entry.binding.room.is_empty() || entry.binding.generation == 0 {
+            return Err(io::Error::other(
+                "a rebinding needs its room and generation",
+            ));
+        }
+        let index = entry.index;
+        let destination = entry.binding.room.clone();
+        let Backend::OpenCode(server) = &entry.backend else {
+            return Err(io::Error::other(
+                "a revived room needs its owned OpenCode server",
+            ));
+        };
+        if !self.servers.get().contains_key(&destination) {
+            return Err(io::Error::other("that room has no owned OpenCode server"));
+        }
+        let previous_server = self.server_for(index);
+        let previous_room = self.rooms.get(&index).cloned();
+        self.replace_opencode_server(&destination, Arc::clone(server));
+        if let Err(error) = server.adopt(&entry.binding) {
+            if let Some(previous) = previous_server {
+                let mut servers = self.servers.get().clone();
+                servers.insert(destination.clone(), previous);
+                drop(std::mem::replace(
+                    &mut self.servers,
+                    crate::native_launch::Reaped::new(servers),
+                ));
+            }
+            return Err(io::Error::new(
+                error.kind(),
+                format!("that room could not move to the reported session: {error}"),
+            )
+            .into());
+        }
+        self.rooms
+            .insert(index, (entry.title.clone(), entry.binding.clone()));
+        self.bindings
+            .insert(destination.clone(), entry.binding.clone());
+        self.titles.insert(destination.clone(), entry.title.clone());
+        self.codex.remove(&destination);
+        if let Err(error) = self.adapter.get().rebind(self.entries()) {
+            if let Some((title, binding)) = previous_room {
+                self.rooms.insert(index, (title, binding.clone()));
+                self.bindings.insert(destination.clone(), binding);
+            } else {
+                self.rooms.remove(&index);
+                self.bindings.remove(&destination);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Releases a revived lane's pending hold after its pane commit
+    /// succeeded: the lane's pending-held mail is retargeted onto the
+    /// current binding and future mail is no longer held. The binding must
+    /// already be the revived one; only the outbox hold moves.
+    pub(crate) fn release_revived_hold(&mut self, index: usize) -> io::Result<()> {
+        let (destination, binding) = match self.rooms.get(&index) {
+            Some((_, binding)) => (binding.room.clone(), binding.clone()),
+            None => return Err(io::Error::other("that room has no native binding")),
+        };
+        self.send_retarget(&destination, &binding)?;
+        let rooms: Vec<String> = self
+            .pending_rooms
+            .iter()
+            .filter(|room| *room != &destination)
+            .cloned()
+            .collect();
+        self.send_pending(&rooms)?;
+        self.pending_rooms.remove(&destination);
         Ok(())
     }
 
