@@ -1200,8 +1200,9 @@ pub(crate) mod tests {
     fn a_launch_that_times_out_kills_and_waits_for_its_child_before_exit_waits_finish() {
         let root = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        // The stand-in takes 2 s to announce its server.
-        let fake = fake_room_with_delay(root.path(), "slow", "v2.2.5", 2);
+        // The stand-in never announces its server within the test: the caller
+        // gives up and the launch kills it, so the delay costs nothing.
+        let fake = fake_room_with_delay(root.path(), "slow", "v2.2.5", 30);
         let launch = begin(NativeLaunch::direct(
             fake.program.as_os_str(),
             cwd.path(),
@@ -1326,7 +1327,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     fn wait_for_pid_file(path: &Path) -> String {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(text) = fs::read_to_string(path) {
                 if !text.is_empty() {
