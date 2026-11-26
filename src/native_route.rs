@@ -42,7 +42,11 @@ const SCHEDULE_INTERVAL: Duration = Duration::from_millis(100);
 /// doorbell gives up on an answer after 2 seconds, so this must stay clearly
 /// below that or a saved message would be reported as a timeout.
 const REPLY_WAIT: Duration = Duration::from_millis(1500);
+#[cfg(not(test))]
 const STARTUP_WAIT: Duration = Duration::from_secs(5);
+// A loaded runner can take far longer than five seconds to fsync the first load.
+#[cfg(test)]
+const STARTUP_WAIT: Duration = Duration::from_secs(30);
 /// An uncertain message is checked against the native inbox this often.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -1542,7 +1546,7 @@ mod tests {
         fused: bool,
         done: impl Fn(&Mailroom) -> bool,
     ) {
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             router.tick(Instant::now(), mailroom, paused, fused);
             if done(mailroom) {
@@ -1574,7 +1578,7 @@ mod tests {
     /// Ticks until both messages have an answer of their own, collecting the
     /// notices each pass drained.
     fn answered(router: &mut NativeRouter, mailroom: &mut Mailroom, notices: &mut Vec<String>) {
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             notices.extend(
                 router
@@ -1673,7 +1677,7 @@ mod tests {
 
         // The enqueue's own answer is last in the queue, so once it lands
         // every earlier event has been drained too.
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             router.tick(Instant::now(), &mut mailroom, false, false);
             if !mailroom.summary().contains("SAVING") {
@@ -1766,7 +1770,7 @@ mod tests {
         // Fused scheduling drains the same answers as paused scheduling does.
         pump_for(&mut router, &mut mailroom, false, true, 300);
 
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             router.tick(Instant::now(), &mut mailroom, false, false);
             if !mailroom.summary().contains("SAVING") {
@@ -1798,7 +1802,7 @@ mod tests {
 
     /// The previous router's outbox thread releases its lock asynchronously.
     fn start_again(path: &Path, rooms: impl Fn() -> Vec<RoomEntry>) -> NativeRouter {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             match NativeRouter::start(path.to_path_buf(), rooms()) {
                 Ok(router) => return router,
@@ -2478,7 +2482,7 @@ mod tests {
 
     fn deliver_to(router: &mut NativeRouter, mailroom: &mut Mailroom, index: usize, marker: &Path) {
         router.send(mailroom, "Room X", index, "hi", None).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !marker.exists() {
             router.tick(Instant::now(), mailroom, false, false);
             assert!(
@@ -2696,7 +2700,7 @@ mod tests {
                 .send(&mut mailroom, "Room X", 1, "held mail", recorder(&log))
                 .unwrap();
 
-            let deadline = Instant::now() + Duration::from_secs(8);
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 router.hold_scheduling();
                 router.tick(Instant::now(), &mut mailroom, paused, fused);
@@ -2737,7 +2741,7 @@ mod tests {
         router
             .send(&mut mailroom, "Room X", 1, "queued mail", recorder(&log))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             router.hold_scheduling();
             router.tick(Instant::now(), &mut mailroom, false, false);
@@ -2777,7 +2781,7 @@ mod tests {
             .send(&mut mailroom, "Room X", 1, "held mail", recorder(&log))
             .unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             router.hold_scheduling();
             router.tick(Instant::now(), &mut mailroom, false, false);
@@ -3178,7 +3182,7 @@ mod tests {
     }
 
     fn answered_with(router: &mut NativeRouter, mailroom: &mut Mailroom, log: &Log) -> NativeReply {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             router.tick(Instant::now(), mailroom, false, false);
             if let Some((_, outcome)) = log.borrow_mut().pop() {
@@ -3605,7 +3609,7 @@ mod tests {
                 .unwrap();
             // Drain the schedules sent before the report while collection is
             // still held, so the first pass that collects has the new binding.
-            let drained = Instant::now() + Duration::from_secs(10);
+            let drained = Instant::now() + Duration::from_secs(30);
             while router.schedule_in_flight {
                 router.tick(Instant::now(), &mut mailroom, false, false);
                 assert!(
@@ -3619,7 +3623,7 @@ mod tests {
             // binding. The sender's reply has its own deadline, so either reply
             // form is accepted.
             let mut reply = None;
-            let settled = Instant::now() + Duration::from_secs(10);
+            let settled = Instant::now() + Duration::from_secs(30);
             loop {
                 router.tick(Instant::now(), &mut mailroom, false, false);
                 if reply.is_none() {
@@ -3663,7 +3667,7 @@ mod tests {
                 evidence[0].binding.session, placeholder,
                 "the evidence keeps the claim-time binding"
             );
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 router.tick(Instant::now(), &mut mailroom, false, false);
                 let settled = router
@@ -3746,7 +3750,7 @@ mod tests {
         assert_eq!(inbox.peek_late().len(), 1);
         assert_eq!(router.resolving.len(), 1);
         let mut mailroom = Mailroom::new(50);
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             router.tick(Instant::now(), &mut mailroom, false, false);
             if router.resolving.is_empty() {

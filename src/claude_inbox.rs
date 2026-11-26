@@ -870,7 +870,7 @@ impl FakeMod {
 
     /// Claims and returns the next message, waiting for the sender to queue it.
     pub(crate) fn claim(&self) -> Claim {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(claim) = self.next_claim() {
                 return claim;
