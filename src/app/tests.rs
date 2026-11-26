@@ -4892,3 +4892,405 @@ mod loop_behaviour {
         assert!(!panes[0].is_online(), "pane must be cleaned up on exit");
     }
 }
+
+/// An owned OpenCode server exit is noticed, reaped and reported once: the
+/// room goes offline, the wrapper leaves no zombie, and the outbox holds the
+/// room's mail instead of pasting it anywhere.
+#[cfg(all(test, unix))]
+#[test]
+fn opencode_server_death_marks_room_offline_holds_mail_and_reaps_wrapper() {
+    use crate::native_launch::{self, tests::fake_room};
+    use crate::native_route::{Backend, NativeRouter, RoomEntry};
+    use std::time::{Duration, Instant};
+
+    let _state = crate::pane::session_state::StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let fake = fake_room(root.path(), "revive-death", "v2.2.5");
+    let size = PtySize {
+        rows: 6,
+        cols: 60,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let spec = report_test_spec(&fake.program, cwd.path(), "Opencode \u{b7} 1", true);
+    let launch_generation =
+        native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+            .next()
+            .unwrap();
+    let native = native_launch::start(native_launch::NativeLaunch::direct(
+        fake.program.as_os_str(),
+        cwd.path(),
+        "1.1".to_owned(),
+        launch_generation,
+        &[],
+    ))
+    .unwrap();
+    let router = NativeRouter::start(
+        root.path().join("outbox.json"),
+        vec![RoomEntry {
+            index: 0,
+            title: spec.title.clone(),
+            binding: native.binding().clone(),
+            backend: Backend::OpenCode(native.server()),
+        }],
+    )
+    .unwrap();
+    let pane =
+        Pane::spawn_with_native(spec, size, pane::GuestEnvironment::new([]), Some(native)).unwrap();
+    let mut rig = ReportDispatch::new(vec![pane], Some(router));
+    assert!(rig.panes[0].is_online());
+    assert!(!rig.panes[0].poll_opencode_server_exit().unwrap());
+
+    let wrapper = rig
+        .router
+        .as_ref()
+        .unwrap()
+        .server_for(0)
+        .unwrap()
+        .wrapper_pid()
+        .expect("wrapper pid is recorded");
+    assert!(native_launch::tests::process_alive(&wrapper.to_string()));
+
+    // SIGTERM the wrapper exactly by its recorded pid, then close the
+    // endpoint, like the incident that killed the owned servers.
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &wrapper.to_string()])
+        .status();
+    fake.shutdown();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while native_launch::tests::process_alive(&wrapper.to_string())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+        let _ = rig.panes[0].poll_opencode_server_exit();
+    }
+
+    detect_dead_opencode_servers(&mut rig.panes, rig.router.as_mut(), &mut rig.notice);
+    assert!(!rig.panes[0].is_online(), "dead server reads offline");
+    assert_eq!(rig.notice.entries.len(), 1, "one notice, got {:?}", rig.notice.entries);
+    let only = &rig.notice.entries[0];
+    assert_eq!(only.severity, NoticeSeverity::Failure);
+    assert!(only.text.contains("Opencode"), "{only:?}");
+    assert!(only.text.contains("exited"), "{only:?}");
+
+    // A second pass reports nothing again.
+    detect_dead_opencode_servers(&mut rig.panes, rig.router.as_mut(), &mut rig.notice);
+    assert_eq!(rig.notice.entries.len(), 1, "no duplicate notice");
+
+    // The wrapper is reaped: kill -0 now fails.
+    assert!(
+        !native_launch::tests::process_alive(&wrapper.to_string()),
+        "wrapper leaves no zombie"
+    );
+    assert!(rig.panes[0].poll_opencode_server_exit().unwrap());
+
+    // The router keeps its binding, so new mail is held, never pasted.
+    assert!(rig.router.as_ref().unwrap().binding_for(0).is_some());
+    rig.router
+        .as_mut()
+        .unwrap()
+        .send(&mut rig.mailroom, "Room X", 0, "after-death", None)
+        .unwrap();
+    pump_router_until(
+        rig.router.as_mut().unwrap(),
+        &mut rig.mailroom,
+        |mailroom| mailroom.summary().contains("after-death"),
+        "held mail after server death",
+    );
+    assert!(
+        !fake.state.received.lock().unwrap().iter().any(|(_, text)| text.contains("after-death")),
+        "nothing is sent to the dead server"
+    );
+    assert!(
+        rig.mailroom.summary().contains("HELD")
+            || rig.mailroom.summary().contains("QUEUED")
+            || rig.mailroom.summary().contains("after-death"),
+        "mail is held, not lost: {}",
+        rig.mailroom.summary()
+    );
+}
+
+/// Ctrl+R on a dead owned-OpenCode room starts a new server and session
+/// through the launch path, rebinds under a new generation, and the held
+/// mail plus the intro are each delivered exactly once.
+#[cfg(all(test, unix))]
+#[test]
+fn ctrl_r_revives_dead_opencode_room_with_new_server_and_delivers_held_mail_once() {
+    use crate::native_launch::{self, tests::fake_room};
+    use crate::native_route::{Backend, NativeRouter, RoomEntry};
+    use std::time::{Duration, Instant};
+
+    let _state = crate::pane::session_state::StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let fake = fake_room(root.path(), "revive-ctrlr", "v2.2.5");
+    let size = PtySize {
+        rows: 6,
+        cols: 60,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let spec = report_test_spec(&fake.program, cwd.path(), "Opencode \u{b7} 1", true);
+    let launch_generation =
+        native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+            .next()
+            .unwrap();
+    let native = native_launch::start(native_launch::NativeLaunch::direct(
+        fake.program.as_os_str(),
+        cwd.path(),
+        "1.1".to_owned(),
+        launch_generation,
+        &[],
+    ))
+    .unwrap();
+    let router = NativeRouter::start(
+        root.path().join("outbox.json"),
+        vec![RoomEntry {
+            index: 0,
+            title: spec.title.clone(),
+            binding: native.binding().clone(),
+            backend: Backend::OpenCode(native.server()),
+        }],
+    )
+    .unwrap();
+    let pane =
+        Pane::spawn_with_native(spec, size, pane::GuestEnvironment::new([]), Some(native)).unwrap();
+    let mut rig = ReportDispatch::new(vec![pane], Some(router));
+    let old = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+
+    // Kill only the wrapper; the fake endpoint stays up so the revived
+    // server can announce on the same address the harness bakes in.
+    let wrapper = rig
+        .router
+        .as_ref()
+        .unwrap()
+        .server_for(0)
+        .unwrap()
+        .wrapper_pid()
+        .unwrap();
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &wrapper.to_string()])
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while native_launch::tests::process_alive(&wrapper.to_string())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+        let _ = rig.panes[0].poll_opencode_server_exit();
+    }
+    detect_dead_opencode_servers(&mut rig.panes, rig.router.as_mut(), &mut rig.notice);
+    assert!(!rig.panes[0].is_online());
+
+    // Mail sent while offline is held for the lane.
+    rig.router
+        .as_mut()
+        .unwrap()
+        .send(&mut rig.mailroom, "Room X", 0, "held-while-offline", None)
+        .unwrap();
+
+    revive_opencode_room(
+        0,
+        size,
+        &mut rig.panes,
+        rig.router.as_mut(),
+        &mut rig.gates,
+        &mut rig.last_output,
+        &mut rig.spawned_at,
+        &mut rig.pulses,
+        &rig.environments,
+        Instant::now(),
+    )
+    .expect("revive starts a new server");
+    assert!(rig.panes[0].is_online());
+    let new = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    assert_eq!(new.room, old.room, "lane is kept so held mail is adopted");
+    assert!(new.generation > old.generation, "new generation");
+    assert_ne!(new.session, old.session, "new session");
+
+    // Reintroduce like a clear does.
+    let title = rig.panes[0].title().to_owned();
+    let (text, severity) = reintroduce_native_room(
+        &title,
+        rig.router.as_mut().unwrap(),
+        &mut rig.mailroom,
+        0,
+        "INTRO-revive-marker",
+    );
+    assert_eq!(severity, NoticeSeverity::Info, "{text}");
+
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        rig.router
+            .as_mut()
+            .unwrap()
+            .tick(Instant::now(), &mut rig.mailroom, false, false);
+        {
+            let received = fake.state.received.lock().unwrap();
+            if received.iter().any(|(_, text)| text.contains("held-while-offline"))
+                && received.iter().any(|(_, text)| text.contains("INTRO-revive-marker"))
+            {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < end,
+            "timed out waiting for held mail and intro: {}",
+            rig.mailroom.summary()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let received = fake.state.received.lock().unwrap().clone();
+    let held = received.iter().filter(|(_, text)| text.contains("held-while-offline")).count();
+    let intro = received.iter().filter(|(_, text)| text.contains("INTRO-revive-marker")).count();
+    assert_eq!(held, 1, "held mail delivered once: {received:?}");
+    assert_eq!(intro, 1, "intro delivered once: {received:?}");
+    assert!(rig.mailroom.summary().contains("ACCEPTED"), "{}", rig.mailroom.summary());
+}
+
+/// A revive whose new server cannot start leaves the room offline with its
+/// reason instead of inventing a session.
+#[cfg(all(test, unix))]
+#[test]
+fn failed_revive_leaves_dead_opencode_room_offline_with_reason() {
+    use crate::native_launch::{self, tests::fake_room};
+    use crate::native_route::{Backend, NativeRouter, RoomEntry};
+    use std::time::{Duration, Instant};
+
+    let _state = crate::pane::session_state::StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let fake = fake_room(root.path(), "revive-fail", "v2.2.5");
+    let size = PtySize {
+        rows: 6,
+        cols: 60,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let spec = report_test_spec(&fake.program, cwd.path(), "Opencode \u{b7} 1", true);
+    let launch_generation =
+        native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+            .next()
+            .unwrap();
+    let native = native_launch::start(native_launch::NativeLaunch::direct(
+        fake.program.as_os_str(),
+        cwd.path(),
+        "1.1".to_owned(),
+        launch_generation,
+        &[],
+    ))
+    .unwrap();
+    let old = native.binding().clone();
+    let router = NativeRouter::start(
+        root.path().join("outbox.json"),
+        vec![RoomEntry {
+            index: 0,
+            title: spec.title.clone(),
+            binding: native.binding().clone(),
+            backend: Backend::OpenCode(native.server()),
+        }],
+    )
+    .unwrap();
+    let pane =
+        Pane::spawn_with_native(spec, size, pane::GuestEnvironment::new([]), Some(native)).unwrap();
+    let mut rig = ReportDispatch::new(vec![pane], Some(router));
+
+    let wrapper = rig.router.as_ref().unwrap().server_for(0).unwrap().wrapper_pid().unwrap();
+    let _ = std::process::Command::new("kill").args(["-TERM", &wrapper.to_string()]).status();
+    fake.shutdown();
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = rig.panes[0].poll_opencode_server_exit();
+    detect_dead_opencode_servers(&mut rig.panes, rig.router.as_mut(), &mut rig.notice);
+    assert!(!rig.panes[0].is_online());
+
+    // Remove the server program so the new launch cannot start.
+    std::fs::remove_file(&fake.program).unwrap();
+    let error = revive_opencode_room(
+        0,
+        size,
+        &mut rig.panes,
+        rig.router.as_mut(),
+        &mut rig.gates,
+        &mut rig.last_output,
+        &mut rig.spawned_at,
+        &mut rig.pulses,
+        &rig.environments,
+        Instant::now(),
+    )
+    .unwrap_err();
+    assert!(!rig.panes[0].is_online(), "failed revive stays offline");
+    assert_eq!(
+        rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
+        old.session,
+        "binding is unchanged"
+    );
+    assert!(!error.to_string().is_empty(), "a reason is reported");
+}
+
+/// A live owned-OpenCode room is never revived: the call fails and the
+/// server, session and generation are untouched.
+#[cfg(all(test, unix))]
+#[test]
+fn live_opencode_room_is_never_revived() {
+    use crate::native_launch::{self, tests::fake_room};
+    use crate::native_route::{Backend, NativeRouter, RoomEntry};
+    use std::time::Instant;
+
+    let _state = crate::pane::session_state::StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let fake = fake_room(root.path(), "revive-live", "v2.2.5");
+    let size = PtySize {
+        rows: 6,
+        cols: 60,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let spec = report_test_spec(&fake.program, cwd.path(), "Opencode \u{b7} 1", true);
+    let launch_generation =
+        native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+            .next()
+            .unwrap();
+    let native = native_launch::start(native_launch::NativeLaunch::direct(
+        fake.program.as_os_str(),
+        cwd.path(),
+        "1.1".to_owned(),
+        launch_generation,
+        &[],
+    ))
+    .unwrap();
+    let router = NativeRouter::start(
+        root.path().join("outbox.json"),
+        vec![RoomEntry {
+            index: 0,
+            title: spec.title.clone(),
+            binding: native.binding().clone(),
+            backend: Backend::OpenCode(native.server()),
+        }],
+    )
+    .unwrap();
+    let pane =
+        Pane::spawn_with_native(spec, size, pane::GuestEnvironment::new([]), Some(native)).unwrap();
+    let mut rig = ReportDispatch::new(vec![pane], Some(router));
+    let old = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+
+    let error = revive_opencode_room(
+        0,
+        size,
+        &mut rig.panes,
+        rig.router.as_mut(),
+        &mut rig.gates,
+        &mut rig.last_output,
+        &mut rig.spawned_at,
+        &mut rig.pulses,
+        &rig.environments,
+        Instant::now(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("still online"), "{error}");
+    assert!(rig.panes[0].is_online());
+    let kept = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    assert_eq!(kept.session, old.session);
+    assert_eq!(kept.generation, old.generation);
+    fake.shutdown();
+}
