@@ -3,7 +3,9 @@ use std::{
     ffi::{OsStr, OsString},
     io,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command},
+    thread,
+    time::{Duration, Instant},
 };
 
 use portable_pty::CommandBuilder;
@@ -19,6 +21,32 @@ const LAUNCH_PROGRAM: &str = "CROWDED_INTERNAL_LAUNCH_PROGRAM";
 const LAUNCH_ARG_COUNT: &str = "CROWDED_INTERNAL_LAUNCH_ARG_COUNT";
 #[cfg(windows)]
 const LAUNCH_ARG_PREFIX: &str = "CROWDED_INTERNAL_LAUNCH_ARG_";
+
+/// ETXTBSY on Linux and macOS.
+#[cfg(unix)]
+const TEXT_FILE_BUSY: i32 = 26;
+const TEXT_FILE_BUSY_PATIENCE: Duration = Duration::from_secs(2);
+
+/// Spawns `command`, retrying while the program is briefly open for writing.
+///
+/// A sibling thread that forks while an installer or updater still has the
+/// program open for writing hands the child a copy of that descriptor until the
+/// child execs, so the kernel refuses to run the program ("Text file busy")
+/// for a few milliseconds. Any other error is returned at once.
+pub(crate) fn spawn_retrying_text_busy(command: &mut Command) -> io::Result<Child> {
+    let deadline = Instant::now() + TEXT_FILE_BUSY_PATIENCE;
+    loop {
+        match command.spawn() {
+            #[cfg(unix)]
+            Err(error)
+                if error.raw_os_error() == Some(TEXT_FILE_BUSY) && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ResolvedCommand {
@@ -469,6 +497,40 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    // macOS does not refuse to exec a file that is open for writing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_program_held_open_for_writing_is_spawned_once_it_is_released() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("stub");
+        fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        // The writable descriptor a forked sibling would be holding.
+        let holder = fs::OpenOptions::new().append(true).open(&program).unwrap();
+        let busy = Command::new(&program).spawn().err().expect("must be busy");
+        assert_eq!(busy.raw_os_error(), Some(TEXT_FILE_BUSY), "{busy}");
+
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            drop(holder);
+        });
+        let mut child = spawn_retrying_text_busy(&mut Command::new(&program)).unwrap();
+        assert!(child.wait().unwrap().success());
+        releaser.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_program_is_reported_without_waiting() {
+        let started = Instant::now();
+        let error = spawn_retrying_text_busy(&mut Command::new("/nonexistent/crowded-stub"))
+            .err()
+            .expect("must fail");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(started.elapsed() < TEXT_FILE_BUSY_PATIENCE);
+    }
 
     fn test_directory() -> PathBuf {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);

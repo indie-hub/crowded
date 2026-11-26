@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::command::{ProcessTree, ResolvedCommand};
+use crate::command::{ProcessTree, ResolvedCommand, spawn_retrying_text_busy};
 use crate::native_binding::{LaunchBinding, OwnershipEvidence};
 use crate::native_outbox::Binding;
 
@@ -790,11 +790,12 @@ impl Server {
         for (key, value) in variables {
             command.env(key, value);
         }
-        let mut child = command
+        command
             .env("OPENCODE_PASSWORD", &password)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .spawn()?;
+            ;
+        let mut child = spawn_retrying_text_busy(&mut command)?;
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {

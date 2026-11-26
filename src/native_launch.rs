@@ -18,7 +18,7 @@ use std::{
 };
 
 use crate::{
-    command::ResolvedCommand,
+    command::{ResolvedCommand, spawn_retrying_text_busy},
     native_outbox::Binding,
     opencode_native::{Handoff, Server},
     pane::session_state::{create_private_directory, private_file, refuse_symlink},
@@ -440,11 +440,12 @@ fn check_version(
     for (key, value) in variables {
         command.env(key, value);
     }
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()?;
+        ;
+    let mut child = spawn_retrying_text_busy(&mut command)?;
     let deadline = Instant::now() + timeout;
     loop {
         if child.try_wait()?.is_some() {

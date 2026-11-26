@@ -20,7 +20,7 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    command::ResolvedCommand,
+    command::{ResolvedCommand, spawn_retrying_text_busy},
     native_outbox::{Adapter, AdapterResult, Binding, Message},
 };
 
@@ -392,7 +392,7 @@ pub(crate) fn deliver(room: &Room, text: &str, timeout: Duration) -> Delivery {
         Ok(process) => process,
         Err(_) => return Delivery::NotSent,
     };
-    let mut child = match process.spawn() {
+    let mut child = match spawn_retrying_text_busy(&mut process) {
         Ok(child) => child,
         Err(_) => return Delivery::NotSent,
     };
@@ -457,8 +457,7 @@ pub(crate) fn start_session(
 ) -> Result<String, String> {
     let mut process = command_for(program, arguments, cwd, variables)
         .map_err(|error| format!("could not start `codex exec`: {error}"))?;
-    let mut child = process
-        .spawn()
+    let mut child = spawn_retrying_text_busy(&mut process)
         .map_err(|error| format!("could not start `codex exec`: {error}"))?;
     let (stdout, stderr) = match (child.stdout.take(), child.stderr.take()) {
         (Some(stdout), Some(stderr)) => (head(stdout), drain(stderr)),
