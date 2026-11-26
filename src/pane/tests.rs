@@ -2054,10 +2054,8 @@ fn a_native_codex_pane_never_writes_automated_text_to_its_terminal() {
 
 #[cfg(unix)]
 fn codex_stub_for_pane(root: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = root.join(name);
-    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::command::write_warmed_stub(&path, body);
     path
 }
 
@@ -5304,6 +5302,17 @@ fn headroom_startup_finishes(
     wait: Duration,
     deadline: Duration,
 ) -> bool {
+    headroom_startup_waits(codex, wait, deadline).is_some()
+}
+
+/// Runs the startup loop with the Windows Headroom lane on. `None` when it did
+/// not finish within `wait`, otherwise the rooms the lane waited on, in order.
+#[cfg(unix)]
+fn headroom_startup_waits(
+    codex: Vec<Option<CodexMint>>,
+    wait: Duration,
+    deadline: Duration,
+) -> Option<Vec<usize>> {
     let cwd = tempfile::tempdir().unwrap();
     let (_directory, path, _ext) = headroom_path();
     let specs: Vec<RoomSpec> = (0..codex.len())
@@ -5338,9 +5347,10 @@ fn headroom_startup_finishes(
             deadline,
             &mut crate::app::Notices::default(),
         );
-        let _ = done.send(result.is_ok());
+        let waits = crate::app::HEADROOM_WAITS.with(|waits| waits.take());
+        let _ = done.send(result.is_ok().then_some(waits));
     });
-    finished.recv_timeout(wait) == Ok(true)
+    finished.recv_timeout(wait).ok().flatten()
 }
 
 #[cfg(unix)]
@@ -5355,9 +5365,13 @@ fn the_headroom_lane_never_waits_on_a_placeholder_room() {
             reused: true,
         }),
     ];
+    // The ordering is asserted directly: no room is ever waited on. The outer
+    // bound only keeps a hung lane from hanging the suite.
+    let waits = headroom_startup_waits(codex, Duration::from_secs(30), Duration::from_millis(5))
+        .expect("the startup loop finished");
     assert!(
-        headroom_startup_finishes(codex, Duration::from_secs(30), Duration::from_millis(5)),
-        "a later Headroom room waited for a room that has no process"
+        waits.is_empty(),
+        "the lane waited on rooms with no process: {waits:?}"
     );
 }
 

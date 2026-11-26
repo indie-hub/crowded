@@ -2894,17 +2894,14 @@ fn a_report_rebinds_only_the_reporting_room() {
     );
     let codex_room = {
         let stub = |thread: &str| {
-            use std::os::unix::fs::PermissionsExt;
             let path = root.path().join(format!("codex-{thread}"));
-            std::fs::write(
-                    &path,
-                    format!(
-                        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nprintf 'Queued message sub_1 for thread %s.\\n' '{thread}'\n",
-                        root.path().join("codex.args").display()
-                    ),
-                )
-                .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            crate::command::write_warmed_stub(
+                &path,
+                &format!(
+                    "printf '%s\\n' \"$@\" >> '{}'\nprintf 'Queued message sub_1 for thread %s.\\n' '{thread}'",
+                    root.path().join("codex.args").display()
+                ),
+            );
             path
         };
         let program = stub("thread-a");
