@@ -1976,6 +1976,18 @@ pub(crate) fn relaunch_opencode_room(
     now: Instant,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let title = panes[index].title().to_owned();
+    // A dead server cannot clear onto a new session on itself: point at the
+    // revive path instead of failing on the first unreachable request.
+    match panes[index].poll_opencode_server_exit() {
+        Ok(true) | Err(_) => {
+            return Err(launch_failure(
+                &title,
+                index + 1,
+                "its owned OpenCode server has exited; press Ctrl+R to revive it",
+            ));
+        }
+        Ok(false) => {}
+    }
     let generation =
         pane::next_generation().map_err(|error| launch_failure(&title, index + 1, error))?;
     // A failed clear changes nothing, so the room keeps its old session and
@@ -2015,6 +2027,120 @@ pub(crate) fn relaunch_opencode_room(
         }
     }
     Ok(abort)
+}
+
+/// Marks rooms whose owned OpenCode server died: reaps the wrapper child,
+/// kills the looping TUI so the room reads offline, and keeps the router
+/// binding so the outbox holds the room's mail instead of pasting it.
+/// One Failure notice per room, naming the room; already-offline rooms are
+/// not reported again. Never touches another room's server.
+pub(crate) fn detect_dead_opencode_servers(
+    panes: &mut [Pane],
+    mut router: Option<&mut NativeRouter>,
+    notice: &mut Notices,
+) {
+    for index in 0..panes.len() {
+        if !panes[index].opencode_native() {
+            continue;
+        }
+        let exited = match panes[index].poll_opencode_server_exit() {
+            Ok(exited) => exited,
+            Err(_) => true,
+        };
+        if !exited || !panes[index].is_online() {
+            continue;
+        }
+        let title = panes[index].title().to_owned();
+        panes[index].cleanup();
+        // Between sessions: new mail is held with a visible reason and is
+        // adopted onto the revived binding, like a clear's pending hold.
+        // A room with no binding has nothing to hold.
+        if let Some(router) = router.as_deref_mut() {
+            // Borrow ends before the push below.
+            let held = router.mark_pending(index);
+            let _ = held;
+        }
+        notice.push(
+            format!(
+                "{title}: its owned OpenCode server exited; the room is offline and its mail is held; press Ctrl+R to revive it"
+            ),
+            NoticeSeverity::Failure,
+        );
+    }
+}
+
+/// Revives one offline owned-OpenCode room on a new server through the same
+/// launch path as startup, then rebinds the router under a new generation
+/// like a clear. Held mail for the room's lane is adopted onto the new
+/// binding and delivered once; the caller reintroduces the house rules like
+/// a clear. A live room is never revived. A failed revive leaves the room
+/// offline on its previous binding with its reason.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn revive_opencode_room(
+    index: usize,
+    size: portable_pty::PtySize,
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    delivery_gates: &mut [DeliveryGate],
+    last_output: &mut [Option<Instant>],
+    spawned_at: &mut [Instant],
+    room_pulses: &mut [Option<PulseSample>],
+    environments: &[pane::GuestEnvironment],
+    now: Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let title = panes[index].title().to_owned();
+    if !panes[index].opencode_native() {
+        return Err(launch_failure(&title, index + 1, "only a room on an owned OpenCode server can be revived this way"));
+    }
+    match panes[index].poll_opencode_server_exit() {
+        Ok(false) if panes[index].is_online() => {
+            return Err(launch_failure(
+                &title,
+                index + 1,
+                "the room is still online; use clear for a new session",
+            ));
+        }
+        Err(error) if panes[index].is_online() => {
+            let _ = error;
+        }
+        _ => {}
+    }
+    let old = panes[index]
+        .opencode_binding()
+        .ok_or_else(|| launch_failure(&title, index + 1, "that room has no owned OpenCode session"))?;
+    let generation =
+        pane::next_generation().map_err(|error| launch_failure(&title, index + 1, error))?;
+    let spec = panes[index].room_spec().clone();
+    let launch = pane::opencode_revive_launch(&spec, &environments[index], old.room.clone(), generation)
+        .map_err(|error| launch_failure(&title, index + 1, error))?;
+    let room = crate::native_launch::begin(launch)
+        .wait(crate::native_launch::LAUNCH_TIMEOUT)
+        .map_err(|error| launch_failure(&title, index + 1, error))?;
+    let server = room.server();
+    let binding = panes[index]
+        .revive_opencode_session(size, room)
+        .map_err(|error| launch_failure(&title, index + 1, error))?;
+    delivery_gates[index] = DeliveryGate::new(false);
+    last_output[index] = None;
+    spawned_at[index] = now;
+    room_pulses[index] = Some(PulseSample::now(PulseState::Starting, None));
+    if let Some(router) = router {
+        router.replace_opencode_server(&binding.room, server.clone());
+        if let Err(error) = router.rebind_room(crate::native_route::RoomEntry {
+            index,
+            title: title.clone(),
+            binding: binding.clone(),
+            backend: crate::native_route::Backend::OpenCode(server),
+        }) {
+            return Err(io::Error::other(format!(
+                "{title}: the room now runs session {} but the router could not follow it ({error}); the mail is held, so run `control {} clear` again",
+                binding.session,
+                index + 1
+            ))
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Revives one room after F5 or an offline Ctrl+R. A native Codex room comes
@@ -2060,6 +2186,20 @@ pub(crate) fn restart_room(
             panes,
             router,
             codex,
+            delivery_gates,
+            last_output,
+            spawned_at,
+            room_pulses,
+            environments,
+            now,
+        );
+    }
+    if panes[index].opencode_native() {
+        return revive_opencode_room(
+            index,
+            size,
+            panes,
+            router,
             delivery_gates,
             last_output,
             spawned_at,
@@ -2137,6 +2277,7 @@ pub(crate) struct LoopState<'a> {
     pub(crate) spawned_at: &'a mut [Instant],
     pub(crate) room_pulses: &'a mut [Option<PulseSample>],
     pub(crate) environments: &'a [pane::GuestEnvironment],
+    pub(crate) mailroom: &'a mut Mailroom,
     pub(crate) notice: &'a mut Notices,
 }
 
@@ -2155,6 +2296,7 @@ pub(crate) fn loop_state<'a>(
     spawned_at: &'a mut [Instant],
     room_pulses: &'a mut [Option<PulseSample>],
     environments: &'a [pane::GuestEnvironment],
+    mailroom: &'a mut Mailroom,
     notice: &'a mut Notices,
 ) -> LoopState<'a> {
     LoopState {
@@ -2169,6 +2311,7 @@ pub(crate) fn loop_state<'a>(
         spawned_at,
         room_pulses,
         environments,
+        mailroom,
         notice,
     }
 }
@@ -2188,6 +2331,7 @@ pub(crate) fn run_rooms_key_event(
         return Ok(true);
     }
     let size = (state.pane_size)(focused)?;
+    let now = Instant::now();
     let result = restart_key(
         *key,
         size,
@@ -2201,9 +2345,23 @@ pub(crate) fn run_rooms_key_event(
         state.room_pulses,
         state.environments,
         state.fuse_size,
-        Instant::now(),
+        now,
     );
+    let restarted = matches!(&result, Some((_, severity)) if *severity == NoticeSeverity::Info);
     if let Some((text, severity)) = result {
+        state.notice.push(text, severity);
+    }
+    // A revived owned-OpenCode room runs a fresh session: reteach the house
+    // rules through the router exactly like a clear does.
+    if restarted
+        && state.panes[focused].opencode_native()
+        && let Some(router) = state.router.as_deref_mut()
+    {
+        let roster = welcome_roster(state.panes, state.room_pulses, now);
+        let message = house_rules(focused + 1, &roster, state.fuse_size);
+        let title = state.panes[focused].title().to_owned();
+        let (text, severity) =
+            reintroduce_native_room(&title, router, state.mailroom, focused, &message);
         state.notice.push(text, severity);
     }
     Ok(false)
@@ -2920,6 +3078,7 @@ where
         notice,
         now,
     )?;
+    detect_dead_opencode_servers(panes, router.as_mut(), notice);
     if let Some(router) = router.as_mut() {
         let notices = tick_native(
             router,
@@ -3720,6 +3879,7 @@ where
         for pane in panes.iter_mut() {
             pane.poll_exit()?;
         }
+        detect_dead_opencode_servers(panes, router.as_mut(), notice);
         // A child reaped here must not leave its room marked live for the next
         // pass, or for a doorbell handled later in this one.
         if let Some(router) = router.as_mut() {
@@ -3875,6 +4035,7 @@ where
                             &mut spawned_at,
                             &mut room_pulses,
                             &environments,
+                            &mut mailroom,
                             &mut notice,
                         ),
                     )? =>

@@ -2413,6 +2413,7 @@ impl IterationHarness {
             &mut self.spawned_at,
             &mut self.pulses,
             &self.environments,
+            &mut self.mailroom,
             &mut self.notice,
         )
     }
@@ -4304,6 +4305,7 @@ fn an_ordinary_key_is_forwarded_to_the_focused_pane_only() {
     let mut pulses = [None, None];
     let environments = [GuestEnvironment::new([]), GuestEnvironment::new([])];
     let mut notice = crate::app::Notices::default();
+    let mut mailroom = crate::mailroom::Mailroom::new(50);
     let mut size = |_index: usize| Ok(small_size());
     let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
     let event = crossterm::event::Event::Key(key);
@@ -4319,6 +4321,7 @@ fn an_ordinary_key_is_forwarded_to_the_focused_pane_only() {
         &mut spawned_at,
         &mut pulses,
         &environments,
+        &mut mailroom,
         &mut notice,
     );
     assert!(crate::app::run_rooms_key_event(&event, &mut state).unwrap());
@@ -4348,6 +4351,7 @@ fn an_online_ctrl_r_is_not_a_restart_and_forwards_0x12() {
     let mut spawned_at = [Instant::now()];
     let mut pulses = [None];
     let environments = [GuestEnvironment::new([])];
+    let mut mailroom = crate::mailroom::Mailroom::new(50);
     let mut context = crate::app::loop_state(
         0,
         100,
@@ -4360,6 +4364,7 @@ fn an_online_ctrl_r_is_not_a_restart_and_forwards_0x12() {
         &mut spawned_at,
         &mut pulses,
         &environments,
+        &mut mailroom,
         &mut notice,
     );
     assert!(crate::app::run_rooms_key_event(&ctrl_r, &mut context).unwrap());
