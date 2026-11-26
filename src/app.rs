@@ -2039,34 +2039,89 @@ pub(crate) fn detect_dead_opencode_servers(
     mut router: Option<&mut NativeRouter>,
     notice: &mut Notices,
 ) {
-    for index in 0..panes.len() {
-        if !panes[index].opencode_native() {
+    for (index, pane) in panes.iter_mut().enumerate() {
+        if !pane.opencode_native() {
             continue;
         }
-        let exited = match panes[index].poll_opencode_server_exit() {
-            Ok(exited) => exited,
-            Err(_) => true,
-        };
-        if !exited || !panes[index].is_online() {
+        // A failed poll fails safe to dead: a broken server is never treated
+        // as live.
+        let exited = pane.poll_opencode_server_exit().unwrap_or(true);
+        if !exited {
             continue;
         }
-        let title = panes[index].title().to_owned();
-        panes[index].cleanup();
+        // Already offline: retry a pending hold an earlier pass could not
+        // mark, so later mail is still adopted on revive. Silent: the room
+        // already has its notice.
+        if !pane.is_online() {
+            if let Some(router) = router.as_deref_mut()
+                && !router.is_pending(index)
+                && router.binding_for(index).is_some()
+            {
+                let _ = router.mark_pending(index);
+            }
+            continue;
+        }
+        let title = pane.title().to_owned();
+        pane.cleanup();
         // Between sessions: new mail is held with a visible reason and is
-        // adopted onto the revived binding, like a clear's pending hold.
-        // A room with no binding has nothing to hold.
-        if let Some(router) = router.as_deref_mut() {
-            // Borrow ends before the push below.
-            let held = router.mark_pending(index);
-            let _ = held;
-        }
-        notice.push(
-            format!(
-                "{title}: its owned OpenCode server exited; the room is offline and its mail is held; press Ctrl+R to revive it"
+        // adopted onto the revived binding, like a clear's pending hold. A
+        // failed mark is surfaced honestly instead of claiming a hold the
+        // outbox never took: the room stays offline either way, but mail may
+        // then follow the old binding, and later passes retry the mark above.
+        let mark = match router.as_deref_mut() {
+            Some(router) => router
+                .mark_pending(index)
+                .err()
+                .map(|error| error.to_string()),
+            None => Some("native delivery is unavailable".to_owned()),
+        };
+        match mark {
+            None => notice.push(
+                format!(
+                    "{title}: its owned OpenCode server exited; the room is offline and its mail is held; press Ctrl+R to revive it"
+                ),
+                NoticeSeverity::Failure,
             ),
-            NoticeSeverity::Failure,
-        );
+            Some(error) => notice.push(
+                format!(
+                    "{title}: its owned OpenCode server exited; the room is offline but its pending hold could not be marked ({error}), so mail may follow the old binding; press Ctrl+R to revive it"
+                ),
+                NoticeSeverity::Failure,
+            ),
+        }
     }
+}
+
+/// Moves one lane onto its revived server: swaps the lane's server, then
+/// rebinds under the new generation like a clear. Fails before touching the
+/// pane: the caller leaves the room offline on its previous binding, and the
+/// outbox keeps the lane's mail held. Only the revived server's recorded
+/// processes are ever affected, via its own drop on failure.
+/// Restores the previous server in the lane map when the rebind fails.
+pub(crate) fn rebind_revived_room(
+    router: &mut NativeRouter,
+    index: usize,
+    title: &str,
+    binding: &crate::native_outbox::Binding,
+    server: &std::sync::Arc<crate::opencode_native::Server>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let previous = router.server_for(index);
+    router.replace_opencode_server(&binding.room, std::sync::Arc::clone(server));
+    if let Err(error) = router.rebind_room(crate::native_route::RoomEntry {
+        index,
+        title: title.to_owned(),
+        binding: binding.clone(),
+        backend: crate::native_route::Backend::OpenCode(std::sync::Arc::clone(server)),
+    }) {
+        if let Some(previous) = previous {
+            router.replace_opencode_server(&binding.room, previous);
+        }
+        return Err(io::Error::other(format!(
+            "{title}: the revived server could not be bound ({error}); the room stays offline and its mail stays held"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// Revives one offline owned-OpenCode room on a new server through the same
@@ -2090,7 +2145,11 @@ pub(crate) fn revive_opencode_room(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let title = panes[index].title().to_owned();
     if !panes[index].opencode_native() {
-        return Err(launch_failure(&title, index + 1, "only a room on an owned OpenCode server can be revived this way"));
+        return Err(launch_failure(
+            &title,
+            index + 1,
+            "only a room on an owned OpenCode server can be revived this way",
+        ));
     }
     match panes[index].poll_opencode_server_exit() {
         Ok(false) if panes[index].is_online() => {
@@ -2105,41 +2164,34 @@ pub(crate) fn revive_opencode_room(
         }
         _ => {}
     }
-    let old = panes[index]
-        .opencode_binding()
-        .ok_or_else(|| launch_failure(&title, index + 1, "that room has no owned OpenCode session"))?;
+    let old = panes[index].opencode_binding().ok_or_else(|| {
+        launch_failure(&title, index + 1, "that room has no owned OpenCode session")
+    })?;
     let generation =
         pane::next_generation().map_err(|error| launch_failure(&title, index + 1, error))?;
     let spec = panes[index].room_spec().clone();
-    let launch = pane::opencode_revive_launch(&spec, &environments[index], old.room.clone(), generation)
-        .map_err(|error| launch_failure(&title, index + 1, error))?;
+    let launch =
+        pane::opencode_revive_launch(&spec, &environments[index], old.room.clone(), generation)
+            .map_err(|error| launch_failure(&title, index + 1, error))?;
     let room = crate::native_launch::begin(launch)
         .wait(crate::native_launch::LAUNCH_TIMEOUT)
         .map_err(|error| launch_failure(&title, index + 1, error))?;
     let server = room.server();
-    let binding = panes[index]
+    let binding = room.binding().clone();
+    // Bind the router before touching the pane: a failed rebind drops the
+    // new server and leaves the room offline on its previous binding with
+    // its mail still held, instead of stranding a live terminal off-router.
+    if let Some(router) = router {
+        rebind_revived_room(router, index, &title, &binding, &server)
+            .map_err(|error| launch_failure(&title, index + 1, error))?;
+    }
+    panes[index]
         .revive_opencode_session(size, room)
         .map_err(|error| launch_failure(&title, index + 1, error))?;
     delivery_gates[index] = DeliveryGate::new(false);
     last_output[index] = None;
     spawned_at[index] = now;
     room_pulses[index] = Some(PulseSample::now(PulseState::Starting, None));
-    if let Some(router) = router {
-        router.replace_opencode_server(&binding.room, server.clone());
-        if let Err(error) = router.rebind_room(crate::native_route::RoomEntry {
-            index,
-            title: title.clone(),
-            binding: binding.clone(),
-            backend: crate::native_route::Backend::OpenCode(server),
-        }) {
-            return Err(io::Error::other(format!(
-                "{title}: the room now runs session {} but the router could not follow it ({error}); the mail is held, so run `control {} clear` again",
-                binding.session,
-                index + 1
-            ))
-            .into());
-        }
-    }
     Ok(())
 }
 
