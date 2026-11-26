@@ -570,13 +570,9 @@ fn headroom_lane_holds(windows: bool, spec_uses_headroom: bool, prior_headroom: 
 /// lane shares the same ready boundary as intro delivery.
 pub(crate) const HEADROOM_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[cfg(test)]
-thread_local! {
-    /// Every room the Headroom lane waited on, on this thread only, so a test
-    /// can assert which rooms were waited on instead of timing the wait.
-    pub(crate) static HEADROOM_WAITS: std::cell::RefCell<Vec<usize>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
+/// Test seam: records a room the Headroom lane waits on.
+#[cfg(not(test))]
+fn note_headroom_wait(_room: usize) {}
 
 pub(crate) fn wait_for_headroom_ready(
     pane: &mut Pane,
@@ -1698,8 +1694,7 @@ pub(crate) fn start_rooms(
         let headroom = pane::spec_uses_headroom(&spec);
         if headroom_lane_holds(serialize_headroom, headroom, prior_headroom.is_some()) {
             if let Some(prior) = prior_headroom {
-                #[cfg(test)]
-                HEADROOM_WAITS.with(|waits| waits.borrow_mut().push(prior));
+                note_headroom_wait(prior);
                 let timed_out = wait_for_headroom_ready(
                     &mut panes[prior],
                     &mut last_output[prior],
@@ -4298,3 +4293,16 @@ pub(crate) use tests::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+thread_local! {
+    /// Every room the Headroom lane waited on, on this thread only, so a test
+    /// can assert which rooms were waited on instead of timing the wait.
+    pub(crate) static HEADROOM_WAITS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn note_headroom_wait(room: usize) {
+    HEADROOM_WAITS.with(|waits| waits.borrow_mut().push(room));
+}
