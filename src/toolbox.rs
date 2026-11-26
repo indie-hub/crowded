@@ -1,7 +1,7 @@
 //! Materialize the shared toolbox into each guest's native project config.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -546,7 +546,7 @@ fn remove_managed_json(
                 continue;
             };
             match managed_hook_position(handlers, &owned, None) {
-                HookMatch::Found(position) => {
+                HookMatch::Found { position, .. } => {
                     handlers.remove(position);
                 }
                 HookMatch::Missing => {
@@ -586,9 +586,11 @@ fn remove_managed_json(
 }
 
 /// Which recorded hook a configured handler refers to. `Missing` means the hook
-/// is already gone, not that the file changed in an unexpected way.
+/// is already gone, not that the file changed in an unexpected way. `owned`
+/// means the match came from Crowded's env prefix, so only the commands
+/// Crowded wrote are removed from that handler.
 pub(crate) enum HookMatch {
-    Found(usize),
+    Found { position: usize, owned: bool },
     Missing,
     Ambiguous,
 }
@@ -602,62 +604,101 @@ pub(crate) struct HookOwners<'a> {
 }
 
 /// Finds a recorded hook in a configured handler list. An exact entry wins.
-/// Otherwise a handler is owned only when it carries Crowded's env prefix and
-/// runs the same script; more than one such handler is ambiguous.
+/// Otherwise a handler is owned when it carries Crowded's env prefix for a
+/// recorded script; more than one such handler is ambiguous.
 pub(crate) fn managed_hook_position(
     handlers: &[Value],
     recorded: &Value,
     owners: Option<&HookOwners<'_>>,
 ) -> HookMatch {
     if let Some(position) = handlers.iter().position(|handler| handler == recorded) {
-        return HookMatch::Found(position);
+        return HookMatch::Found {
+            position,
+            owned: false,
+        };
     }
     let Some(owners) = owners else {
         return HookMatch::Missing;
     };
-    let Some(recorded_script) = owned_hook_script(recorded, owners) else {
+    let recorded_scripts = owned_hook_scripts(recorded, owners);
+    if recorded_scripts.is_empty() {
         return HookMatch::Missing;
-    };
+    }
     let candidates: Vec<usize> = handlers
         .iter()
         .enumerate()
-        .filter(|(_, handler)| {
-            owned_hook_script(handler, owners).as_ref() == Some(&recorded_script)
-        })
+        .filter(|(_, handler)| !owned_hook_scripts(handler, owners).is_disjoint(&recorded_scripts))
         .map(|(position, _)| position)
         .collect();
     match candidates.as_slice() {
         [] => HookMatch::Missing,
-        [position] => HookMatch::Found(*position),
+        [position] => HookMatch::Found {
+            position: *position,
+            owned: true,
+        },
         _ => HookMatch::Ambiguous,
     }
 }
 
-fn owned_hook_script(
-    value: &Value,
+/// Removes the commands Crowded wrote from a handler that matched by owner
+/// fallback and keeps every user command. Returns true when no command remains
+/// and the caller should remove the entry.
+pub(crate) fn strip_owned_hook_commands(
+    entry: &mut Value,
+    recorded: &Value,
     owners: &HookOwners<'_>,
-) -> Option<std::collections::BTreeSet<String>> {
+) -> bool {
+    let recorded_scripts = owned_hook_scripts(recorded, owners);
+    if recorded_scripts.is_empty() {
+        return false;
+    }
+    let command_prefix = normalize_separators(owners.command_prefix);
+    let command_windows_prefix = normalize_separators(owners.command_windows_prefix);
+    let root = normalize_separators(owners.root);
+    prune_owned_commands(
+        entry,
+        &recorded_scripts,
+        &command_prefix,
+        &command_windows_prefix,
+        &root,
+    );
+    !has_hook_command(entry)
+}
+
+fn owned_hook_scripts(value: &Value, owners: &HookOwners<'_>) -> BTreeSet<String> {
     // Windows accepts both separators, and the recorded prefix and the prefix
     // recomputed at disable time can spell the same path differently. Compare
     // them in one spelling; the prefix is still the full root and data dir.
     let command_prefix = normalize_separators(owners.command_prefix);
     let command_windows_prefix = normalize_separators(owners.command_windows_prefix);
     let root = normalize_separators(owners.root);
-    let mut scripts = std::collections::BTreeSet::new();
-    let mut owned = false;
+    let mut scripts = BTreeSet::new();
     collect_owned_hook_scripts(
         value,
         &command_prefix,
         &command_windows_prefix,
         &root,
-        &mut owned,
         &mut scripts,
     );
-    owned.then_some(scripts)
+    scripts
 }
 
 fn normalize_separators(value: &str) -> String {
     value.replace('\\', "/")
+}
+
+fn is_owned_hook_command(
+    command: &str,
+    recorded_scripts: &BTreeSet<String>,
+    command_prefix: &str,
+    command_windows_prefix: &str,
+    root: &str,
+) -> bool {
+    let command = normalize_separators(command);
+    command
+        .strip_prefix(command_prefix)
+        .or_else(|| command.strip_prefix(command_windows_prefix))
+        .is_some_and(|remainder| recorded_scripts.contains(&normalize_hook_script(remainder, root)))
 }
 
 fn collect_owned_hook_scripts(
@@ -665,8 +706,7 @@ fn collect_owned_hook_scripts(
     command_prefix: &str,
     command_windows_prefix: &str,
     root: &str,
-    owned: &mut bool,
-    scripts: &mut std::collections::BTreeSet<String>,
+    scripts: &mut BTreeSet<String>,
 ) {
     match value {
         Value::Array(values) => {
@@ -676,7 +716,6 @@ fn collect_owned_hook_scripts(
                     command_prefix,
                     command_windows_prefix,
                     root,
-                    owned,
                     scripts,
                 );
             }
@@ -687,13 +726,12 @@ fn collect_owned_hook_scripts(
                     continue;
                 };
                 let command = normalize_separators(command);
-                let remainder = command
+                if let Some(remainder) = command
                     .strip_prefix(command_prefix)
-                    .or_else(|| command.strip_prefix(command_windows_prefix));
-                if remainder.is_some() {
-                    *owned = true;
+                    .or_else(|| command.strip_prefix(command_windows_prefix))
+                {
+                    scripts.insert(normalize_hook_script(remainder, root));
                 }
-                scripts.insert(normalize_hook_script(remainder.unwrap_or(&command), root));
             }
             for value in object.values() {
                 collect_owned_hook_scripts(
@@ -701,12 +739,82 @@ fn collect_owned_hook_scripts(
                     command_prefix,
                     command_windows_prefix,
                     root,
-                    owned,
                     scripts,
                 );
             }
         }
         _ => {}
+    }
+}
+
+fn prune_owned_commands(
+    value: &mut Value,
+    recorded_scripts: &BTreeSet<String>,
+    command_prefix: &str,
+    command_windows_prefix: &str,
+    root: &str,
+) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                prune_owned_commands(
+                    value,
+                    recorded_scripts,
+                    command_prefix,
+                    command_windows_prefix,
+                    root,
+                );
+            }
+        }
+        Value::Object(object) => {
+            for field in ["command", "commandWindows"] {
+                let owned = object
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| {
+                        is_owned_hook_command(
+                            command,
+                            recorded_scripts,
+                            command_prefix,
+                            command_windows_prefix,
+                            root,
+                        )
+                    });
+                if owned {
+                    object.remove(field);
+                }
+            }
+            for (key, value) in object.iter_mut() {
+                prune_owned_commands(
+                    value,
+                    recorded_scripts,
+                    command_prefix,
+                    command_windows_prefix,
+                    root,
+                );
+                if key == "hooks"
+                    && let Value::Array(handlers) = value
+                {
+                    handlers.retain(has_hook_command);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn has_hook_command(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(has_hook_command),
+        Value::Object(object) => {
+            ["command", "commandWindows"].iter().any(|field| {
+                object
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| !command.is_empty())
+            }) || object.values().any(has_hook_command)
+        }
+        _ => false,
     }
 }
 
@@ -2206,7 +2314,10 @@ export const CrowdedPulse = async () => {
 
         assert!(matches!(
             managed_hook_position(&[rewritten], &recorded, Some(&owners)),
-            HookMatch::Found(0)
+            HookMatch::Found {
+                position: 0,
+                owned: true
+            }
         ));
     }
 

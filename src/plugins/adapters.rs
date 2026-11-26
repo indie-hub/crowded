@@ -17,7 +17,9 @@ use std::os::windows::fs::symlink_file as symlink;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::toolbox::{HookMatch, HookOwners, managed_hook_position, remove_empty_directory};
+use crate::toolbox::{
+    HookMatch, HookOwners, managed_hook_position, remove_empty_directory, strip_owned_hook_commands,
+};
 
 use super::{
     INSTALLS_DIRECTORY, NativeHooks, NativePluginManifest, invalid_data, invalid_input,
@@ -635,8 +637,19 @@ fn prepare_hook_disable(root: &Path, name: &str, hooks: &AdapterHooks) -> io::Re
         };
         for removal in removals {
             match managed_hook_position(handlers, removal, Some(&owners)) {
-                HookMatch::Found(position) => {
+                HookMatch::Found {
+                    position,
+                    owned: false,
+                } => {
                     handlers.remove(position);
+                }
+                HookMatch::Found {
+                    position,
+                    owned: true,
+                } => {
+                    if strip_owned_hook_commands(&mut handlers[position], removal, &owners) {
+                        handlers.remove(position);
+                    }
                 }
                 HookMatch::Missing => {
                     println!(
@@ -988,6 +1001,44 @@ mod tests {
 
         let generated = update.generated.as_deref().unwrap();
         assert!(generated.contains("\"keep\""));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disable_keeps_user_commands_in_a_mixed_handler() {
+        let root = fixture_root();
+        let entry = adapted_entry(&root, "activate.js");
+        let plugin_root = root.join(".crowded/plugins/example");
+        let user_same_script = format!("node \"{}/hooks/activate.js\"", plugin_root.display());
+        let user_other_script = format!("node \"{}/hooks/other.js\"", plugin_root.display());
+        let mut mixed = entry.clone();
+        mixed["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type": "command", "command": user_same_script}));
+        mixed["hooks"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type": "command", "command": user_other_script}));
+        write_hooks(
+            &root,
+            &serde_json::json!({"hooks": {"SessionStart": [mixed]}}),
+        );
+        let hooks = recorded(".claude/settings.local.json", &[("SessionStart", entry)]);
+
+        let update = prepare_hook_disable(&root, "example", &hooks).unwrap();
+
+        let generated: Value = serde_json::from_str(update.generated.as_deref().unwrap()).unwrap();
+        let remaining = generated["hooks"]["SessionStart"][0]["hooks"]
+            .as_array()
+            .expect("the mixed handler keeps its user commands");
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0]["command"], user_same_script);
+        assert_eq!(remaining[1]["command"], user_other_script);
+        assert!(
+            !generated.to_string().contains("CLAUDE_PLUGIN_ROOT="),
+            "the owned command is removed"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
