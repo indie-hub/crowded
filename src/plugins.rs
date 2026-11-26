@@ -394,12 +394,8 @@ fn list(root: &Path) -> io::Result<Vec<InstallRecord>> {
     Ok(installed)
 }
 
-fn opencode_load_lines(
-    name: &str,
-    installed: &Path,
-    declared: &[String],
-) -> io::Result<Vec<String>> {
-    let load = opencode_load(installed)?;
+fn opencode_load_lines(root: &Path, name: &str, declared: &[String]) -> io::Result<Vec<String>> {
+    let load = opencode_load(root, name, declared)?;
     let mut lines = Vec::new();
     if load.native {
         lines.push(format!("opencode {name}: native package"));
@@ -416,10 +412,7 @@ fn opencode_load_lines(
             load.support.join(", ")
         ));
     }
-    if !load.native
-        && load.entries.is_empty()
-        && !declared.iter().any(|package| package_name(package) == name)
-    {
+    if !load.native && load.entries.is_empty() {
         lines.push(format!("OpenCode will not load {name}: no .js/.ts entry"));
     }
     Ok(lines)
@@ -430,8 +423,7 @@ pub(crate) fn opencode_notices(root: &Path) -> io::Result<Vec<String>> {
     let installed = list(root)?;
     let declared = declared_opencode_packages(root);
     for plugin in &installed {
-        let directory = root.join(INSTALLS_DIRECTORY).join(&plugin.name);
-        lines.extend(opencode_load_lines(&plugin.name, &directory, &declared)?);
+        lines.extend(opencode_load_lines(root, &plugin.name, &declared)?);
     }
     lines.extend(opencode_package_notices(root, &installed, &declared));
     Ok(lines)
@@ -458,34 +450,23 @@ struct OpenCodeLoad {
     native: bool,
 }
 
-fn opencode_load(installed: &Path) -> io::Result<OpenCodeLoad> {
+fn opencode_load(root: &Path, name: &str, declared: &[String]) -> io::Result<OpenCodeLoad> {
     let mut entries = Vec::new();
     let mut support = Vec::new();
-    match fs::read_dir(installed.join(".opencode/plugins")) {
-        Ok(files) => {
-            for file in files {
-                let file = file?;
-                if !file.file_type()?.is_file() {
-                    continue;
-                }
-                let name = file.file_name().to_string_lossy().into_owned();
-                match Path::new(&name)
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                {
-                    Some("js" | "ts") => entries.push(name),
-                    Some("mjs" | "cjs") => support.push(name),
-                    _ => {}
-                }
-            }
+    for path in adapters::loaded_opencode_files(root, name)? {
+        let Some(file) = path.file_name().and_then(|file| file.to_str()) else {
+            continue;
+        };
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("js" | "ts") => entries.push(file.to_owned()),
+            Some("mjs" | "cjs") => support.push(file.to_owned()),
+            _ => {}
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
     }
     entries.sort();
     support.sort();
     Ok(OpenCodeLoad {
-        native: native_opencode_package(installed)?.is_some(),
+        native: declared.iter().any(|package| package_name(package) == name),
         entries,
         support,
     })
@@ -1741,33 +1722,56 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
-    #[test]
-    fn opencode_load_report_names_entries_and_warns_without_one() {
-        let base = test_directory();
-        let entry = base.join("entry");
-        let support_only = base.join("support-only");
-        let native = base.join("native");
-        for directory in [&entry, &support_only, &native] {
-            fs::create_dir_all(directory.join(".opencode/plugins")).unwrap();
+    fn linked_plugin(root: &Path, name: &str, files: &[(&str, bool)]) {
+        let installed = root.join(".crowded/plugins").join(name);
+        fs::create_dir_all(installed.join(".opencode/plugins")).unwrap();
+        let mut links = Vec::new();
+        for (file, present) in files {
+            fs::write(
+                installed.join(".opencode/plugins").join(file),
+                "export default {}\n",
+            )
+            .unwrap();
+            links.push(serde_json::json!({
+                "path": format!(".opencode/plugins/{file}"),
+                "target": PathBuf::from("../../.crowded/plugins")
+                    .join(name)
+                    .join(".opencode/plugins")
+                    .join(file),
+                "copied": true
+            }));
+            if *present {
+                fs::create_dir_all(root.join(".opencode/plugins")).unwrap();
+                fs::write(
+                    root.join(".opencode/plugins").join(file),
+                    "export default {}\n",
+                )
+                .unwrap();
+            }
         }
         fs::write(
-            entry.join(".opencode/plugins/index.js"),
+            installed.join(".crowded-adapters.json"),
+            serde_json::json!({"version": 1, "links": links, "hooks": []}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn opencode_load_report_names_linked_entries_and_warns_without_one() {
+        let base = test_directory();
+        linked_plugin(&base, "entry", &[("index.js", true), ("helper.mjs", true)]);
+        linked_plugin(&base, "support-only", &[("helper.mjs", true)]);
+        // The installed repo has an entry, but its project link is gone.
+        linked_plugin(&base, "missing-link", &[("missing.js", false)]);
+        // Adapters disabled: files in the repo, no adapter state and no links.
+        fs::create_dir_all(base.join(".crowded/plugins/disabled/.opencode/plugins")).unwrap();
+        fs::write(
+            base.join(".crowded/plugins/disabled/.opencode/plugins/disabled.js"),
             "export default {}\n",
         )
         .unwrap();
-        fs::write(entry.join(".opencode/plugins/helper.mjs"), "export {}\n").unwrap();
-        fs::write(
-            support_only.join(".opencode/plugins/helper.mjs"),
-            "export {}\n",
-        )
-        .unwrap();
-        fs::write(
-            native.join("package.json"),
-            r#"{"name":"native-package","version":"1.0.0","exports":{"./server":"./server.js"}}"#,
-        )
-        .unwrap();
 
-        let lines = opencode_load_lines("entry", &entry, &[]).unwrap();
+        let lines = opencode_load_lines(&base, "entry", &[]).unwrap();
         assert!(
             lines
                 .iter()
@@ -1779,7 +1783,7 @@ mod tests {
                 .any(|line| line == "opencode entry: support helper.mjs")
         );
 
-        let lines = opencode_load_lines("support-only", &support_only, &[]).unwrap();
+        let lines = opencode_load_lines(&base, "support-only", &[]).unwrap();
         assert_eq!(
             lines,
             [
@@ -1787,16 +1791,17 @@ mod tests {
                 "OpenCode will not load support-only: no .js/.ts entry"
             ]
         );
-        // A declared package loads even when the installed plugin has no entry.
-        let lines = opencode_load_lines(
-            "support-only",
-            &support_only,
-            &["support-only@1.0.0".to_owned()],
-        )
-        .unwrap();
-        assert_eq!(lines, ["opencode support-only: support helper.mjs"]);
 
-        let lines = opencode_load_lines("native", &native, &[]).unwrap();
+        let lines = opencode_load_lines(&base, "missing-link", &[]).unwrap();
+        assert_eq!(
+            lines,
+            ["OpenCode will not load missing-link: no .js/.ts entry"]
+        );
+
+        let lines = opencode_load_lines(&base, "disabled", &[]).unwrap();
+        assert_eq!(lines, ["OpenCode will not load disabled: no .js/.ts entry"]);
+
+        let lines = opencode_load_lines(&base, "native", &["native@1.0.0".to_owned()]).unwrap();
         assert_eq!(lines, ["opencode native: native package"]);
         fs::remove_dir_all(base).unwrap();
     }

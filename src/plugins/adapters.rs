@@ -244,6 +244,45 @@ pub(super) fn disable_adapters(root: &Path, name: &str) -> io::Result<AdapterSta
     Ok(state)
 }
 
+/// OpenCode plugin files in the project that currently link to this plugin's
+/// adapters. A state entry whose project file is gone or changed does not count.
+pub(super) fn loaded_opencode_files(root: &Path, name: &str) -> io::Result<Vec<PathBuf>> {
+    let installed = root.join(INSTALLS_DIRECTORY).join(name);
+    let state_path = installed.join(ADAPTER_FILE);
+    let state: AdapterState = match fs::read_to_string(&state_path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map_err(|error| invalid_data(format!("invalid {}: {error}", state_path.display())))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    if state.version != ADAPTER_VERSION {
+        return Ok(Vec::new());
+    }
+    let mut present = Vec::new();
+    for link in &state.links {
+        if link.path.parent() != Some(Path::new(".opencode/plugins")) {
+            continue;
+        }
+        let path = root.join(&link.path);
+        let linked = if link.copied {
+            match (
+                fs::read(&path),
+                fs::read(adapter_source(&path, &link.target)?),
+            ) {
+                (Ok(current), Ok(source)) => current == source,
+                _ => false,
+            }
+        } else {
+            fs::read_link(&path).is_ok_and(|target| target == link.target)
+        };
+        if linked {
+            present.push(link.path.clone());
+        }
+    }
+    present.sort();
+    Ok(present)
+}
+
 pub(super) fn adapter_plan(root: &Path, name: &str) -> io::Result<AdapterState> {
     validate_name("plugin", name)?;
     let installed = root.join(INSTALLS_DIRECTORY).join(name);
