@@ -3023,6 +3023,9 @@ pub(crate) fn resume_collection_at(path: &Path) {
 pub(crate) struct BackgroundOutbox {
     commands: mpsc::SyncSender<TaggedCommand>,
     pub events: mpsc::Receiver<TaggedEvent>,
+    /// Disconnects once the worker has dropped everything it owns.
+    #[cfg(test)]
+    exited: mpsc::Receiver<()>,
 }
 
 impl BackgroundOutbox {
@@ -3043,7 +3046,14 @@ impl BackgroundOutbox {
     ) -> Self {
         let (commands, input) = mpsc::sync_channel(64);
         let (output, events) = mpsc::sync_channel(64);
+        #[cfg(test)]
+        let (exit_guard, exited) = mpsc::channel::<()>();
         thread::spawn(move || {
+            // Locals drop in reverse order, so the guard outlives the channel
+            // ends rebound here and disconnects only once they are gone.
+            #[cfg(test)]
+            let _exit_guard = exit_guard;
+            let (input, output) = (input, output);
             let mut outbox = match Outbox::open(&path, capacity, history, max_in_flight) {
                 Ok(outbox) => outbox,
                 Err(error) => {
@@ -3110,7 +3120,24 @@ impl BackgroundOutbox {
                 }
             }
         });
-        Self { commands, events }
+        Self {
+            commands,
+            events,
+            #[cfg(test)]
+            exited,
+        }
+    }
+
+    /// Blocks until the worker thread has exited and dropped its channels.
+    #[cfg(test)]
+    pub fn await_worker_exit(&self) {
+        assert!(
+            matches!(
+                self.exited.recv_timeout(std::time::Duration::from_secs(30)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "the outbox worker did not exit"
+        );
     }
 }
 

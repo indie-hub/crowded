@@ -53,9 +53,9 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 #[cfg(test)]
 thread_local! {
     /// Holds `NativeRouter::start` back before its first send, on this
-    /// thread only, so a test can let the worker exit first.
-    static START_SCHEDULE_DELAY: std::cell::Cell<Duration> =
-        const { std::cell::Cell::new(Duration::ZERO) };
+    /// thread only, until the outbox worker has exited, so a test can make
+    /// the worker lose no race: it is always gone before the send.
+    static AWAIT_WORKER_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Hands messages to whichever adapter is current, so rooms can be bound again
@@ -441,7 +441,9 @@ impl NativeRouter {
         // A paused schedule loads the saved state without sending anything, and
         // tells us at once whether the file could be opened.
         #[cfg(test)]
-        thread::sleep(START_SCHEDULE_DELAY.with(|delay| delay.get()));
+        if AWAIT_WORKER_EXIT.with(|wait| wait.get()) {
+            router.outbox().await_worker_exit();
+        }
         if let Err(stopped) = router.send_schedule(true, false) {
             // A worker that could not open the file reports why and exits, so
             // the send can lose that race; the report is still queued.
@@ -2198,12 +2200,12 @@ mod tests {
         let path = state_path(root.path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"{ not json").unwrap();
-        // Far longer than the worker needs to fail to open and exit.
-        super::START_SCHEDULE_DELAY.with(|delay| delay.set(Duration::from_millis(500)));
+        // The worker has exited before the first send, every run.
+        super::AWAIT_WORKER_EXIT.with(|wait| wait.set(true));
         let error = NativeRouter::start(path.clone(), vec![entry(&a, 0, "Room A")])
             .err()
             .expect("must refuse");
-        super::START_SCHEDULE_DELAY.with(|delay| delay.set(Duration::ZERO));
+        super::AWAIT_WORKER_EXIT.with(|wait| wait.set(false));
         assert!(error.to_string().contains("left unchanged"), "{error}");
         assert_eq!(fs::read(&path).unwrap(), b"{ not json");
     }
@@ -2364,10 +2366,8 @@ mod tests {
     // --- Codex native delivery ---
 
     fn codex_stub(root: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let path = root.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::command::write_warmed_stub(&path, body);
         path
     }
 
@@ -3986,19 +3986,22 @@ mod tests {
         router
             .send(&mut mailroom, "Sender", 0, "new", None)
             .unwrap();
-        for _ in 0..20 {
-            router.tick(Instant::now(), &mut mailroom, false, false);
-            thread::sleep(Duration::from_millis(20));
-        }
-        let saved: serde_json::Value =
-            serde_json::from_slice(&fs::read(state_path(root.path())).unwrap()).unwrap();
-        assert!(
+        // Wait for the end state, the trimmed row gone from disk, not a count of ticks.
+        let trimmed = |path: &Path| {
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
             saved["messages"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .all(|m| m["id"] != id)
-        );
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !trimmed(&state_path(root.path())) {
+            assert!(Instant::now() < deadline, "the row was never trimmed");
+            router.tick(Instant::now(), &mut mailroom, false, false);
+            thread::sleep(Duration::from_millis(20));
+        }
 
         router
             .claude_inbox(0)
@@ -4010,7 +4013,16 @@ mod tests {
                 held: None,
             });
         let mut notices = Vec::new();
-        for _ in 0..20 {
+        let dropped_count = |notices: &[String]| {
+            notices
+                .iter()
+                .filter(|text| text.contains("dropped a late Claude receipt"))
+                .count()
+        };
+        // Wait for the drop itself; the passes after it show it is not repeated.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while dropped_count(&notices) == 0 {
+            assert!(Instant::now() < deadline, "never dropped: {notices:?}");
             notices.extend(
                 router
                     .tick(Instant::now(), &mut mailroom, false, false)
@@ -4019,10 +4031,16 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
-        let dropped = notices
-            .iter()
-            .filter(|text| text.contains("dropped a late Claude receipt"))
-            .count();
+        for _ in 0..10 {
+            notices.extend(
+                router
+                    .tick(Instant::now(), &mut mailroom, false, false)
+                    .into_iter()
+                    .map(|(text, _)| text),
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let dropped = dropped_count(&notices);
         assert_eq!(
             dropped, 1,
             "one notice, then the evidence is gone: {notices:?}"
