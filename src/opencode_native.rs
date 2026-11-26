@@ -516,25 +516,36 @@ pub(crate) struct Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let taken = self
-            .child
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take());
-        if let Some(mut child) = taken {
-            let spawned = child.id();
-            #[cfg(windows)]
-            {
-                if let Some(tree) = self.tree.take() {
-                    stop_owned(&mut child, Some(tree), self.server_pid);
+        // The wrapper may already be reaped by `poll_exit`; the recorded
+        // server pid is kept regardless and stopped below, so a live owned
+        // server is never orphaned on replacement or drop. Only recorded
+        // pids are ever signalled, never a pattern.
+        let taken = self.child.lock().ok().and_then(|mut guard| guard.take());
+        let spawned = taken.as_ref().map(|child| child.id());
+        #[cfg(windows)]
+        {
+            if let Some(tree) = self.tree.take() {
+                if taken.is_some() || self.server_pid.is_some() {
+                    if let Some(mut child) = taken {
+                        stop_owned(&mut child, Some(tree), self.server_pid);
+                    } else {
+                        let _ = tree.terminate();
+                        if let Some(server) = self.server_pid {
+                            stop_process(server);
+                        }
+                    }
                 }
+            } else if let Some(mut child) = taken {
+                let _ = child.wait();
             }
-            #[cfg(not(windows))]
-            {
+        }
+        #[cfg(not(windows))]
+        {
+            if let Some(mut child) = taken {
                 terminate(&mut child);
-                if let Some(server) = self.server_pid.filter(|server| *server != spawned) {
-                    stop_process(server);
-                }
+            }
+            if let Some(server) = self.server_pid.filter(|server| Some(*server) != spawned) {
+                stop_process(server);
             }
         }
     }
@@ -599,15 +610,12 @@ impl Server {
                 .child
                 .lock()
                 .map_err(|_| io::Error::other("server child state is poisoned"))?;
-            match guard.as_mut() {
-                Some(child) => match child.try_wait()? {
-                    Some(_) => {
-                        guard.take();
-                        return Ok(true);
-                    }
-                    None => {}
-                },
-                None => return Ok(true),
+            let Some(child) = guard.as_mut() else {
+                return Ok(true);
+            };
+            if child.try_wait()?.is_some() {
+                guard.take();
+                return Ok(true);
             }
         }
         const PROBE_INTERVAL: Duration = Duration::from_secs(1);
@@ -622,12 +630,16 @@ impl Server {
             }
             *last = Instant::now();
         }
+        // Only a refused connection (or the reaped wrapper above) counts
+        // as death. A timeout or any other error leaves a healthy busy
+        // room alone: it is counted by the throttle above, never acted on.
         match std::net::TcpStream::connect_timeout(
             &std::net::SocketAddr::V4(self.client.address),
             PROBE_TIMEOUT,
         ) {
             Ok(_) => Ok(false),
-            Err(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => Ok(true),
+            Err(_) => Ok(false),
         }
     }
 
