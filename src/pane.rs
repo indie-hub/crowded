@@ -2507,13 +2507,13 @@ impl Pane {
     /// session on the same server, then a TUI respawn that attaches to it, and
     /// finally an abort of the old session's in-flight run.
     ///
-    /// Each failure path is defined: a marker that cannot be saved or a session
-    /// that cannot be created changes nothing; a respawn that fails puts the
-    /// old binding back on the server and the room, so the old terminal, its
-    /// arguments and `binding()` are as before, and the old run is not aborted.
-    /// The abort runs last so a failed abort can never leave the room with no
-    /// working session; its failure is returned as a warning, because the clear
-    /// itself succeeded. The marker deliberately stays written once set, even
+    /// Each failure path is defined: a session that cannot be created, a
+    /// respawn that fails, or a marker that cannot be saved changes nothing
+    /// persisted or bound: the old binding is put back on the server and the
+    /// room, so the old terminal, its arguments and `binding()` are as
+    /// before, and the old run is not aborted. The abort runs last so a
+    /// failed abort can never leave the room without a working session; its
+    /// failure is returned as a warning, because the clear itself succeeded.
     /// if the clear fails later: a stale session id must never be resumed.
     pub(crate) fn clear_opencode_session(
         &mut self,
@@ -2526,19 +2526,15 @@ impl Pane {
             )
             .into());
         }
-        // A marker that cannot be saved fails the clear: the old session is
-        // still trusted, so a fresh launch could strand it.
-        let vendor = controls::cli_vendor(&self.spec)?;
-        let cwd = working_directory(self.spec.cwd.as_deref())?;
-        session_state::clear_room(vendor.key(), &cwd, &self.spec.title)?;
         let native = self
             .native
             .as_mut()
             .expect("open code native room has its server");
         let previous = native.binding().clone();
         let binding = native.clear_session(generation)?;
-        // Build the replacement before giving up the server, then roll the
-        // session back if the terminal cannot be restarted.
+        // Build the replacement before touching persisted state or giving up
+        // the server, then roll the session back if the terminal cannot be
+        // restarted, so a failed spawn changes nothing persisted either.
         let replacement = match Self::spawn_attached(
             &self.spec,
             size,
@@ -2564,6 +2560,29 @@ impl Pane {
                 };
             }
         };
+        // A marker that cannot be saved fails the clear: the replacement is
+        // dropped and the old session is restored, so the previous stored
+        // session is never replaced by a room that did not start.
+        let vendor = controls::cli_vendor(&self.spec)?;
+        let cwd = working_directory(self.spec.cwd.as_deref())?;
+        if let Err(marker) = session_state::clear_room(vendor.key(), &cwd, &self.spec.title) {
+            let _replacement = replacement;
+            let restored = self
+                .native
+                .as_mut()
+                .expect("open code native room has its server")
+                .restore_binding(&previous);
+            return match restored {
+                Ok(()) => Err(marker.into()),
+                Err(rollback) => Err(io::Error::other(format!(
+                    "the new session was created but its fresh-state marker could not be saved \
+                     ({marker}), and restoring the previous session also failed \
+                     ({rollback}): run the control clear command for this room again, \
+                     or restart Crowded"
+                ))
+                .into()),
+            };
+        }
         let native = self.native.take();
         self.cleanup();
         *self = replacement;
@@ -2604,18 +2623,14 @@ impl Pane {
             )
             .into());
         }
+        // Build the replacement before touching persisted state or giving
+        // up the old server, so a failed spawn changes nothing: the room
+        // stays offline on its previous binding with its stored session.
+        let replacement =
+            Self::spawn_attached(&self.spec, size, self.environment.clone(), Some(&room))?;
         let vendor = controls::cli_vendor(&self.spec)?;
         let cwd = working_directory(self.spec.cwd.as_deref())?;
         session_state::clear_room(vendor.key(), &cwd, &self.spec.title)?;
-        // Build the replacement before giving up the old server, so a failed
-        // spawn keeps the room offline on its previous binding instead of
-        // leaving it with no server at all.
-        let replacement = Self::spawn_attached(
-            &self.spec,
-            size,
-            self.environment.clone(),
-            Some(&room),
-        )?;
         let _old = self.native.take();
         self.cleanup();
         *self = replacement;
