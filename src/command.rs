@@ -34,12 +34,40 @@ const TEXT_FILE_BUSY_PATIENCE: Duration = Duration::from_secs(2);
 /// child execs, so the kernel refuses to run the program ("Text file busy")
 /// for a few milliseconds. Any other error is returned at once.
 pub(crate) fn spawn_retrying_text_busy(command: &mut Command) -> io::Result<Child> {
+    retrying_text_busy(|| command.spawn(), |error| Some(error))
+}
+
+/// The PTY twin of [`spawn_retrying_text_busy`]: the same refusal, found
+/// anywhere in the error chain the PTY layer wraps it in.
+pub(crate) fn pty_spawn_retrying_text_busy<T, E>(
+    attempt: impl FnMut() -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: AsRef<dyn std::error::Error + 'static>,
+{
+    retrying_text_busy(attempt, |error| {
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error.as_ref());
+        while let Some(current) = cause {
+            if let Some(io) = current.downcast_ref::<io::Error>() {
+                return Some(io);
+            }
+            cause = current.source();
+        }
+        None
+    })
+}
+
+fn retrying_text_busy<T, E>(
+    mut attempt: impl FnMut() -> Result<T, E>,
+    io_error: impl Fn(&E) -> Option<&io::Error>,
+) -> Result<T, E> {
     let deadline = Instant::now() + TEXT_FILE_BUSY_PATIENCE;
     loop {
-        match command.spawn() {
+        match attempt() {
             #[cfg(unix)]
             Err(error)
-                if error.raw_os_error() == Some(TEXT_FILE_BUSY) && Instant::now() < deadline =>
+                if io_error(&error).and_then(io::Error::raw_os_error) == Some(TEXT_FILE_BUSY)
+                    && Instant::now() < deadline =>
             {
                 thread::sleep(Duration::from_millis(10));
             }
@@ -489,6 +517,33 @@ impl Drop for ProcessTree {
     }
 }
 
+/// Writes an executable `#!/bin/sh` stand-in and runs it once before anyone
+/// else does.
+///
+/// The first run of a freshly written program is slow on a loaded macOS host
+/// (the OS vets the new file first), and a delivery bounded by a timeout would
+/// be called uncertain by it. The warm-up exits at once through its guard line
+/// and has no effect on `body`, and it waits however long the vetting takes.
+#[cfg(all(test, unix))]
+pub(crate) fn write_warmed_stub(path: &Path, body: &str) {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    fs::write(
+        path,
+        format!("#!/bin/sh\n[ \"$1\" = crowded-warm-up ] && exit 0\n{body}\n"),
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut warm_up = Command::new(path);
+    warm_up.arg("crowded-warm-up");
+    assert!(
+        spawn_retrying_text_busy(&mut warm_up)
+            .unwrap()
+            .wait()
+            .unwrap()
+            .success()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +552,68 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn a_warmed_stub_runs_nothing_of_its_body_while_warming() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let stub = dir.path().join("stub");
+        write_warmed_stub(&stub, &format!("touch '{}'", marker.display()));
+        assert!(!marker.exists(), "the warm-up ran the body");
+        assert!(Command::new(&stub).status().unwrap().success());
+        assert!(marker.exists(), "a real run still runs the body");
+    }
+
+    /// Stands in for the error chain a PTY spawn reports: the OS refusal sits
+    /// inside a wrapper, not at the top.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct Wrapped(io::Error);
+
+    #[cfg(unix)]
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "spawn failed")
+        }
+    }
+
+    #[cfg(unix)]
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[cfg(unix)]
+    impl AsRef<dyn std::error::Error + 'static> for Wrapped {
+        fn as_ref(&self) -> &(dyn std::error::Error + 'static) {
+            self
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pty_spawn_is_retried_through_a_wrapped_text_file_busy_and_only_that() {
+        let mut busy_attempts = 0;
+        let result = pty_spawn_retrying_text_busy(|| {
+            busy_attempts += 1;
+            if busy_attempts < 3 {
+                Err(Wrapped(io::Error::from_raw_os_error(TEXT_FILE_BUSY)))
+            } else {
+                Ok(busy_attempts)
+            }
+        });
+        assert_eq!(result.ok(), Some(3), "retried until the file was free");
+
+        let mut other_attempts = 0;
+        let result: Result<(), Wrapped> = pty_spawn_retrying_text_busy(|| {
+            other_attempts += 1;
+            Err(Wrapped(io::Error::from(io::ErrorKind::NotFound)))
+        });
+        assert!(result.is_err());
+        assert_eq!(other_attempts, 1, "any other error is returned at once");
+    }
 
     // macOS does not refuse to exec a file that is open for writing.
     #[cfg(target_os = "linux")]

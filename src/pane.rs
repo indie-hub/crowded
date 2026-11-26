@@ -22,7 +22,9 @@ use tui_term::vt100::{Parser, Screen};
 
 use crate::{
     codex_native,
-    command::{ResolvedCommand, headroom_on_path},
+    command::{
+        ResolvedCommand, headroom_on_path, pty_spawn_retrying_text_busy, spawn_retrying_text_busy,
+    },
     config::{RoomScheduling, RoomSpec, Transport},
     doorbell::RoomCapabilities,
     native_launch::{self, GenerationAllocator, NativeRoom},
@@ -1753,7 +1755,7 @@ fn switch_opencode_session_model(
     for (key, value) in &environment.variables {
         command.env(key, value);
     }
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = spawn_retrying_text_busy(&mut command).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("failed to run OpenCode model switch: {error}"),
@@ -1890,7 +1892,10 @@ impl Pane {
         // delivered, so the capture `since` must be this instant; OpenCode's
         // row (committed much later) must still postdate it.
         let spawned_at = SystemTime::now();
-        let child = ChildGuard::new(pty.slave.spawn_command(command)?, tree)?;
+        let child = ChildGuard::new(
+            pty_spawn_retrying_text_busy(|| pty.slave.spawn_command(command.clone()))?,
+            tree,
+        )?;
         // The parent must not keep a second slave handle alive.
         drop(pty.slave);
 
