@@ -393,7 +393,11 @@ fn list(root: &Path) -> io::Result<Vec<InstallRecord>> {
     Ok(installed)
 }
 
-fn opencode_load_lines(name: &str, installed: &Path) -> io::Result<Vec<String>> {
+fn opencode_load_lines(
+    name: &str,
+    installed: &Path,
+    declared: &[String],
+) -> io::Result<Vec<String>> {
     let load = opencode_load(installed)?;
     let mut lines = Vec::new();
     if load.native {
@@ -411,7 +415,10 @@ fn opencode_load_lines(name: &str, installed: &Path) -> io::Result<Vec<String>> 
             load.support.join(", ")
         ));
     }
-    if !load.native && load.entries.is_empty() {
+    if !load.native
+        && load.entries.is_empty()
+        && !declared.iter().any(|package| package_name(package) == name)
+    {
         lines.push(format!("OpenCode will not load {name}: no .js/.ts entry"));
     }
     Ok(lines)
@@ -423,7 +430,7 @@ pub(crate) fn opencode_notices(root: &Path) -> io::Result<Vec<String>> {
     let declared = declared_opencode_packages(root);
     for plugin in &installed {
         let directory = root.join(INSTALLS_DIRECTORY).join(&plugin.name);
-        lines.extend(opencode_load_lines(&plugin.name, &directory)?);
+        lines.extend(opencode_load_lines(&plugin.name, &directory, &declared)?);
     }
     lines.extend(opencode_package_notices(root, &installed, &declared));
     Ok(lines)
@@ -918,22 +925,41 @@ fn remove(root: &Path, name: &str) -> io::Result<InstallRecord> {
 
 fn clone_source(source: &str, reference: Option<&str>, destination: &Path) -> io::Result<()> {
     let source = normalized_source(source);
+    // `git clone --branch` accepts branches and tags, not commit hashes. A
+    // pinned commit needs a full clone, then a checkout of that commit.
+    let commit = reference.is_some_and(is_commit_hash);
     let mut command = Command::new("git");
     command.args(["clone", "--quiet"]);
-    if !Path::new(&source).exists() {
+    if !commit && !Path::new(&source).exists() {
         command.args(["--depth", "1"]);
     }
-    if let Some(reference) = reference {
+    if let Some(reference) = reference.filter(|_| !commit) {
         command.args(["--branch", reference]);
     }
-    let status = command.arg("--").arg(source).arg(destination).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
+    let status = command.arg("--").arg(&source).arg(destination).status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
             "git clone failed with status {status}"
-        )))
+        )));
     }
+    if let Some(reference) = reference.filter(|_| commit) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(destination)
+            .args(["checkout", "--quiet", reference])
+            .status()?;
+        if !status.success() {
+            return Err(io::Error::other(format!(
+                "git checkout {reference} failed with status {status}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_commit_hash(reference: &str) -> bool {
+    // A hex-only branch name still works: `git checkout` resolves it too.
+    (7..=40).contains(&reference.len()) && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn temporary_plugin_path(root: &Path, operation: &str) -> io::Result<PathBuf> {
@@ -1639,7 +1665,7 @@ mod tests {
         )
         .unwrap();
 
-        let lines = opencode_load_lines("entry", &entry).unwrap();
+        let lines = opencode_load_lines("entry", &entry, &[]).unwrap();
         assert!(
             lines
                 .iter()
@@ -1651,7 +1677,7 @@ mod tests {
                 .any(|line| line == "opencode entry: support helper.mjs")
         );
 
-        let lines = opencode_load_lines("support-only", &support_only).unwrap();
+        let lines = opencode_load_lines("support-only", &support_only, &[]).unwrap();
         assert_eq!(
             lines,
             [
@@ -1659,8 +1685,16 @@ mod tests {
                 "OpenCode will not load support-only: no .js/.ts entry"
             ]
         );
+        // A declared package loads even when the installed plugin has no entry.
+        let lines = opencode_load_lines(
+            "support-only",
+            &support_only,
+            &["support-only@1.0.0".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(lines, ["opencode support-only: support helper.mjs"]);
 
-        let lines = opencode_load_lines("native", &native).unwrap();
+        let lines = opencode_load_lines("native", &native, &[]).unwrap();
         assert_eq!(lines, ["opencode native: native package"]);
         fs::remove_dir_all(base).unwrap();
     }
@@ -1750,6 +1784,58 @@ mod tests {
             )]
         );
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_commit_reference_is_checked_out_after_cloning() {
+        let base = test_directory();
+        let source = base.join("source");
+        let project = base.join("project");
+        fs::create_dir_all(source.join("skills/room-greeter")).unwrap();
+        fs::create_dir(&project).unwrap();
+        fs::write(
+            source.join("crowded-plugin.toml"),
+            "name = \"pinned\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            source.join("skills/room-greeter/SKILL.md"),
+            "---\nname: room-greeter\ndescription: Greets\n---\n",
+        )
+        .unwrap();
+        git(&source, &["init", "--quiet"]);
+        git(&source, &["config", "user.name", "Crowded Test"]);
+        git(
+            &source,
+            &["config", "user.email", "crowded@example.invalid"],
+        );
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "--quiet", "-m", "first"]);
+        let first = git_output(&source, &["rev-parse", "HEAD"]);
+        fs::write(
+            source.join("crowded-plugin.toml"),
+            "name = \"pinned\"\nversion = \"2.0.0\"\n",
+        )
+        .unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "--quiet", "-m", "second"]);
+
+        let record = add(&project, source.to_str().unwrap(), Some(&first[..7])).unwrap();
+
+        assert_eq!(record.version, "1.0.0");
+        assert_eq!(record.revision, first);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    fn git_output(directory: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
     fn git(directory: &Path, args: &[&str]) {

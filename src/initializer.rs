@@ -35,17 +35,26 @@ allow_control = true
 [[plugin]]
 name = "code4me-ntg"
 source = "https://github.com/indie-hub/code4me-ntg.git"
+ref = "dbc7945c6f75ea3aa51077f0fd50c449a987625d"
 adapters = true
 
 [[plugin]]
 name = "ponytail"
 source = "https://github.com/DietrichGebert/ponytail.git"
+ref = "96608e078b2d5ea607c5c3b8b5a54d1c1fba6846"
+adapters = true
 
+# The v2 git tag ships source-only hooks (the built Claude/Codex manifest lives
+# in the npm package), so Claude and Codex keep the v1 hooks. OpenCode 2 loads
+# 2.2.4 natively from the declaration below.
 [[plugin]]
 name = "context-mode"
 source = "https://github.com/mksglu/context-mode.git"
 ref = "v1.0.169"
 adapters = true
+
+[[opencode_plugin]]
+package = "context-mode@2.2.4"
 
 # Shared, pinned tools. `npx` caches lightweight runners. Basic Memory and CCC
 # are installed once as user tools because they are persistent services.
@@ -69,7 +78,7 @@ args = ["mcp", "--project", __BASIC_MEMORY_PROJECT__]
 name = "context-mode"
 command = "npx"
 args = ["-y", "context-mode@1.0.169"]
-clients = ["claude", "codex", "opencode"]
+clients = ["claude", "codex"]
 
 # Setup commands run once, in order. CCC asks you to choose its embedding model
 # the first time and its local model dependencies can download several GB.
@@ -98,6 +107,8 @@ provides = "ccc"
 
 [[setup]]
 name = "ccc-init"
+# Without --force, ccc refuses when a parent directory is a project, and
+# container repos nest projects. An already-initialised project is a no-op.
 command = "ccc"
 args = ["init", "--force"]
 
@@ -442,6 +453,39 @@ mod tests {
                 .plugins
                 .iter()
                 .any(|plugin| { plugin.name == "code4me-ntg" && plugin.adapters })
+        );
+        let code4me = starter
+            .plugins
+            .iter()
+            .find(|plugin| plugin.name == "code4me-ntg")
+            .unwrap();
+        assert_eq!(
+            code4me.reference.as_deref(),
+            Some("dbc7945c6f75ea3aa51077f0fd50c449a987625d")
+        );
+        let ponytail = starter
+            .plugins
+            .iter()
+            .find(|plugin| plugin.name == "ponytail")
+            .unwrap();
+        assert_eq!(
+            ponytail.reference.as_deref(),
+            Some("96608e078b2d5ea607c5c3b8b5a54d1c1fba6846")
+        );
+        assert!(ponytail.adapters);
+        assert_eq!(starter.opencode_plugins.len(), 1);
+        assert_eq!(starter.opencode_plugins[0].package, "context-mode@2.2.4");
+        let context_mode = starter
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "context-mode")
+            .unwrap();
+        assert_eq!(
+            context_mode.clients,
+            [
+                crate::config::McpClient::Claude,
+                crate::config::McpClient::Codex
+            ]
         );
         assert_eq!(starter.mcp_servers.len(), 4);
         assert_eq!(starter.setup.len(), 6);
