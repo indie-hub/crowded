@@ -50,6 +50,14 @@ const STARTUP_WAIT: Duration = Duration::from_secs(30);
 /// An uncertain message is checked against the native inbox this often.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
+#[cfg(test)]
+thread_local! {
+    /// Holds `NativeRouter::start` back before its first send, on this
+    /// thread only, so a test can let the worker exit first.
+    static START_SCHEDULE_DELAY: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
+}
+
 /// Hands messages to whichever adapter is current, so rooms can be bound again
 /// without restarting the outbox thread that holds this object.
 pub(crate) struct SwitchAdapter {
@@ -433,7 +441,7 @@ impl NativeRouter {
         // A paused schedule loads the saved state without sending anything, and
         // tells us at once whether the file could be opened.
         #[cfg(test)]
-        thread::sleep(tests::START_SCHEDULE_DELAY.with(|delay| delay.get()));
+        thread::sleep(START_SCHEDULE_DELAY.with(|delay| delay.get()));
         if let Err(stopped) = router.send_schedule(true, false) {
             // A worker that could not open the file reports why and exits, so
             // the send can lose that race; the report is still queued.
@@ -2182,13 +2190,6 @@ mod tests {
         assert!(texts(&a).is_empty());
     }
 
-    thread_local! {
-        /// Holds `NativeRouter::start` back before its first send, on this
-        /// thread only, so a test can let the worker exit first.
-        pub(super) static START_SCHEDULE_DELAY: std::cell::Cell<Duration> =
-            const { std::cell::Cell::new(Duration::ZERO) };
-    }
-
     #[test]
     fn a_corrupt_outbox_is_reported_even_when_its_worker_has_already_exited() {
         let root = tempfile::tempdir().unwrap();
@@ -2198,11 +2199,11 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"{ not json").unwrap();
         // Far longer than the worker needs to fail to open and exit.
-        START_SCHEDULE_DELAY.with(|delay| delay.set(Duration::from_millis(500)));
+        super::START_SCHEDULE_DELAY.with(|delay| delay.set(Duration::from_millis(500)));
         let error = NativeRouter::start(path.clone(), vec![entry(&a, 0, "Room A")])
             .err()
             .expect("must refuse");
-        START_SCHEDULE_DELAY.with(|delay| delay.set(Duration::ZERO));
+        super::START_SCHEDULE_DELAY.with(|delay| delay.set(Duration::ZERO));
         assert!(error.to_string().contains("left unchanged"), "{error}");
         assert_eq!(fs::read(&path).unwrap(), b"{ not json");
     }
