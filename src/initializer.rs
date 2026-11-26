@@ -164,6 +164,10 @@ fn run_at(root: &Path) -> io::Result<()> {
         }
     }
 
+    for line in plugins::opencode_notices(root)? {
+        println!("{line}");
+    }
+
     let synced = if toolbox::native_files_are_active_at(root)? {
         println!("native toolbox already synced");
         0

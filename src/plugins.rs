@@ -13,7 +13,6 @@ use std::{
 use std::os::unix::fs::symlink;
 
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
 use serde_json::Value;
 
 use crate::toolbox::remove_empty_directory;
@@ -78,6 +77,9 @@ pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
                 &installed.revision[..installed.revision.len().min(12)],
                 installed.skills.len()
             );
+            for line in opencode_notices(&root)? {
+                println!("{line}");
+            }
         }
         "update" => {
             let name = args.next().ok_or_else(|| invalid_input(UPDATE_USAGE))?;
@@ -136,6 +138,9 @@ pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
+            for line in opencode_notices(&root)? {
+                println!("{line}");
+            }
         }
         "preview" | "enable" | "disable" => {
             let name = args
@@ -145,7 +150,12 @@ pub(crate) fn command() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(invalid_input(format!("usage: crowded plugin {action} PLUGIN")).into());
             }
             match action.as_str() {
-                "preview" => adapters::preview_adapters(&root, &name)?,
+                "preview" => {
+                    adapters::preview_adapters(&root, &name)?;
+                    for line in opencode_notices(&root)? {
+                        println!("{line}");
+                    }
+                }
                 "enable" => {
                     let (skills, state) = enable_plugin(&root, &name)?;
                     let hooks = state.as_ref().map_or(0, |state| state.hooks.len());
@@ -381,6 +391,132 @@ fn list(root: &Path) -> io::Result<Vec<InstallRecord>> {
     }
     installed.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(installed)
+}
+
+fn opencode_load_lines(name: &str, installed: &Path) -> io::Result<Vec<String>> {
+    let load = opencode_load(installed)?;
+    let mut lines = Vec::new();
+    if load.native {
+        lines.push(format!("opencode {name}: native package"));
+    }
+    if !load.entries.is_empty() {
+        lines.push(format!(
+            "opencode {name}: entry {}",
+            load.entries.join(", ")
+        ));
+    }
+    if !load.support.is_empty() {
+        lines.push(format!(
+            "opencode {name}: support {}",
+            load.support.join(", ")
+        ));
+    }
+    if !load.native && load.entries.is_empty() {
+        lines.push(format!("OpenCode will not load {name}: no .js/.ts entry"));
+    }
+    Ok(lines)
+}
+
+pub(crate) fn opencode_notices(root: &Path) -> io::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    let installed = list(root)?;
+    let declared = declared_opencode_packages(root);
+    for plugin in &installed {
+        let directory = root.join(INSTALLS_DIRECTORY).join(&plugin.name);
+        lines.extend(opencode_load_lines(&plugin.name, &directory)?);
+    }
+    lines.extend(opencode_package_notices(root, &installed, &declared));
+    Ok(lines)
+}
+
+fn declared_opencode_packages(root: &Path) -> Vec<String> {
+    let path = root.join(crate::config::CROWDED_TOML);
+    if !path.is_file() {
+        return Vec::new();
+    }
+    match crate::config::load_room_file(&path) {
+        Ok(config) => config
+            .opencode_plugins
+            .into_iter()
+            .map(|plugin| plugin.package)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+struct OpenCodeLoad {
+    entries: Vec<String>,
+    support: Vec<String>,
+    native: bool,
+}
+
+fn opencode_load(installed: &Path) -> io::Result<OpenCodeLoad> {
+    let mut entries = Vec::new();
+    let mut support = Vec::new();
+    match fs::read_dir(installed.join(".opencode/plugins")) {
+        Ok(files) => {
+            for file in files {
+                let file = file?;
+                if !file.file_type()?.is_file() {
+                    continue;
+                }
+                let name = file.file_name().to_string_lossy().into_owned();
+                match Path::new(&name)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                {
+                    Some("js" | "ts") => entries.push(name),
+                    Some("mjs" | "cjs") => support.push(name),
+                    _ => {}
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    entries.sort();
+    support.sort();
+    Ok(OpenCodeLoad {
+        native: native_opencode_package(installed)?.is_some(),
+        entries,
+        support,
+    })
+}
+
+fn native_opencode_package(installed: &Path) -> io::Result<Option<(String, String)>> {
+    let path = installed.join("package.json");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Ok(package) = serde_json::from_str::<Value>(&text) else {
+        return Ok(None);
+    };
+    if package
+        .get("exports")
+        .and_then(|exports| exports.get("./server"))
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let name = package
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let version = package
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Ok((!name.is_empty()).then(|| (name.to_owned(), version.to_owned())))
+}
+
+fn opencode_package_notices(
+    _root: &Path,
+    _installed: &[InstallRecord],
+    _declared: &[String],
+) -> Vec<String> {
+    Vec::new()
 }
 
 fn installed_record(root: &Path, name: &str) -> io::Result<(PathBuf, InstallRecord)> {
@@ -1360,6 +1496,58 @@ mod tests {
         assert!(!project.join(".opencode/skills/room-greeter").exists());
         assert!(!project.join(".opencode/command/farewell.md").exists());
 
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn opencode_load_report_names_entries_and_warns_without_one() {
+        let base = test_directory();
+        let entry = base.join("entry");
+        let support_only = base.join("support-only");
+        let native = base.join("native");
+        for directory in [&entry, &support_only, &native] {
+            fs::create_dir_all(directory.join(".opencode/plugins")).unwrap();
+        }
+        fs::write(
+            entry.join(".opencode/plugins/index.js"),
+            "export default {}\n",
+        )
+        .unwrap();
+        fs::write(entry.join(".opencode/plugins/helper.mjs"), "export {}\n").unwrap();
+        fs::write(
+            support_only.join(".opencode/plugins/helper.mjs"),
+            "export {}\n",
+        )
+        .unwrap();
+        fs::write(
+            native.join("package.json"),
+            r#"{"name":"native-package","version":"1.0.0","exports":{"./server":"./server.js"}}"#,
+        )
+        .unwrap();
+
+        let lines = opencode_load_lines("entry", &entry).unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "opencode entry: entry index.js")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "opencode entry: support helper.mjs")
+        );
+
+        let lines = opencode_load_lines("support-only", &support_only).unwrap();
+        assert_eq!(
+            lines,
+            [
+                "opencode support-only: support helper.mjs",
+                "OpenCode will not load support-only: no .js/.ts entry"
+            ]
+        );
+
+        let lines = opencode_load_lines("native", &native).unwrap();
+        assert_eq!(lines, ["opencode native: native package"]);
         fs::remove_dir_all(base).unwrap();
     }
 
