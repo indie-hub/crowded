@@ -497,7 +497,7 @@ fn stop_process(pid: u32) {
 
 /// Own and drop the server on a background thread because reaping may block.
 pub(crate) struct Server {
-    child: Option<Child>,
+    child: Mutex<Option<Child>>,
     /// The Windows job every server descendant joins at birth. It outlives
     /// all of them: dropping it first would orphan the processes it owns.
     #[cfg(windows)]
@@ -509,11 +509,19 @@ pub(crate) struct Server {
     /// The authenticated server's own pid; when it differs from the spawned
     /// child (a wrapper sits in between), it is stopped explicitly on drop.
     server_pid: Option<u32>,
+    /// Last endpoint liveness probe, so a hot event loop checks the port at
+    /// most once a second; the wrapper exit check above it runs every pass.
+    last_probe: Mutex<Instant>,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
+        let taken = self
+            .child
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+        if let Some(mut child) = taken {
             let spawned = child.id();
             #[cfg(windows)]
             {
@@ -580,6 +588,59 @@ impl Server {
         })
     }
 
+    /// Whether the owned server is gone. True when its wrapper child has
+    /// exited (and is reaped here, so no zombie remains) or its endpoint no
+    /// longer accepts a connection. The wrapper check runs every call; the
+    /// endpoint probe runs at most once a second. A poisoned lock fails safe
+    /// to dead, so a broken server is never treated as live.
+    pub(crate) fn poll_exit(&self) -> io::Result<bool> {
+        {
+            let mut guard = self
+                .child
+                .lock()
+                .map_err(|_| io::Error::other("server child state is poisoned"))?;
+            match guard.as_mut() {
+                Some(child) => match child.try_wait()? {
+                    Some(_) => {
+                        guard.take();
+                        return Ok(true);
+                    }
+                    None => {}
+                },
+                None => return Ok(true),
+            }
+        }
+        const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+        const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+        {
+            let mut last = self
+                .last_probe
+                .lock()
+                .map_err(|_| io::Error::other("server probe state is poisoned"))?;
+            if last.elapsed() < PROBE_INTERVAL {
+                return Ok(false);
+            }
+            *last = Instant::now();
+        }
+        match std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::V4(self.client.address),
+            PROBE_TIMEOUT,
+        ) {
+            Ok(_) => Ok(false),
+            Err(_) => Ok(true),
+        }
+    }
+
+    /// The wrapper child's pid while it is still reaped here, for tests that
+    /// kill exactly the process Crowded started. Never pattern-matches.
+    #[cfg(test)]
+    pub(crate) fn wrapper_pid(&self) -> Option<u32> {
+        self.child
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|child| child.id()))
+    }
+
     pub(crate) fn claim(&mut self, room: String, generation: u64) -> io::Result<Binding> {
         if self
             .binding
@@ -592,17 +653,24 @@ impl Server {
                 "server already bound",
             ));
         }
-        let child = self
-            .child
-            .as_mut()
-            .ok_or_else(|| io::Error::other("server missing"))?;
-        if child.try_wait()?.is_some() {
-            return Err(io::Error::other("server has exited"));
-        }
+        let child_id = {
+            let mut guard = self
+                .child
+                .lock()
+                .map_err(|_| io::Error::other("server child state is poisoned"))?;
+            let Some(child) = guard.as_mut() else {
+                return Err(io::Error::other("server missing"));
+            };
+            if child.try_wait()?.is_some() {
+                guard.take();
+                return Err(io::Error::other("server has exited"));
+            }
+            child.id()
+        };
         #[cfg(windows)]
-        let reported_pid = self.client.verify_pid(child.id(), self.tree.as_ref())?;
+        let reported_pid = self.client.verify_pid(child_id, self.tree.as_ref())?;
         #[cfg(not(windows))]
-        let reported_pid = self.client.verify_pid(child.id(), None)?;
+        let reported_pid = self.client.verify_pid(child_id, None)?;
         self.server_pid = Some(reported_pid);
         // The binding identifies the verified server process, which is a
         // wrapper's child when Headroom launches OpenCode for us.
@@ -825,7 +893,7 @@ impl Server {
         })();
         match result {
             Ok((client, session, url, server_pid)) => Ok(Self {
-                child: Some(child),
+                child: Mutex::new(Some(child)),
                 #[cfg(windows)]
                 tree: Some(tree),
                 client,
@@ -833,6 +901,7 @@ impl Server {
                 url,
                 binding: Mutex::new(None),
                 server_pid: Some(server_pid),
+                last_probe: Mutex::new(Instant::now()),
             }),
             Err(error) => {
                 #[cfg(windows)]
@@ -1349,7 +1418,7 @@ mod tests {
         assert!(tree.contains(member_pid));
         let client = fake(0, |_, _, _| None);
         let server = Server {
-            child: Some(member),
+            child: Mutex::new(Some(member)),
             #[cfg(windows)]
             tree: Some(tree),
             client,
@@ -1357,6 +1426,7 @@ mod tests {
             url: "http://127.0.0.1:1234".into(),
             binding: Mutex::new(None),
             server_pid: Some(member_pid),
+            last_probe: Mutex::new(Instant::now()),
         };
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1391,7 +1461,7 @@ mod tests {
             })
             .unwrap();
         Server {
-            child: None,
+            child: Mutex::new(None),
             #[cfg(windows)]
             tree: None,
             client: Arc::clone(client),
@@ -1399,6 +1469,7 @@ mod tests {
             url: format!("http://{}", client.address),
             binding: Mutex::new(Some(launch)),
             server_pid: Some(42),
+            last_probe: Mutex::new(Instant::now()),
         }
     }
 
@@ -1680,7 +1751,7 @@ mod tests {
             }
         });
         let mut server = Server {
-            child: Some(child),
+            child: Mutex::new(Some(child)),
             #[cfg(windows)]
             tree: None,
             client,
@@ -1688,6 +1759,7 @@ mod tests {
             url: "http://127.0.0.1:1234".into(),
             binding: Mutex::new(None),
             server_pid: None,
+            last_probe: Mutex::new(Instant::now()),
         };
         let fake_binding = Binding {
             room: "room".into(),
@@ -1767,7 +1839,7 @@ mod tests {
             }
         });
         let mut server = Server {
-            child: Some(child),
+            child: Mutex::new(Some(child)),
             #[cfg(windows)]
             tree: None,
             client,
@@ -1775,6 +1847,7 @@ mod tests {
             url: "http://127.0.0.1:1234".into(),
             binding: Mutex::new(None),
             server_pid: None,
+            last_probe: Mutex::new(Instant::now()),
         };
         let binding = server.claim("room-a".into(), 1).unwrap();
         let server = Arc::new(server);
@@ -1845,7 +1918,7 @@ mod tests {
                 }
             });
             let mut server = Server {
-                child: Some(child),
+                child: Mutex::new(Some(child)),
                 #[cfg(windows)]
                 tree: None,
                 client,
@@ -1853,6 +1926,7 @@ mod tests {
                 url: "http://127.0.0.1:1234".into(),
                 binding: Mutex::new(None),
                 server_pid: None,
+                last_probe: Mutex::new(Instant::now()),
             };
             let binding = server.claim("room-a".into(), 1).unwrap();
             let mut adapter =
@@ -1942,7 +2016,7 @@ mod tests {
             Some(response(200, &json!({"pid":pid + 1})))
         });
         let mut server = Server {
-            child: Some(child),
+            child: Mutex::new(Some(child)),
             #[cfg(windows)]
             tree: None,
             client,
@@ -1950,6 +2024,7 @@ mod tests {
             url: "http://127.0.0.1:1234".into(),
             binding: Mutex::new(None),
             server_pid: None,
+            last_probe: Mutex::new(Instant::now()),
         };
         assert!(server.claim("room".into(), 1).is_err());
         assert!(server.binding.lock().unwrap().is_none());
@@ -2037,7 +2112,7 @@ mod tests {
         let pid = child.id();
         let client = fake(0, |_, _, _| None);
         let server = Server {
-            child: Some(child),
+            child: Mutex::new(Some(child)),
             #[cfg(windows)]
             tree: None,
             client,
@@ -2045,6 +2120,7 @@ mod tests {
             url: "http://127.0.0.1:1234".into(),
             binding: Mutex::new(None),
             server_pid: None,
+            last_probe: Mutex::new(Instant::now()),
         };
         drop(server);
         let status = std::process::Command::new("kill")
