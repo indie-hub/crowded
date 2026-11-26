@@ -793,8 +793,7 @@ impl Server {
         command
             .env("OPENCODE_PASSWORD", &password)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            ;
+            .stderr(Stdio::null());
         let mut child = spawn_retrying_text_busy(&mut command)?;
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,

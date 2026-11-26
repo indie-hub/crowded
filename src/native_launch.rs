@@ -443,8 +443,7 @@ fn check_version(
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        ;
+        .stderr(Stdio::null());
     let mut child = spawn_retrying_text_busy(&mut command)?;
     let deadline = Instant::now() + timeout;
     loop {
