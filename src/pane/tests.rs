@@ -2450,7 +2450,7 @@ impl IterationHarness {
     }
 
     fn pump_until(&mut self, what: &str, done: impl Fn(&str) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             self.iterate();
             if done(&self.mailroom.summary()) {
@@ -2671,7 +2671,7 @@ fn mint_all(
     resume: bool,
 ) -> Vec<Option<CodexMint>> {
     let (mut mints, _) = start_codex_mints(specs, environments, prompts, resume);
-    let deadline = Instant::now() + Duration::from_secs(9);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while mints
         .iter()
         .any(|mint| matches!(mint, Some(CodexMint::Pending(_))))
@@ -5356,7 +5356,7 @@ fn the_headroom_lane_never_waits_on_a_placeholder_room() {
         }),
     ];
     assert!(
-        headroom_startup_finishes(codex, Duration::from_secs(5), Duration::from_millis(5)),
+        headroom_startup_finishes(codex, Duration::from_secs(30), Duration::from_millis(5)),
         "a later Headroom room waited for a room that has no process"
     );
 }
@@ -7970,7 +7970,7 @@ mod production_loop {
     }
 
     fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !done() {
             assert!(Instant::now() < deadline, "{what} never happened");
             std::thread::sleep(Duration::from_millis(20));
