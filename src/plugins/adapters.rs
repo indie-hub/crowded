@@ -17,7 +17,7 @@ use std::os::windows::fs::symlink_file as symlink;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::toolbox::remove_empty_directory;
+use crate::toolbox::{HookMatch, HookOwners, managed_hook_position, remove_empty_directory};
 
 use super::{
     INSTALLS_DIRECTORY, NativeHooks, NativePluginManifest, invalid_data, invalid_input,
@@ -210,7 +210,7 @@ pub(super) fn disable_adapters(root: &Path, name: &str) -> io::Result<AdapterSta
     let updates = state
         .hooks
         .iter()
-        .map(|hooks| prepare_hook_disable(root, hooks))
+        .map(|hooks| prepare_hook_disable(root, name, hooks))
         .collect::<io::Result<Vec<_>>>()?;
 
     for (applied, update) in updates.iter().enumerate() {
@@ -445,13 +445,7 @@ fn adapt_hook_commands(
                     .replace("$CLAUDE_PLUGIN_ROOT", &root)
                     .replace("${PLUGIN_ROOT}", &root)
                     .replace("$PLUGIN_ROOT", &root);
-                *command = format!(
-                    "CLAUDE_PLUGIN_ROOT={} PLUGIN_ROOT={} CLAUDE_PLUGIN_DATA={} PLUGIN_DATA={} {adapted}",
-                    shell_quote(&root),
-                    shell_quote(&root),
-                    shell_quote(&data),
-                    shell_quote(&data)
-                );
+                *command = format!("{}{adapted}", command_env_prefix(&root, &data));
             }
             if let Some(command) = windows {
                 let root = plugin_root.to_string_lossy();
@@ -464,11 +458,8 @@ fn adapt_hook_commands(
                 object.insert(
                     "commandWindows".into(),
                     Value::String(format!(
-                        "$env:CLAUDE_PLUGIN_ROOT={}; $env:PLUGIN_ROOT={}; $env:CLAUDE_PLUGIN_DATA={}; $env:PLUGIN_DATA={}; {adapted}",
-                        powershell_quote(&root),
-                        powershell_quote(&root),
-                        powershell_quote(&data),
-                        powershell_quote(&data)
+                        "{}{adapted}",
+                        command_windows_env_prefix(&root, &data)
                     )),
                 );
             }
@@ -590,36 +581,76 @@ fn prepare_hook_enable(root: &Path, hooks: &AdapterHooks) -> io::Result<HookUpda
     })
 }
 
-fn prepare_hook_disable(root: &Path, hooks: &AdapterHooks) -> io::Result<HookUpdate> {
+fn prepare_hook_disable(root: &Path, name: &str, hooks: &AdapterHooks) -> io::Result<HookUpdate> {
     let path = root.join(&hooks.path);
     let original = read_optional_regular(&path)?;
     let mut document = parse_json_object(original.as_deref(), &path)?;
     let root_object = document.as_object_mut().unwrap();
-    let configured = root_object
-        .get_mut("hooks")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| invalid_data(format!("{} `hooks` must be an object", path.display())))?;
+    let configured = match root_object.get_mut("hooks") {
+        Some(Value::Object(configured)) => Some(configured),
+        Some(_) => {
+            return Err(invalid_data(format!(
+                "{} `hooks` must be an object",
+                path.display()
+            )));
+        }
+        None => None,
+    };
+    let Some(configured) = configured else {
+        println!(
+            "skipping {}: the adapter hooks are already gone",
+            path.display()
+        );
+        let generated = if hooks.created && root_object.is_empty() {
+            None
+        } else {
+            let mut output = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
+            output.push('\n');
+            Some(output)
+        };
+        return Ok(HookUpdate {
+            managed: hooks.clone(),
+            original,
+            generated,
+        });
+    };
+    let plugin_root = root.join(INSTALLS_DIRECTORY).join(name);
+    let plugin_data = root.join(".crowded/plugin-data").join(name);
+    let root_text = plugin_root.to_string_lossy().into_owned();
+    let data_text = plugin_data.to_string_lossy().into_owned();
+    let command_prefix = command_env_prefix(&root_text, &data_text);
+    let command_windows_prefix = command_windows_env_prefix(&root_text, &data_text);
+    let owners = HookOwners {
+        command_prefix: &command_prefix,
+        command_windows_prefix: &command_windows_prefix,
+        root: &root_text,
+    };
     for (event, removals) in &hooks.entries {
-        let handlers = configured
-            .get_mut(event)
-            .and_then(Value::as_array_mut)
-            .ok_or_else(|| {
-                invalid_data(format!(
-                    "{} `hooks.{event}` must be an array",
-                    path.display()
-                ))
-            })?;
+        let Some(handlers) = configured.get_mut(event).and_then(Value::as_array_mut) else {
+            println!(
+                "skipping {}: the `{event}` adapter hook is already gone",
+                path.display()
+            );
+            continue;
+        };
         for removal in removals {
-            let position = handlers
-                .iter()
-                .position(|handler| handler == removal)
-                .ok_or_else(|| {
-                    invalid_data(format!(
-                        "{} no longer contains the `{event}` adapter hook",
+            match managed_hook_position(handlers, removal, Some(&owners)) {
+                HookMatch::Found(position) => {
+                    handlers.remove(position);
+                }
+                HookMatch::Missing => {
+                    println!(
+                        "skipping {}: the `{event}` adapter hook is already gone",
                         path.display()
-                    ))
-                })?;
-            handlers.remove(position);
+                    );
+                }
+                HookMatch::Ambiguous => {
+                    return Err(invalid_data(format!(
+                        "{} contains more than one Crowded-managed `{event}` adapter hook",
+                        path.display()
+                    )));
+                }
+            }
         }
         if handlers.is_empty() {
             configured.remove(event);
@@ -789,9 +820,33 @@ fn powershell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn command_env_prefix(root: &str, data: &str) -> String {
+    format!(
+        "CLAUDE_PLUGIN_ROOT={} PLUGIN_ROOT={} CLAUDE_PLUGIN_DATA={} PLUGIN_DATA={} ",
+        shell_quote(root),
+        shell_quote(root),
+        shell_quote(data),
+        shell_quote(data)
+    )
+}
+
+fn command_windows_env_prefix(root: &str, data: &str) -> String {
+    format!(
+        "$env:CLAUDE_PLUGIN_ROOT={}; $env:PLUGIN_ROOT={}; $env:CLAUDE_PLUGIN_DATA={}; $env:PLUGIN_DATA={}; ",
+        powershell_quote(root),
+        powershell_quote(root),
+        powershell_quote(data),
+        powershell_quote(data)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn codex_hooks_get_powershell_commands() {
@@ -807,5 +862,162 @@ mod tests {
             hook["commandWindows"],
             r#"$env:CLAUDE_PLUGIN_ROOT='C:\Plugin O''Brien'; $env:PLUGIN_ROOT='C:\Plugin O''Brien'; $env:CLAUDE_PLUGIN_DATA='C:\Data O''Brien'; $env:PLUGIN_DATA='C:\Data O''Brien'; node "$env:PLUGIN_ROOT/hooks/codex/pretooluse.mjs""#
         );
+    }
+
+    fn fixture_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "crowded-adapter-test-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        root
+    }
+
+    fn adapted_entry(root: &Path, script: &str) -> Value {
+        let plugin_root = root.join(".crowded/plugins/example");
+        let data = root.join(".crowded/plugin-data/example");
+        let mut entry = serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": format!("node \"${{CLAUDE_PLUGIN_ROOT}}/hooks/{script}\"")
+            }]
+        });
+        adapt_hook_commands(&mut entry, &plugin_root, &data, true);
+        entry
+    }
+
+    fn recorded(path: &str, entries: &[(&str, Value)]) -> AdapterHooks {
+        AdapterHooks {
+            path: PathBuf::from(path),
+            entries: entries
+                .iter()
+                .map(|(event, entry)| ((*event).to_owned(), vec![entry.clone()]))
+                .collect(),
+            created: false,
+        }
+    }
+
+    fn write_hooks(root: &Path, document: &Value) {
+        fs::write(
+            root.join(".claude/settings.local.json"),
+            document.to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn disable_removes_a_hook_rewritten_to_windows_form() {
+        let root = fixture_root();
+        let entry = adapted_entry(&root, "activate.js");
+        let windows = entry["hooks"][0]["commandWindows"].clone();
+        write_hooks(
+            &root,
+            &serde_json::json!({
+                "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": windows}]}]}
+            }),
+        );
+        let hooks = recorded(".claude/settings.local.json", &[("SessionStart", entry)]);
+
+        let update = prepare_hook_disable(&root, "example", &hooks).unwrap();
+
+        let generated: Value = serde_json::from_str(update.generated.as_deref().unwrap()).unwrap();
+        assert!(generated.get("hooks").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disable_keeps_a_user_hook_without_the_crowded_prefix() {
+        let root = fixture_root();
+        let entry = adapted_entry(&root, "activate.js");
+        let plugin_root = root.join(".crowded/plugins/example");
+        let user_command = format!("node \"{}/hooks/activate.js\"", plugin_root.display());
+        write_hooks(
+            &root,
+            &serde_json::json!({
+                "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": user_command}]}]}
+            }),
+        );
+        let hooks = recorded(".claude/settings.local.json", &[("SessionStart", entry)]);
+
+        let update = prepare_hook_disable(&root, "example", &hooks).unwrap();
+
+        let generated = update.generated.as_deref().unwrap();
+        assert!(generated.contains("hooks/activate.js"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disable_refuses_two_owned_candidates_without_changing_the_file() {
+        let root = fixture_root();
+        let entry = adapted_entry(&root, "activate.js");
+        let windows = entry["hooks"][0]["commandWindows"].clone();
+        let document = serde_json::json!({
+            "hooks": {"SessionStart": [
+                {"hooks": [{"type": "command", "command": windows}]},
+                {"hooks": [{"type": "command", "command": windows}]}
+            ]}
+        });
+        write_hooks(&root, &document);
+        let hooks = recorded(".claude/settings.local.json", &[("SessionStart", entry)]);
+
+        let error = prepare_hook_disable(&root, "example", &hooks)
+            .err()
+            .expect("two owned candidates must be refused");
+
+        assert!(error.to_string().contains("more than one"));
+        assert_eq!(
+            fs::read_to_string(root.join(".claude/settings.local.json")).unwrap(),
+            document.to_string()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disable_skips_a_missing_hooks_section_and_keeps_other_settings() {
+        let root = fixture_root();
+        let entry = adapted_entry(&root, "activate.js");
+        write_hooks(&root, &serde_json::json!({"keep": true}));
+        let hooks = recorded(".claude/settings.local.json", &[("SessionStart", entry)]);
+
+        let update = prepare_hook_disable(&root, "example", &hooks).unwrap();
+
+        let generated = update.generated.as_deref().unwrap();
+        assert!(generated.contains("\"keep\""));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disable_skips_a_missing_hook_and_removes_the_rest() {
+        let root = fixture_root();
+        let start = adapted_entry(&root, "activate.js");
+        let stop = adapted_entry(&root, "deactivate.js");
+        // The SessionStart event still exists but holds only a user hook; the
+        // recorded adapter hook there is already gone. Stop still holds ours.
+        write_hooks(
+            &root,
+            &serde_json::json!({"hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "user-hook"}]}],
+                "Stop": [stop.clone()]
+            }}),
+        );
+        let hooks = recorded(
+            ".claude/settings.local.json",
+            &[("SessionStart", start), ("Stop", stop)],
+        );
+
+        let update = prepare_hook_disable(&root, "example", &hooks).unwrap();
+
+        let generated: Value = serde_json::from_str(update.generated.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            generated["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "user-hook"
+        );
+        assert!(generated["hooks"].get("Stop").is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -459,11 +459,17 @@ fn managed_json_matches(file: &ManagedFile, current: &str, section: &str) -> io:
     let current_entries = current.get(section).and_then(Value::as_object);
     if section == "hooks" {
         for (event, expected) in owned_hook_entries(file)? {
-            let contains = current_entries
+            let Some(handlers) = current_entries
                 .and_then(|entries| entries.get(&event))
                 .and_then(Value::as_array)
-                .is_some_and(|handlers| handlers.contains(&expected));
-            if !contains {
+            else {
+                // The hook is already gone; removing the rest still applies.
+                continue;
+            };
+            if matches!(
+                managed_hook_position(handlers, &expected, None),
+                HookMatch::Ambiguous
+            ) {
                 return Ok(false);
             }
         }
@@ -496,15 +502,35 @@ fn remove_managed_json(
             file.path.display()
         ))
     })?;
-    let entries = root
-        .get_mut(section)
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| {
-            invalid_data(format!(
+    let entries = match root.get_mut(section) {
+        Some(Value::Object(entries)) => Some(entries),
+        Some(_) => {
+            return Err(invalid_data(format!(
                 "{} `{section}` must contain a JSON object",
                 file.path.display()
-            ))
-        })?;
+            )));
+        }
+        None => None,
+    };
+    let Some(entries) = entries else {
+        if section != "hooks" {
+            return Err(invalid_data(format!(
+                "{} `{section}` must contain a JSON object",
+                file.path.display()
+            )));
+        }
+        println!(
+            "skipping {}: the Crowded-managed hooks are already gone",
+            file.path.display()
+        );
+        if root.is_empty() && file.original.is_none() {
+            return Ok(None);
+        }
+        let mut output =
+            serde_json::to_string_pretty(&current).map_err(invalid_json(&file.path))?;
+        output.push('\n');
+        return Ok(Some(output));
+    };
     if section == "hooks" {
         let original: Value = match file.original.as_deref() {
             Some(original) => serde_json::from_str(original).map_err(invalid_json(&file.path))?,
@@ -512,25 +538,31 @@ fn remove_managed_json(
         };
         let original_hooks = original.get(section).and_then(Value::as_object);
         for (event, owned) in owned_hook_entries(file)? {
-            let handlers = entries
-                .get_mut(&event)
-                .and_then(Value::as_array_mut)
-                .ok_or_else(|| {
-                    invalid_data(format!(
-                        "{} `hooks.{event}` must contain an array",
+            let Some(handlers) = entries.get_mut(&event).and_then(Value::as_array_mut) else {
+                println!(
+                    "skipping {}: the Crowded-managed `{event}` hook is already gone",
+                    file.path.display()
+                );
+                continue;
+            };
+            match managed_hook_position(handlers, &owned, None) {
+                HookMatch::Found(position) => {
+                    handlers.remove(position);
+                }
+                HookMatch::Missing => {
+                    println!(
+                        "skipping {}: the Crowded-managed `{event}` hook is already gone",
                         file.path.display()
-                    ))
-                })?;
-            let position = handlers
-                .iter()
-                .position(|handler| handler == &owned)
-                .ok_or_else(|| {
-                    invalid_data(format!(
-                        "{} no longer contains a Crowded-managed `{event}` hook",
+                    );
+                    continue;
+                }
+                HookMatch::Ambiguous => {
+                    return Err(invalid_data(format!(
+                        "{} contains more than one Crowded-managed `{event}` hook",
                         file.path.display()
-                    ))
-                })?;
-            handlers.remove(position);
+                    )));
+                }
+            }
             let original_had_event = original_hooks.is_some_and(|hooks| hooks.contains_key(&event));
             if handlers.is_empty() && !original_had_event {
                 entries.remove(&event);
@@ -551,6 +583,115 @@ fn remove_managed_json(
     let mut output = serde_json::to_string_pretty(&current).map_err(invalid_json(&file.path))?;
     output.push('\n');
     Ok(Some(output))
+}
+
+/// Which recorded hook a configured handler refers to. `Missing` means the hook
+/// is already gone, not that the file changed in an unexpected way.
+pub(crate) enum HookMatch {
+    Found(usize),
+    Missing,
+    Ambiguous,
+}
+
+/// The exact env prefix Crowded writes ahead of an adapted plugin hook, plus the
+/// plugin root that prefix embeds.
+pub(crate) struct HookOwners<'a> {
+    pub(crate) command_prefix: &'a str,
+    pub(crate) command_windows_prefix: &'a str,
+    pub(crate) root: &'a str,
+}
+
+/// Finds a recorded hook in a configured handler list. An exact entry wins.
+/// Otherwise a handler is owned only when it carries Crowded's env prefix and
+/// runs the same script; more than one such handler is ambiguous.
+pub(crate) fn managed_hook_position(
+    handlers: &[Value],
+    recorded: &Value,
+    owners: Option<&HookOwners<'_>>,
+) -> HookMatch {
+    if let Some(position) = handlers.iter().position(|handler| handler == recorded) {
+        return HookMatch::Found(position);
+    }
+    let Some(owners) = owners else {
+        return HookMatch::Missing;
+    };
+    let Some(recorded_script) = owned_hook_script(recorded, owners) else {
+        return HookMatch::Missing;
+    };
+    let candidates: Vec<usize> = handlers
+        .iter()
+        .enumerate()
+        .filter(|(_, handler)| {
+            owned_hook_script(handler, owners).as_ref() == Some(&recorded_script)
+        })
+        .map(|(position, _)| position)
+        .collect();
+    match candidates.as_slice() {
+        [] => HookMatch::Missing,
+        [position] => HookMatch::Found(*position),
+        _ => HookMatch::Ambiguous,
+    }
+}
+
+fn owned_hook_script(
+    value: &Value,
+    owners: &HookOwners<'_>,
+) -> Option<std::collections::BTreeSet<String>> {
+    let mut scripts = std::collections::BTreeSet::new();
+    let mut owned = false;
+    collect_owned_hook_scripts(value, owners, &mut owned, &mut scripts);
+    owned.then_some(scripts)
+}
+
+fn collect_owned_hook_scripts(
+    value: &Value,
+    owners: &HookOwners<'_>,
+    owned: &mut bool,
+    scripts: &mut std::collections::BTreeSet<String>,
+) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_owned_hook_scripts(value, owners, owned, scripts);
+            }
+        }
+        Value::Object(object) => {
+            for field in ["command", "commandWindows"] {
+                let Some(command) = object.get(field).and_then(Value::as_str) else {
+                    continue;
+                };
+                let remainder = command
+                    .strip_prefix(owners.command_prefix)
+                    .or_else(|| command.strip_prefix(owners.command_windows_prefix));
+                if remainder.is_some() {
+                    *owned = true;
+                }
+                scripts.insert(normalize_hook_script(
+                    remainder.unwrap_or(command),
+                    owners.root,
+                ));
+            }
+            for value in object.values() {
+                collect_owned_hook_scripts(value, owners, owned, scripts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_hook_script(script: &str, root: &str) -> String {
+    let mut normalized = script.trim().replace(root, "${ROOT}");
+    for variable in [
+        "$env:CLAUDE_PLUGIN_ROOT",
+        "${CLAUDE_PLUGIN_ROOT}",
+        "$CLAUDE_PLUGIN_ROOT",
+        "$env:PLUGIN_ROOT",
+        "${PLUGIN_ROOT}",
+        "$PLUGIN_ROOT",
+    ] {
+        normalized = normalized.replace(variable, "${ROOT}");
+    }
+    normalized.replace('\\', "/")
 }
 
 fn owned_hook_entries(file: &ManagedFile) -> io::Result<Vec<(String, Value)>> {
@@ -2004,6 +2145,52 @@ export const CrowdedPulse = async () => {
     };
 
     use super::*;
+
+    #[test]
+    fn removing_a_hook_that_is_already_gone_still_removes_the_rest() {
+        let generated = r#"{"hooks":{
+            "SessionStart":[{"hooks":[{"type":"command","command":"a"}]}],
+            "Stop":[{"hooks":[{"type":"command","command":"b"}]}]
+        }}"#;
+        let current = r#"{"hooks":{
+            "SessionStart":[{"hooks":[{"type":"command","command":"user"}]}],
+            "Stop":[{"hooks":[{"type":"command","command":"b"}]}]
+        }}"#;
+        let file = ManagedFile {
+            path: PathBuf::from(".claude/settings.local.json"),
+            original: Some("{}".to_owned()),
+            generated: generated.to_owned(),
+        };
+
+        let output = remove_managed_json(&file, current, "hooks")
+            .unwrap()
+            .expect("the remaining managed hook is removed");
+
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            value["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "user"
+        );
+        assert!(value["hooks"].get("Stop").is_none());
+    }
+
+    #[test]
+    fn removing_hooks_without_a_hooks_section_keeps_the_rest() {
+        let generated = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"b"}]}]}}"#;
+        let file = ManagedFile {
+            path: PathBuf::from(".claude/settings.local.json"),
+            original: Some(r#"{"keep":true}"#.to_owned()),
+            generated: generated.to_owned(),
+        };
+
+        let output = remove_managed_json(&file, r#"{"keep": true}"#, "hooks")
+            .unwrap()
+            .expect("the document is preserved");
+
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["keep"], true);
+        assert!(value.get("hooks").is_none());
+    }
 
     #[test]
     fn codex_native_config_serializes_streamable_http_url() {
