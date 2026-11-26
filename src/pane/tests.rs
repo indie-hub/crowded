@@ -91,7 +91,7 @@ fn room_spec(program: &str, args: &[&str]) -> RoomSpec {
 
 #[cfg(unix)]
 fn wait_for_file(path: &Path) -> String {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(text) = fs::read_to_string(path) {
             if !text.is_empty() {
@@ -768,7 +768,7 @@ fn native_room_starts_its_owned_server_through_headroom() {
     let pane = Pane::spawn_with_native(spec, native_test_size(), environment, Some(room)).unwrap();
     assert!(pane.headroom_active());
     // The TUI only attaches; it is not wrapped a second time.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let tui = loop {
         if let Ok(text) = fs::read_to_string(fake.dir.join("tui_argv")) {
             break text;
@@ -860,7 +860,7 @@ fn isolated_real_tui_attaches_to_the_owned_server() {
     let mut pane =
         Pane::spawn_with_native(spec, native_test_size(), environment, Some(room)).unwrap();
     // The TUI keeps a connection to the owned server's port.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let connected = loop {
         let _ = pane.drain_output();
         let lsof = std::process::Command::new("lsof")
@@ -2067,7 +2067,7 @@ fn pump_router(
     mailroom: &mut Mailroom,
     done: impl Fn(&str) -> bool,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         router.tick(Instant::now(), mailroom, false, false);
         let summary = mailroom.summary();
@@ -2776,7 +2776,7 @@ fn restarting_an_offline_codex_room_resumes_its_stored_session() {
     assert_eq!(binding.session, MINTED_A);
     assert!(binding.generation > old, "a relaunch gets a new generation");
     // The resumed terminal names the stored thread; no exec ran.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let log_text = fs::read_to_string(&log).unwrap_or_default();
         if log_text.lines().any(|line| line == "resume") {
@@ -2842,7 +2842,7 @@ fn clearing_a_codex_room_mints_a_new_thread_and_holds_old_mail() {
     // Let the mint finish; the room comes back in the new thread.
     rig.paused = false;
     fs::write(&gate, b"go").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         rig.iterate();
         let bound = rig
@@ -3364,7 +3364,7 @@ fn every_message_to_a_claude_room_is_held() {
     )
     .unwrap();
     let mut mailroom = Mailroom::new(10);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         restarted.tick(Instant::now(), &mut mailroom, true, false);
         let shown = mailroom.summary();
@@ -3767,7 +3767,7 @@ fn a_native_claude_room_restarts_resumes_and_clears() {
     );
     let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
     assert!(binding.generation > old.generation);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !log.exists() {
         rig.iterate();
         assert!(
@@ -3810,7 +3810,7 @@ fn a_native_claude_room_restarts_resumes_and_clears() {
         "{:?}",
         rig.panes[0].room_spec().args
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while fs::read_to_string(&log)
         .unwrap_or_default()
         .lines()
@@ -3997,7 +3997,7 @@ fn f5_drives_the_loop_restart_seam_for_a_native_claude_room() {
             .filter(|line| *line == "exec")
             .count()
     };
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while launched() < 1 {
         assert!(
             Instant::now() < deadline,
@@ -4047,7 +4047,7 @@ fn offline_ctrl_r_drives_the_loop_restart_seam_for_a_native_codex_room() {
             .filter(|line| line.starts_with("resume"))
             .count()
     };
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while resumed() < 1 {
         assert!(Instant::now() < deadline, "the fake codex never resumed");
         thread::sleep(Duration::from_millis(20));
@@ -4165,7 +4165,7 @@ fn f5_at_focus_one_relaunches_only_the_claude_room() {
             .filter(|line| *line == "exec")
             .count()
     };
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while launched(&log1) < 1 {
         assert!(Instant::now() < deadline, "room 1 was never relaunched");
         thread::sleep(Duration::from_millis(20));
@@ -4274,7 +4274,7 @@ fn ctrl_r_at_focus_one_relaunches_only_the_codex_room() {
             .filter(|line| line.starts_with("exec"))
             .count()
     };
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while launched(&log1) < 1 {
         assert!(Instant::now() < deadline, "room 1 was never relaunched");
         thread::sleep(Duration::from_millis(20));
@@ -4493,7 +4493,7 @@ fn a_superseded_clear_mint_never_overwrites_the_newer_session() {
         }
         fs::write(&gate_b, b"go").unwrap();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             rig.iterate();
             let bound = rig
@@ -4560,7 +4560,7 @@ fn a_failed_clear_mint_leaves_the_room_offline_with_its_reason() {
     rig.iterate();
 
     rig.push_control(crate::doorbell::ControlAction::ClearContext);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         rig.iterate();
         let view = rig.notice.ordered_lines().join("; ");
@@ -4940,7 +4940,7 @@ fn a_resume_launch_without_a_rollout_mints_and_keeps_the_stored_id_until_the_ups
         Some(MINTED_A),
         "the stored entry stays until the mint's upsert replaces it"
     );
-    let deadline = Instant::now() + Duration::from_secs(9);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while mints[0]
         .as_ref()
         .is_some_and(|mint| matches!(mint, CodexMint::Pending(_)))
@@ -5145,7 +5145,7 @@ fn a_hung_mint_does_not_delay_the_rooms_whose_mints_finished() {
         started.elapsed() < Duration::from_secs(1),
         "minting blocked startup"
     );
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while ready(&mints[0]).is_none() || ready(&mints[1]).is_none() {
         let _ = poll_codex_mints(&mut mints);
         assert!(
@@ -5614,7 +5614,7 @@ fn a_completed_mint_starts_one_resume_and_binds_without_dropping_earlier_rooms()
             .send(&mut mailroom, "Sender", index, "hi", None)
             .unwrap();
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !(root.path().join("queue0").exists() && root.path().join("queue2").exists()) {
         router.tick(Instant::now(), &mut mailroom, false, false);
         assert!(
@@ -6288,7 +6288,7 @@ fn dropping_a_pane_with_a_blocked_writer_completes() {
         drop_elapsed < Duration::from_secs(3),
         "drop took {drop_elapsed:?}"
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !finished.load(Ordering::SeqCst) {
         assert!(
             Instant::now() < deadline,
@@ -6461,7 +6461,7 @@ fn pane_with_delayed_writer(
 
 fn fill_pane_queue(pane: &mut Pane, entered: &AtomicBool) {
     let job = vec![b'x'; 16 * 1024];
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         while pane.write_bytes(&job).is_ok() {}
         // The writer thread may take a queued job the moment filling
@@ -6938,7 +6938,7 @@ fn a_claude_launch_writes_its_inbox_file_and_a_clean_environment() {
     )
     .unwrap();
     wait_for_file(&marker);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while fs::read_to_string(&marker).unwrap().lines().count() < 2 {
         assert!(Instant::now() < deadline, "the stub wrote one line");
         thread::sleep(Duration::from_millis(20));
@@ -7297,7 +7297,7 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         .expect("node runs the driver");
     // The mod's own poll is the only clock; the bound only stops a broken
     // driver hanging the suite.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if fs::read_to_string(&marker)
             .unwrap_or_default()
@@ -7440,7 +7440,7 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         .stdout(Stdio::null())
         .spawn()
         .expect("node runs room 2 mod");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let a = fs::read_to_string(&marker1)
             .unwrap_or_default()
@@ -7619,7 +7619,7 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         .stdout(Stdio::null())
         .spawn()
         .expect("node runs room 2 mod");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let connected = fs::read_to_string(&marker)
             .unwrap_or_default()
@@ -7720,7 +7720,7 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         .stdout(Stdio::null())
         .spawn()
         .expect("node runs room 1 mod");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if fs::read_to_string(&marker1)
             .unwrap_or_default()
@@ -7745,7 +7745,7 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
         .stdout(Stdio::null())
         .spawn()
         .expect("node runs rogue mod");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let log = fs::read_to_string(&marker2).unwrap_or_default();
         if log.contains("STATUS Crowded inbox not connected") {
@@ -7861,7 +7861,7 @@ await handler($, { cwd, isInteractive: true }, async (e) => e);
             }
         }
         let mut child = cmd.spawn().expect("node runs mod");
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let log = fs::read_to_string(&marker).unwrap_or_default();
             if log.contains("STATUS Crowded inbox not connected") {

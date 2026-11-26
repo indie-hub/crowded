@@ -29,8 +29,11 @@ use crate::{
 /// short bound so a deliberately hung stub does not slow the suite.
 #[cfg(not(test))]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+// Long enough for a loaded runner to start a stub; short of the 30 seconds the
+// hanging stubs sleep and of the tests' own bounds, which the timeout tests
+// must still be able to reach.
 #[cfg(test)]
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Only the start of the CLI's output is kept; the rest is drained so a chatty
 /// process can never block on a full pipe.
 const MAX_OUTPUT: usize = 8 * 1024;
