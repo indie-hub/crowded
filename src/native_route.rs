@@ -428,7 +428,19 @@ impl NativeRouter {
         };
         // A paused schedule loads the saved state without sending anything, and
         // tells us at once whether the file could be opened.
-        router.send_schedule(true, false)?;
+        #[cfg(test)]
+        thread::sleep(tests::START_SCHEDULE_DELAY.with(|delay| delay.get()));
+        if let Err(stopped) = router.send_schedule(true, false) {
+            // A worker that could not open the file reports why and exits, so
+            // the send can lose that race; the report is still queued.
+            return Err(match router.outbox().events.try_recv() {
+                Ok(TaggedEvent {
+                    event: Event::Error(error),
+                    ..
+                }) => router.open_failure(&error),
+                _ => stopped,
+            });
+        }
         match router.outbox().events.recv_timeout(STARTUP_WAIT) {
             Ok(TaggedEvent {
                 id,
@@ -442,15 +454,19 @@ impl NativeRouter {
             Ok(TaggedEvent {
                 event: Event::Error(error),
                 ..
-            }) => Err(io::Error::other(format!(
-                "native outbox {} could not be opened and was left unchanged: {error}",
-                router.path.display()
-            ))),
+            }) => Err(router.open_failure(&error)),
             _ => Err(io::Error::other(format!(
                 "native outbox {} did not start in time",
                 router.path.display()
             ))),
         }
+    }
+
+    fn open_failure(&self, error: &str) -> io::Error {
+        io::Error::other(format!(
+            "native outbox {} could not be opened and was left unchanged: {error}",
+            self.path.display()
+        ))
     }
 
     pub(crate) fn is_native(&self, index: usize) -> bool {
@@ -2160,6 +2176,31 @@ mod tests {
         assert_eq!(log.borrow().len(), 1);
         assert_eq!(log.borrow()[0].1, NativeReply::Queued);
         assert!(texts(&a).is_empty());
+    }
+
+    thread_local! {
+        /// Holds `NativeRouter::start` back before its first send, on this
+        /// thread only, so a test can let the worker exit first.
+        pub(super) static START_SCHEDULE_DELAY: std::cell::Cell<Duration> =
+            const { std::cell::Cell::new(Duration::ZERO) };
+    }
+
+    #[test]
+    fn a_corrupt_outbox_is_reported_even_when_its_worker_has_already_exited() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let a = launch(root.path(), cwd.path(), "a", 1, 1);
+        let path = state_path(root.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{ not json").unwrap();
+        // Far longer than the worker needs to fail to open and exit.
+        START_SCHEDULE_DELAY.with(|delay| delay.set(Duration::from_millis(500)));
+        let error = NativeRouter::start(path.clone(), vec![entry(&a, 0, "Room A")])
+            .err()
+            .expect("must refuse");
+        START_SCHEDULE_DELAY.with(|delay| delay.set(Duration::ZERO));
+        assert!(error.to_string().contains("left unchanged"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), b"{ not json");
     }
 
     #[test]
