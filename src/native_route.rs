@@ -4031,7 +4031,9 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
-        for _ in 0..10 {
+        // Positive state first, then a window no shorter than the original
+        // 400 ms (20 ticks): a repeat of the notice has to land inside it.
+        for _ in 0..25 {
             notices.extend(
                 router
                     .tick(Instant::now(), &mut mailroom, false, false)
