@@ -637,22 +637,48 @@ fn owned_hook_script(
     value: &Value,
     owners: &HookOwners<'_>,
 ) -> Option<std::collections::BTreeSet<String>> {
+    // Windows accepts both separators, and the recorded prefix and the prefix
+    // recomputed at disable time can spell the same path differently. Compare
+    // them in one spelling; the prefix is still the full root and data dir.
+    let command_prefix = normalize_separators(owners.command_prefix);
+    let command_windows_prefix = normalize_separators(owners.command_windows_prefix);
+    let root = normalize_separators(owners.root);
     let mut scripts = std::collections::BTreeSet::new();
     let mut owned = false;
-    collect_owned_hook_scripts(value, owners, &mut owned, &mut scripts);
+    collect_owned_hook_scripts(
+        value,
+        &command_prefix,
+        &command_windows_prefix,
+        &root,
+        &mut owned,
+        &mut scripts,
+    );
     owned.then_some(scripts)
+}
+
+fn normalize_separators(value: &str) -> String {
+    value.replace('\\', "/")
 }
 
 fn collect_owned_hook_scripts(
     value: &Value,
-    owners: &HookOwners<'_>,
+    command_prefix: &str,
+    command_windows_prefix: &str,
+    root: &str,
     owned: &mut bool,
     scripts: &mut std::collections::BTreeSet<String>,
 ) {
     match value {
         Value::Array(values) => {
             for value in values {
-                collect_owned_hook_scripts(value, owners, owned, scripts);
+                collect_owned_hook_scripts(
+                    value,
+                    command_prefix,
+                    command_windows_prefix,
+                    root,
+                    owned,
+                    scripts,
+                );
             }
         }
         Value::Object(object) => {
@@ -660,19 +686,24 @@ fn collect_owned_hook_scripts(
                 let Some(command) = object.get(field).and_then(Value::as_str) else {
                     continue;
                 };
+                let command = normalize_separators(command);
                 let remainder = command
-                    .strip_prefix(owners.command_prefix)
-                    .or_else(|| command.strip_prefix(owners.command_windows_prefix));
+                    .strip_prefix(command_prefix)
+                    .or_else(|| command.strip_prefix(command_windows_prefix));
                 if remainder.is_some() {
                     *owned = true;
                 }
-                scripts.insert(normalize_hook_script(
-                    remainder.unwrap_or(command),
-                    owners.root,
-                ));
+                scripts.insert(normalize_hook_script(remainder.unwrap_or(&command), root));
             }
             for value in object.values() {
-                collect_owned_hook_scripts(value, owners, owned, scripts);
+                collect_owned_hook_scripts(
+                    value,
+                    command_prefix,
+                    command_windows_prefix,
+                    root,
+                    owned,
+                    scripts,
+                );
             }
         }
         _ => {}
@@ -680,6 +711,7 @@ fn collect_owned_hook_scripts(
 }
 
 fn normalize_hook_script(script: &str, root: &str) -> String {
+    // `script` and `root` are already separator-normalized.
     let mut normalized = script.trim().replace(root, "${ROOT}");
     for variable in [
         "$env:CLAUDE_PLUGIN_ROOT",
@@ -691,7 +723,7 @@ fn normalize_hook_script(script: &str, root: &str) -> String {
     ] {
         normalized = normalized.replace(variable, "${ROOT}");
     }
-    normalized.replace('\\', "/")
+    normalized
 }
 
 fn owned_hook_entries(file: &ManagedFile) -> io::Result<Vec<(String, Value)>> {
@@ -2145,6 +2177,38 @@ export const CrowdedPulse = async () => {
     };
 
     use super::*;
+
+    #[test]
+    fn an_owner_prefix_matches_the_same_path_with_other_separators() {
+        // Windows `Path::join` keeps the separators already in each component,
+        // so the recorded prefix and the prefix recomputed at disable time can
+        // end the plugin name with "\" and "/" for the same directory.
+        let recorded_posix = "CLAUDE_PLUGIN_ROOT='C:\\p\\plugins/example' PLUGIN_ROOT='C:\\p\\plugins/example' CLAUDE_PLUGIN_DATA='C:\\p\\data' PLUGIN_DATA='C:\\p\\data' ";
+        let recorded_windows = "$env:CLAUDE_PLUGIN_ROOT='C:\\p\\plugins/example'; $env:PLUGIN_ROOT='C:\\p\\plugins/example'; $env:CLAUDE_PLUGIN_DATA='C:\\p\\data'; $env:PLUGIN_DATA='C:\\p\\data'; ";
+        let owners = HookOwners {
+            command_prefix: "CLAUDE_PLUGIN_ROOT='C:\\p\\plugins\\example' PLUGIN_ROOT='C:\\p\\plugins\\example' CLAUDE_PLUGIN_DATA='C:\\p\\data' PLUGIN_DATA='C:\\p\\data' ",
+            command_windows_prefix: "$env:CLAUDE_PLUGIN_ROOT='C:\\p\\plugins\\example'; $env:PLUGIN_ROOT='C:\\p\\plugins\\example'; $env:CLAUDE_PLUGIN_DATA='C:\\p\\data'; $env:PLUGIN_DATA='C:\\p\\data'; ",
+            root: "C:\\p\\plugins\\example",
+        };
+        let recorded = serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": format!("{recorded_posix}node \"C:\\p\\plugins/example/hooks/x.js\""),
+                "commandWindows": format!("{recorded_windows}node \"$env:PLUGIN_ROOT/hooks/x.js\"")
+            }]
+        });
+        let rewritten = serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": format!("{recorded_windows}node \"$env:PLUGIN_ROOT/hooks/x.js\"")
+            }]
+        });
+
+        assert!(matches!(
+            managed_hook_position(&[rewritten], &recorded, Some(&owners)),
+            HookMatch::Found(0)
+        ));
+    }
 
     #[test]
     fn removing_a_hook_that_is_already_gone_still_removes_the_rest() {

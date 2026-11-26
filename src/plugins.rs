@@ -596,8 +596,12 @@ fn local_plugin_imports(root: &Path, declared: &[String]) -> Vec<(String, String
                 || text.contains(&format!("\"{name}/"))
                 || text.contains(&format!("'{name}/"))
             {
-                let source = path.strip_prefix(root).unwrap_or(&path).display();
-                imports.push((source.to_string(), package.clone()));
+                let source = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                imports.push((source, package.clone()));
             }
         }
     }
