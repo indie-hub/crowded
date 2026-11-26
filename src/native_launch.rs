@@ -294,6 +294,13 @@ impl NativeRoom {
         Arc::clone(self.server.get())
     }
 
+    /// Whether the owned server is gone: its wrapper child exited (reaped
+    /// here) or its endpoint no longer accepts a connection. Never touches
+    /// another room's server: only this room's own handle is polled.
+    pub(crate) fn poll_server_exit(&self) -> io::Result<bool> {
+        self.server.get().poll_exit()
+    }
+
     /// Replaces OpenCode's private `--standalone` server with this one.
     pub(crate) fn tui_arguments(&self) -> Vec<OsString> {
         vec![

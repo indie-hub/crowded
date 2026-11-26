@@ -1504,6 +1504,38 @@ pub(crate) fn launch_native_rooms(
     Ok(rooms)
 }
 
+/// Builds one owned-server launch for reviving a dead room. The lane (room
+/// key) stays the caller's, so held mail for it is adopted onto the new
+/// binding like a clear; only the generation is new. Same variables,
+/// headroom and config as startup, so the revived server runs exactly what a
+/// fresh launch would.
+pub(crate) fn opencode_revive_launch(
+    spec: &RoomSpec,
+    environment: &GuestEnvironment,
+    room_key: String,
+    generation: u64,
+) -> io::Result<native_launch::NativeLaunch> {
+    let cwd = working_directory(spec.cwd.as_deref())?;
+    let mut variables = native_variables(spec, environment)?;
+    let headroom = spec_uses_headroom(spec);
+    let (program, prefix) = native_server_command(spec, headroom);
+    let config = if headroom {
+        write_opencode_config(&mut variables, spec.cwd.as_deref())?
+    } else {
+        None
+    };
+    Ok(native_launch::NativeLaunch {
+        guest: spec.program.clone(),
+        program,
+        prefix,
+        cwd,
+        room: room_key,
+        generation,
+        variables,
+        config,
+    })
+}
+
 fn opencode_wrapped_config(
     guest: &mut RoomSpec,
     headroom_active: bool,
@@ -2446,6 +2478,24 @@ impl Pane {
         self.native.is_some() && owned_server_room(&self.spec)
     }
 
+    /// Whether this room's owned OpenCode server is gone: its wrapper child
+    /// exited (reaped here) or its endpoint no longer accepts a connection.
+    /// False for rooms without an owned server. Never touches another room.
+    pub(crate) fn poll_opencode_server_exit(&self) -> io::Result<bool> {
+        let Some(native) = self.native.as_ref() else {
+            return Ok(false);
+        };
+        if !owned_server_room(&self.spec) {
+            return Ok(false);
+        }
+        native.poll_server_exit()
+    }
+
+    /// This room's current owned-server binding, if it has one.
+    pub(crate) fn opencode_binding(&self) -> Option<crate::native_outbox::Binding> {
+        self.native.as_ref().map(|native| native.binding().clone())
+    }
+
     /// The arguments this room's terminal was started with, when it runs on an
     /// owned server. Only the test rig asks for them.
     #[cfg(all(test, unix))]
@@ -2535,6 +2585,47 @@ impl Pane {
                 )
             });
         Ok((binding, abort))
+    }
+
+    /// Revives an owned OpenCode room on a new server after its old server
+    /// died. The new server already holds a fresh session for this launch
+    /// lane; this only writes the durable fresh-state marker, respawns the
+    /// TUI against it, and moves the room onto it. A spawn failure changes
+    /// nothing: the room stays offline on its old (dead) binding, so a failed
+    /// revive leaves the room offline with its reason.
+    pub(crate) fn revive_opencode_session(
+        &mut self,
+        size: PtySize,
+        room: crate::native_launch::NativeRoom,
+    ) -> Result<crate::native_outbox::Binding, Box<dyn std::error::Error>> {
+        if !self.opencode_native() {
+            return Err(io::Error::other(
+                "only a room on an owned OpenCode server can be revived this way",
+            )
+            .into());
+        }
+        let vendor = controls::cli_vendor(&self.spec)?;
+        let cwd = working_directory(self.spec.cwd.as_deref())?;
+        session_state::clear_room(vendor.key(), &cwd, &self.spec.title)?;
+        // Build the replacement before giving up the old server, so a failed
+        // spawn keeps the room offline on its previous binding instead of
+        // leaving it with no server at all.
+        let replacement = Self::spawn_attached(
+            &self.spec,
+            size,
+            self.environment.clone(),
+            Some(&room),
+        )?;
+        let _old = self.native.take();
+        self.cleanup();
+        *self = replacement;
+        self.native = Some(room);
+        Ok(self
+            .native
+            .as_ref()
+            .expect("revived room keeps its server")
+            .binding()
+            .clone())
     }
 
     /// Returns whether a conversation was actually resumed. A room whose

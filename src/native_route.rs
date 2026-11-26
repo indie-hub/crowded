@@ -605,6 +605,19 @@ impl NativeRouter {
         self.servers.get().get(&binding.room).cloned()
     }
 
+    /// Swaps one lane's owned server for a revived one. Only that lane's
+    /// entry is replaced; every other room keeps its server. The old server
+    /// is dropped on a reaper thread, which stops only the processes Crowded
+    /// started for that lane.
+    pub(crate) fn replace_opencode_server(&mut self, room: &str, server: Arc<Server>) {
+        let mut servers = self.servers.get().clone();
+        servers.insert(room.to_owned(), server);
+        drop(std::mem::replace(
+            &mut self.servers,
+            crate::native_launch::Reaped::new(servers),
+        ));
+    }
+
     /// The room's Claude inbox, bound on first use and then kept: its token
     /// names the room, so a relaunch reuses it.
     pub(crate) fn claude_inbox(&mut self, index: usize) -> io::Result<Arc<ClaudeInbox>> {
