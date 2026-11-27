@@ -2,6 +2,7 @@
 
 use std::{
     collections::VecDeque,
+    ffi::OsString,
     io::{self, Write},
     sync::{Arc, mpsc},
     time::{Duration, Instant},
@@ -1661,9 +1662,20 @@ pub(crate) fn spawn_room(
             pane::resume_session(&mut spec, uuid)?;
             factory.interactive(spec, size, environment, native)
         }
-        Some(pane::CodexMint::Unreported) | None => {
-            factory.interactive(spec, size, environment, native)
+        Some(pane::CodexMint::Unreported { prompt, generation }) => {
+            let base_args = spec.args.clone();
+            let base_variables = spec.variables.clone();
+            let mut launched = spec;
+            pane::controls::set_initial_prompt(&mut launched, prompt)?;
+            launched.variables.push((
+                OsString::from("CROWDED_LAUNCH_GENERATION"),
+                OsString::from(generation.to_string()),
+            ));
+            let mut pane = factory.interactive(launched, size, environment, native)?;
+            pane.restore_launch_view(base_args, base_variables);
+            Ok(pane)
         }
+        None => factory.interactive(spec, size, environment, native),
     }
 }
 
@@ -2570,6 +2582,7 @@ pub(crate) fn report_native_session(
         report.from,
         report.session.clone(),
         report.pending,
+        report.launch,
     ) {
         Ok(status) => {
             append_notice(notice, status.clone(), NoticeSeverity::Info);
@@ -2591,6 +2604,7 @@ fn apply_session_report(
     from: usize,
     session: Option<String>,
     pending: bool,
+    launch: Option<u64>,
 ) -> Result<String, String> {
     let router = router.ok_or_else(|| "native delivery is unavailable".to_owned())?;
     if from >= panes.len() {
@@ -2655,14 +2669,28 @@ fn apply_session_report(
                 "ignored: {title} is not waiting for a session report"
             ));
         }
-        if !pane::codex_rollout_verified(&panes[from].cwd(), &session) {
-            // The hook can arrive before the rollout is readable. Remember the
-            // id and keep the mail held; a later event-loop pass retries the
-            // rollout check and binds the same launch.
-            panes[from].record_session(&session);
+        if launch != current.as_ref().map(|binding| binding.generation) {
             return Ok(format!(
-                "{title}: waiting for the reported session's rollout"
+                "ignored: the report does not name launch {}",
+                current
+                    .as_ref()
+                    .map(|binding| binding.generation)
+                    .unwrap_or(0)
             ));
+        }
+        match pane::codex_rollout_status(&panes[from].cwd(), &session) {
+            pane::controls::CodexRollout::Verified => {}
+            pane::controls::CodexRollout::WrongCwd => {
+                return Ok(format!(
+                    "ignored: the reported session belongs to another directory"
+                ));
+            }
+            pane::controls::CodexRollout::Missing => {
+                panes[from].record_session(&session);
+                return Ok(format!(
+                    "{title}: waiting for the reported session's rollout"
+                ));
+            }
         }
     }
     // The first report of a launch turns its unreported placeholder into the

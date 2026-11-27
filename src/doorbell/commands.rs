@@ -685,6 +685,9 @@ fn deliver_session_report(args: Vec<String>) -> Result<(), (ReportFailure, Strin
             id: format!("{room}-session-report-{now}"),
             session,
             pending: report.pending,
+            launch: env::var("CROWDED_LAUNCH_GENERATION")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok()),
         }),
         SESSION_REPORT_DEADLINE,
     )

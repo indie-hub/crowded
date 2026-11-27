@@ -732,8 +732,9 @@ pub(crate) enum CodexMint {
     #[allow(dead_code)] // Retired mint path, still covered by tests.
     Pending(mpsc::Receiver<Result<Minted, String>>),
     /// The TUI is starting with the house rules as its positional prompt; its
-    /// session id will arrive from the room's own SessionStart hook.
-    Unreported,
+    /// session id will arrive from the room's own SessionStart hook. The
+    /// generation travels to the hook so its report can name this launch.
+    Unreported { prompt: String, generation: u64 },
     /// No session was created, so the room must not start.
     Failed(String),
 }
@@ -833,6 +834,11 @@ pub(crate) fn resume_session(spec: &mut RoomSpec, uuid: &str) -> io::Result<()> 
 /// Whether a reported Codex thread has a rollout that belongs to this cwd.
 pub(crate) fn codex_rollout_verified(cwd: &Path, session: &str) -> bool {
     controls::codex_rollout_verified(cwd, session)
+}
+
+/// A missing rollout is retried; a rollout in another directory is rejected.
+pub(crate) fn codex_rollout_status(cwd: &Path, session: &str) -> controls::CodexRollout {
+    controls::codex_rollout_status(cwd, session)
 }
 
 /// The exact command that mints a room's session: the exec-compatible part of
@@ -1301,11 +1307,21 @@ pub(crate) fn start_codex_mints(
                 continue;
             }
         };
-        if let Err(error) = controls::set_initial_prompt(spec, &prompt) {
+        if let Err(error) = controls::clear_resume_args(spec) {
             results[index] = Some(CodexMint::Failed(format!("{}: {error}", spec.title)));
             continue;
         }
-        results[index] = Some(CodexMint::Unreported);
+        let generation = match GenerationAllocator::new(session_state::state_directory()).next() {
+            Ok(generation) => generation,
+            Err(error) => {
+                results[index] = Some(CodexMint::Failed(format!(
+                    "{}: could not take a launch generation: {error}",
+                    spec.title
+                )));
+                continue;
+            }
+        };
+        results[index] = Some(CodexMint::Unreported { prompt, generation });
     }
     (results, notices)
 }
@@ -1390,8 +1406,12 @@ pub(crate) fn bind_codex_room(
 ) -> io::Result<()> {
     let title = panes[index].title().to_owned();
     // Every launch allocates its own generation, so mail saved for an earlier
-    // launch can never match this binding.
-    let generation = GenerationAllocator::new(session_state::state_directory()).next()?;
+    // launch can never match this binding. A TUI-first launch already took its
+    // generation when it was started, so the hook can name that same launch.
+    let generation = match mint {
+        CodexMint::Unreported { generation, .. } => *generation,
+        _ => GenerationAllocator::new(session_state::state_directory()).next()?,
+    };
     let (room, reason) = match mint {
         CodexMint::Ready { uuid, .. } => {
             panes[index].record_session(uuid);
@@ -1404,7 +1424,7 @@ pub(crate) fn bind_codex_room(
             (Some(Arc::new(room)), None)
         }
         CodexMint::Pending(_) => (None, Some(CODEX_STARTING.to_owned())),
-        CodexMint::Unreported => {
+        CodexMint::Unreported { .. } => {
             let placeholder =
                 crate::native_session::unreported_session(&(index + 1).to_string(), generation);
             let room = crate::codex_native::room(
@@ -1424,7 +1444,7 @@ pub(crate) fn bind_codex_room(
         generation,
         reason,
     }])?;
-    if matches!(mint, CodexMint::Unreported) {
+    if matches!(mint, CodexMint::Unreported { .. }) {
         router.mark_pending(index)?;
     }
     Ok(())
@@ -2408,6 +2428,18 @@ impl Pane {
         self.codex_no_report_notice = true;
     }
 
+    /// The process was launched from a one-shot argv view; the pane keeps the
+    /// room's base arguments and variables so a later clear cannot inherit the
+    /// house-rules prompt or the launch-generation variable.
+    pub(crate) fn restore_launch_view(
+        &mut self,
+        args: Vec<OsString>,
+        variables: Vec<(OsString, OsString)>,
+    ) {
+        self.spec.args = args;
+        self.spec.variables = variables;
+    }
+
     /// The queue target for the room's current process after its hook reported
     /// a new thread: same program, directory and environment, new session.
     pub(crate) fn codex_room_for(&self, thread: String) -> codex_native::Room {
@@ -2494,8 +2526,15 @@ impl Pane {
             controls::set_resume_session(&mut spec, &uuid)?;
             return Ok((spec, CodexMint::Ready { uuid, reused: true }));
         }
-        controls::set_initial_prompt(&mut spec, prompt)?;
-        Ok((spec, CodexMint::Unreported))
+        controls::clear_resume_args(&mut spec)?;
+        let generation = GenerationAllocator::new(session_state::state_directory()).next()?;
+        Ok((
+            spec,
+            CodexMint::Unreported {
+                prompt: prompt.to_owned(),
+                generation,
+            },
+        ))
     }
 
     pub(crate) fn clear_context(

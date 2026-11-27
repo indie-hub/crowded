@@ -71,6 +71,11 @@ pub(super) struct SessionReportRequest {
     /// The room reports it is between sessions; new mail is held.
     #[serde(default)]
     pub(super) pending: bool,
+    /// The launch generation a Codex hook belongs to. Crowded's own
+    /// session-report command reads CROWDED_LAUNCH_GENERATION from the TUI
+    /// environment. Absent values cannot bind a Codex launch placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) launch: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -336,6 +341,7 @@ pub(crate) struct DoorbellSessionReport {
     pub(crate) from: usize,
     pub(crate) session: Option<String>,
     pub(crate) pending: bool,
+    pub(crate) launch: Option<u64>,
     pub(crate) reply: SyncSender<WireResponse>,
 }
 
@@ -820,6 +826,7 @@ mod tests {
             id: "report-1".to_owned(),
             session: session.map(str::to_owned),
             pending,
+            launch: None,
         }
     }
 

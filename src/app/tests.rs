@@ -211,6 +211,17 @@ fn apply_test_report(
     session: Option<&str>,
     pending: bool,
 ) -> String {
+    apply_test_report_with_launch(panes, router, from, session, pending, None)
+}
+
+fn apply_test_report_with_launch(
+    panes: &mut [Pane],
+    router: Option<&mut NativeRouter>,
+    from: usize,
+    session: Option<&str>,
+    pending: bool,
+    launch: Option<u64>,
+) -> String {
     let (reply, _dropped) = std::sync::mpsc::sync_channel(1);
     let mut notice = Notices::default();
     report_native_session(
@@ -220,6 +231,7 @@ fn apply_test_report(
             from,
             session: session.map(str::to_owned),
             pending,
+            launch,
             reply,
         },
         &mut notice,
@@ -2050,6 +2062,7 @@ impl ReportDispatch {
                 from,
                 session: session.map(str::to_owned),
                 pending,
+                launch: None,
                 reply,
             },
         ));
@@ -3087,13 +3100,19 @@ fn a_codex_report_rebinds_persists_and_delivers_to_the_new_thread() {
     let mut panes = vec![report_test_pane(
         specs.into_iter().next().unwrap(),
         None,
-        Some(&pane::CodexMint::Unreported),
+        Some(&pane::CodexMint::Unreported {
+            prompt: "House rules".to_owned(),
+            generation: 2,
+        }),
     )];
     pane::bind_codex_room(
         router.as_mut().unwrap(),
         &mut panes,
         0,
-        &pane::CodexMint::Unreported,
+        &pane::CodexMint::Unreported {
+            prompt: "House rules".to_owned(),
+            generation: 2,
+        },
     )
     .unwrap();
     let mut mailroom = Mailroom::new(50);
@@ -3108,7 +3127,8 @@ fn a_codex_report_rebinds_persists_and_delivers_to_the_new_thread() {
         ),
     )
     .unwrap();
-    let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some(thread), false);
+    let notice =
+        apply_test_report_with_launch(&mut panes, router.as_mut(), 0, Some(thread), false, Some(2));
     assert!(notice.contains("now follows reported session"), "{notice}");
     assert_eq!(
         crate::pane::session_state::lookup_reported("codex", cwd.path(), "Codex · 1").as_deref(),
@@ -3205,13 +3225,19 @@ fn an_unsavable_codex_report_holds_the_room_and_keeps_the_corrupt_file() {
     let mut panes = vec![report_test_pane(
         specs.into_iter().next().unwrap(),
         None,
-        Some(&pane::CodexMint::Unreported),
+        Some(&pane::CodexMint::Unreported {
+            prompt: "House rules".to_owned(),
+            generation: 2,
+        }),
     )];
     pane::bind_codex_room(
         router.as_mut().unwrap(),
         &mut panes,
         0,
-        &pane::CodexMint::Unreported,
+        &pane::CodexMint::Unreported {
+            prompt: "House rules".to_owned(),
+            generation: 2,
+        },
     )
     .unwrap();
     let thread = "33333333-3333-4333-8333-333333333333";
@@ -3226,7 +3252,8 @@ fn an_unsavable_codex_report_holds_the_room_and_keeps_the_corrupt_file() {
     )
     .unwrap();
     let mut mailroom = Mailroom::new(50);
-    let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some(thread), false);
+    let notice =
+        apply_test_report_with_launch(&mut panes, router.as_mut(), 0, Some(thread), false, Some(2));
     assert!(notice.contains(thread), "{notice}");
     assert!(notice.contains("could not be saved"), "{notice}");
     assert_eq!(std::fs::read(&path).unwrap(), b"{ not json");

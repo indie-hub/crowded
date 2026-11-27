@@ -133,3 +133,25 @@ pub(crate) fn is_retryable_hold(reason: &str) -> bool {
 pub(crate) fn is_final_hold(reason: &str) -> bool {
     reason.starts_with(MOD_HOLD_PREFIX) || reason == TOO_LARGE_HOLD || reason == UNCONFIRMED_HOLD
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn placeholder(generation: u64) -> Binding {
+        Binding {
+            room: "1".to_owned(),
+            session: unreported_session("1", generation),
+            endpoint: "codex".to_owned(),
+            generation,
+        }
+    }
+
+    #[test]
+    fn a_placeholder_from_another_generation_is_not_the_same_launch() {
+        let old = placeholder(1);
+        let new = placeholder(2);
+        assert!(same_launch_placeholder(&old, &old));
+        assert!(!same_launch_placeholder(&old, &new));
+    }
+}

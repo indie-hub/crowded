@@ -2618,6 +2618,14 @@ fn codex_mint_spec(program: &Path, cwd: &Path, title: &str, token: &str) -> Room
 /// A stand-in codex: `exec` reports the room's own token, and a `resume`
 /// terminal stays alive so the pane is online.
 #[cfg(unix)]
+#[cfg(unix)]
+fn unreported(prompt: &str, generation: u64) -> CodexMint {
+    CodexMint::Unreported {
+        prompt: prompt.to_owned(),
+        generation,
+    }
+}
+
 fn mint_stub(root: &Path, log: &Path, delay: &str) -> PathBuf {
     codex_stub_for_pane(
         root,
@@ -2858,14 +2866,10 @@ fn clearing_a_codex_room_starts_a_new_tui_and_holds_old_mail() {
         crate::native_session::unreported_session("1", binding.generation)
     );
     assert!(
-        rig.panes[0]
-            .room_spec()
-            .args
-            .last()
-            .unwrap()
+        !rig.panes[0].room_spec().args.iter().any(|arg| arg
             .to_str()
-            .unwrap()
-            .starts_with("House rules:")
+            .is_some_and(|text| text.starts_with("House rules:"))),
+        "the pane keeps base arguments only"
     );
     rig.pump_until("old mail held", |view| {
         view.contains("HELD: sent for an earlier launch")
@@ -4512,12 +4516,10 @@ fn a_failed_clear_mint_leaves_the_room_offline_with_its_reason() {
     rig.iterate();
     let args = rig.panes[0].room_spec().args.clone();
     assert!(
-        args.last()
-            .unwrap()
+        !args.iter().any(|arg| arg
             .to_str()
-            .unwrap()
-            .starts_with("House rules:"),
-        "clear starts the TUI with the rules in argv: {args:?}"
+            .is_some_and(|text| text.starts_with("House rules:"))),
+        "the pane keeps base arguments only: {args:?}"
     );
     assert!(!args.iter().any(|arg| arg == "exec"));
     assert!(rig.panes[0].is_online());
@@ -4881,8 +4883,11 @@ fn a_resume_launch_without_a_rollout_mints_and_keeps_the_stored_id_until_the_ups
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(notices[0].contains(MINTED_A), "{notices:?}");
     assert!(notices[0].contains("no rollout"), "{notices:?}");
-    assert!(matches!(mints[0], Some(CodexMint::Unreported)));
-    assert_eq!(specs[0].args.last().unwrap().to_str(), Some("House rules"));
+    match &mints[0] {
+        Some(CodexMint::Unreported { prompt, .. }) => assert_eq!(prompt, "House rules"),
+        _other => panic!("the launch must carry one prompt"),
+    }
+    assert!(!specs[0].args.iter().any(|arg| arg == "House rules"));
     assert!(!specs[0].args.iter().any(|arg| arg == "resume"));
     assert_eq!(
         session_state::lookup_minted("codex", cwd.path(), "Codex · 1").as_deref(),
@@ -5080,10 +5085,16 @@ fn a_hung_mint_does_not_delay_the_rooms_whose_mints_finished() {
         mints
             .iter()
             .flatten()
-            .all(|mint| matches!(mint, CodexMint::Unreported))
+            .all(|mint| matches!(mint, CodexMint::Unreported { .. }))
     );
+    for mint in mints.iter().flatten() {
+        match mint {
+            CodexMint::Unreported { prompt, .. } => assert_eq!(prompt, "House rules"),
+            _other => panic!("every room must start with one prompt"),
+        }
+    }
     for spec in &specs {
-        assert_eq!(spec.args.last().unwrap().to_str(), Some("House rules"));
+        assert!(!spec.args.iter().any(|arg| arg == "House rules"));
     }
     // No room waits for another: every TUI starts at once.
     for index in 0..3 {
@@ -5105,6 +5116,261 @@ fn a_hung_mint_does_not_delay_the_rooms_whose_mints_finished() {
         assert!(pane.is_online());
     }
 }
+/// Mail held for an earlier launch is stale: a clear takes a new generation
+/// and the new report must not adopt the old mail onto its thread.
+#[cfg(unix)]
+#[test]
+fn a_clear_does_not_adopt_mail_held_for_the_previous_launch() {
+    const SESSION: &str = "ce3f7086-91a5-4e32-bd84-5a617c0d2e9f";
+    let _state = session_state::StateRootGuard::isolated();
+    let home = controls::HomeDirGuard::isolated();
+    let cwd = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let log = root.path().join("argv.log");
+    let stub = codex_stub_for_pane(
+        root.path(),
+        "codex",
+        &format!(
+            r#"if [ "$1" = queue ]; then\n  printf 'Queued message sub_1 for thread %s.\\n' "$CROWDED_TEST_MINT"\n  exit 0\nfi\nprintf '%s\\n' "$@" >> '{log}'\nexec sleep 30\n"#,
+            log = log.display()
+        ),
+    );
+    let spec = codex_mint_spec(&stub, cwd.path(), "Room A", SESSION);
+    let _launch_generation = GenerationAllocator::new(session_state::state_directory())
+        .next()
+        .unwrap();
+    let mint = unreported("House rules", 1);
+    let mut rig = IterationHarness::new(root.path());
+    rig.panes[0] = crate::app::spawn_room(
+        &mut crate::app::LivePanes,
+        spec,
+        small_size(),
+        GuestEnvironment::new([]),
+        None,
+        Some(&mint),
+        None,
+    )
+    .unwrap();
+    bind_codex_room(rig.router.as_mut().unwrap(), &mut rig.panes, 0, &mint).unwrap();
+    rig.router
+        .as_mut()
+        .unwrap()
+        .send(&mut rig.mailroom, "Sender", 0, "old launch mail", None)
+        .unwrap();
+    rig.pump_until("old mail held", |view| {
+        view.contains("HELD: session pending after clear") && view.contains("old launch mail")
+    });
+
+    rig.push_control(crate::doorbell::ControlAction::ClearContext);
+    rig.iterate();
+    let new_binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    let generation = new_binding.generation;
+    assert!(generation > 1, "clear takes a new generation");
+
+    let day = home.path().join(".codex/sessions/2026/08/07");
+    fs::create_dir_all(&day).unwrap();
+    fs::write(
+        day.join(format!("rollout-{SESSION}.jsonl")),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION}\",\"cwd\":\"{}\"}}}}\n",
+            cwd.path().display()
+        ),
+    )
+    .unwrap();
+    crate::app::report_native_session(
+        &mut rig.panes,
+        rig.router.as_mut(),
+        crate::doorbell::DoorbellSessionReport {
+            from: 0,
+            session: Some(SESSION.to_owned()),
+            pending: false,
+            launch: Some(generation),
+            reply: mpsc::sync_channel(1).0,
+        },
+        &mut rig.notice,
+    );
+    for _ in 0..20 {
+        rig.iterate();
+    }
+    let view = rig.mailroom.summary();
+    assert!(
+        view.contains("old launch mail"),
+        "the mail row survived: {view}"
+    );
+    assert!(
+        !view.contains("ACCEPTED by Codex"),
+        "old launch mail must not be adopted: {view}"
+    );
+}
+
+/// The house rules are a per-launch argv element, never a stored base
+/// argument: launch and each clear carry exactly one, resume and restart
+/// carry none and instead resume the stored thread.
+#[cfg(unix)]
+#[test]
+fn codex_launch_clear_clear_resume_restart_carries_exactly_one_prompt_or_resume() {
+    const RULES: &str = "HOUSE RULES -- with a leading dash";
+    let _state = session_state::StateRootGuard::isolated();
+    let cwd = tempfile::tempdir().unwrap();
+    let spec = codex_mint_spec(Path::new("codex"), cwd.path(), "Codex · 1", MINTED_A);
+    let mut factory = RecordingPanes::default();
+    let launch = unreported(RULES, 1);
+    let pane = crate::app::spawn_room(
+        &mut factory,
+        spec,
+        small_size(),
+        GuestEnvironment::new([]),
+        None,
+        Some(&launch),
+        None,
+    )
+    .unwrap();
+    let last_args = |factory: &RecordingPanes| factory.calls.last().unwrap().2.clone();
+    let prompts = |args: &[OsString]| args.iter().filter(|arg| *arg == RULES).count();
+    assert_eq!(
+        prompts(&last_args(&factory)),
+        1,
+        "the launch has one prompt"
+    );
+
+    for _ in 0..2 {
+        let (spec, mint) = pane.relaunch_codex(CodexRelaunch::Clear, RULES, 1).unwrap();
+        crate::app::spawn_room(
+            &mut factory,
+            spec,
+            small_size(),
+            GuestEnvironment::new([]),
+            None,
+            Some(&mint),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            prompts(&last_args(&factory)),
+            1,
+            "each clear has one prompt"
+        );
+    }
+
+    let stored_cwd = pane.cwd();
+    session_state::upsert_minted("codex", &stored_cwd, "Codex · 1", MINTED_A).unwrap();
+    for action in [CodexRelaunch::Resume, CodexRelaunch::Restart] {
+        let (spec, mint) = pane.relaunch_codex(action, RULES, 1).unwrap();
+        crate::app::spawn_room(
+            &mut factory,
+            spec,
+            small_size(),
+            GuestEnvironment::new([]),
+            None,
+            Some(&mint),
+            None,
+        )
+        .unwrap();
+        let args = last_args(&factory);
+        assert_eq!(
+            prompts(&args),
+            0,
+            "resume and restart must not resend rules"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "resume" && pair[1] == MINTED_A)
+        );
+    }
+}
+
+/// Only a report that names this launch may convert a Codex placeholder.
+/// A stale generation, a missing generation, or a rollout in another cwd is
+/// ignored and leaves the held mail held.
+#[cfg(unix)]
+#[test]
+fn a_codex_report_must_name_its_launch_and_rollout_directory() {
+    const SESSION: &str = "ac1d5e24-7f83-4c10-9b62-3e4f6a8d0c57";
+    const WRONG: &str = "bd2e6f35-8094-4d21-ac73-4f507b9e1d68";
+    let _state = session_state::StateRootGuard::isolated();
+    let home = controls::HomeDirGuard::isolated();
+    let cwd = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let stub = codex_stub_for_pane(root.path(), "codex", "exec sleep 30");
+    let spec = codex_mint_spec(&stub, cwd.path(), "Room A", SESSION);
+    let mint = unreported("House rules", 7);
+    let mut rig = IterationHarness::new(root.path());
+    rig.panes[0] = crate::app::spawn_room(
+        &mut crate::app::LivePanes,
+        spec,
+        small_size(),
+        GuestEnvironment::new([]),
+        None,
+        Some(&mint),
+        None,
+    )
+    .unwrap();
+    bind_codex_room(rig.router.as_mut().unwrap(), &mut rig.panes, 0, &mint).unwrap();
+    let launch = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    assert_eq!(launch.generation, 7);
+    rig.router
+        .as_mut()
+        .unwrap()
+        .send(&mut rig.mailroom, "Sender", 0, "held mail", None)
+        .unwrap();
+
+    let write_rollout = |id: &str, dir: &std::path::Path| {
+        let day = home.path().join(".codex/sessions/2026/08/07");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join(format!("rollout-{id}.jsonl")),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{}\"}}}}\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+    };
+    let report = |session: &str, launch: Option<u64>| crate::doorbell::DoorbellSessionReport {
+        from: 0,
+        session: Some(session.to_owned()),
+        pending: false,
+        launch,
+        reply: mpsc::sync_channel(1).0,
+    };
+    let reported = |rig: &mut IterationHarness, session: &str, launch: Option<u64>| -> String {
+        crate::app::report_native_session(
+            &mut rig.panes,
+            rig.router.as_mut(),
+            report(session, launch),
+            &mut rig.notice,
+        );
+        rig.notice.ordered_lines().join("; ")
+    };
+
+    write_rollout(WRONG, other.path());
+    let shown = reported(&mut rig, WRONG, Some(7));
+    assert!(shown.contains("another directory"), "{shown}");
+    write_rollout(SESSION, cwd.path());
+    let shown = reported(&mut rig, SESSION, Some(6));
+    assert!(shown.contains("does not name launch"), "{shown}");
+    let shown = reported(&mut rig, SESSION, None);
+    assert!(shown.contains("does not name launch"), "{shown}");
+    let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    assert_eq!(
+        binding.session, launch.session,
+        "the placeholder never changed"
+    );
+    assert!(rig.router.as_ref().unwrap().is_pending(0));
+    rig.pump_until("mail still held", |view| {
+        view.contains("HELD: session pending after clear") && view.contains("held mail")
+    });
+
+    let shown = reported(&mut rig, SESSION, Some(7));
+    assert!(shown.contains("now follows reported session"), "{shown}");
+    assert_eq!(
+        rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
+        SESSION
+    );
+    assert!(!rig.router.as_ref().unwrap().is_pending(0));
+}
+
 /// A Codex report binds only its own launch's placeholder and only once the
 /// rollout is readable; a report with no rollout stays held and is retried.
 #[cfg(unix)]
@@ -5124,7 +5390,7 @@ fn a_codex_report_waits_for_its_rollout_and_binds_on_a_later_pass() {
         small_size(),
         GuestEnvironment::new([]),
         None,
-        Some(&CodexMint::Unreported),
+        Some(&unreported("House rules", 2)),
         None,
     )
     .unwrap();
@@ -5132,21 +5398,22 @@ fn a_codex_report_waits_for_its_rollout_and_binds_on_a_later_pass() {
         rig.router.as_mut().unwrap(),
         &mut rig.panes,
         0,
-        &CodexMint::Unreported,
+        &unreported("House rules", 2),
     )
     .unwrap();
     let launch = rig.router.as_ref().unwrap().binding_for(0).unwrap();
 
-    let report = |session: &str| crate::doorbell::DoorbellSessionReport {
+    let report = |session: &str, launch: u64| crate::doorbell::DoorbellSessionReport {
         from: 0,
         session: Some(session.to_owned()),
         pending: false,
+        launch: Some(launch),
         reply: mpsc::sync_channel(1).0,
     };
     crate::app::report_native_session(
         &mut rig.panes,
         rig.router.as_mut(),
-        report(SESSION),
+        report(SESSION, launch.generation),
         &mut rig.notice,
     );
     let shown = rig.notice.ordered_lines().join("; ");
@@ -5179,7 +5446,7 @@ fn a_codex_report_waits_for_its_rollout_and_binds_on_a_later_pass() {
     crate::app::report_native_session(
         &mut rig.panes,
         rig.router.as_mut(),
-        report(MINTED_B),
+        report(MINTED_B, launch.generation + 1),
         &mut rig.notice,
     );
     let shown = rig.notice.ordered_lines().join("; ");
@@ -5212,7 +5479,7 @@ fn a_late_codex_report_still_binds_after_the_no_report_notice() {
         small_size(),
         GuestEnvironment::new([]),
         None,
-        Some(&CodexMint::Unreported),
+        Some(&unreported("House rules", 2)),
         None,
     )
     .unwrap();
@@ -5220,7 +5487,7 @@ fn a_late_codex_report_still_binds_after_the_no_report_notice() {
         rig.router.as_mut().unwrap(),
         &mut rig.panes,
         0,
-        &CodexMint::Unreported,
+        &unreported("House rules", 2),
     )
     .unwrap();
     rig.spawned_at[0] = Instant::now() - Duration::from_secs(30);
@@ -5264,6 +5531,7 @@ fn a_late_codex_report_still_binds_after_the_no_report_notice() {
             from: 0,
             session: Some(SESSION.to_owned()),
             pending: false,
+            launch: Some(launch.generation),
             reply,
         },
         &mut rig.notice,
@@ -5412,8 +5680,15 @@ fn a_plain_codex_launch_sets_the_positional_prompt_without_a_mint() {
         false,
     );
     assert!(notices.is_empty());
-    assert!(matches!(mints[0], Some(CodexMint::Unreported)));
-    assert_eq!(specs[0].args.last().unwrap().to_str(), Some(RULES));
+    match &mints[0] {
+        Some(CodexMint::Unreported { prompt, .. }) => assert_eq!(prompt, RULES),
+        _other => panic!("the launch must carry one prompt"),
+    }
+    assert!(
+        !specs[0].args.iter().any(|arg| arg == RULES),
+        "the base arguments must stay clean: {:?}",
+        specs[0].args
+    );
     assert!(!specs[0].args.iter().any(|arg| arg == "exec"));
 }
 
@@ -5424,8 +5699,7 @@ fn a_plain_codex_launch_sets_the_positional_prompt_without_a_mint() {
 fn an_unreported_codex_room_starts_the_tui_with_rules_in_argv_only() {
     const RULES: &str = "Room 4 house rules\nuse \"quotes\" and 'single'\n-- leading dash\nend";
     let cwd = tempfile::tempdir().unwrap();
-    let mut spec = codex_mint_spec(Path::new("codex"), cwd.path(), "Codex · 4", MINTED_A);
-    super::controls::set_initial_prompt(&mut spec, RULES).unwrap();
+    let spec = codex_mint_spec(Path::new("codex"), cwd.path(), "Codex · 4", MINTED_A);
     let mut factory = RecordingPanes::default();
     let mut last_output = vec![None];
     let (panes, _) = crate::app::start_rooms(
@@ -5434,7 +5708,7 @@ fn an_unreported_codex_room_starts_the_tui_with_rules_in_argv_only() {
         &[small_size()],
         &[GuestEnvironment::new([])],
         vec![None],
-        &[Some(CodexMint::Unreported)],
+        &[Some(unreported(RULES, 1))],
         &[None],
         &mut last_output,
         false,

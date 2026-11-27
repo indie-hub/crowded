@@ -343,6 +343,7 @@ fn listener_loop(
                                 from,
                                 session: request.session,
                                 pending: request.pending,
+                                launch: request.launch,
                                 reply,
                             });
                             match events.try_send(event) {

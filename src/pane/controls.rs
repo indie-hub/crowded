@@ -121,7 +121,7 @@ enum Resume {
 
 /// The house rules as one positional argv element for the Codex TUI. It is
 /// never typed or pasted into the PTY: a native room's intro travels in argv.
-pub(super) fn set_initial_prompt(spec: &mut RoomSpec, prompt: &str) -> io::Result<()> {
+pub(crate) fn set_initial_prompt(spec: &mut RoomSpec, prompt: &str) -> io::Result<()> {
     if cli_vendor(spec)? != CliVendor::Codex {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -620,6 +620,27 @@ fn codex_session_meta_id(path: &Path, cwd: &Path) -> Option<String> {
 /// session id and room directory. `crowded resume` reopens a stored Codex
 /// session only when its rollout is verified; a stored id with no rollout is
 /// not resumable and the room mints a new session instead.
+pub(crate) enum CodexRollout {
+    Verified,
+    WrongCwd,
+    Missing,
+}
+
+pub(crate) fn codex_rollout_status(cwd: &Path, session_id: &str) -> CodexRollout {
+    let Some(home) = home_dir() else {
+        return CodexRollout::Missing;
+    };
+    let sessions = home.join(".codex").join("sessions");
+    if super::session_state::find_codex_rollout(&sessions, session_id).is_none() {
+        return CodexRollout::Missing;
+    }
+    if codex_rollout_verified(cwd, session_id) {
+        CodexRollout::Verified
+    } else {
+        CodexRollout::WrongCwd
+    }
+}
+
 pub(super) fn codex_rollout_verified(cwd: &Path, session_id: &str) -> bool {
     let Some(home) = home_dir() else {
         return false;
