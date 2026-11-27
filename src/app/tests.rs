@@ -1990,6 +1990,7 @@ pub(crate) struct ReportDispatch {
     fuse: DeliveryFuse,
     paused: bool,
     notice: Notices,
+    doorbell_stopped: bool,
     input_ready_out: Vec<bool>,
     codex: Vec<Option<pane::CodexMint>>,
     sizes: Vec<PtySize>,
@@ -2001,14 +2002,19 @@ pub(crate) struct ReportDispatch {
 #[cfg(all(test, unix))]
 struct ReportEvents {
     events: std::collections::VecDeque<DoorbellEvent>,
+    disconnected: bool,
 }
 
 #[cfg(all(test, unix))]
 impl DoorbellSource for ReportEvents {
     fn try_recv(&mut self) -> Result<DoorbellEvent, std::sync::mpsc::TryRecvError> {
-        self.events
-            .pop_front()
-            .ok_or(std::sync::mpsc::TryRecvError::Empty)
+        if let Some(event) = self.events.pop_front() {
+            return Ok(event);
+        }
+        if self.disconnected {
+            return Err(std::sync::mpsc::TryRecvError::Disconnected);
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty)
     }
 
     fn path(&self) -> &std::path::Path {
@@ -2024,6 +2030,7 @@ impl ReportDispatch {
         Self {
             doorbell: ReportEvents {
                 events: std::collections::VecDeque::new(),
+                disconnected: false,
             },
             gates: (0..rooms).map(|_| DeliveryGate::new(false)).collect(),
             last_output: vec![None; rooms],
@@ -2035,6 +2042,7 @@ impl ReportDispatch {
             fuse: DeliveryFuse::new(0),
             paused: false,
             notice: Notices::default(),
+            doorbell_stopped: false,
             input_ready_out: Vec::new(),
             codex: (0..rooms).map(|_| None).collect(),
             sizes: (0..rooms)
@@ -2085,6 +2093,11 @@ impl ReportDispatch {
         std::mem::take(&mut self.notice).ordered_lines().join("; ")
     }
 
+    /// Simulates the listener thread ending: the source stays closed.
+    pub(crate) fn stop_doorbell(&mut self) {
+        self.doorbell.disconnected = true;
+    }
+
     /// Runs one pass with explicit cached costs, as production does with the
     /// pulse cache. Callers that do not care about cost pass an empty slice.
     fn dispatch_with_costs(&mut self, costs: &[Option<(Instant, String)>]) {
@@ -2092,6 +2105,7 @@ impl ReportDispatch {
         let now = Instant::now();
         run_rooms_iteration(
             &mut self.doorbell,
+            &mut self.doorbell_stopped,
             None::<&mut Terminal<CrosstermBackend<io::Stdout>>>,
             &mut self.panes,
             &mut self.router,
@@ -2195,6 +2209,26 @@ impl ReportDispatch {
             Instant::now(),
         )
     }
+}
+
+/// The listener owns the only event sender: once it ends and the queue is
+/// drained, the app says so exactly once instead of looking healthy.
+#[cfg(unix)]
+#[test]
+fn a_stopped_doorbell_reports_one_failure_notice() {
+    let mut rig = ReportDispatch::new(Vec::new(), None);
+    rig.stop_doorbell();
+    rig.dispatch_keep();
+    assert_eq!(rig.notice.entries.len(), 1);
+    assert_eq!(rig.notice.entries[0].severity, NoticeSeverity::Failure);
+    assert!(
+        rig.notice.entries[0].text.starts_with("Doorbell stopped:"),
+        "{}",
+        rig.notice.entries[0].text
+    );
+    // The source stays closed: a later pass must not repeat the notice.
+    rig.dispatch_keep();
+    assert_eq!(rig.notice.entries.len(), 1);
 }
 
 /// A Claude room's own report is the only other source of its session: a

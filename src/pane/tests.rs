@@ -2424,8 +2424,10 @@ impl IterationHarness {
 
     fn iterate(&mut self) {
         let now = Instant::now();
+        let mut doorbell_stopped = false;
         crate::app::run_rooms_iteration(
             &mut self.doorbell,
+            &mut doorbell_stopped,
             None::<&mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>>,
             &mut self.panes,
             &mut self.router,
