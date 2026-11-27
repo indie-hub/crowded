@@ -5626,6 +5626,90 @@ fn a_codex_report_waits_for_its_rollout_and_binds_on_a_later_pass() {
     );
 }
 
+/// A failed rebind leaves the placeholder pending. Many production loop passes
+/// must still walk the rollout at most once a second: clearing the slot on the
+/// error path would walk it on every pass under outbox pressure.
+#[cfg(unix)]
+#[test]
+fn a_failed_rebind_keeps_the_rollout_retry_throttle() {
+    const SESSION: &str = "3b7c1d92-6a45-4f8e-9c10-22d5e7a4b831";
+    let _state = session_state::StateRootGuard::isolated();
+    let home = controls::HomeDirGuard::isolated();
+    let cwd = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let stub = codex_stub_for_pane(root.path(), "codex", "exec sleep 30");
+    let spec = codex_mint_spec(&stub, cwd.path(), "Room A", SESSION);
+    let mut rig = IterationHarness::new(root.path());
+    rig.panes[0] = crate::app::spawn_room(
+        &mut crate::app::LivePanes,
+        spec,
+        small_size(),
+        GuestEnvironment::new([]),
+        None,
+        Some(&unreported("House rules", 2)),
+        None,
+    )
+    .unwrap();
+    bind_codex_room(
+        rig.router.as_mut().unwrap(),
+        &mut rig.panes,
+        0,
+        &unreported("House rules", 2),
+    )
+    .unwrap();
+    let launch = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    crate::app::report_native_session(
+        &mut rig.panes,
+        rig.router.as_mut(),
+        crate::doorbell::DoorbellSessionReport {
+            from: 0,
+            session: Some(SESSION.to_owned()),
+            pending: false,
+            launch: Some(launch.generation),
+            reply: mpsc::sync_channel(1).0,
+        },
+        &mut rig.notice,
+    );
+    let day = home.path().join(".codex/sessions/2026/08/07");
+    fs::create_dir_all(&day).unwrap();
+    fs::write(
+        day.join(format!("rollout-{SESSION}.jsonl")),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION}\",\"cwd\":\"{}\"}}}}\n",
+            cwd.path().display()
+        ),
+    )
+    .unwrap();
+
+    crate::native_route::FAIL_REBIND.with(|fail| fail.set(true));
+    super::ROLLOUT_VERIFY_CALLS.with(|count| count.set(0));
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(1200) {
+        rig.iterate();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let calls = super::ROLLOUT_VERIFY_CALLS.with(|count| count.get());
+    crate::native_route::FAIL_REBIND.with(|fail| fail.set(false));
+
+    assert!(
+        rig.notice
+            .ordered_lines()
+            .join("; ")
+            .contains("could not bind the reported session"),
+        "the failed rebind must be reported"
+    );
+    assert_eq!(
+        rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
+        launch.session,
+        "the launch stays pending"
+    );
+    assert!(calls >= 1, "the first pass must still check the rollout");
+    assert!(
+        calls <= 3,
+        "failed rebind kept the slot: {calls} walks in 1.2 s"
+    );
+}
+
 /// No report within the bound produces one notice, leaves mail held, and a
 /// late report still binds the same launch.
 #[cfg(unix)]

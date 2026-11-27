@@ -1914,10 +1914,11 @@ fn retry_codex_reports(
                 format!("{title}: could not bind the reported session: {error}"),
                 NoticeSeverity::Failure,
             );
+        } else {
+            // A successful bind ends this launch's placeholder. A failed
+            // rebind leaves it pending, so keep the slot and wait a second.
+            pane.rollout_check_at = None;
         }
-        // The retry slot belongs to this launch only; a later generation
-        // starts with a fresh one.
-        pane.rollout_check_at = None;
     }
 }
 

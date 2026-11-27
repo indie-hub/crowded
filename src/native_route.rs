@@ -56,6 +56,9 @@ thread_local! {
     /// thread only, until the outbox worker has exited, so a test can make
     /// the worker lose no race: it is always gone before the send.
     static AWAIT_WORKER_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Refuses a rebind before any binding changes, like a busy outbox, so a
+    /// test can keep a placeholder pending on the production call path.
+    pub(crate) static FAIL_REBIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Hands messages to whichever adapter is current, so rooms can be bound again
@@ -753,6 +756,10 @@ impl NativeRouter {
     /// mail for the room is adopted onto the new binding; mail held for any
     /// other reason stays put.
     pub(crate) fn rebind_room(&mut self, entry: RoomEntry) -> io::Result<()> {
+        #[cfg(test)]
+        if FAIL_REBIND.with(|fail| fail.get()) {
+            return Err(io::Error::other("busy: rebind refused"));
+        }
         if entry.binding.room.is_empty() || entry.binding.generation == 0 {
             return Err(io::Error::other(
                 "a rebinding needs its room and generation",

@@ -57,6 +57,14 @@ const SCROLLBACK_LINES: usize = 1000;
 /// is recursive and the event loop runs about 60 passes a second.
 const ROLLOUT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
+#[cfg(test)]
+thread_local! {
+    /// Counts verifier calls made through the production retry path, on this
+    /// test thread only.
+    pub(crate) static ROLLOUT_VERIFY_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 fn rollout_retry_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= ROLLOUT_RETRY_INTERVAL)
 }
@@ -74,6 +82,8 @@ pub(crate) fn rollout_retry_check(
         return false;
     }
     *last = Some(now);
+    #[cfg(test)]
+    ROLLOUT_VERIFY_CALLS.with(|count| count.set(count.get() + 1));
     verify(cwd, session)
 }
 
