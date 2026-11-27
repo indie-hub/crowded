@@ -112,7 +112,7 @@ pub(crate) fn send_command() -> Result<(), Box<dyn std::error::Error>> {
         hop: 0,
     });
 
-    let response = send_request(&request)?;
+    let response = send_within(request, CLIENT_DEADLINE).map_err(queued_advice)?;
     println!("{}", serde_json::to_string(&response)?);
     if let Some(advice) = pending_advice(&response) {
         eprintln!("{advice}");
@@ -194,7 +194,7 @@ pub(crate) fn control_command() -> Result<(), Box<dyn std::error::Error>> {
         action,
     });
 
-    let response = send_request(&request)?;
+    let response = send_within(request, CLIENT_DEADLINE).map_err(queued_advice)?;
     println!("{}", serde_json::to_string(&response)?);
     if let Some(advice) = pending_advice(&response) {
         eprintln!("{advice}");
@@ -247,13 +247,16 @@ pub(crate) fn pulse_command() -> Result<(), Box<dyn std::error::Error>> {
     let token = env::var("CROWDED_TOKEN").map_err(|_| "CROWDED_TOKEN is not set")?;
     let room = env::var("CROWDED_ROOM").unwrap_or_else(|_| "external".to_owned());
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let response = send_request(&WireRequest::Pulse(PulseRequest {
-        token,
-        id: format!("{room}-pulse-{}-{now}", process::id()),
-        state,
-        model,
-        detail,
-    }))?;
+    let response = send_within(
+        WireRequest::Pulse(PulseRequest {
+            token,
+            id: format!("{room}-pulse-{}-{now}", process::id()),
+            state,
+            model,
+            detail,
+        }),
+        CLIENT_DEADLINE,
+    )?;
     response.into_result("Doorbell rejected pulse")
 }
 
@@ -391,17 +394,80 @@ const SESSION_REPORT_USAGE: &str = "usage: crowded session-report [--session ID]
 /// Unix socket and the Windows pipe, where std has no connect timeout.
 const SESSION_REPORT_DEADLINE: Duration = Duration::from_secs(4);
 
-fn send_within(request: WireRequest, deadline: Duration) -> Result<WireResponse, String> {
+/// The most a plain doorbell command (send, control, pulse, roster) may take.
+/// Longer than the server's worst case (a 5 s request read plus a 2 s reply
+/// wait), so a queued request is not cut short before its answer can arrive.
+const CLIENT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The exchange got no answer before its deadline. The request may already
+/// have reached Crowded, so the caller must not invite a blind resend.
+#[derive(Debug)]
+struct NoAnswer {
+    deadline: Duration,
+}
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Crowded did not answer within {} seconds",
+            self.deadline.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for NoAnswer {}
+
+/// Why one doorbell exchange produced no answer. A stalled exchange (possibly
+/// queued) is distinct from a transport error (nothing was sent).
+#[derive(Debug)]
+enum SendFailure {
+    NoAnswer(NoAnswer),
+    Transport(String),
+}
+
+impl std::fmt::Display for SendFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAnswer(error) => error.fmt(formatter),
+            Self::Transport(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for SendFailure {}
+
+/// A stalled send or control may already be queued, so its error says not to
+/// resend. Roster and pulse stay retry-safe and keep the plain text.
+fn queued_advice(failure: SendFailure) -> Box<dyn std::error::Error> {
+    match failure {
+        SendFailure::NoAnswer(error) => {
+            format!("{error}; the request may have been queued, do not resend").into()
+        }
+        SendFailure::Transport(detail) => detail.into(),
+    }
+}
+
+fn send_within(request: WireRequest, deadline: Duration) -> Result<WireResponse, SendFailure> {
+    send_within_using(deadline, move || send_request(&request))
+}
+
+/// Runs one exchange on a worker thread and waits at most `deadline`. The
+/// shared clients set no socket deadline, so this bound is the only thing
+/// between a stalled server and a hung CLI. A timed-out worker is left to die
+/// with the short-lived command process: the command performs one exchange and
+/// exits, so joining a blocked worker would only turn a timeout into a hang.
+fn send_within_using(
+    deadline: Duration,
+    exchange: impl FnOnce() -> Result<WireResponse, Box<dyn std::error::Error>> + Send + 'static,
+) -> Result<WireResponse, SendFailure> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let _ = sender.send(send_request(&request).map_err(|error| error.to_string()));
+        let _ = sender.send(exchange().map_err(|error| SendFailure::Transport(error.to_string())));
     });
-    receiver.recv_timeout(deadline).unwrap_or_else(|_| {
-        Err(format!(
-            "Crowded did not answer within {} seconds",
-            deadline.as_secs()
-        ))
-    })
+    receiver
+        .recv_timeout(deadline)
+        .unwrap_or_else(|_| Err(SendFailure::NoAnswer(NoAnswer { deadline })))
 }
 
 /// How `--ack` reports a failed report: each cause has its own exit status so a
@@ -718,7 +784,7 @@ fn deliver_session_report(args: Vec<String>) -> Result<(), (ReportFailure, Strin
         }),
         SESSION_REPORT_DEADLINE,
     )
-    .map_err(|error| (ReportFailure::Unreachable, error))?;
+    .map_err(|error| (ReportFailure::Unreachable, error.to_string()))?;
     report_result(response)
 }
 
@@ -730,10 +796,13 @@ pub(crate) fn roster_command() -> Result<(), Box<dyn std::error::Error>> {
     let token = env::var("CROWDED_TOKEN").map_err(|_| "CROWDED_TOKEN is not set")?;
     let room = env::var("CROWDED_ROOM").unwrap_or_else(|_| "external".to_owned());
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let response = send_request(&WireRequest::Roster(RosterRequest {
-        token,
-        id: format!("{room}-roster-{}-{now}", process::id()),
-    }))?;
+    let response = send_within(
+        WireRequest::Roster(RosterRequest {
+            token,
+            id: format!("{room}-roster-{}-{now}", process::id()),
+        }),
+        CLIENT_DEADLINE,
+    )?;
     println!("{}", serde_json::to_string(&response)?);
     response.into_result("Doorbell rejected roster request")
 }
@@ -1054,5 +1123,117 @@ mod tests {
         assert_eq!(pending.0, ReportFailure::Pending);
         let rejected = report_result(WireResponse::rejected("no")).unwrap_err();
         assert_eq!(rejected.0, ReportFailure::Rejected);
+    }
+
+    /// Runs `work` on its own thread and fails the test when it has not
+    /// returned in `guard`: a regression that removes the deadline must fail
+    /// here instead of hanging the whole suite.
+    fn must_finish<T: Send + 'static>(
+        guard: Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        receiver
+            .recv_timeout(guard)
+            .expect("the doorbell exchange must stay bounded")
+    }
+
+    /// The server accepts the request and never answers. The client bound, not
+    /// the transport, is what ends the wait.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_listener_returns_no_answer_instead_of_hanging() {
+        use std::{
+            io::{BufReader, Write},
+            os::unix::net::{UnixListener, UnixStream},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silent.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let silence = path.clone();
+        let started = Instant::now();
+        let failure = match must_finish(Duration::from_secs(2), move || {
+            send_within_using(Duration::from_millis(300), move || {
+                let mut stream = UnixStream::connect(&silence)?;
+                serde_json::to_writer(
+                    &mut stream,
+                    &WireRequest::Roster(RosterRequest {
+                        token: "token".to_owned(),
+                        id: "silent".to_owned(),
+                    }),
+                )?;
+                stream.write_all(b"\n")?;
+                stream.flush()?;
+                Ok(serde_json::from_reader(BufReader::new(stream))?)
+            })
+        }) {
+            Ok(_) => panic!("a silent listener must not produce an answer"),
+            Err(failure) => failure,
+        };
+        assert!(matches!(failure, SendFailure::NoAnswer(_)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(listener);
+    }
+
+    /// A server that answers promptly still completes well inside the bound.
+    #[cfg(unix)]
+    #[test]
+    fn a_prompt_answer_completes_within_the_deadline() {
+        use std::{
+            io::{BufRead, BufReader, Write},
+            os::unix::net::{UnixListener, UnixStream},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("answering.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            serde_json::to_writer(&mut stream, &WireResponse::accepted("listed", None)).unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+        let answer_path = path.clone();
+        let response = send_within_using(Duration::from_secs(2), move || {
+            let mut stream = UnixStream::connect(&answer_path)?;
+            serde_json::to_writer(
+                &mut stream,
+                &WireRequest::Roster(RosterRequest {
+                    token: "token".to_owned(),
+                    id: "prompt".to_owned(),
+                }),
+            )?;
+            stream.write_all(b"\n")?;
+            stream.flush()?;
+            Ok(serde_json::from_reader(BufReader::new(stream))?)
+        })
+        .unwrap();
+        assert_eq!(response.status, "listed");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn only_a_stalled_send_or_control_tells_the_caller_not_to_resend() {
+        let stalled = || {
+            SendFailure::NoAnswer(NoAnswer {
+                deadline: CLIENT_DEADLINE,
+            })
+        };
+        let advice = queued_advice(stalled()).to_string();
+        assert!(advice.contains("do not resend"), "{advice}");
+        // Roster and pulse are retry-safe, so they keep the plain text.
+        let plain = stalled().to_string();
+        assert!(!plain.contains("do not resend"), "{plain}");
+        assert!(plain.contains("did not answer"), "{plain}");
+        // A transport error is not a stall and keeps its own text.
+        assert_eq!(
+            SendFailure::Transport("connection refused".to_owned()).to_string(),
+            "connection refused"
+        );
     }
 }
