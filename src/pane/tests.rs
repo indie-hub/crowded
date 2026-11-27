@@ -4525,6 +4525,9 @@ fn repeated_clears_take_new_generations_and_keep_no_stale_session() {
             None,
         );
         rig.iterate();
+        let lines_before = fs::read_to_string(&log)
+            .map(|text| text.lines().count())
+            .unwrap_or(0);
 
         rig.push_control(crate::doorbell::ControlAction::ClearContext);
         rig.iterate();
@@ -4555,8 +4558,24 @@ fn repeated_clears_take_new_generations_and_keep_no_stale_session() {
             session_state::lookup("codex", cwd.path(), "Room A").as_deref(),
             Some(session_state::FRESH_STATE_MARKER)
         );
-        let log_text = fs::read_to_string(&log).unwrap();
-        assert!(!log_text.lines().any(|line| line == "exec"));
+        // A negative check needs a positive wait first: the relaunched TUI
+        // must have written its arguments before "no exec line" means anything.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut log_text = String::new();
+        loop {
+            if let Ok(text) = fs::read_to_string(&log) {
+                log_text = text;
+                if log_text.lines().count() > lines_before {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the relaunched Codex TUI never wrote its arguments: {log_text}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!log_text.lines().any(|line| line == "exec"), "{log_text}");
     }
 }
 /// A clear whose mint fails leaves the room offline, unbound and named,
