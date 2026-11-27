@@ -596,6 +596,8 @@ pub(crate) struct Pane {
     /// The owned OpenCode server behind a native-delivery room. Dropping the
     /// pane hands the server to a reaper thread instead of killing it inline.
     native: Option<NativeRoom>,
+    /// Whether the no-session-report notice was already shown for this launch.
+    codex_no_report_notice: bool,
 }
 
 #[derive(Clone)]
@@ -826,6 +828,11 @@ fn codex_phase_command(spec: &RoomSpec, arguments: &[OsString]) -> (OsString, Ve
 /// Points a room's terminal at the session it was given.
 pub(crate) fn resume_session(spec: &mut RoomSpec, uuid: &str) -> io::Result<()> {
     controls::set_resume_session(spec, uuid)
+}
+
+/// Whether a reported Codex thread has a rollout that belongs to this cwd.
+pub(crate) fn codex_rollout_verified(cwd: &Path, session: &str) -> bool {
+    controls::codex_rollout_verified(cwd, session)
 }
 
 /// The exact command that mints a room's session: the exec-compatible part of
@@ -2024,6 +2031,7 @@ impl Pane {
             headroom_active,
             _opencode_config: opencode_config,
             native: None,
+            codex_no_report_notice: false,
         })
     }
 
@@ -2082,6 +2090,7 @@ impl Pane {
             headroom_active: false,
             _opencode_config: None,
             native: None,
+            codex_no_report_notice: false,
         })
     }
 
@@ -2383,6 +2392,19 @@ impl Pane {
         if let Ok(mut guard) = self.captured_session.lock() {
             *guard = Some(uuid.to_owned());
         }
+    }
+
+    /// The session this pane is waiting to bind, if a report named one.
+    pub(crate) fn captured_session_id(&self) -> Option<String> {
+        self.captured_session.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    pub(crate) fn codex_no_report_notice(&self) -> bool {
+        self.codex_no_report_notice
+    }
+
+    pub(crate) fn set_codex_no_report_notice(&mut self) {
+        self.codex_no_report_notice = true;
     }
 
     /// The queue target for the room's current process after its hook reported

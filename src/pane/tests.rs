@@ -2027,6 +2027,7 @@ fn scroll_fixture(rows: u16, cols: u16) -> Pane {
         headroom_active: false,
         _opencode_config: None,
         native: None,
+        codex_no_report_notice: false,
     }
 }
 
@@ -5085,6 +5086,158 @@ fn a_hung_mint_does_not_delay_the_rooms_whose_mints_finished() {
         assert!(pane.is_online());
     }
     }
+/// A Codex report binds only its own launch's placeholder and only once the
+/// rollout is readable; a report with no rollout stays held and is retried.
+#[cfg(unix)]
+#[test]
+fn a_codex_report_waits_for_its_rollout_and_binds_on_a_later_pass() {
+    const SESSION: &str = "8c3f4b96-3b74-4021-9f83-2c3d4e5f6071";
+    let _state = session_state::StateRootGuard::isolated();
+    let home = controls::HomeDirGuard::isolated();
+    let cwd = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let stub = codex_stub_for_pane(root.path(), "codex", "exec sleep 30");
+    let spec = codex_mint_spec(&stub, cwd.path(), "Room A", SESSION);
+    let mut rig = IterationHarness::new(root.path());
+    rig.panes[0] = crate::app::spawn_room(
+        &mut crate::app::LivePanes,
+        spec,
+        small_size(),
+        GuestEnvironment::new([]),
+        None,
+        Some(&CodexMint::Unreported),
+        None,
+    )
+    .unwrap();
+    bind_codex_room(
+        rig.router.as_mut().unwrap(),
+        &mut rig.panes,
+        0,
+        &CodexMint::Unreported,
+    )
+    .unwrap();
+    let launch = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+
+    let report = |session: &str| crate::doorbell::DoorbellSessionReport {
+        from: 0,
+        session: Some(session.to_owned()),
+        pending: false,
+        reply: mpsc::sync_channel(1).0,
+    };
+    crate::app::report_native_session(
+        &mut rig.panes,
+        rig.router.as_mut(),
+        report(SESSION),
+        &mut rig.notice,
+    );
+    let shown = rig.notice.ordered_lines().join("; ");
+    assert!(shown.contains("waiting for the reported session's rollout"), "{shown}");
+    let waiting = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    assert_eq!(waiting.session, launch.session, "the launch stays held");
+
+    let day = home.path().join(".codex/sessions/2026/08/07");
+    fs::create_dir_all(&day).unwrap();
+    fs::write(
+        day.join(format!("rollout-{SESSION}.jsonl")),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION}\",\"cwd\":\"{}\"}}}}\n",
+            cwd.path().display()
+        ),
+    )
+    .unwrap();
+    rig.iterate();
+    let bound = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    assert_eq!(bound.session, SESSION);
+    assert_eq!(bound.generation, launch.generation, "same launch keeps its mail");
+    assert!(!rig.router.as_ref().unwrap().is_pending(0));
+
+    crate::app::report_native_session(
+        &mut rig.panes,
+        rig.router.as_mut(),
+        report(MINTED_B),
+        &mut rig.notice,
+    );
+    let shown = rig.notice.ordered_lines().join("; ");
+    assert!(shown.contains("not waiting for a session report"), "{shown}");
+    assert_eq!(rig.router.as_ref().unwrap().binding_for(0).unwrap().session, SESSION);
+}
+
+/// No report within the bound produces one notice, leaves mail held, and a
+/// late report still binds the same launch.
+#[cfg(unix)]
+#[test]
+fn a_late_codex_report_still_binds_after_the_no_report_notice() {
+    const SESSION: &str = "9d4e7c08-4a85-4c31-b0f2-1e3d5a7c9b24";
+    let _state = session_state::StateRootGuard::isolated();
+    let home = controls::HomeDirGuard::isolated();
+    let cwd = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let stub = codex_stub_for_pane(root.path(), "codex", "exec sleep 30");
+    let spec = codex_mint_spec(&stub, cwd.path(), "Room A", SESSION);
+    let mut rig = IterationHarness::new(root.path());
+    rig.panes[0] = crate::app::spawn_room(
+        &mut crate::app::LivePanes,
+        spec,
+        small_size(),
+        GuestEnvironment::new([]),
+        None,
+        Some(&CodexMint::Unreported),
+        None,
+    )
+    .unwrap();
+    bind_codex_room(
+        rig.router.as_mut().unwrap(),
+        &mut rig.panes,
+        0,
+        &CodexMint::Unreported,
+    )
+    .unwrap();
+    rig.spawned_at[0] = Instant::now() - Duration::from_secs(30);
+
+    rig.iterate();
+    rig.iterate();
+    let shown = rig.notice.ordered_lines().join("; ");
+    assert!(shown.contains("approve Crowded's hook in Codex /hooks"), "{shown}");
+    assert_eq!(
+        shown.matches("approve Crowded's hook in Codex /hooks").count(),
+        1,
+        "the notice is shown once: {shown}"
+    );
+    let launch = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    assert_eq!(
+        launch.session,
+        crate::native_session::unreported_session("1", launch.generation)
+    );
+    assert!(rig.router.as_ref().unwrap().is_pending(0));
+
+    let day = home.path().join(".codex/sessions/2026/08/07");
+    fs::create_dir_all(&day).unwrap();
+    fs::write(
+        day.join(format!("rollout-{SESSION}.jsonl")),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION}\",\"cwd\":\"{}\"}}}}\n",
+            cwd.path().display()
+        ),
+    )
+    .unwrap();
+    let (reply, _dropped) = mpsc::sync_channel(1);
+    crate::app::report_native_session(
+        &mut rig.panes,
+        rig.router.as_mut(),
+        crate::doorbell::DoorbellSessionReport {
+            from: 0,
+            session: Some(SESSION.to_owned()),
+            pending: false,
+            reply,
+        },
+        &mut rig.notice,
+    );
+    let bound = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    assert_eq!(bound.session, SESSION);
+    assert_eq!(bound.generation, launch.generation);
+    assert!(!rig.router.as_ref().unwrap().is_pending(0));
+}
+
 /// Records which kind of pane the production start code asks for, and hands
 /// back a pane that has no process.
 #[cfg(unix)]

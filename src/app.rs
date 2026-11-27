@@ -393,6 +393,12 @@ impl TornMouseReport {
 // stopped reporting must not pin the roster to a stale self-report forever.
 const PULSE_FRESHNESS_WINDOW: Duration = Duration::from_secs(30);
 
+/// A Codex room with no session report gets one visible notice, then waits.
+#[cfg(not(test))]
+const NO_REPORT_AFTER: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const NO_REPORT_AFTER: Duration = Duration::from_millis(100);
+
 pub(crate) struct DeliveryFuse {
     used: usize,
     limit: usize,
@@ -1806,7 +1812,105 @@ pub(crate) fn complete_mints(
         eprintln!("{message}");
         append_notice(notice, message, NoticeSeverity::Failure);
     }
+    retry_codex_reports(router.as_deref_mut(), panes, notice);
+    check_codex_report_timeouts(router, panes, spawned_at, notice);
     Ok(())
+}
+
+/// One visible notice when a launch has waited too long for its session
+/// report. The room is not torn down and its mail is not released: a late
+/// report still binds this generation. No exec fallback is started.
+fn check_codex_report_timeouts(
+    router: Option<&mut NativeRouter>,
+    panes: &mut [Pane],
+    spawned_at: &[Instant],
+    notice: &mut Notices,
+) {
+    let Some(router) = router else {
+        return;
+    };
+    for (index, pane) in panes.iter_mut().enumerate() {
+        if !pane.codex_native() || pane.codex_no_report_notice() {
+            continue;
+        }
+        let Some(binding) = router.binding_for(index) else {
+            continue;
+        };
+        if !crate::native_session::is_unreported_placeholder(&binding) {
+            continue;
+        }
+        if spawned_at
+            .get(index)
+            .is_some_and(|started| started.elapsed() >= NO_REPORT_AFTER)
+        {
+            pane.set_codex_no_report_notice();
+            append_notice(
+                notice,
+                format!(
+                    "{}: no Codex session report; approve Crowded's hook in Codex /hooks, or trust the folder, then Ctrl+R. Mail stays held.",
+                    pane.title()
+                ),
+                NoticeSeverity::Failure,
+            );
+        }
+    }
+}
+
+/// Completes a Codex report whose rollout was not readable yet. The mail
+/// stayed held on the same launch placeholder, so binding it now releases
+/// exactly that launch's mail and nothing from an older one.
+fn retry_codex_reports(
+    router: Option<&mut NativeRouter>,
+    panes: &mut [Pane],
+    notice: &mut Notices,
+) {
+    let Some(router) = router else {
+        return;
+    };
+    for (index, pane) in panes.iter_mut().enumerate() {
+        if !pane.codex_native() {
+            continue;
+        }
+        let Some(session) = pane.captured_session_id() else {
+            continue;
+        };
+        let Some(binding) = router.binding_for(index) else {
+            continue;
+        };
+        if !crate::native_session::is_unreported_placeholder(&binding)
+            || !pane::codex_rollout_verified(&pane.cwd(), &session)
+        {
+            continue;
+        }
+        let title = pane.title().to_owned();
+        if let Err(error) = crate::pane::session_state::upsert_reported(
+            "codex",
+            &pane.cwd(),
+            &title,
+            &session,
+        ) {
+            append_notice(
+                notice,
+                format!("{title}: session report could not be saved: {error}"),
+                NoticeSeverity::Failure,
+            );
+            continue;
+        }
+        let room = pane.codex_room_for(session.clone());
+        let destination = (index + 1).to_string();
+        if let Err(error) = router.rebind_room(crate::native_route::RoomEntry {
+            index,
+            title: title.clone(),
+            binding: crate::codex_native::binding(&destination, &session, binding.generation),
+            backend: crate::native_route::Backend::Codex(Arc::new(room)),
+        }) {
+            append_notice(
+                notice,
+                format!("{title}: could not bind the reported session: {error}"),
+                NoticeSeverity::Failure,
+            );
+        }
+    }
 }
 
 /// Relaunches one native Codex room in place. A trusted stored session starts
@@ -2547,6 +2651,27 @@ fn apply_session_report(
         return Ok(format!(
             "ignored: the reported session is not a Claude session id"
         ));
+    }
+    if panes[from].codex_native() {
+        // A report may only turn this launch's own placeholder into a session.
+        // A real binding is either a resumed session or a report already
+        // applied, so a later report is stale and must not retarget mail.
+        if !current.as_ref().is_some_and(|binding| {
+            crate::native_session::is_unreported_placeholder(binding)
+        }) {
+            return Ok(format!(
+                "ignored: {title} is not waiting for a session report"
+            ));
+        }
+        if !pane::codex_rollout_verified(&panes[from].cwd(), &session) {
+            // The hook can arrive before the rollout is readable. Remember the
+            // id and keep the mail held; a later event-loop pass retries the
+            // rollout check and binds the same launch.
+            panes[from].record_session(&session);
+            return Ok(format!(
+                "{title}: waiting for the reported session's rollout"
+            ));
+        }
     }
     // The first report of a launch turns its unreported placeholder into the
     // real session: the launch keeps its generation, so mail saved against the
