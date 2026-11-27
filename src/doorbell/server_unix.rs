@@ -120,12 +120,12 @@ fn listener_loop(
     let mut recent_by_room = vec![VecDeque::<Instant>::new(); room_count];
     let mut seen = HashSet::<String>::new();
     let mut seen_order = VecDeque::<String>::new();
-    let mut accept_failures = 0_u32;
+    let mut accept_failures = AcceptFailures::new();
 
     while !stop.load(Ordering::Relaxed) {
         match accept() {
             Ok(mut stream) => {
-                accept_failures = 0;
+                accept_failures.connected();
                 let _ = stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT));
                 let request = read_request(&mut stream);
                 let response = match request {
@@ -283,11 +283,10 @@ fn listener_loop(
                 thread::sleep(Duration::from_millis(10));
             }
             Err(_) => {
-                accept_failures = accept_failures.saturating_add(1);
-                sleep_unless_stopped(accept_backoff(accept_failures), &stop);
-                if accept_failures >= MAX_ACCEPT_FAILURES {
+                if accept_failures.failed() {
                     break;
                 }
+                sleep_unless_stopped(accept_failures.backoff(), &stop);
             }
         }
     }

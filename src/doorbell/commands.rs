@@ -33,7 +33,7 @@ pub(super) struct SendArgs {
 const SEND_USAGE: &str = "usage: crowded send ROOM [--task ID] [--role ROLE] [--] MESSAGE";
 
 #[cfg(not(any(unix, windows)))]
-fn send_request(_: &WireRequest) -> Result<WireResponse, Box<dyn std::error::Error>> {
+fn send_request(_: &WireRequest) -> Result<WireResponse, ExchangeError> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "Doorbell local transport is not available on this platform",
@@ -399,52 +399,69 @@ const SESSION_REPORT_DEADLINE: Duration = Duration::from_secs(4);
 /// wait), so a queued request is not cut short before its answer can arrive.
 const CLIENT_DEADLINE: Duration = Duration::from_secs(10);
 
-/// The exchange got no answer before its deadline. The request may already
-/// have reached Crowded, so the caller must not invite a blind resend.
-#[derive(Debug)]
-struct NoAnswer {
-    deadline: Duration,
-}
-
-impl std::fmt::Display for NoAnswer {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "Crowded did not answer within {} seconds",
-            self.deadline.as_secs()
-        )
-    }
-}
-
-impl std::error::Error for NoAnswer {}
-
 /// Why one doorbell exchange produced no answer. A stalled exchange (possibly
 /// queued) is distinct from a transport error (nothing was sent).
-#[derive(Debug)]
 enum SendFailure {
-    NoAnswer(NoAnswer),
-    Transport(String),
+    /// No answer arrived before the deadline; the request may be queued.
+    NoAnswer { deadline: Duration },
+    /// The transport itself failed, so nothing was delivered.
+    Transport(ExchangeError),
 }
 
 impl std::fmt::Display for SendFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoAnswer(error) => error.fmt(formatter),
-            Self::Transport(detail) => formatter.write_str(detail),
+            Self::NoAnswer { deadline } => write!(
+                formatter,
+                "Crowded did not answer within {} seconds",
+                deadline.as_secs()
+            ),
+            Self::Transport(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::fmt::Debug for SendFailure {
+    /// `main` returns `Result`, so the runtime prints `Err` with `Debug`.
+    /// A timeout must read as the plain message, and a transport error must
+    /// read exactly as it did before the exchange gained a deadline.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAnswer { .. } => std::fmt::Display::fmt(self, formatter),
+            Self::Transport(error) => std::fmt::Debug::fmt(error, formatter),
         }
     }
 }
 
 impl std::error::Error for SendFailure {}
 
+/// A command failure whose CLI text is its Display text. The runtime prints
+/// `Err` from `main` with `Debug`, so Debug must not add quotes or a wrapper.
+struct CliMessage(String);
+
+impl std::fmt::Display for CliMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Debug for CliMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl std::error::Error for CliMessage {}
+
 /// A stalled send or control may already be queued, so its error says not to
 /// resend. Roster and pulse stay retry-safe and keep the plain text.
 fn queued_advice(failure: SendFailure) -> Box<dyn std::error::Error> {
     match failure {
-        SendFailure::NoAnswer(error) => {
-            format!("{error}; the request may have been queued, do not resend").into()
-        }
-        SendFailure::Transport(detail) => detail.into(),
+        SendFailure::NoAnswer { deadline } => Box::new(CliMessage(format!(
+            "Crowded did not answer within {} seconds; the request may have been queued, do not resend",
+            deadline.as_secs()
+        ))),
+        SendFailure::Transport(error) => error,
     }
 }
 
@@ -459,15 +476,15 @@ fn send_within(request: WireRequest, deadline: Duration) -> Result<WireResponse,
 /// exits, so joining a blocked worker would only turn a timeout into a hang.
 fn send_within_using(
     deadline: Duration,
-    exchange: impl FnOnce() -> Result<WireResponse, Box<dyn std::error::Error>> + Send + 'static,
+    exchange: impl FnOnce() -> Result<WireResponse, ExchangeError> + Send + 'static,
 ) -> Result<WireResponse, SendFailure> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let _ = sender.send(exchange().map_err(|error| SendFailure::Transport(error.to_string())));
+        let _ = sender.send(exchange().map_err(SendFailure::Transport));
     });
     receiver
         .recv_timeout(deadline)
-        .unwrap_or_else(|_| Err(SendFailure::NoAnswer(NoAnswer { deadline })))
+        .unwrap_or_else(|_| Err(SendFailure::NoAnswer { deadline }))
 }
 
 /// How `--ack` reports a failed report: each cause has its own exit status so a
@@ -1154,6 +1171,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("silent.sock");
         let listener = UnixListener::bind(&path).unwrap();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&accepted);
+        let server = thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                flag.store(true, Ordering::SeqCst);
+                // Accepted and held open, but never answered.
+                thread::sleep(Duration::from_secs(5));
+                drop(stream);
+            }
+        });
         let silence = path.clone();
         let started = Instant::now();
         let failure = match must_finish(Duration::from_secs(2), move || {
@@ -1174,9 +1201,10 @@ mod tests {
             Ok(_) => panic!("a silent listener must not produce an answer"),
             Err(failure) => failure,
         };
-        assert!(matches!(failure, SendFailure::NoAnswer(_)));
+        assert!(matches!(failure, SendFailure::NoAnswer { .. }));
         assert!(started.elapsed() < Duration::from_secs(2));
-        drop(listener);
+        assert!(accepted.load(Ordering::SeqCst), "the listener must accept");
+        drop(server);
     }
 
     /// A server that answers promptly still completes well inside the bound.
@@ -1219,21 +1247,39 @@ mod tests {
 
     #[test]
     fn only_a_stalled_send_or_control_tells_the_caller_not_to_resend() {
-        let stalled = || {
-            SendFailure::NoAnswer(NoAnswer {
-                deadline: CLIENT_DEADLINE,
-            })
+        let stalled = || SendFailure::NoAnswer {
+            deadline: CLIENT_DEADLINE,
         };
-        let advice = queued_advice(stalled()).to_string();
-        assert!(advice.contains("do not resend"), "{advice}");
-        // Roster and pulse are retry-safe, so they keep the plain text.
-        let plain = stalled().to_string();
-        assert!(!plain.contains("do not resend"), "{plain}");
-        assert!(plain.contains("did not answer"), "{plain}");
-        // A transport error is not a stall and keeps its own text.
+        let advice = queued_advice(stalled());
         assert_eq!(
-            SendFailure::Transport("connection refused".to_owned()).to_string(),
-            "connection refused"
+            advice.to_string(),
+            "Crowded did not answer within 10 seconds; the request may have been queued, do not resend"
         );
+        // `main` prints Err with Debug, so Debug must be that same text.
+        assert_eq!(format!("{advice:?}"), advice.to_string());
+        // Roster and pulse are retry-safe, so they keep the plain text.
+        let plain = stalled();
+        assert_eq!(
+            plain.to_string(),
+            "Crowded did not answer within 10 seconds"
+        );
+        assert_eq!(format!("{plain:?}"), plain.to_string());
+        assert!(!plain.to_string().contains("do not resend"));
+    }
+
+    #[test]
+    fn a_transport_error_keeps_the_base_cli_text() {
+        let transport = || {
+            SendFailure::Transport(Box::new(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no socket",
+            )))
+        };
+        assert_eq!(transport().to_string(), "no socket");
+        // Debug is what main prints: no `Transport(...)` wrapper, exactly the
+        // underlying error's own Debug form.
+        let base = r#"Custom { kind: NotFound, error: "no socket" }"#;
+        assert_eq!(format!("{:?}", transport()), base);
+        assert_eq!(format!("{:?}", queued_advice(transport())), base);
     }
 }

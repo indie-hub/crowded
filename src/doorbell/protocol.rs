@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 use crate::config::RoomScheduling;
 use crate::room_detail::DetailEvent;
 
+/// A doorbell transport failure that can cross back from the exchange worker
+/// thread. Keeping the original error object lets the CLI print exactly the
+/// text it printed before the exchange gained a deadline.
+pub(super) type ExchangeError = Box<dyn std::error::Error + Send + Sync>;
+
 pub(super) const MAX_WIRE_BYTES: usize = 2 * 1024 * 1024;
 pub(super) const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_ID_BYTES: usize = 128;
@@ -34,6 +39,36 @@ pub(super) const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(5);
 /// Consecutive accept failures a listener tolerates before it gives up, so a
 /// permanently broken socket or pipe stops serving instead of spinning.
 pub(super) const MAX_ACCEPT_FAILURES: u32 = 20;
+
+/// Consecutive create/connect failures for one listener. Only a completed
+/// connection clears the streak, so repeated connect failures after a
+/// successful instance creation still reach [`MAX_ACCEPT_FAILURES`].
+pub(super) struct AcceptFailures {
+    consecutive: u32,
+}
+
+impl AcceptFailures {
+    pub(super) const fn new() -> Self {
+        Self { consecutive: 0 }
+    }
+
+    /// Records one failed create or connect. Returns whether the listener
+    /// must stop.
+    pub(super) fn failed(&mut self) -> bool {
+        self.consecutive = self.consecutive.saturating_add(1);
+        self.consecutive >= MAX_ACCEPT_FAILURES
+    }
+
+    /// How long to wait before the next attempt, for the current streak.
+    pub(super) fn backoff(&self) -> Duration {
+        accept_backoff(self.consecutive)
+    }
+
+    /// A completed connection: the streak is over.
+    pub(super) fn connected(&mut self) {
+        self.consecutive = 0;
+    }
+}
 
 /// Delay before retrying a failed accept: 50 ms doubling up to one second,
 /// about 16 s of backoff before [`MAX_ACCEPT_FAILURES`] ends the loop.
@@ -982,5 +1017,24 @@ mod tests {
                 "backoff must never shrink at {failures}"
             );
         }
+    }
+
+    /// A successful instance creation must not clear the streak: only a
+    /// completed connection does, so repeated connect failures stop the loop.
+    #[test]
+    fn only_a_completed_connection_resets_the_accept_failure_streak() {
+        let mut failures = AcceptFailures::new();
+        // Mixed create/connect failures: every failure counts until a
+        // connection succeeds.
+        for _ in 0..MAX_ACCEPT_FAILURES - 1 {
+            assert!(!failures.failed());
+            assert!(failures.backoff() > Duration::ZERO);
+        }
+        assert!(
+            failures.failed(),
+            "the {MAX_ACCEPT_FAILURES}th consecutive failure must stop the listener"
+        );
+        failures.connected();
+        assert!(!failures.failed(), "a connection starts a new streak");
     }
 }
