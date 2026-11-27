@@ -1878,13 +1878,13 @@ fn retry_codex_reports(
             continue;
         };
         if !crate::native_session::is_unreported_placeholder(&binding)
-            || !pane::codex_rollout_verified(&pane.cwd(), &session)
+            || !pane::codex_rollout_verified(pane.cwd(), &session)
         {
             continue;
         }
         let title = pane.title().to_owned();
         if let Err(error) =
-            crate::pane::session_state::upsert_reported("codex", &pane.cwd(), &title, &session)
+            crate::pane::session_state::upsert_reported("codex", pane.cwd(), &title, &session)
         {
             append_notice(
                 notice,
