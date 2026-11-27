@@ -5,8 +5,11 @@ use std::{
     env,
     ffi::OsStr,
     fs::File,
-    io::{self, BufRead, BufReader, Read, Write},
-    os::windows::{ffi::OsStrExt, io::FromRawHandle},
+    io::{self, Read, Write},
+    os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle},
+    },
     path::{Path, PathBuf},
     process,
     sync::{
@@ -20,8 +23,8 @@ use std::{
 
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ,
-        GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY,
+        ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     },
     Security::Authentication::Identity::RtlGenRandom,
     Storage::FileSystem::{
@@ -30,7 +33,7 @@ use windows_sys::Win32::{
     },
     System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe,
     },
 };
 
@@ -76,6 +79,7 @@ impl Doorbell {
                 room_count,
                 event_tx,
                 thread_stop,
+                REQUEST_READ_DEADLINE,
             );
         });
 
@@ -225,6 +229,7 @@ fn listener_loop(
     room_count: usize,
     events: SyncSender<DoorbellEvent>,
     stop: Arc<AtomicBool>,
+    read_deadline: Duration,
 ) {
     let mut recent_by_room = vec![VecDeque::<Instant>::new(); room_count];
     let mut seen = HashSet::<String>::new();
@@ -263,7 +268,7 @@ fn listener_loop(
         accept_failures = 0;
 
         let mut stream = unsafe { File::from_raw_handle(handle as _) };
-        let request = read_request(&stream);
+        let request = read_request(&stream, read_deadline, &stop);
         let response = match request {
             Ok(WireRequest::Message(request)) => {
                 if seen.contains(&request.id) {
@@ -402,18 +407,88 @@ fn listener_loop(
     }
 }
 
-fn read_request(stream: &File) -> io::Result<WireRequest> {
-    let mut line = String::new();
-    BufReader::new(stream)
-        .take((MAX_WIRE_BYTES + 1) as u64)
-        .read_line(&mut line)?;
-    if line.len() > MAX_WIRE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "envelope exceeds wire limit",
-        ));
+/// How long a read with nothing to consume waits before re-checking the
+/// deadline and the stop flag.
+const READ_POLL: Duration = Duration::from_millis(10);
+
+/// Reads one newline-terminated request without blocking past `read_deadline`.
+/// A blocking `read_line` on a pipe has no timeout, so a client that writes
+/// half a line holds the only listener instance forever. Peeking the available
+/// bytes keeps every read non-blocking; the deadline bounds waiting for the
+/// rest of the line.
+fn read_request(
+    stream: &File,
+    read_deadline: Duration,
+    stop: &AtomicBool,
+) -> io::Result<WireRequest> {
+    let handle = stream.as_raw_handle() as HANDLE;
+    let deadline = Instant::now() + read_deadline;
+    let mut reader = stream;
+    let mut bytes = Vec::with_capacity(4096);
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let available = match peek_available(handle) {
+            Ok(available) => available,
+            // The client closed its end: parse what arrived, as the old
+            // read_line EOF path did.
+            Err(error) if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => break,
+            Err(error) => return Err(error),
+        };
+        if available == 0 {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "request read deadline exceeded",
+                ));
+            }
+            if stop.load(Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "doorbell is stopping",
+                ));
+            }
+            thread::sleep(READ_POLL);
+            continue;
+        }
+        let capacity_left = MAX_WIRE_BYTES + 1 - bytes.len();
+        let want = (available as usize).min(capacity_left).min(chunk.len());
+        let count = reader.read(&mut chunk[..want])?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        if bytes.len() > MAX_WIRE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "envelope exceeds wire limit",
+            ));
+        }
+        if bytes.ends_with(b"\n") {
+            break;
+        }
     }
-    serde_json::from_str(&line).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Bytes waiting in the pipe, without consuming them. A broken pipe surfaces
+/// as an error and the caller treats it as EOF.
+fn peek_available(handle: HANDLE) -> io::Result<u32> {
+    let mut available = 0_u32;
+    let ok = unsafe {
+        PeekNamedPipe(
+            handle,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(available)
 }
 
 fn remember_id(id: String, seen: &mut HashSet<String>, order: &mut VecDeque<String>) {
@@ -434,7 +509,108 @@ fn write_response(stream: &mut File, response: &WireResponse) -> io::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader};
+
     use super::*;
+
+    /// A listener on a private test pipe, plus the event end the test answers
+    /// from. `read_deadline` is the value the listener passes to each read.
+    struct TestPipe {
+        path: PathBuf,
+        events: Receiver<DoorbellEvent>,
+        stop: Arc<AtomicBool>,
+        token: String,
+        listener: Option<JoinHandle<()>>,
+    }
+
+    impl TestPipe {
+        fn start(read_deadline: Duration) -> Self {
+            let nonce = PIPE_NONCE.fetch_add(1, Ordering::Relaxed);
+            let path = PathBuf::from(format!(r"\\.\pipe\crowded-test-{}-{nonce}", process::id()));
+            let first = create_instance(&path, true).unwrap();
+            let token = "left".to_owned();
+            let tokens = vec![token.clone(), "right".to_owned()];
+            let (event_tx, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let loop_path = path.clone();
+            let listener = thread::spawn(move || {
+                listener_loop(
+                    first as usize,
+                    loop_path,
+                    tokens,
+                    2,
+                    event_tx,
+                    thread_stop,
+                    read_deadline,
+                );
+            });
+            Self {
+                path,
+                events,
+                stop,
+                token,
+                listener: Some(listener),
+            }
+        }
+    }
+
+    impl Drop for TestPipe {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            // Unblock a ConnectNamedPipe wait; the stopped read returns at once.
+            let _ = open_client(&self.path);
+            if let Some(handle) = self.listener.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// Connects to a pipe that may be between instances for a moment.
+    fn connect_with_retry(path: &Path) -> File {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match open_client(path) {
+                Ok(client) => return client,
+                Err(error) if retryable_connect(&error) && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("could not connect to the test pipe: {error}"),
+            }
+        }
+    }
+
+    fn answer_one_roster(events: &Receiver<DoorbellEvent>, deadline: Instant) {
+        loop {
+            match events.try_recv() {
+                Ok(DoorbellEvent::Roster(request)) => {
+                    request.reply(vec![RosterRoom {
+                        room: 2,
+                        name: "Builder".to_owned(),
+                        guest: "codex".to_owned(),
+                        vendor: "openai".to_owned(),
+                        transport: "raw".to_owned(),
+                        state: PulseState::Ready,
+                        state_source: PulseSource::Gate,
+                        allow_control: true,
+                        model: None,
+                        effort: None,
+                        cost: "unknown".to_owned(),
+                        headroom: true,
+                        pulse_age_ms: None,
+                        capabilities: Default::default(),
+                        scheduling: None,
+                    }]);
+                    return;
+                }
+                Ok(_) => panic!("unexpected Doorbell event"),
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("roster request did not arrive: {error}"),
+            }
+        }
+    }
 
     #[test]
     fn capability_tokens_are_random_and_doorbell_shuts_down_cleanly() {
@@ -564,5 +740,97 @@ mod tests {
         let response = resend.join().unwrap();
         assert!(response.ok);
         assert_eq!(response.status, "duplicate");
+    }
+
+    /// A client that writes half a line and holds the pipe open is rejected at
+    /// the read deadline, and does not stop later clients from being served.
+    #[test]
+    fn a_stalled_partial_request_is_rejected_and_later_clients_are_served() {
+        let pipe = TestPipe::start(Duration::from_millis(200));
+        let mut stalled = connect_with_retry(&pipe.path);
+        stalled.write_all(b"{\"kind\":").unwrap();
+        stalled.flush().unwrap();
+
+        let started = Instant::now();
+        let mut line = String::new();
+        BufReader::new(&stalled).read_line(&mut line).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the request read deadline must bound a stalled request"
+        );
+        let rejected: WireResponse = serde_json::from_str(&line).unwrap();
+        assert!(!rejected.ok);
+        assert_eq!(rejected.status, "rejected");
+
+        // The stalled client is still open: a second authenticated client must
+        // still complete a roster round trip on the next pipe instance.
+        let path = pipe.path.clone();
+        let token = pipe.token.clone();
+        let client = thread::spawn(move || {
+            let mut stream = connect_with_retry(&path);
+            serde_json::to_writer(
+                &mut stream,
+                &WireRequest::Roster(RosterRequest {
+                    token,
+                    id: "after-stall".to_owned(),
+                }),
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+        answer_one_roster(&pipe.events, Instant::now() + Duration::from_secs(2));
+        assert_eq!(client.join().unwrap().status, "listed");
+        drop(stalled);
+    }
+
+    /// A valid request split across two writes, with a gap inside the read
+    /// deadline, still parses.
+    #[test]
+    fn a_request_split_across_writes_within_the_deadline_parses() {
+        let pipe = TestPipe::start(Duration::from_millis(500));
+        let path = pipe.path.clone();
+        let token = pipe.token.clone();
+        let client = thread::spawn(move || {
+            let mut stream = connect_with_retry(&path);
+            let mut wire = serde_json::to_vec(&WireRequest::Message(MessageRequest {
+                token,
+                id: "split-request".to_owned(),
+                to: 2,
+                body: "hello in two writes".to_owned(),
+                task: None,
+                role: None,
+                hop: 0,
+            }))
+            .unwrap();
+            wire.push(b'\n');
+            let split = wire.len() / 2;
+            stream.write_all(&wire[..split]).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(100));
+            stream.write_all(&wire[split..]).unwrap();
+            stream.flush().unwrap();
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match pipe.events.try_recv() {
+                Ok(DoorbellEvent::Message(envelope)) => {
+                    assert_eq!(envelope.body, "hello in two writes");
+                    envelope.reply_injected(1);
+                    break;
+                }
+                Ok(_) => panic!("unexpected Doorbell event"),
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("split request did not arrive: {error}"),
+            }
+        }
+        let response = client.join().unwrap();
+        assert!(response.ok);
+        assert_eq!(response.status, "injected");
     }
 }

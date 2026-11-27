@@ -19,12 +19,6 @@ use std::{
 /// Per-read timeout while assembling one request line. Bounds a single `read`
 /// call so the overall [`REQUEST_READ_DEADLINE`] is re-checked between pieces.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(250);
-/// Upper bound for reading one request line from a connected client. Longer
-/// than the old one-second read boundary, so a valid request delivered across
-/// multiple writes (an agent flushing a prompt in pieces) still parses, while
-/// still bounding a stalled connection instead of blocking the accept loop
-/// indefinitely.
-const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(5);
 
 use super::protocol::*;
 use crate::pane::GuestEnvironment;

@@ -26,6 +26,10 @@ pub(super) const DEDUPE_CAPACITY: usize = 256;
 pub(super) const MAX_MODEL_BYTES: usize = 128;
 pub(super) const MAX_SESSION_BYTES: usize = 128;
 pub(super) const REPLY_WAIT: Duration = Duration::from_secs(2);
+/// Upper bound for reading one request line from a connected client. Shared by
+/// both transports so a stalled connection cannot block a listener forever,
+/// while a valid request delivered across multiple writes still parses.
+pub(super) const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Consecutive accept failures a listener tolerates before it gives up, so a
 /// permanently broken socket or pipe stops serving instead of spinning.
