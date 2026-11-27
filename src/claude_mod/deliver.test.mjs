@@ -138,6 +138,7 @@ test("FIFO and no overlapping poll", async (t) => {
   await waitFor(() => inbox.calls.next === 1);
   assert.equal(inbox.calls.next, 1);
   await ctx.timers[0].cb(); await ctx.timers[0].cb(); await flush();
+  await waitFor(() => ctx.submits.length === 1);
   assert.equal(inbox.calls.next, 1); assert.equal(ctx.submits.length, 1);
   resolveSubmit({});
   await p1;
