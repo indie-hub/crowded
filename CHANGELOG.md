@@ -7,6 +7,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-11-27
+
+### Changed
+- A native Codex room starts at once. A plain launch and a clear no longer run `codex exec` to create the session and wait for its whole first turn (up to 180 s, which timed out on Windows with "`codex exec` did not finish within 180 seconds"). The terminal starts directly, with the house rules passed as its first prompt on the command line (never typed into the terminal), and the room is bound when Codex's SessionStart hook reports the session, about two seconds later. Mail is held until then and delivered to the new session only. Resume is unchanged.
+- A Codex session report binds a room only for the launch it came from (`CROWDED_LAUNCH_GENERATION`) and only if the session's rollout belongs to the room's directory. A rollout that is still being written is retried, not rejected; one from another directory is rejected. Mail saved for an earlier launch is retired with one notice and never sent to the new session.
+- If no session report arrives within 20 seconds, the room shows one notice: approve Crowded's hook in Codex `/hooks` or trust the folder, then press Ctrl+R. Mail stays held, and a late report still binds the room. The README describes this one-time Codex setup.
+
+### Fixed
+- Clearing a native Codex room repeatedly no longer adds another copy of the house rules to its launch command, and a resume no longer carries an old prompt.
+
 ## [0.50.0] - 2026-11-27
 
 ### Added
