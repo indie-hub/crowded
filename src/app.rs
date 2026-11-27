@@ -393,12 +393,6 @@ impl TornMouseReport {
 // stopped reporting must not pin the roster to a stale self-report forever.
 const PULSE_FRESHNESS_WINDOW: Duration = Duration::from_secs(30);
 
-/// A Codex room with no session report gets one visible notice, then waits.
-#[cfg(not(test))]
-const NO_REPORT_AFTER: Duration = Duration::from_secs(20);
-#[cfg(test)]
-const NO_REPORT_AFTER: Duration = Duration::from_millis(100);
-
 pub(crate) struct DeliveryFuse {
     used: usize,
     limit: usize,
@@ -4657,3 +4651,9 @@ thread_local! {
 fn note_headroom_wait(room: usize) {
     HEADROOM_WAITS.with(|waits| waits.borrow_mut().push(room));
 }
+
+/// A Codex room with no session report gets one visible notice, then waits.
+#[cfg(not(test))]
+const NO_REPORT_AFTER: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const NO_REPORT_AFTER: Duration = Duration::from_millis(100);
