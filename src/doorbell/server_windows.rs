@@ -527,7 +527,9 @@ mod tests {
         fn start(read_deadline: Duration) -> Self {
             let nonce = PIPE_NONCE.fetch_add(1, Ordering::Relaxed);
             let path = PathBuf::from(format!(r"\\.\pipe\crowded-test-{}-{nonce}", process::id()));
-            let first = create_instance(&path, true).unwrap();
+            // HANDLE is not Send, so it crosses into the listener thread as a
+            // pointer-sized value, exactly like the production start path.
+            let first = create_instance(&path, true).unwrap() as usize;
             let token = "left".to_owned();
             let tokens = vec![token.clone(), "right".to_owned()];
             let (event_tx, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
@@ -536,7 +538,7 @@ mod tests {
             let loop_path = path.clone();
             let listener = thread::spawn(move || {
                 listener_loop(
-                    first as usize,
+                    first,
                     loop_path,
                     tokens,
                     2,
