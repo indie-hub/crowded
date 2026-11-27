@@ -2028,6 +2028,7 @@ fn scroll_fixture(rows: u16, cols: u16) -> Pane {
         _opencode_config: None,
         native: None,
         codex_no_report_notice: false,
+        rollout_check_at: None,
     }
 }
 
@@ -5526,11 +5527,14 @@ fn an_unfinished_rollout_is_retried_and_a_wrong_cwd_is_rejected() {
             cwd.path().display()
         ),
     );
-    rig.iterate();
-    assert_eq!(
-        rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
-        SESSION
-    );
+    // The unverified rollout is checked at most once a second, so a late
+    // file binds on the next allowed pass, not the immediately following one.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while rig.router.as_ref().unwrap().binding_for(0).unwrap().session != SESSION {
+        assert!(Instant::now() < deadline, "late rollout was never retried");
+        rig.iterate();
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A Codex report binds only its own launch's placeholder and only once the
@@ -9090,4 +9094,77 @@ mod production_loop {
             panes[2].visible_width()
         );
     }
+}
+
+#[test]
+fn rollout_retry_is_due_once_a_second() {
+    let now = Instant::now();
+    assert!(rollout_retry_due(None, now));
+    assert!(!rollout_retry_due(Some(now), now));
+    assert!(!rollout_retry_due(
+        Some(now),
+        now + Duration::from_millis(999)
+    ));
+    assert!(rollout_retry_due(Some(now), now + Duration::from_secs(1)));
+}
+
+#[test]
+fn rollout_retry_checks_at_most_once_per_interval_across_many_passes() {
+    let cwd = Path::new("/tmp/crowded-rollout-retry");
+    let start = Instant::now();
+    let mut last = None;
+    let mut calls = 0usize;
+    for step in 0..100 {
+        let now = start + Duration::from_millis(step * 10);
+        let verified = rollout_retry_check(&mut last, now, cwd, "session", |_, _| {
+            calls += 1;
+            false
+        });
+        assert!(!verified);
+    }
+    assert_eq!(
+        calls, 1,
+        "100 event-loop passes must walk the rollout tree only once"
+    );
+}
+
+#[test]
+fn rollout_retry_finds_a_late_rollout_on_the_next_allowed_check() {
+    let cwd = Path::new("/tmp/crowded-rollout-retry");
+    let start = Instant::now();
+    let mut last = None;
+    let available = std::cell::Cell::new(false);
+    let mut check =
+        |now| rollout_retry_check(&mut last, now, cwd, "session", |_, _| available.get());
+    assert!(!check(start), "first walk finds no rollout");
+    assert!(!check(start + Duration::from_millis(999)), "throttled");
+    available.set(true);
+    assert!(
+        !check(start + Duration::from_millis(999)),
+        "still throttled"
+    );
+    assert!(check(start + Duration::from_secs(1)), "late rollout binds");
+}
+
+#[test]
+fn rollout_retry_slot_is_fresh_after_binding() {
+    let cwd = Path::new("/tmp/crowded-rollout-retry");
+    let start = Instant::now();
+    let mut last = None;
+    assert!(!rollout_retry_check(
+        &mut last,
+        start,
+        cwd,
+        "session",
+        |_, _| false
+    ));
+    assert!(!rollout_retry_due(last, start + Duration::from_millis(10)));
+    last = None; // what app.rs does once the launch is bound
+    assert!(rollout_retry_check(
+        &mut last,
+        start + Duration::from_millis(10),
+        cwd,
+        "session",
+        |_, _| true
+    ));
 }

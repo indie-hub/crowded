@@ -53,6 +53,30 @@ const CURSOR_POSITION_RESPONSE: &[u8] = b"\x1b[1;1R";
 // why the bound is explicit rather than unbounded.
 const SCROLLBACK_LINES: usize = 1000;
 
+/// How often an unverified Codex report may walk `~/.codex/sessions`. The walk
+/// is recursive and the event loop runs about 60 passes a second.
+const ROLLOUT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+fn rollout_retry_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= ROLLOUT_RETRY_INTERVAL)
+}
+
+/// Consumes one retry slot before the expensive check. The verifier is injected
+/// so a test can count calls without touching the filesystem.
+pub(crate) fn rollout_retry_check(
+    last: &mut Option<Instant>,
+    now: Instant,
+    cwd: &Path,
+    session: &str,
+    mut verify: impl FnMut(&Path, &str) -> bool,
+) -> bool {
+    if !rollout_retry_due(*last, now) {
+        return false;
+    }
+    *last = Some(now);
+    verify(cwd, session)
+}
+
 pub(crate) fn respond_to_terminal_queries(
     writer: &mut dyn Write,
     tail: &mut Vec<u8>,
@@ -598,6 +622,9 @@ pub(crate) struct Pane {
     native: Option<NativeRoom>,
     /// Whether the no-session-report notice was already shown for this launch.
     codex_no_report_notice: bool,
+    /// When this launch last walked the Codex rollout tree for an unverified
+    /// report. `None` until the first check.
+    pub(crate) rollout_check_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -2050,6 +2077,7 @@ impl Pane {
             _opencode_config: opencode_config,
             native: None,
             codex_no_report_notice: false,
+            rollout_check_at: None,
         })
     }
 
@@ -2109,6 +2137,7 @@ impl Pane {
             _opencode_config: None,
             native: None,
             codex_no_report_notice: false,
+            rollout_check_at: None,
         })
     }
 
@@ -2426,6 +2455,17 @@ impl Pane {
 
     pub(crate) fn set_codex_no_report_notice(&mut self) {
         self.codex_no_report_notice = true;
+    }
+
+    /// Runs the expensive rollout check only when this launch's retry slot is
+    /// due. A late rollout is still found: the slot opens again every second.
+    pub(crate) fn rollout_verified_when_due(
+        &mut self,
+        now: Instant,
+        session: &str,
+        verify: impl FnMut(&Path, &str) -> bool,
+    ) -> bool {
+        rollout_retry_check(&mut self.rollout_check_at, now, &self.cwd, session, verify)
     }
 
     /// The process was launched from a one-shot argv view; the pane keeps the

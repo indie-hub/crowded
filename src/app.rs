@@ -1818,7 +1818,7 @@ pub(crate) fn complete_mints(
         eprintln!("{message}");
         append_notice(notice, message, NoticeSeverity::Failure);
     }
-    retry_codex_reports(router.as_deref_mut(), panes, notice);
+    retry_codex_reports(router.as_deref_mut(), panes, notice, now);
     check_codex_report_timeouts(router, panes, spawned_at, notice);
     Ok(())
 }
@@ -1869,6 +1869,7 @@ fn retry_codex_reports(
     router: Option<&mut NativeRouter>,
     panes: &mut [Pane],
     notice: &mut Notices,
+    now: Instant,
 ) {
     let Some(router) = router else {
         return;
@@ -1883,9 +1884,10 @@ fn retry_codex_reports(
         let Some(binding) = router.binding_for(index) else {
             continue;
         };
-        if !crate::native_session::is_unreported_placeholder(&binding)
-            || !pane::codex_rollout_verified(pane.cwd(), &session)
-        {
+        if !crate::native_session::is_unreported_placeholder(&binding) {
+            continue;
+        }
+        if !pane.rollout_verified_when_due(now, &session, pane::codex_rollout_verified) {
             continue;
         }
         let title = pane.title().to_owned();
@@ -1913,6 +1915,9 @@ fn retry_codex_reports(
                 NoticeSeverity::Failure,
             );
         }
+        // The retry slot belongs to this launch only; a later generation
+        // starts with a fresh one.
+        pane.rollout_check_at = None;
     }
 }
 
