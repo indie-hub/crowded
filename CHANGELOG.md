@@ -7,6 +7,23 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.50.0] - 2026-11-27
+
+### Added
+- A native OpenCode room whose owned server dies is noticed within a few seconds: Crowded reaps its wrapper, shows one notice, takes the room offline and holds its mail. Ctrl+R revives the room on a new server and session; the house rules and the held mail are delivered once. A failed revive leaves the room offline with its reason. Only a refused connection or an exited wrapper counts as a dead server, so a busy server is never taken down.
+- Plugin installs report, per plugin, which linked files OpenCode loads as entries, and warn about missing or dangling links.
+- A plugin that ships a native OpenCode package gets a notice to declare it as `[[opencode_plugin]]`, and a warning when it would load twice (from the declaration and from a linked file or any OpenCode config, including `opencode.jsonc`, `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT`). Crowded never writes the user's `opencode.json`.
+
+### Changed
+- `crowded init` writes a starter config that pins ponytail and code4me-ntg to commits, enables ponytail's adapters, and declares context-mode v2.2.4 as an OpenCode package (Claude and Codex keep v1.0.169). Plugin commit refs are cloned and checked out.
+
+### Fixed
+- Clearing a native OpenCode room now interrupts the previous session's run. Before, the old session kept working, editing files and sending mail after the clear. A failed interrupt is reported and does not undo the clear.
+- `crowded plugin disable`, `update` and `remove` work after another tool rewrote a hook entry Crowded added, including Windows path spellings, and never remove a user's own command, even in the same handler.
+- The native outbox reports why it could not open, instead of "the native outbox stopped", when its worker exits first.
+- Launching a guest no longer fails at random with "Text file busy" on Linux; the spawn retries briefly.
+- Several timing-sensitive tests now wait for the state they check, so CI fails far less often on unrelated runs.
+
 ## [0.49.0] - 2026-11-26
 
 ### Added
