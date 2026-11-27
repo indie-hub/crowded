@@ -2,7 +2,7 @@
 
 use std::{
     collections::VecDeque,
-    sync::mpsc::SyncSender,
+    sync::mpsc::{Receiver, RecvTimeoutError, SyncSender},
     time::{Duration, Instant},
 };
 
@@ -21,6 +21,7 @@ pub(super) const EVENT_QUEUE_CAPACITY: usize = 100;
 pub(super) const DEDUPE_CAPACITY: usize = 256;
 pub(super) const MAX_MODEL_BYTES: usize = 128;
 pub(super) const MAX_SESSION_BYTES: usize = 128;
+pub(super) const REPLY_WAIT: Duration = Duration::from_secs(2);
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum WireRequest {
@@ -312,6 +313,17 @@ impl WireResponse {
             rooms: None,
         }
     }
+}
+
+/// Waits for a reply to a request already queued to the app. A timeout or a
+/// dropped reply channel is not a rejection: the app may have acted, so the
+/// caller must not invite a resend.
+pub(super) fn await_queued_reply(rx: &Receiver<WireResponse>, wait: Duration) -> WireResponse {
+    rx.recv_timeout(wait).unwrap_or_else(|error| match error {
+        RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected => {
+            WireResponse::accepted("pending", None)
+        }
+    })
 }
 
 pub(crate) struct DoorbellEnvelope {
@@ -877,5 +889,34 @@ mod tests {
         );
         // Neither an id nor the pending flag: nothing to report.
         assert!(validate_session_report(&session_report("left", None, false), &tokens).is_err());
+    }
+
+    #[test]
+    fn await_queued_reply_reports_pending_when_unanswered() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let response = await_queued_reply(&rx, Duration::from_millis(10));
+        assert!(response.ok);
+        assert_eq!(response.status, "pending");
+        assert_eq!(response.error, None);
+        assert_eq!(response.envelope_id, None);
+    }
+
+    #[test]
+    fn await_queued_reply_reports_pending_when_the_reply_channel_drops() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        let response = await_queued_reply(&rx, Duration::from_millis(10));
+        assert!(response.ok);
+        assert_eq!(response.status, "pending");
+    }
+
+    #[test]
+    fn await_queued_reply_returns_the_apps_answer() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(WireResponse::accepted("applied", Some(7))).unwrap();
+        let response = await_queued_reply(&rx, Duration::from_millis(10));
+        assert!(response.ok);
+        assert_eq!(response.status, "applied");
+        assert_eq!(response.envelope_id, Some(7));
     }
 }

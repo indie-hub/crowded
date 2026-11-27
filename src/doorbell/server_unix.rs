@@ -148,7 +148,7 @@ fn listener_loop(
                                     match events.try_send(event) {
                                         Ok(()) => {
                                             remember_id(request.id, &mut seen, &mut seen_order);
-                                            reply_rx.recv_timeout(Duration::from_secs(2)).ok()
+                                            Some(await_queued_reply(&reply_rx, REPLY_WAIT))
                                         }
                                         Err(TrySendError::Full(_)) => {
                                             Some(WireResponse::rejected("Doorbell queue is full"))
@@ -181,7 +181,7 @@ fn listener_loop(
                                     match events.try_send(event) {
                                         Ok(()) => {
                                             remember_id(request.id, &mut seen, &mut seen_order);
-                                            reply_rx.recv_timeout(Duration::from_secs(2)).ok()
+                                            Some(await_queued_reply(&reply_rx, REPLY_WAIT))
                                         }
                                         Err(TrySendError::Full(_)) => {
                                             Some(WireResponse::rejected("Doorbell queue is full"))
@@ -237,7 +237,7 @@ fn listener_loop(
                                     match events.try_send(event) {
                                         Ok(()) => {
                                             remember_id(request.id, &mut seen, &mut seen_order);
-                                            reply_rx.recv_timeout(Duration::from_secs(2)).ok()
+                                            Some(await_queued_reply(&reply_rx, REPLY_WAIT))
                                         }
                                         Err(TrySendError::Full(_)) => {
                                             Some(WireResponse::rejected("Doorbell queue is full"))
@@ -769,5 +769,115 @@ mod tests {
         assert_eq!(response["rooms"][0]["vendor"], "openai");
         assert_eq!(response["rooms"][0]["state"], "ready");
         assert_eq!(response["rooms"][0]["headroom"], true);
+    }
+
+    /// A message that reaches the app but is never answered is a delivery,
+    /// not a rejection: the client sees `pending`, one event is queued, and a
+    /// resend with the same id is deduped.
+    #[test]
+    fn a_queued_message_without_a_reply_is_pending_and_deduped() {
+        let doorbell = Doorbell::start(2).unwrap();
+        let path = doorbell.path().to_owned();
+        let token = doorbell.tokens[0].clone();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(path).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &WireRequest::Message(MessageRequest {
+                    token,
+                    id: "pending-message".to_owned(),
+                    to: 2,
+                    body: "hello".to_owned(),
+                    task: None,
+                    role: None,
+                    hop: 0,
+                }),
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+
+        // Deliberately never answer the envelope; the server times out and
+        // reports pending rather than inviting the client to resend.
+        let response = client.join().unwrap();
+        assert!(response.ok);
+        assert_eq!(response.status, "pending");
+        assert_eq!(response.error, None);
+
+        let event = doorbell.try_recv().expect("one event was queued");
+        match event {
+            DoorbellEvent::Message(envelope) => assert_eq!(envelope.body, "hello"),
+            _ => panic!("unexpected doorbell event"),
+        }
+        assert!(matches!(doorbell.try_recv(), Err(TryRecvError::Empty)));
+
+        let path = doorbell.path().to_owned();
+        let token = doorbell.tokens[0].clone();
+        let resend = thread::spawn(move || {
+            let mut stream = UnixStream::connect(path).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &WireRequest::Message(MessageRequest {
+                    token,
+                    id: "pending-message".to_owned(),
+                    to: 2,
+                    body: "again".to_owned(),
+                    task: None,
+                    role: None,
+                    hop: 0,
+                }),
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+        let response = resend.join().unwrap();
+        assert!(response.ok);
+        assert_eq!(response.status, "duplicate");
+    }
+
+    /// A roster read is retry-safe, so it keeps the old rejection on timeout.
+    #[test]
+    fn a_roster_without_a_reply_is_still_rejected() {
+        let doorbell = Doorbell::start(2).unwrap();
+        let path = doorbell.path().to_owned();
+        let token = doorbell.tokens[0].clone();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(path).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &WireRequest::Roster(RosterRequest {
+                    token,
+                    id: "roster-no-reply".to_owned(),
+                }),
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+
+        // Drain the event but never answer it.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match doorbell.try_recv() {
+                Ok(DoorbellEvent::Roster(_)) => break,
+                Ok(_) => panic!("unexpected doorbell event"),
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("roster request did not arrive: {error}"),
+            }
+        }
+        let response = client.join().unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.status, "rejected");
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Doorbell response timed out")
+        );
     }
 }

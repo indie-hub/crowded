@@ -114,6 +114,9 @@ pub(crate) fn send_command() -> Result<(), Box<dyn std::error::Error>> {
 
     let response = send_request(&request)?;
     println!("{}", serde_json::to_string(&response)?);
+    if let Some(advice) = pending_advice(&response) {
+        eprintln!("{advice}");
+    }
     response.into_result("Doorbell rejected envelope")
 }
 
@@ -193,6 +196,9 @@ pub(crate) fn control_command() -> Result<(), Box<dyn std::error::Error>> {
 
     let response = send_request(&request)?;
     println!("{}", serde_json::to_string(&response)?);
+    if let Some(advice) = pending_advice(&response) {
+        eprintln!("{advice}");
+    }
     response.into_result("Doorbell rejected control")
 }
 
@@ -375,7 +381,7 @@ fn hook_detail_events(payload: &HookPayload) -> Vec<DetailEvent> {
     events
 }
 
-const SESSION_REPORT_USAGE: &str = "usage: crowded session-report [--session ID] [--pending] [--ack] (the id may also arrive as JSON on stdin with session_id or sessionID). Without --ack the command is silent and always exits 0, so a hook never breaks its CLI. With --ack it exits 0 only when Crowded accepted the report: 2 usage or nothing to report, 3 invalid session id, 4 not configured (no token or unusable environment), 5 Crowded unreachable or silent for 4 seconds, 6 report rejected";
+const SESSION_REPORT_USAGE: &str = "usage: crowded session-report [--session ID] [--pending] [--ack] (the id may also arrive as JSON on stdin with session_id or sessionID). Without --ack the command is silent and always exits 0, so a hook never breaks its CLI. With --ack it exits 0 only when Crowded accepted the report: 2 usage or nothing to report, 3 invalid session id, 4 not configured (no token or unusable environment), 5 Crowded unreachable or silent for 4 seconds, 6 report rejected, 7 queued but not yet confirmed";
 
 /// The most a report exchange (connect, write, read) may take. A hook must
 /// never hang, and a server that accepts the request and never answers would
@@ -407,6 +413,7 @@ enum ReportFailure {
     NotConfigured,
     Unreachable,
     Rejected,
+    Pending,
 }
 
 impl ReportFailure {
@@ -417,8 +424,28 @@ impl ReportFailure {
             ReportFailure::NotConfigured => 4,
             ReportFailure::Unreachable => 5,
             ReportFailure::Rejected => 6,
+            ReportFailure::Pending => 7,
         }
     }
+}
+
+/// A queued-but-unconfirmed answer is not a rejection and not a success: the
+/// app may have acted, so `--ack` must report it distinctly and the hook must
+/// not resend.
+fn report_result(response: WireResponse) -> Result<(), (ReportFailure, String)> {
+    if !response.ok {
+        return Err((
+            ReportFailure::Rejected,
+            response.error.unwrap_or_else(|| response.status.clone()),
+        ));
+    }
+    if response.status == "pending" {
+        return Err((
+            ReportFailure::Pending,
+            "queued, not yet confirmed by Crowded".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// What the hook reported: a session id, a between-sessions mark, or both.
@@ -692,14 +719,7 @@ fn deliver_session_report(args: Vec<String>) -> Result<(), (ReportFailure, Strin
         SESSION_REPORT_DEADLINE,
     )
     .map_err(|error| (ReportFailure::Unreachable, error))?;
-    if response.ok {
-        Ok(())
-    } else {
-        Err((
-            ReportFailure::Rejected,
-            response.error.unwrap_or_else(|| response.status.clone()),
-        ))
-    }
+    report_result(response)
 }
 
 pub(crate) fn roster_command() -> Result<(), Box<dyn std::error::Error>> {
@@ -716,6 +736,13 @@ pub(crate) fn roster_command() -> Result<(), Box<dyn std::error::Error>> {
     }))?;
     println!("{}", serde_json::to_string(&response)?);
     response.into_result("Doorbell rejected roster request")
+}
+
+/// Send and control stay successful on a `pending` answer: a warning on
+/// stderr tells the caller not to resend, while `error` still means failure.
+fn pending_advice(response: &WireResponse) -> Option<&'static str> {
+    (response.ok && response.status == "pending")
+        .then_some("crowded: queued, not yet confirmed by Crowded; do not resend")
 }
 
 impl WireResponse {
@@ -997,5 +1024,35 @@ mod tests {
         assert_eq!(detail.sub_agents[0].kind, "Task");
         assert_eq!(detail.todos.len(), 1);
         assert_eq!(detail.todos[0].content, "Build");
+    }
+
+    #[test]
+    fn a_pending_reply_warns_without_failing_send_or_control() {
+        let advice = pending_advice(&WireResponse::accepted("pending", None));
+        assert_eq!(
+            advice,
+            Some("crowded: queued, not yet confirmed by Crowded; do not resend")
+        );
+        // The warning is advice only: `ok` still means exit 0.
+        assert!(
+            WireResponse::accepted("pending", None)
+                .into_result("fallback")
+                .is_ok()
+        );
+        assert_eq!(
+            pending_advice(&WireResponse::accepted("applied", None)),
+            None
+        );
+        assert_eq!(pending_advice(&WireResponse::rejected("no")), None);
+    }
+
+    #[test]
+    fn a_pending_session_report_has_its_own_ack_exit_code() {
+        assert_eq!(ReportFailure::Pending.exit_code(), 7);
+        assert!(report_result(WireResponse::accepted("recorded", None)).is_ok());
+        let pending = report_result(WireResponse::accepted("pending", None)).unwrap_err();
+        assert_eq!(pending.0, ReportFailure::Pending);
+        let rejected = report_result(WireResponse::rejected("no")).unwrap_err();
+        assert_eq!(rejected.0, ReportFailure::Rejected);
     }
 }

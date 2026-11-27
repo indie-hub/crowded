@@ -268,7 +268,7 @@ fn listener_loop(
                             match events.try_send(event) {
                                 Ok(()) => {
                                     remember_id(request.id, &mut seen, &mut seen_order);
-                                    reply_rx.recv_timeout(Duration::from_secs(2)).ok()
+                                    Some(await_queued_reply(&reply_rx, REPLY_WAIT))
                                 }
                                 Err(TrySendError::Full(_)) => {
                                     Some(WireResponse::rejected("Doorbell queue is full"))
@@ -296,7 +296,7 @@ fn listener_loop(
                             match events.try_send(event) {
                                 Ok(()) => {
                                     remember_id(request.id, &mut seen, &mut seen_order);
-                                    reply_rx.recv_timeout(Duration::from_secs(2)).ok()
+                                    Some(await_queued_reply(&reply_rx, REPLY_WAIT))
                                 }
                                 Err(TrySendError::Full(_)) => {
                                     Some(WireResponse::rejected("Doorbell queue is full"))
@@ -349,7 +349,7 @@ fn listener_loop(
                             match events.try_send(event) {
                                 Ok(()) => {
                                     remember_id(request.id, &mut seen, &mut seen_order);
-                                    reply_rx.recv_timeout(Duration::from_secs(2)).ok()
+                                    Some(await_queued_reply(&reply_rx, REPLY_WAIT))
                                 }
                                 Err(TrySendError::Full(_)) => {
                                     Some(WireResponse::rejected("Doorbell queue is full"))
@@ -483,5 +483,71 @@ mod tests {
         assert_eq!(response["rooms"][0]["room"], 2);
         assert_eq!(response["rooms"][0]["vendor"], "openai");
         assert_eq!(response["rooms"][0]["headroom"], true);
+    }
+
+    /// The named-pipe transport must agree with the Unix one: a queued
+    /// message that is never answered is pending, not rejected, and the id
+    /// is remembered so a resend is a duplicate.
+    #[test]
+    fn a_queued_message_without_a_reply_is_pending_and_deduped() {
+        let doorbell = Doorbell::start(2).unwrap();
+        let path = doorbell.path().to_owned();
+        let token = doorbell.tokens[0].clone();
+        let client = thread::spawn(move || {
+            let mut stream = open_client(&path).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &WireRequest::Message(MessageRequest {
+                    token,
+                    id: "pending-message".to_owned(),
+                    to: 2,
+                    body: "hello".to_owned(),
+                    task: None,
+                    role: None,
+                    hop: 0,
+                }),
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+
+        let response = client.join().unwrap();
+        assert!(response.ok);
+        assert_eq!(response.status, "pending");
+        assert_eq!(response.error, None);
+
+        let event = doorbell.try_recv().expect("one event was queued");
+        match event {
+            DoorbellEvent::Message(envelope) => assert_eq!(envelope.body, "hello"),
+            _ => panic!("unexpected doorbell event"),
+        }
+        assert!(matches!(doorbell.try_recv(), Err(TryRecvError::Empty)));
+
+        let path = doorbell.path().to_owned();
+        let token = doorbell.tokens[0].clone();
+        let resend = thread::spawn(move || {
+            let mut stream = open_client(&path).unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &WireRequest::Message(MessageRequest {
+                    token,
+                    id: "pending-message".to_owned(),
+                    to: 2,
+                    body: "again".to_owned(),
+                    task: None,
+                    role: None,
+                    hop: 0,
+                }),
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+        let response = resend.join().unwrap();
+        assert!(response.ok);
+        assert_eq!(response.status, "duplicate");
     }
 }
