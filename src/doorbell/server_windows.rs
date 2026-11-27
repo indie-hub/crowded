@@ -426,14 +426,25 @@ fn listener_loop(
 /// deadline and the stop flag.
 const READ_POLL: Duration = Duration::from_millis(10);
 
-/// Reads one newline-terminated request from `fill`, which returns bytes that
-/// are already available and `Ok(0)` when the source is empty. The absolute
-/// deadline and the stop flag are checked on every iteration, including while
-/// bytes keep arriving, so neither can be postponed by a non-empty stream.
+/// What one source step found. `Empty` and `Eof` are distinct: only an empty
+/// source waits for more input, and only an ended source parses what arrived.
+enum Fill {
+    /// Nothing is available right now; the loop waits `READ_POLL` and retries.
+    Empty,
+    /// This many bytes were written into the chunk.
+    Data(usize),
+    /// The source ended; parse the bytes collected so far.
+    Eof,
+}
+
+/// Reads one newline-terminated request from `fill`, which reports what one
+/// step of the source found. The absolute deadline and the stop flag are
+/// checked on every iteration, including while bytes keep arriving, so neither
+/// can be postponed by a non-empty stream. Source errors propagate unchanged.
 fn read_request_with(
     read_deadline: Duration,
     stop: &AtomicBool,
-    mut fill: impl FnMut(&mut [u8]) -> io::Result<usize>,
+    mut fill: impl FnMut(&mut [u8]) -> io::Result<Fill>,
 ) -> io::Result<WireRequest> {
     let deadline = Instant::now() + read_deadline;
     let mut bytes = Vec::with_capacity(4096);
@@ -456,14 +467,12 @@ fn read_request_with(
         let capacity_left = MAX_WIRE_BYTES + 1 - bytes.len();
         let want = capacity_left.min(chunk.len());
         let count = match fill(&mut chunk[..want]) {
-            Ok(0) => {
+            Ok(Fill::Empty) => {
                 thread::sleep(READ_POLL);
                 continue;
             }
-            Ok(count) => count,
-            // The client closed its end: parse what arrived, as the old
-            // read_line EOF path did.
-            Err(error) if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => break,
+            Ok(Fill::Eof) => break,
+            Ok(Fill::Data(count)) => count,
             Err(error) => return Err(error),
         };
         bytes.extend_from_slice(&chunk[..count]);
@@ -503,12 +512,26 @@ fn read_request(
     let handle = stream.as_raw_handle() as HANDLE;
     let mut reader = stream;
     read_request_with(read_deadline, stop, |chunk| {
-        let available = peek_available(handle)?;
+        let available = match peek_available(handle) {
+            Ok(available) => available,
+            // Only a broken pipe seen by the peek is EOF; the bytes that did
+            // arrive are still parsed below.
+            Err(error) if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => {
+                return Ok(Fill::Eof);
+            }
+            Err(error) => return Err(error),
+        };
         if available == 0 {
-            return Ok(0);
+            return Ok(Fill::Empty);
         }
         let want = (available as usize).min(chunk.len());
-        reader.read(&mut chunk[..want])
+        // A zero-byte read after a non-empty peek is EOF, but a read error is
+        // an error, exactly as the blocking read_line path reported it.
+        match reader.read(&mut chunk[..want]) {
+            Ok(0) => Ok(Fill::Eof),
+            Ok(count) => Ok(Fill::Data(count)),
+            Err(error) => Err(error),
+        }
     })
 }
 
@@ -1067,9 +1090,9 @@ mod tests {
     /// A source that never reports an empty pipe must still end at the absolute
     /// deadline.
     ///
-    /// Mutation: moving the deadline check into the `Ok(0)` branch (the old
-    /// check-only-when-empty loop) never reaches the deadline check; the guard
-    /// error below then surfaces instead of TimedOut.
+    /// Mutation: moving the deadline check into the `Fill::Empty` branch (the
+    /// old check-only-when-empty loop) never reaches the deadline check; the
+    /// guard error below then surfaces instead of TimedOut.
     #[test]
     fn a_continuously_available_stream_still_hits_the_deadline() {
         let stop = AtomicBool::new(false);
@@ -1085,7 +1108,7 @@ mod tests {
             // No newline, always one byte: the pipe is never empty.
             chunk[0] = b'{';
             bytes = bytes.saturating_add(1);
-            Ok(1)
+            Ok(Fill::Data(1))
         })
         .err()
         .expect("a continuously available stream must still end the read");
@@ -1118,7 +1141,7 @@ mod tests {
                 return Err(io::Error::other("stream guard"));
             }
             chunk[0] = b'{';
-            Ok(1)
+            Ok(Fill::Data(1))
         })
         .err()
         .expect("a stop request must end the read");
@@ -1128,5 +1151,39 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "a stop request must not wait for the read deadline"
         );
+    }
+
+    /// `Fill::Eof` parses the bytes that already arrived instead of waiting for
+    /// more, and a source error propagates unchanged. Neither case is treated
+    /// like an empty source.
+    #[test]
+    fn eof_parses_the_collected_bytes_and_source_errors_propagate() {
+        let wire = serde_json::to_vec(&WireRequest::Roster(RosterRequest {
+            token: "left".to_owned(),
+            id: "eof-request".to_owned(),
+        }))
+        .unwrap();
+        let mut sent = 0_usize;
+        let request = read_request_with(Duration::from_secs(1), &AtomicBool::new(false), |chunk| {
+            if sent >= wire.len() {
+                return Ok(Fill::Eof);
+            }
+            let count = (wire.len() - sent).min(chunk.len());
+            chunk[..count].copy_from_slice(&wire[sent..sent + count]);
+            sent += count;
+            Ok(Fill::Data(count))
+        })
+        .expect("a complete request followed by EOF must parse");
+        match request {
+            WireRequest::Roster(roster) => assert_eq!(roster.id, "eof-request"),
+            _ => panic!("unexpected request kind"),
+        }
+
+        let error = read_request_with(Duration::from_secs(1), &AtomicBool::new(false), |_| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .err()
+        .expect("a source error must surface");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 }
