@@ -835,9 +835,9 @@ impl NativeRouter {
         let previous_room = self.rooms.get(&index).cloned();
         self.replace_opencode_server(&destination, Arc::clone(server));
         if let Err(error) = server.adopt(&entry.binding) {
-            if let Some(previous) = previous_server {
+            if let Some(previous) = previous_server.as_ref() {
                 let mut servers = self.servers.get().clone();
-                servers.insert(destination.clone(), previous);
+                servers.insert(destination.clone(), Arc::clone(previous));
                 drop(std::mem::replace(
                     &mut self.servers,
                     crate::native_launch::Reaped::new(servers),
@@ -856,6 +856,20 @@ impl NativeRouter {
         self.titles.insert(destination.clone(), entry.title.clone());
         self.codex.remove(&destination);
         if let Err(error) = self.adapter.get().rebind(self.entries()) {
+            // Restore the lane's server too: the new server's last reference
+            // drops here, so it stops by its recorded processes, and the old
+            // binding resolves to the previous server again.
+            match previous_server {
+                Some(previous) => self.replace_opencode_server(&destination, previous),
+                None => {
+                    let mut servers = self.servers.get().clone();
+                    servers.remove(&destination);
+                    drop(std::mem::replace(
+                        &mut self.servers,
+                        crate::native_launch::Reaped::new(servers),
+                    ));
+                }
+            }
             if let Some((title, binding)) = previous_room {
                 self.rooms.insert(index, (title, binding.clone()));
                 self.bindings.insert(destination.clone(), binding);

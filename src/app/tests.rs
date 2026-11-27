@@ -5616,6 +5616,196 @@ fn failed_rebind_leaves_room_offline_with_mail_held() {
     other.shutdown();
 }
 
+/// An adapter rebind failure after the lane server was swapped restores the
+/// lane map too: the room keeps its previous binding on the previous server,
+/// the discarded candidate is stopped, and the held mail stays HELD.
+#[cfg(all(test, unix))]
+#[test]
+fn failed_adapter_rebind_restores_lane_server_and_holds_mail() {
+    use crate::native_launch::{self, tests::fake_room};
+    use crate::native_route::{Backend, NativeRouter, RoomEntry};
+    use std::time::{Duration, Instant};
+
+    let _state = crate::pane::session_state::StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let fake = fake_room(root.path(), "revive-adapter", "v2.2.5");
+    let size = PtySize {
+        rows: 6,
+        cols: 60,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let spec = report_test_spec(&fake.program, cwd.path(), "Opencode \u{b7} 1", true);
+    let launch_generation =
+        native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+            .next()
+            .unwrap();
+    let native = native_launch::start(native_launch::NativeLaunch::direct(
+        fake.program.as_os_str(),
+        cwd.path(),
+        "1.1".to_owned(),
+        launch_generation,
+        &[],
+    ))
+    .unwrap();
+    let router = NativeRouter::start(
+        root.path().join("outbox.json"),
+        vec![RoomEntry {
+            index: 0,
+            title: spec.title.clone(),
+            binding: native.binding().clone(),
+            backend: Backend::OpenCode(native.server()),
+        }],
+    )
+    .unwrap();
+    let pane =
+        Pane::spawn_with_native(spec, size, pane::GuestEnvironment::new([]), Some(native)).unwrap();
+    let mut rig = ReportDispatch::new(vec![pane], Some(router));
+    let old = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+
+    // Kill the server and mark the room offline with a pending hold.
+    let wrapper = rig
+        .router
+        .as_ref()
+        .unwrap()
+        .server_for(0)
+        .unwrap()
+        .wrapper_pid()
+        .unwrap();
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &wrapper.to_string()])
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while native_launch::tests::process_alive(&wrapper.to_string()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        let _ = rig.panes[0].poll_opencode_server_exit();
+    }
+    detect_dead_opencode_servers(&mut rig.panes, rig.router.as_mut(), &mut rig.notice);
+    assert!(!rig.panes[0].is_online());
+
+    rig.router
+        .as_mut()
+        .unwrap()
+        .send(&mut rig.mailroom, "Room X", 0, "adapter-proof-held", None)
+        .unwrap();
+
+    // A valid revived binding on a new server, but the adapter rebind is
+    // poisoned: the lane map restore must cover the server entry too.
+    let other = fake_room(root.path(), "revive-adapter-other", "v2.2.5");
+    let other_generation =
+        native_launch::GenerationAllocator::new(crate::pane::session_state::state_directory())
+            .next()
+            .unwrap();
+    let other_native = native_launch::start(native_launch::NativeLaunch::direct(
+        other.program.as_os_str(),
+        cwd.path(),
+        old.room.clone(),
+        other_generation,
+        &[],
+    ))
+    .unwrap();
+    let revived = other_native.binding().clone();
+    assert_ne!(revived.session, old.session);
+    rig.router.as_ref().unwrap().poison_switching_adapter();
+    let error = rig
+        .router
+        .as_mut()
+        .unwrap()
+        .rebind_revived_room_keep_pending(crate::native_route::RoomEntry {
+            index: 0,
+            title: rig.panes[0].title().to_owned(),
+            binding: revived,
+            backend: crate::native_route::Backend::OpenCode(other_native.server()),
+        })
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("poisoned"),
+        "the adapter failure is reported: {error}"
+    );
+
+    // The room is offline on its previous binding, and the lane resolves to
+    // the previous server again: the restore covers the server map.
+    assert!(!rig.panes[0].is_online());
+    assert_eq!(rig.router.as_ref().unwrap().binding_for(0).unwrap(), old);
+    assert_eq!(
+        rig.router
+            .as_ref()
+            .unwrap()
+            .server_for(0)
+            .unwrap()
+            .handoff()
+            .unwrap()
+            .url,
+        old.endpoint,
+        "the lane map restore covers the server entry"
+    );
+    assert!(rig.router.as_ref().unwrap().is_pending(0));
+
+    // The discarded candidate is stopped by its recorded pid.
+    let other_wrapper = other_native
+        .server()
+        .wrapper_pid()
+        .expect("candidate wrapper pid is recorded");
+    drop(other_native);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while native_launch::tests::process_alive(&other_wrapper.to_string())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !native_launch::tests::process_alive(&other_wrapper.to_string()),
+        "the discarded candidate server is stopped"
+    );
+
+    // Drain every queued operation, then read the persisted outbox: the row
+    // stays HELD with its pending hold, and nothing is delivered.
+    let outbox_path = root.path().join("outbox.json");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        rig.router
+            .as_mut()
+            .unwrap()
+            .tick(Instant::now(), &mut rig.mailroom, false, false);
+        if let Some(reason) = persisted_hold_reason(&outbox_path, "adapter-proof-held") {
+            assert_eq!(
+                reason,
+                crate::native_session::PENDING_HOLD,
+                "the hold stays pending, never converted"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the persisted pending row: {}",
+            rig.mailroom.summary()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !fake
+            .state
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, text)| text.contains("adapter-proof-held")),
+        "nothing is delivered after a failed adapter rebind"
+    );
+    assert!(
+        !other
+            .state
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, text)| text.contains("adapter-proof-held")),
+        "nothing reached the candidate server either"
+    );
+    fake.shutdown();
+    other.shutdown();
+}
 /// Reads the persisted native outbox and reports the hold reason stored on
 /// the row carrying `marker`, if any.
 #[cfg(all(test, unix))]
