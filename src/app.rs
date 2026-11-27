@@ -1661,7 +1661,9 @@ pub(crate) fn spawn_room(
             pane::resume_session(&mut spec, uuid)?;
             factory.interactive(spec, size, environment, native)
         }
-        None => factory.interactive(spec, size, environment, native),
+        Some(pane::CodexMint::Unreported) | None => {
+            factory.interactive(spec, size, environment, native)
+        }
     }
 }
 

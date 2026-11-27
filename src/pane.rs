@@ -727,7 +727,11 @@ pub(crate) enum CodexMint {
         reused: bool,
     },
     /// The exec phase is running; its result arrives on this channel.
+    #[allow(dead_code)] // Retired mint path, still covered by tests.
     Pending(mpsc::Receiver<Result<Minted, String>>),
+    /// The TUI is starting with the house rules as its positional prompt; its
+    /// session id will arrive from the room's own SessionStart hook.
+    Unreported,
     /// No session was created, so the room must not start.
     Failed(String),
 }
@@ -826,6 +830,7 @@ pub(crate) fn resume_session(spec: &mut RoomSpec, uuid: &str) -> io::Result<()> 
 
 /// The exact command that mints a room's session: the exec-compatible part of
 /// the room's launch options, through the same wrapper as its terminal.
+#[allow(dead_code)] // Retired mint path, still covered by tests.
 fn mint_command(spec: &RoomSpec, prompt: &str) -> (OsString, Vec<OsString>) {
     let exec = codex_native::exec_arguments(&spec.args, prompt);
     codex_phase_command(spec, &exec)
@@ -1215,7 +1220,9 @@ pub(crate) fn codex_native_spec(spec: &RoomSpec) -> bool {
 }
 
 #[cfg(not(test))]
+#[allow(dead_code)] // Retired mint path, still covered by tests.
 const CODEX_MINT_TIMEOUT: Duration = Duration::from_secs(180);
+#[allow(dead_code)]
 #[cfg(test)]
 const CODEX_MINT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1229,7 +1236,7 @@ const CODEX_MINT_TIMEOUT: Duration = Duration::from_secs(5);
 /// bounded on its own worker, so a slow room never delays another.
 pub(crate) fn start_codex_mints(
     specs: &mut [RoomSpec],
-    environments: &[GuestEnvironment],
+    _environments: &[GuestEnvironment],
     prompts: &[Option<String>],
     resume: bool,
 ) -> (Vec<Option<CodexMint>>, Vec<String>) {
@@ -1287,11 +1294,11 @@ pub(crate) fn start_codex_mints(
                 continue;
             }
         };
-        if let Err(error) = controls::clear_resume_args(spec) {
+        if let Err(error) = controls::set_initial_prompt(spec, &prompt) {
             results[index] = Some(CodexMint::Failed(format!("{}: {error}", spec.title)));
             continue;
         }
-        results[index] = Some(start_codex_mint(spec, cwd, &environments[index], prompt));
+        results[index] = Some(CodexMint::Unreported);
     }
     (results, notices)
 }
@@ -1299,6 +1306,7 @@ pub(crate) fn start_codex_mints(
 /// Runs one room's `codex exec` mint on its own worker. The result is saved by
 /// the consumer, never here: a worker whose launch has been replaced must not
 /// persist its session.
+#[allow(dead_code)] // Retired mint path, still covered by tests.
 fn start_codex_mint(
     spec: &RoomSpec,
     cwd: PathBuf,
@@ -1389,6 +1397,19 @@ pub(crate) fn bind_codex_room(
             (Some(Arc::new(room)), None)
         }
         CodexMint::Pending(_) => (None, Some(CODEX_STARTING.to_owned())),
+        CodexMint::Unreported => {
+            let placeholder = crate::native_session::unreported_session(
+                &(index + 1).to_string(),
+                generation,
+            );
+            let room = crate::codex_native::room(
+                panes[index].spec.program.clone(),
+                panes[index].cwd(),
+                placeholder,
+                panes[index].native_delivery_variables(),
+            );
+            (Some(Arc::new(room)), None)
+        }
         CodexMint::Failed(reason) => (None, Some(reason.clone())),
     };
     router.bind_codex(vec![crate::native_route::CodexEntry {
@@ -1397,7 +1418,11 @@ pub(crate) fn bind_codex_room(
         room,
         generation,
         reason,
-    }])
+    }])?;
+    if matches!(mint, CodexMint::Unreported) {
+        router.mark_pending(index)?;
+    }
+    Ok(())
 }
 
 /// Binds every native Codex room at startup.
@@ -2446,14 +2471,8 @@ impl Pane {
             controls::set_resume_session(&mut spec, &uuid)?;
             return Ok((spec, CodexMint::Ready { uuid, reused: true }));
         }
-        controls::clear_resume_args(&mut spec)?;
-        let mint = start_codex_mint(
-            &spec,
-            self.cwd.clone(),
-            &self.environment,
-            prompt.to_owned(),
-        );
-        Ok((spec, mint))
+        controls::set_initial_prompt(&mut spec, prompt)?;
+        Ok((spec, CodexMint::Unreported))
     }
 
     pub(crate) fn clear_context(

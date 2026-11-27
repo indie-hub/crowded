@@ -119,6 +119,20 @@ enum Resume {
     Fresh,
 }
 
+/// The house rules as one positional argv element for the Codex TUI. It is
+/// never typed or pasted into the PTY: a native room's intro travels in argv.
+pub(super) fn set_initial_prompt(spec: &mut RoomSpec, prompt: &str) -> io::Result<()> {
+    if cli_vendor(spec)? != CliVendor::Codex {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an initial prompt is only supported for Codex rooms",
+        ));
+    }
+    clear_resume_args(spec)?;
+    spec.args.push(prompt.into());
+    Ok(())
+}
+
 /// Relaunch targeting exactly `session_id`, replacing any resume form already
 /// present.
 pub(super) fn set_resume_session(spec: &mut RoomSpec, session_id: &str) -> io::Result<()> {

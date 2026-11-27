@@ -2663,15 +2663,30 @@ fn args_after<'a>(args: &'a [OsString], flag: &str) -> &'a [OsString] {
     &args[index + 1..]
 }
 
-/// Starts the production mint path and waits for every worker to report.
+/// Starts the retired mint path directly and waits for every worker. These
+/// tests keep the exec machinery covered even though production no longer
+/// calls it for a plain launch.
 #[cfg(unix)]
 fn mint_all(
     specs: &mut [RoomSpec],
     environments: &[GuestEnvironment],
     prompts: &[Option<String>],
-    resume: bool,
+    _resume: bool,
 ) -> Vec<Option<CodexMint>> {
-    let (mut mints, _) = start_codex_mints(specs, environments, prompts, resume);
+    let mut mints: Vec<Option<CodexMint>> = specs
+        .iter_mut()
+        .enumerate()
+        .map(|(index, spec)| {
+            let cwd = working_directory(spec.cwd.as_deref()).unwrap();
+            let prompt = prompts[index].clone().unwrap_or_default();
+            Some(start_codex_mint(
+                spec,
+                cwd,
+                &environments[index],
+                prompt,
+            ))
+        })
+        .collect();
     let deadline = Instant::now() + Duration::from_secs(30);
     while mints
         .iter()
@@ -2797,7 +2812,7 @@ fn restarting_an_offline_codex_room_resumes_its_stored_session() {
 /// mail saved for the old thread.
 #[cfg(unix)]
 #[test]
-fn clearing_a_codex_room_mints_a_new_thread_and_holds_old_mail() {
+fn clearing_a_codex_room_starts_a_new_tui_and_holds_old_mail() {
     let _state = session_state::StateRootGuard::isolated();
     let cwd = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -2838,61 +2853,29 @@ fn clearing_a_codex_room_mints_a_new_thread_and_holds_old_mail() {
         session_state::lookup("codex", cwd.path(), "Room A").as_deref(),
         Some(session_state::FRESH_STATE_MARKER)
     );
-    assert!(!rig.panes[0].is_online(), "the room shows itself starting");
+    assert!(rig.panes[0].is_online(), "the TUI starts without a mint");
 
-    // Let the mint finish; the room comes back in the new thread.
-    rig.paused = false;
-    fs::write(&gate, b"go").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        rig.iterate();
-        let bound = rig
-            .router
-            .as_ref()
-            .and_then(|router| router.binding_for(0))
-            .is_some_and(|binding| binding.session == MINTED_B);
-        if bound {
-            break;
-        }
-        assert!(Instant::now() < deadline, "the new thread was never bound");
-        thread::sleep(Duration::from_millis(20));
-    }
     let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
     assert!(binding.generation > old, "a relaunch gets a new generation");
     assert_eq!(
-        session_state::lookup_minted("codex", cwd.path(), "Room A").as_deref(),
-        Some(MINTED_B)
+        binding.session,
+        crate::native_session::unreported_session("1", binding.generation)
     );
-
-    // Exactly one exec created the new thread; the old mail is held.
-    let log_text = fs::read_to_string(&log).unwrap();
-    assert_eq!(
-        log_text.lines().filter(|line| *line == "exec").count(),
-        1,
-        "{log_text}"
+    assert!(
+        rig.panes[0]
+            .room_spec()
+            .args
+            .last()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("House rules:")
     );
     rig.pump_until("old mail held", |view| {
         view.contains("HELD: sent for an earlier launch")
     });
-    assert!(
-        !log_text.lines().any(|line| line == "queue"),
-        "old mail reached Codex"
-    );
-
-    // A reintroduction now reaches the new thread.
-    crate::app::reintroduce_native_room(
-        "Room A",
-        rig.router.as_mut().unwrap(),
-        &mut rig.mailroom,
-        0,
-        "House rules",
-    );
-    rig.pump_until("reintroduction", |view| view.contains("ACCEPTED by Codex"));
     let log_text = fs::read_to_string(&log).unwrap();
-    assert!(
-        log_text.lines().any(|line| line == MINTED_B),
-        "the reintroduction must name the new thread: {log_text}"
-    );
+    assert!(!log_text.lines().any(|line| line == "queue"), "old mail reached Codex");
 }
 
 #[cfg(unix)]
@@ -4272,7 +4255,7 @@ fn ctrl_r_at_focus_one_relaunches_only_the_codex_room() {
         fs::read_to_string(path)
             .unwrap_or_default()
             .lines()
-            .filter(|line| line.starts_with("exec"))
+            .filter(|line| line.starts_with("House rules:"))
             .count()
     };
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -4437,32 +4420,18 @@ fn a_clear_whose_marker_cannot_be_saved_changes_nothing() {
 /// session and the router must both name the newer thread.
 #[cfg(unix)]
 #[test]
-fn a_superseded_clear_mint_never_overwrites_the_newer_session() {
-    for older_finishes_first in [true, false] {
+fn repeated_clears_take_new_generations_and_keep_no_stale_session() {
+    for _ in [true, false] {
         let _state = session_state::StateRootGuard::isolated();
         let cwd = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let log = root.path().join("argv.log");
-        let gate_a = root.path().join("gate-a");
-        let gate_b = root.path().join("gate-b");
         let stub = codex_stub_for_pane(
             root.path(),
             "codex",
             &format!(
-                "printf '%s\\n' \"$@\" >> '{log}'\n\
-                     case \"$1\" in\n\
-                     resume) exec sleep 30 ;;\n\
-                     esac\n\
-                     case \"$CROWDED_TEST_MINT\" in\n\
-                     '{MINTED_A}') gate='{gate_a}' ;;\n\
-                     '{MINTED_B}') gate='{gate_b}' ;;\n\
-                     *) gate='' ;;\n\
-                     esac\n\
-                     while [ -n \"$gate\" ] && [ ! -e \"$gate\" ]; do sleep 0.05; done\n\
-                     printf '{{\"type\":\"thread.started\",\"thread_id\":\"%s\"}}\\n' \"$CROWDED_TEST_MINT\"",
-                log = log.display(),
-                gate_a = gate_a.display(),
-                gate_b = gate_b.display(),
+                "printf '%s\\n' \"$@\" >> '{log}'\nexec sleep 30\n",
+                log = log.display()
             ),
         );
         session_state::upsert_minted("codex", cwd.path(), "Room A", MINTED_C).unwrap();
@@ -4481,61 +4450,25 @@ fn a_superseded_clear_mint_never_overwrites_the_newer_session() {
 
         rig.push_control(crate::doorbell::ControlAction::ClearContext);
         rig.iterate();
-        // The second clear starts the newer mint in the same room.
-        rig.panes[0].spec.variables = vec![(
-            OsString::from("CROWDED_TEST_MINT"),
-            OsString::from(MINTED_B),
-        )];
+        let first = rig.router.as_ref().unwrap().binding_for(0).unwrap().generation;
+        assert_eq!(session_state::lookup_minted("codex", cwd.path(), "Room A"), None);
+
         rig.push_control(crate::doorbell::ControlAction::ClearContext);
         rig.iterate();
-
-        if older_finishes_first {
-            fs::write(&gate_a, b"go").unwrap();
-            for _ in 0..20 {
-                rig.iterate();
-                thread::sleep(Duration::from_millis(5));
-            }
-        }
-        fs::write(&gate_b, b"go").unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            rig.iterate();
-            let bound = rig
-                .router
-                .as_ref()
-                .and_then(|router| router.binding_for(0))
-                .is_some_and(|binding| binding.session == MINTED_B);
-            if bound {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the newer thread was never bound"
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
-
-        // The superseded mint finishes after the newer one is bound, in
-        // either order; it must never become the durable session.
-        fs::write(&gate_a, b"go").unwrap();
-        thread::sleep(Duration::from_millis(150));
-        for _ in 0..5 {
-            rig.iterate();
-        }
-
+        let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+        assert!(binding.generation > first, "each clear takes a new generation");
         assert_eq!(
-            session_state::lookup_minted("codex", cwd.path(), "Room A").as_deref(),
-            Some(MINTED_B),
-            "durable state must follow the newer clear (older first: {older_finishes_first})"
+            binding.session,
+            crate::native_session::unreported_session("1", binding.generation)
         );
         assert_eq!(
-            rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
-            MINTED_B
+            session_state::lookup("codex", cwd.path(), "Room A").as_deref(),
+            Some(session_state::FRESH_STATE_MARKER)
         );
+        let log_text = fs::read_to_string(&log).unwrap();
+        assert!(!log_text.lines().any(|line| line == "exec"));
     }
 }
-
 /// A clear whose mint fails leaves the room offline, unbound and named,
 /// never half-bound to the thread it could not create.
 #[cfg(unix)]
@@ -4565,22 +4498,20 @@ fn a_failed_clear_mint_leaves_the_room_offline_with_its_reason() {
     rig.iterate();
 
     rig.push_control(crate::doorbell::ControlAction::ClearContext);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        rig.iterate();
-        let view = rig.notice.ordered_lines().join("; ");
-        if view.contains("the room was not started") {
-            assert!(view.contains("mint failed"), "{view}");
-            break;
-        }
-        assert!(Instant::now() < deadline, "the failed mint was never shown");
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert!(!rig.panes[0].is_online());
+    rig.iterate();
+    let args = rig.panes[0].room_spec().args.clone();
     assert!(
-        rig.router.as_ref().unwrap().binding_for(0).is_none(),
-        "a failed relaunch must not keep a binding"
+        args.last().unwrap().to_str().unwrap().starts_with("House rules:"),
+        "clear starts the TUI with the rules in argv: {args:?}"
     );
+    assert!(!args.iter().any(|arg| arg == "exec"));
+    assert!(rig.panes[0].is_online());
+    let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    assert_eq!(
+        binding.session,
+        crate::native_session::unreported_session("1", binding.generation)
+    );
+    assert!(rig.router.as_ref().unwrap().is_pending(0));
     assert_eq!(
         session_state::lookup("codex", cwd.path(), "Room A").as_deref(),
         Some(session_state::FRESH_STATE_MARKER)
@@ -4930,38 +4861,18 @@ fn a_resume_launch_without_a_rollout_mints_and_keeps_the_stored_id_until_the_ups
     session_state::upsert_minted("codex", cwd.path(), "Codex · 1", MINTED_A).unwrap();
     let mut specs = vec![codex_mint_spec(&stub, cwd.path(), "Codex · 1", MINTED_B)];
     let prompts = vec![Some("House rules".to_owned())];
-    let (mut mints, notices) =
+    let (mints, notices) =
         start_codex_mints(&mut specs, &[GuestEnvironment::new([])], &prompts, true);
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(notices[0].contains(MINTED_A), "{notices:?}");
     assert!(notices[0].contains("no rollout"), "{notices:?}");
-    assert!(
-        !specs[0].args.iter().any(|arg| arg == "resume"),
-        "the unverifiable stored id must not be resumed: {:?}",
-        specs[0].args
-    );
+    assert!(matches!(mints[0], Some(CodexMint::Unreported)));
+    assert_eq!(specs[0].args.last().unwrap().to_str(), Some("House rules"));
+    assert!(!specs[0].args.iter().any(|arg| arg == "resume"));
     assert_eq!(
         session_state::lookup_minted("codex", cwd.path(), "Codex · 1").as_deref(),
         Some(MINTED_A),
-        "the stored entry stays until the mint's upsert replaces it"
-    );
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while mints[0]
-        .as_ref()
-        .is_some_and(|mint| matches!(mint, CodexMint::Pending(_)))
-    {
-        let _ = poll_codex_mints(&mut mints);
-        assert!(Instant::now() < deadline, "the mint never finished");
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert_eq!(ready(&mints[0]), Some(MINTED_B));
-    assert!(matches!(
-        mints[0],
-        Some(CodexMint::Ready { reused: false, .. })
-    ));
-    assert_eq!(
-        session_state::lookup_minted("codex", cwd.path(), "Codex · 1").as_deref(),
-        Some(MINTED_B)
+        "the stored entry stays until a report replaces it"
     );
 }
 
@@ -5145,25 +5056,17 @@ fn a_hung_mint_does_not_delay_the_rooms_whose_mints_finished() {
         Some("House rules".to_owned()),
     ];
     let started = Instant::now();
-    let (mut mints, _) = start_codex_mints(&mut specs, &environments, &prompts, false);
+    let (mints, _) = start_codex_mints(&mut specs, &environments, &prompts, false);
     assert!(
         started.elapsed() < Duration::from_secs(1),
-        "minting blocked startup"
+        "TUI-first startup blocked"
     );
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while ready(&mints[0]).is_none() || ready(&mints[1]).is_none() {
-        let _ = poll_codex_mints(&mut mints);
-        assert!(
-            Instant::now() < deadline,
-            "fast rooms waited for the hung one: {:?} {:?}",
-            failed(&mints[0]),
-            failed(&mints[1])
-        );
-        thread::sleep(Duration::from_millis(10));
+    assert!(mints.iter().flatten().all(|mint| matches!(mint, CodexMint::Unreported)));
+    for spec in &specs {
+        assert_eq!(spec.args.last().unwrap().to_str(), Some("House rules"));
     }
-    assert!(matches!(mints[2], Some(CodexMint::Pending(_))));
-    // The finished rooms can start now; the pending room is held.
-    for index in 0..2 {
+    // No room waits for another: every TUI starts at once.
+    for index in 0..3 {
         let pane = crate::app::spawn_room(
             &mut crate::app::LivePanes,
             specs[index].clone(),
@@ -5181,8 +5084,7 @@ fn a_hung_mint_does_not_delay_the_rooms_whose_mints_finished() {
         .unwrap();
         assert!(pane.is_online());
     }
-}
-
+    }
 /// Records which kind of pane the production start code asks for, and hands
 /// back a pane that has no process.
 #[cfg(unix)]
@@ -5299,6 +5201,62 @@ fn startup_starts_an_interactive_codex_only_for_a_completed_mint() {
         [OsString::from(MINTED_B)]
     );
     assert!(!factory.calls[3].2.iter().any(|arg| arg == "resume"));
+}
+
+/// A plain launch creates no exec worker; the rules are already in the TUI's
+/// argv before any process is started.
+#[cfg(unix)]
+#[test]
+fn a_plain_codex_launch_sets_the_positional_prompt_without_a_mint() {
+    const RULES: &str = "first line\nquoted \"value\" and 'other'\n-- dash\nlast";
+    let cwd = tempfile::tempdir().unwrap();
+    let mut specs = vec![codex_mint_spec(
+        Path::new("codex"),
+        cwd.path(),
+        "Codex · 4",
+        MINTED_A,
+    )];
+    let (mints, notices) = start_codex_mints(
+        &mut specs,
+        &[GuestEnvironment::new([])],
+        &[Some(RULES.to_owned())],
+        false,
+    );
+    assert!(notices.is_empty());
+    assert!(matches!(mints[0], Some(CodexMint::Unreported)));
+    assert_eq!(specs[0].args.last().unwrap().to_str(), Some(RULES));
+    assert!(!specs[0].args.iter().any(|arg| arg == "exec"));
+}
+
+/// A plain Codex launch passes the house rules as one argv element. Nothing
+/// ever writes an intro into the PTY: a native room's intro is argv.
+#[cfg(unix)]
+#[test]
+fn an_unreported_codex_room_starts_the_tui_with_rules_in_argv_only() {
+    const RULES: &str = "Room 4 house rules\nuse \"quotes\" and 'single'\n-- leading dash\nend";
+    let cwd = tempfile::tempdir().unwrap();
+    let mut spec = codex_mint_spec(Path::new("codex"), cwd.path(), "Codex · 4", MINTED_A);
+    super::controls::set_initial_prompt(&mut spec, RULES).unwrap();
+    let mut factory = RecordingPanes::default();
+    let mut last_output = vec![None];
+    let (panes, _) = crate::app::start_rooms(
+        &mut factory,
+        vec![spec],
+        &[small_size()],
+        &[GuestEnvironment::new([])],
+        vec![None],
+        &[Some(CodexMint::Unreported)],
+        &[None],
+        &mut last_output,
+        false,
+        Duration::from_millis(5),
+        &mut crate::app::Notices::default(),
+    )
+    .unwrap();
+    assert_eq!(factory.kinds(), ["interactive"]);
+    assert_eq!(factory.calls[0].2.last().unwrap().to_str(), Some(RULES));
+    assert!(!factory.calls[0].2.iter().any(|arg| arg == "exec"));
+    assert!(!panes[0].needs_intro());
 }
 
 /// Runs the startup loop with the Windows Headroom lane on, and reports
@@ -8371,7 +8329,7 @@ mod production_loop {
             fs::read_to_string(path)
                 .unwrap_or_default()
                 .lines()
-                .filter(|line| line.starts_with("exec"))
+                .filter(|line| line.starts_with("House rules:"))
                 .count()
         };
         wait_until("room 1 relaunched", || launched(&log1) >= 1);
