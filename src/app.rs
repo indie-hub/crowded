@@ -1883,12 +1883,9 @@ fn retry_codex_reports(
             continue;
         }
         let title = pane.title().to_owned();
-        if let Err(error) = crate::pane::session_state::upsert_reported(
-            "codex",
-            &pane.cwd(),
-            &title,
-            &session,
-        ) {
+        if let Err(error) =
+            crate::pane::session_state::upsert_reported("codex", &pane.cwd(), &title, &session)
+        {
             append_notice(
                 notice,
                 format!("{title}: session report could not be saved: {error}"),
@@ -2656,9 +2653,10 @@ fn apply_session_report(
         // A report may only turn this launch's own placeholder into a session.
         // A real binding is either a resumed session or a report already
         // applied, so a later report is stale and must not retarget mail.
-        if !current.as_ref().is_some_and(|binding| {
-            crate::native_session::is_unreported_placeholder(binding)
-        }) {
+        if !current
+            .as_ref()
+            .is_some_and(|binding| crate::native_session::is_unreported_placeholder(binding))
+        {
             return Ok(format!(
                 "ignored: {title} is not waiting for a session report"
             ));

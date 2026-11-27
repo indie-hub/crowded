@@ -2680,12 +2680,7 @@ fn mint_all(
         .map(|(index, spec)| {
             let cwd = working_directory(spec.cwd.as_deref()).unwrap();
             let prompt = prompts[index].clone().unwrap_or_default();
-            Some(start_codex_mint(
-                spec,
-                cwd,
-                &environments[index],
-                prompt,
-            ))
+            Some(start_codex_mint(spec, cwd, &environments[index], prompt))
         })
         .collect();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -2876,7 +2871,10 @@ fn clearing_a_codex_room_starts_a_new_tui_and_holds_old_mail() {
         view.contains("HELD: sent for an earlier launch")
     });
     let log_text = fs::read_to_string(&log).unwrap();
-    assert!(!log_text.lines().any(|line| line == "queue"), "old mail reached Codex");
+    assert!(
+        !log_text.lines().any(|line| line == "queue"),
+        "old mail reached Codex"
+    );
 }
 
 #[cfg(unix)]
@@ -4451,13 +4449,25 @@ fn repeated_clears_take_new_generations_and_keep_no_stale_session() {
 
         rig.push_control(crate::doorbell::ControlAction::ClearContext);
         rig.iterate();
-        let first = rig.router.as_ref().unwrap().binding_for(0).unwrap().generation;
-        assert_eq!(session_state::lookup_minted("codex", cwd.path(), "Room A"), None);
+        let first = rig
+            .router
+            .as_ref()
+            .unwrap()
+            .binding_for(0)
+            .unwrap()
+            .generation;
+        assert_eq!(
+            session_state::lookup_minted("codex", cwd.path(), "Room A"),
+            None
+        );
 
         rig.push_control(crate::doorbell::ControlAction::ClearContext);
         rig.iterate();
         let binding = rig.router.as_ref().unwrap().binding_for(0).unwrap();
-        assert!(binding.generation > first, "each clear takes a new generation");
+        assert!(
+            binding.generation > first,
+            "each clear takes a new generation"
+        );
         assert_eq!(
             binding.session,
             crate::native_session::unreported_session("1", binding.generation)
@@ -4502,7 +4512,11 @@ fn a_failed_clear_mint_leaves_the_room_offline_with_its_reason() {
     rig.iterate();
     let args = rig.panes[0].room_spec().args.clone();
     assert!(
-        args.last().unwrap().to_str().unwrap().starts_with("House rules:"),
+        args.last()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("House rules:"),
         "clear starts the TUI with the rules in argv: {args:?}"
     );
     assert!(!args.iter().any(|arg| arg == "exec"));
@@ -5062,7 +5076,12 @@ fn a_hung_mint_does_not_delay_the_rooms_whose_mints_finished() {
         started.elapsed() < Duration::from_secs(1),
         "TUI-first startup blocked"
     );
-    assert!(mints.iter().flatten().all(|mint| matches!(mint, CodexMint::Unreported)));
+    assert!(
+        mints
+            .iter()
+            .flatten()
+            .all(|mint| matches!(mint, CodexMint::Unreported))
+    );
     for spec in &specs {
         assert_eq!(spec.args.last().unwrap().to_str(), Some("House rules"));
     }
@@ -5085,7 +5104,7 @@ fn a_hung_mint_does_not_delay_the_rooms_whose_mints_finished() {
         .unwrap();
         assert!(pane.is_online());
     }
-    }
+}
 /// A Codex report binds only its own launch's placeholder and only once the
 /// rollout is readable; a report with no rollout stays held and is retried.
 #[cfg(unix)]
@@ -5131,7 +5150,10 @@ fn a_codex_report_waits_for_its_rollout_and_binds_on_a_later_pass() {
         &mut rig.notice,
     );
     let shown = rig.notice.ordered_lines().join("; ");
-    assert!(shown.contains("waiting for the reported session's rollout"), "{shown}");
+    assert!(
+        shown.contains("waiting for the reported session's rollout"),
+        "{shown}"
+    );
     let waiting = rig.router.as_ref().unwrap().binding_for(0).unwrap();
     assert_eq!(waiting.session, launch.session, "the launch stays held");
 
@@ -5148,7 +5170,10 @@ fn a_codex_report_waits_for_its_rollout_and_binds_on_a_later_pass() {
     rig.iterate();
     let bound = rig.router.as_ref().unwrap().binding_for(0).unwrap();
     assert_eq!(bound.session, SESSION);
-    assert_eq!(bound.generation, launch.generation, "same launch keeps its mail");
+    assert_eq!(
+        bound.generation, launch.generation,
+        "same launch keeps its mail"
+    );
     assert!(!rig.router.as_ref().unwrap().is_pending(0));
 
     crate::app::report_native_session(
@@ -5158,8 +5183,14 @@ fn a_codex_report_waits_for_its_rollout_and_binds_on_a_later_pass() {
         &mut rig.notice,
     );
     let shown = rig.notice.ordered_lines().join("; ");
-    assert!(shown.contains("not waiting for a session report"), "{shown}");
-    assert_eq!(rig.router.as_ref().unwrap().binding_for(0).unwrap().session, SESSION);
+    assert!(
+        shown.contains("not waiting for a session report"),
+        "{shown}"
+    );
+    assert_eq!(
+        rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
+        SESSION
+    );
 }
 
 /// No report within the bound produces one notice, leaves mail held, and a
@@ -5197,9 +5228,14 @@ fn a_late_codex_report_still_binds_after_the_no_report_notice() {
     rig.iterate();
     rig.iterate();
     let shown = rig.notice.ordered_lines().join("; ");
-    assert!(shown.contains("approve Crowded's hook in Codex /hooks"), "{shown}");
+    assert!(
+        shown.contains("approve Crowded's hook in Codex /hooks"),
+        "{shown}"
+    );
     assert_eq!(
-        shown.matches("approve Crowded's hook in Codex /hooks").count(),
+        shown
+            .matches("approve Crowded's hook in Codex /hooks")
+            .count(),
         1,
         "the notice is shown once: {shown}"
     );

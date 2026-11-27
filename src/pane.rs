@@ -1405,10 +1405,8 @@ pub(crate) fn bind_codex_room(
         }
         CodexMint::Pending(_) => (None, Some(CODEX_STARTING.to_owned())),
         CodexMint::Unreported => {
-            let placeholder = crate::native_session::unreported_session(
-                &(index + 1).to_string(),
-                generation,
-            );
+            let placeholder =
+                crate::native_session::unreported_session(&(index + 1).to_string(), generation);
             let room = crate::codex_native::room(
                 panes[index].spec.program.clone(),
                 panes[index].cwd(),
@@ -2396,7 +2394,10 @@ impl Pane {
 
     /// The session this pane is waiting to bind, if a report named one.
     pub(crate) fn captured_session_id(&self) -> Option<String> {
-        self.captured_session.lock().ok().and_then(|guard| guard.clone())
+        self.captured_session
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     pub(crate) fn codex_no_report_notice(&self) -> bool {
