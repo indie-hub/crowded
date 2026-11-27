@@ -577,6 +577,15 @@ a message naming the file and leaves the file exactly as it is. Hook files are
 the exception - there Crowded replaces only the entries it owns and keeps
 yours. `remove` works the same way, taking away only what Crowded wrote.
 
+A native Codex room starts its TUI at once and passes the house rules as one
+command-line argument; there is no separate `codex exec` turn to wait for. The
+room learns its thread id from the `SessionStart` report described above and
+holds its mail until that report arrives. On a first launch Codex may ask you
+to trust the folder and then to review the hooks; approve both. If no report
+arrives within 20 seconds, Crowded shows one notice naming `/hooks` and the
+folder trust, keeps the mail held, and accepts a later report. Ctrl+R relaunches
+the room after you approve.
+
 ## Session reporting after /clear
 
 A human `/clear` starts a fresh CLI session that Crowded otherwise never
