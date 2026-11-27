@@ -272,6 +272,7 @@ fn listener_loop(
             },
         };
 
+        accept_failures.connected(); // MUTATION: reset before connect
         if connect(handle).is_err() {
             unsafe { CloseHandle(handle) };
             if accept_failures.failed() {
@@ -441,22 +442,17 @@ fn read_request_with(
     loop {
         // Checked even while bytes arrive, so a client that keeps the pipe
         // non-empty cannot outlive the deadline or delay shutdown.
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "request read deadline exceeded",
-            ));
-        }
-        if stop.load(Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "doorbell is stopping",
-            ));
-        }
         let capacity_left = MAX_WIRE_BYTES + 1 - bytes.len();
         let want = capacity_left.min(chunk.len());
         let count = match fill(&mut chunk[..want]) {
             Ok(0) => {
+                // MUTATION: checks only when empty
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "request read deadline exceeded"));
+                }
+                if stop.load(Ordering::Relaxed) {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "doorbell is stopping"));
+                }
                 thread::sleep(READ_POLL);
                 continue;
             }
