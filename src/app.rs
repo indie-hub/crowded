@@ -2685,7 +2685,7 @@ fn apply_session_report(
                     "ignored: the reported session belongs to another directory"
                 ));
             }
-            pane::controls::CodexRollout::Missing => {
+            pane::controls::CodexRollout::NotYet => {
                 panes[from].record_session(&session);
                 return Ok(format!(
                     "{title}: waiting for the reported session's rollout"

@@ -589,55 +589,75 @@ fn codex_session_id(
 /// deserialized independently rather than via `#[serde(alias)]` -- an alias
 /// on `id` makes serde treat a payload containing both keys as a duplicate
 /// field and reject it outright.
-fn codex_session_meta_id(path: &Path, cwd: &Path) -> Option<String> {
-    #[derive(Deserialize)]
-    struct SessionPayload {
-        id: Option<String>,
-        session_id: Option<String>,
-        cwd: String,
-    }
+#[derive(Deserialize)]
+struct SessionPayload {
+    id: Option<String>,
+    session_id: Option<String>,
+    cwd: String,
+}
 
-    #[derive(Deserialize)]
-    struct SessionMetaRecord {
-        #[serde(rename = "type")]
-        kind: Option<String>,
-        payload: Option<SessionPayload>,
-    }
+#[derive(Deserialize)]
+struct SessionMetaRecord {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    payload: Option<SessionPayload>,
+}
 
+/// Reads a rollout's first line. A file that is still being written may be
+/// empty, truncated or malformed; those are not a cwd mismatch.
+fn codex_session_meta(path: &Path) -> Option<(Option<String>, String)> {
     let first_line = fs::read_to_string(path).ok()?.lines().next()?.to_owned();
+    if first_line.trim().is_empty() {
+        return None;
+    }
     let record: SessionMetaRecord = serde_json::from_str(&first_line).ok()?;
     if record.kind.as_deref() != Some("session_meta") {
         return None;
     }
     let payload = record.payload?;
-    if payload.cwd != cwd.to_string_lossy() {
+    Some((payload.id.or(payload.session_id), payload.cwd))
+}
+
+fn codex_session_meta_id(path: &Path, cwd: &Path) -> Option<String> {
+    let (id, recorded_cwd) = codex_session_meta(path)?;
+    if recorded_cwd != cwd.to_string_lossy() {
         return None;
     }
-    payload.id.or(payload.session_id)
+    id
 }
 
 /// Whether Codex's own session directory holds a rollout for this exact
 /// session id and room directory. `crowded resume` reopens a stored Codex
 /// session only when its rollout is verified; a stored id with no rollout is
 /// not resumable and the room mints a new session instead.
+#[derive(Debug)]
 pub(crate) enum CodexRollout {
     Verified,
+    /// Readable and naming another directory: reject the report.
     WrongCwd,
-    Missing,
+    /// Missing, empty, unreadable, partial or without usable metadata: hold
+    /// the mail and retry. Codex writes the rollout while the hook runs.
+    NotYet,
 }
 
 pub(crate) fn codex_rollout_status(cwd: &Path, session_id: &str) -> CodexRollout {
     let Some(home) = home_dir() else {
-        return CodexRollout::Missing;
+        return CodexRollout::NotYet;
     };
     let sessions = home.join(".codex").join("sessions");
-    if super::session_state::find_codex_rollout(&sessions, session_id).is_none() {
-        return CodexRollout::Missing;
+    let Some(path) = super::session_state::find_codex_rollout(&sessions, session_id) else {
+        return CodexRollout::NotYet;
+    };
+    let Some((id, recorded_cwd)) = codex_session_meta(&path) else {
+        return CodexRollout::NotYet;
+    };
+    if recorded_cwd != cwd.to_string_lossy() {
+        return CodexRollout::WrongCwd;
     }
-    if codex_rollout_verified(cwd, session_id) {
+    if id.as_deref() == Some(session_id) {
         CodexRollout::Verified
     } else {
-        CodexRollout::WrongCwd
+        CodexRollout::NotYet
     }
 }
 
@@ -2246,5 +2266,47 @@ mod tests {
         add_resume_args(&mut spec, &[]).unwrap();
         assert!(spec.args.contains(&OsString::from("fresh-capture-id")));
         assert!(!spec.args.contains(&OsString::from("--last")));
+    }
+
+    /// An unfinished rollout is not evidence of another cwd. Only a readable
+    /// session_meta with a different cwd rejects the report.
+    #[test]
+    fn codex_rollout_status_separates_unreadable_from_wrong_cwd() {
+        let _home = HomeDirGuard::isolated();
+        let room = std::path::Path::new("/room");
+        let other = std::path::Path::new("/other");
+        let day = _home.path().join(".codex/sessions/2026/08/07");
+        std::fs::create_dir_all(&day).unwrap();
+        let id = "8c3f4b96-3b74-4021-9f83-2c3d4e5f6071";
+        let path = day.join(format!("rollout-{id}.jsonl"));
+        let good = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"/room\"}}}}\n"
+        );
+        for body in [
+            "",
+            "{\"type\":\"session_meta\",\"pay",
+            "{ not json",
+            "{\"type\":\"other\"}",
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let status = codex_rollout_status(room, id);
+            assert!(
+                !matches!(status, CodexRollout::WrongCwd),
+                "{body}: {status:?}"
+            );
+            assert!(matches!(status, CodexRollout::NotYet), "{body}");
+        }
+        let wrong = good.replace("/room", "/other");
+        std::fs::write(&path, &wrong).unwrap();
+        assert!(matches!(
+            codex_rollout_status(room, id),
+            CodexRollout::WrongCwd
+        ));
+        std::fs::write(&path, &good).unwrap();
+        assert!(matches!(
+            codex_rollout_status(room, id),
+            CodexRollout::Verified
+        ));
+        let _ = other;
     }
 }

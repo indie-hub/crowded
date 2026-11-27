@@ -5371,6 +5371,94 @@ fn a_codex_report_must_name_its_launch_and_rollout_directory() {
     assert!(!rig.router.as_ref().unwrap().is_pending(0));
 }
 
+/// A rollout still being written keeps the mail held until a later pass;
+/// a readable rollout from another directory is rejected outright.
+#[cfg(unix)]
+#[test]
+fn an_unfinished_rollout_is_retried_and_a_wrong_cwd_is_rejected() {
+    const SESSION: &str = "de4f7186-a2c5-4d30-91be-6f708a3c2d51";
+    const WRONG: &str = "ef508297-b3d6-4e41-ac2f-70819b4d3e62";
+    let _state = session_state::StateRootGuard::isolated();
+    let home = controls::HomeDirGuard::isolated();
+    let cwd = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let stub = codex_stub_for_pane(root.path(), "codex", "exec sleep 30");
+    let spec = codex_mint_spec(&stub, cwd.path(), "Room A", SESSION);
+    let mint = unreported("House rules", 3);
+    let mut rig = IterationHarness::new(root.path());
+    rig.panes[0] = crate::app::spawn_room(
+        &mut crate::app::LivePanes,
+        spec,
+        small_size(),
+        GuestEnvironment::new([]),
+        None,
+        Some(&mint),
+        None,
+    )
+    .unwrap();
+    bind_codex_room(rig.router.as_mut().unwrap(), &mut rig.panes, 0, &mint).unwrap();
+    let launch = rig.router.as_ref().unwrap().binding_for(0).unwrap();
+    let day = home.path().join(".codex/sessions/2026/08/07");
+    fs::create_dir_all(&day).unwrap();
+    let write = |id: &str, body: &str| {
+        fs::write(day.join(format!("rollout-{id}.jsonl")), body).unwrap();
+    };
+    let report = |rig: &mut IterationHarness, id: &str| {
+        crate::app::report_native_session(
+            &mut rig.panes,
+            rig.router.as_mut(),
+            crate::doorbell::DoorbellSessionReport {
+                from: 0,
+                session: Some(id.to_owned()),
+                pending: false,
+                launch: Some(launch.generation),
+                reply: mpsc::sync_channel(1).0,
+            },
+            &mut rig.notice,
+        );
+        rig.notice.ordered_lines().join("; ")
+    };
+
+    write(
+        WRONG,
+        &format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{WRONG}\",\"cwd\":\"{}\"}}}}\n",
+            other.path().display()
+        ),
+    );
+    let shown = report(&mut rig, WRONG);
+    assert!(shown.contains("another directory"), "{shown}");
+    assert_eq!(
+        rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
+        launch.session
+    );
+
+    write(SESSION, "");
+    let shown = report(&mut rig, SESSION);
+    assert!(
+        shown.contains("waiting for the reported session's rollout"),
+        "{shown}"
+    );
+    rig.iterate();
+    assert_eq!(
+        rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
+        launch.session
+    );
+    write(
+        SESSION,
+        &format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{SESSION}\",\"cwd\":\"{}\"}}}}\n",
+            cwd.path().display()
+        ),
+    );
+    rig.iterate();
+    assert_eq!(
+        rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
+        SESSION
+    );
+}
+
 /// A Codex report binds only its own launch's placeholder and only once the
 /// rollout is readable; a report with no rollout stays held and is retried.
 #[cfg(unix)]
