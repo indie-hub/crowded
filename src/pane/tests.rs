@@ -2626,6 +2626,7 @@ fn unreported(prompt: &str, generation: u64) -> CodexMint {
     }
 }
 
+#[cfg(unix)]
 fn mint_stub(root: &Path, log: &Path, delay: &str) -> PathBuf {
     codex_stub_for_pane(
         root,
@@ -2871,9 +2872,26 @@ fn clearing_a_codex_room_starts_a_new_tui_and_holds_old_mail() {
             .is_some_and(|text| text.starts_with("House rules:"))),
         "the pane keeps base arguments only"
     );
-    rig.pump_until("old mail held", |view| {
-        view.contains("HELD: sent for an earlier launch")
-    });
+    // Mail saved for the old launch is either held as stale or retired with
+    // one notice; both end states mean it was never delivered to the new
+    // thread. Which one wins depends on the outbox tick's ordering.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        rig.iterate();
+        let view = rig.mailroom.summary();
+        let notices = rig.notice.ordered_lines().join("; ");
+        if view.contains("HELD: sent for an earlier launch")
+            || view.contains("FAILED: sent for an earlier launch")
+            || notices.contains("messages from an earlier launch were not delivered; not resent")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "old mail never reached a terminal state:\n{view}\n{notices}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     let log_text = fs::read_to_string(&log).unwrap();
     assert!(
         !log_text.lines().any(|line| line == "queue"),
