@@ -3252,6 +3252,7 @@ fn append_notice(notice: &mut Notices, text: String, severity: NoticeSeverity) {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_rooms_iteration<D, B>(
     doorbell: &mut D,
+    doorbell_stopped: &mut bool,
     mut terminal: Option<&mut Terminal<B>>,
     panes: &mut [Pane],
     router: &mut Option<NativeRouter>,
@@ -3394,7 +3395,26 @@ where
             );
         }
     }
-    while let Ok(event) = doorbell.try_recv() {
+    loop {
+        let event = match doorbell.try_recv() {
+            Ok(event) => event,
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // The listener owns the only sender, so this fires once the
+                // listener thread has ended and its queue is drained. Normal
+                // shutdown stops outside this loop and never reaches it.
+                if !*doorbell_stopped {
+                    *doorbell_stopped = true;
+                    append_notice(
+                        notice,
+                        "Doorbell stopped: crowded send/roster no longer reach this app; restart Crowded"
+                            .to_owned(),
+                        NoticeSeverity::Failure,
+                    );
+                }
+                break;
+            }
+        };
         let envelope = match event {
             DoorbellEvent::Roster(request) => {
                 request.reply(
@@ -3717,6 +3737,7 @@ where
     // and any key run handed back by the torn-report filter.
     let mut stashed_events: VecDeque<Event> = VecDeque::new();
     let mut torn_report = TornMouseReport::default();
+    let mut doorbell_stopped = false;
 
     // A native room is introduced through its outbox, like all of its mail.
     if let Some(router) = router.as_mut() {
@@ -3754,6 +3775,7 @@ where
         let mut input_ready = vec![false; room_count];
         run_rooms_iteration(
             doorbell,
+            &mut doorbell_stopped,
             Some(&mut *terminal),
             panes,
             router,

@@ -2,7 +2,11 @@
 
 use std::{
     collections::VecDeque,
-    sync::mpsc::{Receiver, RecvTimeoutError, SyncSender},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, RecvTimeoutError, SyncSender},
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -22,6 +26,31 @@ pub(super) const DEDUPE_CAPACITY: usize = 256;
 pub(super) const MAX_MODEL_BYTES: usize = 128;
 pub(super) const MAX_SESSION_BYTES: usize = 128;
 pub(super) const REPLY_WAIT: Duration = Duration::from_secs(2);
+
+/// Consecutive accept failures a listener tolerates before it gives up, so a
+/// permanently broken socket or pipe stops serving instead of spinning.
+pub(super) const MAX_ACCEPT_FAILURES: u32 = 20;
+
+/// Delay before retrying a failed accept: 50 ms doubling up to one second,
+/// about 16 s of backoff before [`MAX_ACCEPT_FAILURES`] ends the loop.
+pub(super) fn accept_backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(5);
+    Duration::from_millis(50_u64.saturating_mul(1 << doublings)).min(Duration::from_secs(1))
+}
+
+/// Sleeps in short slices so a stop request never waits out a whole backoff
+/// before the listener can exit.
+pub(super) fn sleep_unless_stopped(duration: Duration, stop: &AtomicBool) {
+    let ends_at = Instant::now() + duration;
+    while !stop.load(Ordering::Relaxed) {
+        let remaining = ends_at.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum WireRequest {
@@ -932,5 +961,22 @@ mod tests {
         assert!(response.ok);
         assert_eq!(response.status, "applied");
         assert_eq!(response.envelope_id, Some(7));
+    }
+
+    #[test]
+    fn accept_backoff_doubles_and_caps_at_one_second() {
+        assert_eq!(accept_backoff(1), Duration::from_millis(50));
+        assert_eq!(accept_backoff(2), Duration::from_millis(100));
+        assert_eq!(accept_backoff(3), Duration::from_millis(200));
+        assert_eq!(accept_backoff(4), Duration::from_millis(400));
+        assert_eq!(accept_backoff(5), Duration::from_millis(800));
+        assert_eq!(accept_backoff(6), Duration::from_secs(1));
+        assert_eq!(accept_backoff(MAX_ACCEPT_FAILURES), Duration::from_secs(1));
+        for failures in 1..MAX_ACCEPT_FAILURES {
+            assert!(
+                accept_backoff(failures + 1) >= accept_backoff(failures),
+                "backoff must never shrink at {failures}"
+            );
+        }
     }
 }

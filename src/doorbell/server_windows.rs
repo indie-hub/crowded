@@ -230,22 +230,37 @@ fn listener_loop(
     let mut seen = HashSet::<String>::new();
     let mut seen_order = VecDeque::<String>::new();
     let mut first_instance = Some(first_instance as HANDLE);
+    let mut accept_failures = 0_u32;
 
     while !stop.load(Ordering::Relaxed) {
         let handle = match first_instance.take() {
             Some(handle) => handle,
             None => match create_instance(&path, false) {
                 Ok(handle) => handle,
-                Err(_) => break,
+                Err(_) => {
+                    accept_failures = accept_failures.saturating_add(1);
+                    sleep_unless_stopped(accept_backoff(accept_failures), &stop);
+                    if accept_failures >= MAX_ACCEPT_FAILURES {
+                        break;
+                    }
+                    continue;
+                }
             },
         };
+        accept_failures = 0;
 
         let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0
             || io::Error::last_os_error().raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32);
         if !connected {
             unsafe { CloseHandle(handle) };
+            accept_failures = accept_failures.saturating_add(1);
+            sleep_unless_stopped(accept_backoff(accept_failures), &stop);
+            if accept_failures >= MAX_ACCEPT_FAILURES {
+                break;
+            }
             continue;
         }
+        accept_failures = 0;
 
         let mut stream = unsafe { File::from_raw_handle(handle as _) };
         let request = read_request(&stream);

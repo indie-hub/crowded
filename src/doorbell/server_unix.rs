@@ -58,7 +58,13 @@ impl Doorbell {
         let thread_stop = Arc::clone(&stop);
         let (event_tx, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
         let listener_thread = thread::spawn(move || {
-            listener_loop(listener, thread_tokens, room_count, event_tx, thread_stop);
+            listener_loop(
+                move || listener.accept().map(|(stream, _)| stream),
+                thread_tokens,
+                room_count,
+                event_tx,
+                thread_stop,
+            );
         });
 
         Ok(Self {
@@ -108,8 +114,10 @@ fn capability_token() -> io::Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// `accept` is the listener's accept step, injectable so tests can script
+/// transient failures without a broken socket.
 fn listener_loop(
-    listener: UnixListener,
+    mut accept: impl FnMut() -> io::Result<UnixStream>,
     tokens: Vec<String>,
     room_count: usize,
     events: SyncSender<DoorbellEvent>,
@@ -118,10 +126,12 @@ fn listener_loop(
     let mut recent_by_room = vec![VecDeque::<Instant>::new(); room_count];
     let mut seen = HashSet::<String>::new();
     let mut seen_order = VecDeque::<String>::new();
+    let mut accept_failures = 0_u32;
 
     while !stop.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((mut stream, _)) => {
+        match accept() {
+            Ok(mut stream) => {
+                accept_failures = 0;
                 let _ = stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT));
                 let request = read_request(&mut stream);
                 let response = match request {
@@ -274,7 +284,17 @@ fn listener_loop(
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                // Not a failure, but it must not become a busy loop either.
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                accept_failures = accept_failures.saturating_add(1);
+                sleep_unless_stopped(accept_backoff(accept_failures), &stop);
+                if accept_failures >= MAX_ACCEPT_FAILURES {
+                    break;
+                }
+            }
         }
     }
 }
@@ -879,5 +899,109 @@ mod tests {
             response.error.as_deref(),
             Some("Doorbell response timed out")
         );
+    }
+
+    /// A few transient accept errors back off instead of ending the listener.
+    #[test]
+    fn transient_accept_errors_do_not_stop_the_listener() {
+        let path = env::temp_dir().join(format!(
+            "crowded-accept-test-{}-{}.sock",
+            process::id(),
+            SOCKET_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        if path.exists() {
+            fs::remove_file(&path).unwrap();
+        }
+        let listener = UnixListener::bind(&path).unwrap();
+        let tokens = vec!["left".to_owned(), "right".to_owned()];
+        let (event_tx, events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            let mut failures_left = 3_u32;
+            listener_loop(
+                move || {
+                    if failures_left > 0 {
+                        failures_left -= 1;
+                        return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
+                    }
+                    listener.accept().map(|(stream, _)| stream)
+                },
+                tokens,
+                2,
+                event_tx,
+                thread_stop,
+            );
+        });
+
+        let client_path = path.clone();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(client_path).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            serde_json::to_writer(
+                &mut stream,
+                &WireRequest::Roster(RosterRequest {
+                    token: "left".to_owned(),
+                    id: "after-failures".to_owned(),
+                }),
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match events.try_recv() {
+                Ok(DoorbellEvent::Roster(request)) => {
+                    request.reply(Vec::new());
+                    break;
+                }
+                Ok(_) => panic!("unexpected doorbell event"),
+                Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("roster request did not arrive: {error}"),
+            }
+        }
+        assert_eq!(client.join().unwrap().status, "listed");
+
+        stop.store(true, Ordering::Relaxed);
+        // Unblock the listener's blocking accept so it observes the stop flag.
+        // An invalid line keeps that exchange short instead of a 5 s read.
+        let mut wake = UnixStream::connect(&path).unwrap();
+        wake.write_all(b"not a request\n").unwrap();
+        wake.flush().unwrap();
+        drop(wake);
+        server.join().unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    /// After MAX_ACCEPT_FAILURES consecutive failures the listener gives up
+    /// instead of spinning forever.
+    #[test]
+    fn repeated_accept_failures_end_the_listener() {
+        let (event_tx, _events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let started = Instant::now();
+        let server = thread::spawn(move || {
+            listener_loop(
+                || Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
+                Vec::new(),
+                0,
+                event_tx,
+                thread_stop,
+            );
+        });
+        server.join().unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(15),
+            "the loop must back off before giving up"
+        );
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 }
