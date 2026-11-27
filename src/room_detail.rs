@@ -209,7 +209,7 @@ fn opencode_detail(_cwd: &Path, session_id: &str) -> Option<RoomDetail> {
     Some(detail)
 }
 fn codex_detail(_cwd: &Path, session_id: &str) -> Option<RoomDetail> {
-    let sessions = home_dir()?.join(".codex").join("sessions");
+    let sessions = crate::pane::controls::codex_sessions_dir(&home_dir()?);
     // Sub-agents: every rollout whose `session_meta` opens a sub-agent thread
     // whose `parent_thread_id` is this session. The correlation is
     // retrospective (read from the child's own persisted log).

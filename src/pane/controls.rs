@@ -346,7 +346,7 @@ pub(super) fn discover_session_id(
             claude_session_id(&projects, cwd, since, exclude)
         }
         CliVendor::Codex => {
-            let sessions = home.join(".codex").join("sessions");
+            let sessions = codex_sessions_dir(&home);
             codex_session_id(&sessions, cwd, since, exclude)
         }
         CliVendor::OpenCode => {
@@ -366,6 +366,20 @@ fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+/// Codex keeps rollouts under `$CODEX_HOME/sessions` when `CODEX_HOME` is set,
+/// and under `~/.codex/sessions` otherwise.
+pub(crate) fn codex_sessions_dir(home: &Path) -> PathBuf {
+    sessions_dir(home, env::var_os("CODEX_HOME").as_deref())
+}
+
+/// Pure form so the rule is testable without changing the process environment.
+fn sessions_dir(home: &Path, codex_home: Option<&OsStr>) -> PathBuf {
+    match codex_home.filter(|value| !value.is_empty()) {
+        Some(dir) => PathBuf::from(dir).join("sessions"),
+        None => home.join(".codex").join("sessions"),
+    }
 }
 
 /// Test-only override for the home directory, so `discover_session_id` (which
@@ -620,7 +634,7 @@ fn codex_session_meta(path: &Path) -> Option<(Option<String>, String)> {
 
 fn codex_session_meta_id(path: &Path, cwd: &Path) -> Option<String> {
     let (id, recorded_cwd) = codex_session_meta(path)?;
-    if recorded_cwd != cwd.to_string_lossy() {
+    if !same_dir(&recorded_cwd, cwd, cfg!(windows)) {
         return None;
     }
     id
@@ -633,26 +647,55 @@ fn codex_session_meta_id(path: &Path, cwd: &Path) -> Option<String> {
 #[derive(Debug)]
 pub(crate) enum CodexRollout {
     Verified,
-    /// Readable and naming another directory: reject the report.
-    WrongCwd,
+    /// Readable and naming another directory: reject the report and show which.
+    WrongCwd(String),
     /// Missing, empty, unreadable, partial or without usable metadata: hold
     /// the mail and retry. Codex writes the rollout while the hook runs.
     NotYet,
 }
 
+/// Compare a rollout's recorded cwd with the room's cwd. Windows Codex can spell
+/// one directory with a different drive-letter case, `/`, a `\\?\` prefix or a
+/// trailing separator. Kept pure: the rollout may name a directory that no
+/// longer exists.
+fn same_dir(recorded: &str, cwd: &Path, windows: bool) -> bool {
+    if windows {
+        fn key(value: &str) -> String {
+            let value = value
+                .strip_prefix(r"\\?\UNC\")
+                .map(|rest| format!(r"\\{rest}"))
+                .or_else(|| value.strip_prefix(r"\\?\").map(str::to_owned))
+                .unwrap_or_else(|| value.to_owned());
+            value
+                .replace('/', r"\")
+                .trim_end_matches('\\')
+                .to_ascii_lowercase()
+        }
+        key(recorded) == key(&cwd.to_string_lossy())
+    } else {
+        recorded.trim_end_matches('/') == cwd.to_string_lossy().trim_end_matches('/')
+    }
+}
+
 pub(crate) fn codex_rollout_status(cwd: &Path, session_id: &str) -> CodexRollout {
+    codex_rollout_status_with(cwd, session_id, cfg!(windows))
+}
+
+/// The Windows flag is a parameter so normalization is exercised on every
+/// platform's CI, not only where `cfg!(windows)` holds.
+fn codex_rollout_status_with(cwd: &Path, session_id: &str, windows: bool) -> CodexRollout {
     let Some(home) = home_dir() else {
         return CodexRollout::NotYet;
     };
-    let sessions = home.join(".codex").join("sessions");
+    let sessions = codex_sessions_dir(&home);
     let Some(path) = super::session_state::find_codex_rollout(&sessions, session_id) else {
         return CodexRollout::NotYet;
     };
     let Some((id, recorded_cwd)) = codex_session_meta(&path) else {
         return CodexRollout::NotYet;
     };
-    if recorded_cwd != cwd.to_string_lossy() {
-        return CodexRollout::WrongCwd;
+    if !same_dir(&recorded_cwd, cwd, windows) {
+        return CodexRollout::WrongCwd(recorded_cwd);
     }
     if id.as_deref() == Some(session_id) {
         CodexRollout::Verified
@@ -665,7 +708,7 @@ pub(super) fn codex_rollout_verified(cwd: &Path, session_id: &str) -> bool {
     let Some(home) = home_dir() else {
         return false;
     };
-    let sessions = home.join(".codex").join("sessions");
+    let sessions = codex_sessions_dir(&home);
     super::session_state::find_codex_rollout(&sessions, session_id)
         .is_some_and(|path| codex_session_meta_id(&path, cwd).as_deref() == Some(session_id))
 }
@@ -2268,6 +2311,71 @@ mod tests {
         assert!(!spec.args.contains(&OsString::from("--last")));
     }
 
+    #[test]
+    fn same_dir_matches_identical_paths_and_trailing_separator() {
+        assert!(same_dir("/repo", Path::new("/repo"), false));
+        assert!(same_dir("/repo/", Path::new("/repo"), false));
+        assert!(!same_dir("/other", Path::new("/repo"), false));
+    }
+
+    #[test]
+    fn same_dir_normalizes_windows_spelling_variants() {
+        let room = Path::new(r"C:\a\b");
+        for recorded in [r"c:\A\b", r"C:/a/b", r"\\?\C:\a\b", r"C:\a\b\"] {
+            assert!(same_dir(recorded, room, true), "{recorded}");
+        }
+        assert!(!same_dir(r"C:\other\b", room, true));
+        assert!(same_dir(
+            r"\\?\UNC\server\share",
+            Path::new(r"\\server\share"),
+            true
+        ));
+    }
+
+    #[test]
+    fn sessions_dir_honours_codex_home() {
+        let home = Path::new("/home/user");
+        assert_eq!(
+            sessions_dir(home, Some(OsStr::new("/custom/codex"))),
+            Path::new("/custom/codex/sessions")
+        );
+        assert_eq!(
+            sessions_dir(home, Some(OsStr::new(""))),
+            Path::new("/home/user/.codex/sessions")
+        );
+        assert_eq!(
+            sessions_dir(home, None),
+            Path::new("/home/user/.codex/sessions")
+        );
+    }
+
+    #[test]
+    fn codex_rollout_status_accepts_windows_spelling_and_reports_wrong_cwd_value() {
+        let _home = HomeDirGuard::isolated();
+        let room = Path::new(r"C:\a\b");
+        let day = _home.path().join(".codex/sessions/2026/08/07");
+        std::fs::create_dir_all(&day).unwrap();
+        let id = "8c3f4b96-3b74-4021-9f83-2c3d4e5f6071";
+        let path = day.join(format!("rollout-{id}.jsonl"));
+        let write_recorded = |recorded: &str| {
+            let escaped = recorded.replace('\\', r"\\");
+            let body = format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{escaped}\"}}}}\n"
+            );
+            std::fs::write(&path, body).unwrap();
+        };
+        write_recorded(r"c:\A\b");
+        assert!(matches!(
+            codex_rollout_status_with(room, id, true),
+            CodexRollout::Verified
+        ));
+        write_recorded(r"C:\other\b");
+        match codex_rollout_status_with(room, id, true) {
+            CodexRollout::WrongCwd(recorded) => assert_eq!(recorded, r"C:\other\b"),
+            status => panic!("{status:?}"),
+        }
+    }
+
     /// An unfinished rollout is not evidence of another cwd. Only a readable
     /// session_meta with a different cwd rejects the report.
     #[test]
@@ -2291,7 +2399,7 @@ mod tests {
             std::fs::write(&path, body).unwrap();
             let status = codex_rollout_status(room, id);
             assert!(
-                !matches!(status, CodexRollout::WrongCwd),
+                !matches!(status, CodexRollout::WrongCwd(..)),
                 "{body}: {status:?}"
             );
             assert!(matches!(status, CodexRollout::NotYet), "{body}");
@@ -2306,7 +2414,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
             if std::fs::read(&path).is_err() {
                 let status = codex_rollout_status(room, id);
-                assert!(!matches!(status, CodexRollout::WrongCwd), "{status:?}");
+                assert!(!matches!(status, CodexRollout::WrongCwd(..)), "{status:?}");
                 assert!(matches!(status, CodexRollout::NotYet), "{status:?}");
             }
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -2315,7 +2423,7 @@ mod tests {
         std::fs::write(&path, &wrong).unwrap();
         assert!(matches!(
             codex_rollout_status(room, id),
-            CodexRollout::WrongCwd
+            CodexRollout::WrongCwd(..)
         ));
         std::fs::write(&path, &good).unwrap();
         assert!(matches!(

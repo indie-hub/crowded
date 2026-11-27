@@ -294,7 +294,7 @@ fn claude_cost(home: &Path, cwd: &Path, session_id: &str, pricing: &[TokenPricin
 }
 
 fn codex_cost(home: &Path, session_id: &str, pricing: &[TokenPricing]) -> Option<f64> {
-    let path = find_codex_rollout(&home.join(".codex").join("sessions"), session_id)?;
+    let path = find_codex_rollout(&controls::codex_sessions_dir(home), session_id)?;
     let mut model = None;
     let mut usage = None;
     let mut matches_session = false;

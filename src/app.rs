@@ -2686,9 +2686,10 @@ fn apply_session_report(
         }
         match pane::codex_rollout_status(&panes[from].cwd(), &session) {
             pane::controls::CodexRollout::Verified => {}
-            pane::controls::CodexRollout::WrongCwd => {
+            pane::controls::CodexRollout::WrongCwd(recorded) => {
                 return Ok(format!(
-                    "ignored: the reported session belongs to another directory"
+                    "ignored: the reported session belongs to another directory (session: {recorded}, room: {})",
+                    panes[from].cwd().display()
                 ));
             }
             pane::controls::CodexRollout::NotYet => {
