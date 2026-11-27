@@ -18,19 +18,17 @@ use windows_sys::Win32::{
     Storage::FileSystem::{CreateFileW, FILE_SHARE_NONE, OPEN_EXISTING},
 };
 
-use super::protocol::{WireRequest, WireResponse};
+use super::protocol::{ExchangeError, WireRequest, WireResponse};
 
 const CONNECT_ATTEMPTS: u32 = 10;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(20);
 
-pub(super) fn send_request(
-    request: &WireRequest,
-) -> Result<WireResponse, Box<dyn std::error::Error>> {
+pub(super) fn send_request(request: &WireRequest) -> Result<WireResponse, ExchangeError> {
     let path = env::var_os("CROWDED_SOCKET").ok_or("CROWDED_SOCKET is not set")?;
     send_to(Path::new(&path), request)
 }
 
-fn send_to(path: &Path, request: &WireRequest) -> Result<WireResponse, Box<dyn std::error::Error>> {
+fn send_to(path: &Path, request: &WireRequest) -> Result<WireResponse, ExchangeError> {
     let mut stream = connect(path)?;
     serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;

@@ -235,7 +235,7 @@ fn listener_loop(
     let mut seen = HashSet::<String>::new();
     let mut seen_order = VecDeque::<String>::new();
     let mut first_instance = Some(first_instance as HANDLE);
-    let mut accept_failures = 0_u32;
+    let mut accept_failures = AcceptFailures::new();
 
     while !stop.load(Ordering::Relaxed) {
         let handle = match first_instance.take() {
@@ -243,29 +243,26 @@ fn listener_loop(
             None => match create_instance(&path, false) {
                 Ok(handle) => handle,
                 Err(_) => {
-                    accept_failures = accept_failures.saturating_add(1);
-                    sleep_unless_stopped(accept_backoff(accept_failures), &stop);
-                    if accept_failures >= MAX_ACCEPT_FAILURES {
+                    if accept_failures.failed() {
                         break;
                     }
+                    sleep_unless_stopped(accept_failures.backoff(), &stop);
                     continue;
                 }
             },
         };
-        accept_failures = 0;
 
         let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0
             || io::Error::last_os_error().raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32);
         if !connected {
             unsafe { CloseHandle(handle) };
-            accept_failures = accept_failures.saturating_add(1);
-            sleep_unless_stopped(accept_backoff(accept_failures), &stop);
-            if accept_failures >= MAX_ACCEPT_FAILURES {
+            if accept_failures.failed() {
                 break;
             }
+            sleep_unless_stopped(accept_failures.backoff(), &stop);
             continue;
         }
-        accept_failures = 0;
+        accept_failures.connected();
 
         let mut stream = unsafe { File::from_raw_handle(handle as _) };
         let request = read_request(&stream, read_deadline, &stop);
@@ -427,6 +424,20 @@ fn read_request(
     let mut bytes = Vec::with_capacity(4096);
     let mut chunk = [0_u8; 4096];
     loop {
+        // Checked even while bytes arrive, so a client that keeps the pipe
+        // non-empty cannot outlive the deadline or delay shutdown.
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "request read deadline exceeded",
+            ));
+        }
+        if stop.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "doorbell is stopping",
+            ));
+        }
         let available = match peek_available(handle) {
             Ok(available) => available,
             // The client closed its end: parse what arrived, as the old
@@ -435,18 +446,6 @@ fn read_request(
             Err(error) => return Err(error),
         };
         if available == 0 {
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "request read deadline exceeded",
-                ));
-            }
-            if stop.load(Ordering::Relaxed) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "doorbell is stopping",
-                ));
-            }
             thread::sleep(READ_POLL);
             continue;
         }
@@ -457,14 +456,23 @@ fn read_request(
             break;
         }
         bytes.extend_from_slice(&chunk[..count]);
+        // Frame at the first newline: bytes after it are not part of this
+        // request, and waiting for more input would hang a valid request.
+        if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
+            if newline >= MAX_WIRE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "envelope exceeds wire limit",
+                ));
+            }
+            bytes.truncate(newline + 1);
+            break;
+        }
         if bytes.len() > MAX_WIRE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "envelope exceeds wire limit",
             ));
-        }
-        if bytes.ends_with(b"\n") {
-            break;
         }
     }
     serde_json::from_slice(&bytes)
@@ -834,5 +842,63 @@ mod tests {
         let response = client.join().unwrap();
         assert!(response.ok);
         assert_eq!(response.status, "injected");
+    }
+
+    /// A client that keeps bytes arriving must not extend the read past the
+    /// deadline: the deadline is checked on every iteration, not only when the
+    /// pipe is empty.
+    #[test]
+    fn a_trickling_request_is_rejected_at_the_deadline() {
+        let pipe = TestPipe::start(Duration::from_millis(200));
+        let path = pipe.path.clone();
+        let client = thread::spawn(move || {
+            let mut stream = connect_with_retry(&path);
+            let started = Instant::now();
+            let mut wrote_for = Duration::ZERO;
+            for _ in 0..40 {
+                // No newline: only the deadline can end the read.
+                if stream
+                    .write_all(b"{")
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
+                    break;
+                }
+                wrote_for = started.elapsed();
+                thread::sleep(Duration::from_millis(50));
+            }
+            wrote_for
+        });
+        let wrote_for = client.join().unwrap();
+        assert!(
+            wrote_for < Duration::from_secs(1),
+            "the read must end while bytes still arrive; the client wrote for {wrote_for:?}"
+        );
+    }
+
+    /// Bytes after the first newline are not part of this request: the line is
+    /// served without waiting for more input.
+    #[test]
+    fn trailing_bytes_after_the_newline_are_ignored() {
+        let pipe = TestPipe::start(Duration::from_millis(500));
+        let path = pipe.path.clone();
+        let token = pipe.token.clone();
+        let client = thread::spawn(move || {
+            let mut stream = connect_with_retry(&path);
+            let mut wire = serde_json::to_vec(&WireRequest::Roster(RosterRequest {
+                token,
+                id: "trailing-bytes".to_owned(),
+            }))
+            .unwrap();
+            wire.push(b'\n');
+            // No second newline: a reader that frames on the buffer's last
+            // byte would wait for the deadline instead of serving the line.
+            wire.extend_from_slice(b"{\"kind\":\"roster\"}");
+            stream.write_all(&wire).unwrap();
+            stream.flush().unwrap();
+            serde_json::from_reader::<_, WireResponse>(BufReader::new(stream)).unwrap()
+        });
+        answer_one_roster(&pipe.events, Instant::now() + Duration::from_secs(2));
+        assert_eq!(client.join().unwrap().status, "listed");
     }
 }
