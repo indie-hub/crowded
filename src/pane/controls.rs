@@ -2296,6 +2296,18 @@ mod tests {
             );
             assert!(matches!(status, CodexRollout::NotYet), "{body}");
         }
+        // A file that exists but cannot be read is also unavailable
+        // metadata, not evidence of a different cwd. Root bypasses mode bits.
+        #[cfg(unix)]
+        if std::env::var("USER").as_deref() != Ok("root") {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&path, &good).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let status = codex_rollout_status(room, id);
+            assert!(!matches!(status, CodexRollout::WrongCwd), "{status:?}");
+            assert!(matches!(status, CodexRollout::NotYet), "{status:?}");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let wrong = good.replace("/room", "/other");
         std::fs::write(&path, &wrong).unwrap();
         assert!(matches!(

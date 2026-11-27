@@ -2819,6 +2819,7 @@ fn restarting_an_offline_codex_room_resumes_its_stored_session() {
 #[test]
 fn clearing_a_codex_room_starts_a_new_tui_and_holds_old_mail() {
     let _state = session_state::StateRootGuard::isolated();
+    let home = controls::HomeDirGuard::isolated();
     let cwd = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
     let log = root.path().join("argv.log");
@@ -2872,16 +2873,49 @@ fn clearing_a_codex_room_starts_a_new_tui_and_holds_old_mail() {
             .is_some_and(|text| text.starts_with("House rules:"))),
         "the pane keeps base arguments only"
     );
-    // Mail saved for the old launch is either held as stale or retired with
-    // one notice; both end states mean it was never delivered to the new
-    // thread. Which one wins depends on the outbox tick's ordering.
+    // Give the new launch a verified session and resume delivery.
+    let new_session = MINTED_B;
+    let day = home.path().join(".codex/sessions/2026/08/07");
+    fs::create_dir_all(&day).unwrap();
+    fs::write(
+        day.join(format!("rollout-{new_session}.jsonl")),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{new_session}\",\"cwd\":\"{}\"}}}}\n",
+            cwd.path().display()
+        ),
+    )
+    .unwrap();
+    crate::app::report_native_session(
+        &mut rig.panes,
+        rig.router.as_mut(),
+        crate::doorbell::DoorbellSessionReport {
+            from: 0,
+            session: Some(new_session.to_owned()),
+            pending: false,
+            launch: Some(binding.generation),
+            reply: mpsc::sync_channel(1).0,
+        },
+        &mut rig.notice,
+    );
+    assert_eq!(
+        rig.router.as_ref().unwrap().binding_for(0).unwrap().session,
+        new_session
+    );
+    assert!(!rig.router.as_ref().unwrap().is_pending(0));
+    rig.paused = false;
+    let _ = rig.send("new launch mail");
+    rig.pump_until("new thread accepts mail", |view| {
+        view.contains("new launch mail") && !view.contains("HELD:")
+    });
+
+    // With the new thread demonstrably receiving mail, the old row must
+    // still end stale: no queue call may ever carry its text.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         rig.iterate();
         let view = rig.mailroom.summary();
         let notices = rig.notice.ordered_lines().join("; ");
-        if view.contains("HELD: sent for an earlier launch")
-            || view.contains("FAILED: sent for an earlier launch")
+        if view.contains("FAILED: sent for an earlier launch")
             || notices.contains("messages from an earlier launch were not delivered; not resent")
         {
             break;
@@ -2892,10 +2926,32 @@ fn clearing_a_codex_room_starts_a_new_tui_and_holds_old_mail() {
         );
         thread::sleep(Duration::from_millis(20));
     }
+    for _ in 0..25 {
+        rig.iterate();
+        thread::sleep(Duration::from_millis(20));
+    }
     let log_text = fs::read_to_string(&log).unwrap();
     assert!(
-        !log_text.lines().any(|line| line == "queue"),
-        "old mail reached Codex"
+        !log_text
+            .lines()
+            .any(|line| line.contains("saved before the clear")),
+        "old mail reached Codex after the new thread was live: {log_text}"
+    );
+    assert!(
+        log_text
+            .lines()
+            .any(|line| line.contains("new launch mail")),
+        "the new thread never received mail: {log_text}"
+    );
+    let summary = rig.mailroom.summary();
+    assert_eq!(
+        summary
+            .lines()
+            .filter(|line| line
+                .contains("messages from an earlier launch were not delivered; not resent"))
+            .count(),
+        1,
+        "stale mail gets exactly one notice: {summary}"
     );
 }
 
