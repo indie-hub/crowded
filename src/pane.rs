@@ -30,7 +30,7 @@ use crate::{
     native_launch::{self, GenerationAllocator, NativeRoom},
 };
 
-mod controls;
+pub(crate) mod controls;
 
 #[cfg(target_os = "linux")]
 mod pty_io;

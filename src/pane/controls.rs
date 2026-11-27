@@ -389,14 +389,14 @@ static HOME_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Points `discover_session_id`'s home at a fresh temp tree while held, and
 /// restores the real home on drop.
 #[cfg(test)]
-pub(super) struct HomeDirGuard {
+pub(crate) struct HomeDirGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     home: PathBuf,
 }
 
 #[cfg(test)]
 impl HomeDirGuard {
-    pub(super) fn isolated() -> Self {
+    pub(crate) fn isolated() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let hold = HOME_DIR_LOCK
             .lock()
@@ -413,7 +413,7 @@ impl HomeDirGuard {
         Self { _lock: hold, home }
     }
 
-    pub(super) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.home
     }
 }

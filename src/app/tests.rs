@@ -3083,30 +3083,31 @@ fn a_codex_report_rebinds_persists_and_delivers_to_the_new_thread() {
     let specs = vec![report_test_spec(&program, cwd.path(), "Codex · 1", true)];
     let mut router =
         pane::start_native_router(&specs, &[None]).expect("native rooms start a router");
-    let mint = pane::CodexMint::Ready {
-        uuid: "11111111-1111-4111-8111-111111111111".to_owned(),
-        reused: true,
-    };
+    let _home = crate::pane::controls::HomeDirGuard::isolated();
     let mut panes = vec![report_test_pane(
         specs.into_iter().next().unwrap(),
         None,
-        Some(&mint),
+        Some(&pane::CodexMint::Unreported),
     )];
-    router
-        .as_mut()
-        .unwrap()
-        .bind_codex(vec![crate::native_route::CodexEntry {
-            index: 0,
-            title: "Codex · 1".to_owned(),
-            room: Some(std::sync::Arc::new(
-                panes[0].codex_room_for("11111111-1111-4111-8111-111111111111".to_owned()),
-            )),
-            generation: 1,
-            reason: None,
-        }])
-        .unwrap();
+    pane::bind_codex_room(
+        router.as_mut().unwrap(),
+        &mut panes,
+        0,
+        &pane::CodexMint::Unreported,
+    )
+    .unwrap();
     let mut mailroom = Mailroom::new(50);
     let thread = "33333333-3333-4333-8333-333333333333";
+    let day = _home.path().join(".codex/sessions/2026/08/07");
+    std::fs::create_dir_all(&day).unwrap();
+    std::fs::write(
+        day.join(format!("rollout-{thread}.jsonl")),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\",\"cwd\":\"{}\"}}}}\n",
+            cwd.path().display()
+        ),
+    )
+    .unwrap();
     let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some(thread), false);
     assert!(notice.contains("now follows reported session"), "{notice}");
     assert_eq!(
@@ -3200,29 +3201,30 @@ fn an_unsavable_codex_report_holds_the_room_and_keeps_the_corrupt_file() {
     let program = report_test_stub(root.path(), "codex", &root.path().join("calls"));
     let specs = vec![report_test_spec(&program, cwd.path(), "Codex · 1", true)];
     let mut router = pane::start_native_router(&specs, &[None]).expect("router starts");
-    let mint = pane::CodexMint::Ready {
-        uuid: "11111111-1111-4111-8111-111111111111".to_owned(),
-        reused: true,
-    };
+    let _home = crate::pane::controls::HomeDirGuard::isolated();
     let mut panes = vec![report_test_pane(
         specs.into_iter().next().unwrap(),
         None,
-        Some(&mint),
+        Some(&pane::CodexMint::Unreported),
     )];
-    router
-        .as_mut()
-        .unwrap()
-        .bind_codex(vec![crate::native_route::CodexEntry {
-            index: 0,
-            title: "Codex · 1".to_owned(),
-            room: Some(std::sync::Arc::new(
-                panes[0].codex_room_for("11111111-1111-4111-8111-111111111111".to_owned()),
-            )),
-            generation: 1,
-            reason: None,
-        }])
-        .unwrap();
+    pane::bind_codex_room(
+        router.as_mut().unwrap(),
+        &mut panes,
+        0,
+        &pane::CodexMint::Unreported,
+    )
+    .unwrap();
     let thread = "33333333-3333-4333-8333-333333333333";
+    let day = _home.path().join(".codex/sessions/2026/08/07");
+    std::fs::create_dir_all(&day).unwrap();
+    std::fs::write(
+        day.join(format!("rollout-{thread}.jsonl")),
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\",\"cwd\":\"{}\"}}}}\n",
+            cwd.path().display()
+        ),
+    )
+    .unwrap();
     let mut mailroom = Mailroom::new(50);
     let notice = apply_test_report(&mut panes, router.as_mut(), 0, Some(thread), false);
     assert!(notice.contains(thread), "{notice}");
