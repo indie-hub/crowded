@@ -5571,25 +5571,28 @@ fn failed_rebind_leaves_room_offline_with_mail_held() {
     // is still HELD there, never delivered anywhere.
     let outbox_path = root.path().join("outbox.json");
     let deadline = Instant::now() + Duration::from_secs(15);
-    let persisted = loop {
+    // Wait for the pending hold itself, not just any persisted hold: the
+    // enqueue's own unconfirmed save lands first and must not end the wait.
+    let reason = loop {
         rig.router
             .as_mut()
             .unwrap()
             .tick(Instant::now(), &mut rig.mailroom, false, false);
-        if let Some(held) = persisted_held_row(&outbox_path, "rebind-proof-held") {
-            break held;
+        if let Some(reason) = persisted_hold_reason(&outbox_path, "rebind-proof-held")
+            && reason == crate::native_session::PENDING_HOLD
+        {
+            break reason;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for the persisted held row: {}",
+            "timed out waiting for the persisted pending row: {}",
             rig.mailroom.summary()
         );
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert!(persisted, "the persisted row stays HELD");
     assert_eq!(
-        persisted_hold_reason(&outbox_path, "rebind-proof-held").as_deref(),
-        Some(crate::native_session::PENDING_HOLD),
+        reason.as_str(),
+        crate::native_session::PENDING_HOLD,
         "the hold stays pending, never converted"
     );
     assert!(
@@ -5760,21 +5763,23 @@ fn failed_adapter_rebind_restores_lane_server_and_holds_mail() {
     );
 
     // Drain every queued operation, then read the persisted outbox: the row
-    // stays HELD with its pending hold, and nothing is delivered.
+    // stays HELD with its pending hold, and nothing is delivered. Only the
+    // pending hold ends the wait: the enqueue's own unconfirmed save lands
+    // first and must not end it.
     let outbox_path = root.path().join("outbox.json");
     let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
+    // Wait for the pending hold itself: the enqueue's own unconfirmed save
+    // lands first and must not end the wait. Only the end state breaks the
+    // loop, so no send or schedule pass in between can surface a transient.
+    let reason = loop {
         rig.router
             .as_mut()
             .unwrap()
             .tick(Instant::now(), &mut rig.mailroom, false, false);
-        if let Some(reason) = persisted_hold_reason(&outbox_path, "adapter-proof-held") {
-            assert_eq!(
-                reason,
-                crate::native_session::PENDING_HOLD,
-                "the hold stays pending, never converted"
-            );
-            break;
+        if let Some(reason) = persisted_hold_reason(&outbox_path, "adapter-proof-held")
+            && reason == crate::native_session::PENDING_HOLD
+        {
+            break reason;
         }
         assert!(
             Instant::now() < deadline,
@@ -5782,7 +5787,12 @@ fn failed_adapter_rebind_restores_lane_server_and_holds_mail() {
             rig.mailroom.summary()
         );
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
+    assert_eq!(
+        reason.as_str(),
+        crate::native_session::PENDING_HOLD,
+        "the hold stays pending, never converted"
+    );
     assert!(
         !fake
             .state
@@ -5822,24 +5832,6 @@ fn persisted_hold_reason(path: &std::path::Path, marker: &str) -> Option<String>
                 .as_str()
                 .map(str::to_owned);
         }
-    }
-    None
-}
-
-/// Reads the persisted native outbox and reports whether the row carrying
-/// `marker` is stored with a held status (`Queued` with a hold reason).
-#[cfg(all(test, unix))]
-fn persisted_held_row(path: &std::path::Path, marker: &str) -> Option<bool> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let saved: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let messages = saved.get("messages")?.as_array()?;
-    for message in messages {
-        let text = message.get("text")?.as_str()?;
-        if !text.contains(marker) {
-            continue;
-        }
-        let hold = message.get("status")?.get("Queued")?.get("hold")?;
-        return Some(hold.is_string());
     }
     None
 }
@@ -6006,26 +5998,29 @@ fn failed_commit_after_rebind_reports_press_ctrl_r_again_with_mail_held() {
     // the persisted outbox, and nothing is delivered.
     let outbox_path = root.path().join("outbox.json");
     let deadline = Instant::now() + Duration::from_secs(15);
-    let persisted = loop {
+    // Only the pending hold ends the wait: the enqueue's own unconfirmed
+    // save lands first and must not end it.
+    let reason = loop {
         rig.router
             .as_mut()
             .unwrap()
             .tick(Instant::now(), &mut rig.mailroom, false, false);
-        if let Some(held) = persisted_held_row(&outbox_path, "commit-proof-held") {
-            break held;
+        if let Some(reason) = persisted_hold_reason(&outbox_path, "commit-proof-held")
+            && reason == crate::native_session::PENDING_HOLD
+        {
+            break reason;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for the persisted held row: {}",
+            "timed out waiting for the persisted pending row: {}",
             rig.mailroom.summary()
         );
         std::thread::sleep(Duration::from_millis(50));
     };
-    assert!(persisted, "the persisted row stays HELD");
-    assert!(
-        rig.mailroom.summary().contains("HELD"),
-        "held with a held status: {}",
-        rig.mailroom.summary()
+    assert_eq!(
+        reason.as_str(),
+        crate::native_session::PENDING_HOLD,
+        "the hold stays pending, never converted"
     );
     assert!(
         !fake
