@@ -73,8 +73,10 @@ impl Doorbell {
         let thread_path = path.clone();
         let listener_thread = thread::spawn(move || {
             listener_loop(
-                first_instance,
+                Some(first_instance),
                 thread_path,
+                |path| create_instance(path, false),
+                connect_instance,
                 thread_tokens,
                 room_count,
                 event_tx,
@@ -196,6 +198,19 @@ fn create_instance(path: &Path, first: bool) -> io::Result<HANDLE> {
     Ok(handle)
 }
 
+/// Completes the server side of a created pipe instance. A client that
+/// connected before this call is the success case, not a failure.
+fn connect_instance(handle: HANDLE) -> io::Result<()> {
+    if unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32) {
+        return Ok(());
+    }
+    Err(error)
+}
+
 fn retryable_connect(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
@@ -222,9 +237,15 @@ fn open_client(path: &Path) -> io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle as _) })
 }
 
+/// `create` and `connect` are the listener's per-attempt instance steps,
+/// injectable so tests can script create and connect failures. `connect`
+/// returns `Ok` only for a completed connection: that is the only event that
+/// resets the failure streak.
 fn listener_loop(
-    first_instance: usize,
+    mut first_instance: Option<usize>,
     path: PathBuf,
+    mut create: impl FnMut(&Path) -> io::Result<HANDLE>,
+    mut connect: impl FnMut(HANDLE) -> io::Result<()>,
     tokens: Vec<String>,
     room_count: usize,
     events: SyncSender<DoorbellEvent>,
@@ -234,13 +255,12 @@ fn listener_loop(
     let mut recent_by_room = vec![VecDeque::<Instant>::new(); room_count];
     let mut seen = HashSet::<String>::new();
     let mut seen_order = VecDeque::<String>::new();
-    let mut first_instance = Some(first_instance as HANDLE);
     let mut accept_failures = AcceptFailures::new();
 
     while !stop.load(Ordering::Relaxed) {
         let handle = match first_instance.take() {
-            Some(handle) => handle,
-            None => match create_instance(&path, false) {
+            Some(handle) => handle as HANDLE,
+            None => match create(&path) {
                 Ok(handle) => handle,
                 Err(_) => {
                     if accept_failures.failed() {
@@ -252,9 +272,7 @@ fn listener_loop(
             },
         };
 
-        let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0
-            || io::Error::last_os_error().raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32);
-        if !connected {
+        if connect(handle).is_err() {
             unsafe { CloseHandle(handle) };
             if accept_failures.failed() {
                 break;
@@ -400,7 +418,7 @@ fn listener_loop(
     }
 
     if let Some(handle) = first_instance {
-        unsafe { CloseHandle(handle) };
+        unsafe { CloseHandle(handle as HANDLE) };
     }
 }
 
@@ -408,19 +426,16 @@ fn listener_loop(
 /// deadline and the stop flag.
 const READ_POLL: Duration = Duration::from_millis(10);
 
-/// Reads one newline-terminated request without blocking past `read_deadline`.
-/// A blocking `read_line` on a pipe has no timeout, so a client that writes
-/// half a line holds the only listener instance forever. Peeking the available
-/// bytes keeps every read non-blocking; the deadline bounds waiting for the
-/// rest of the line.
-fn read_request(
-    stream: &File,
+/// Reads one newline-terminated request from `fill`, which returns bytes that
+/// are already available and `Ok(0)` when the source is empty. The absolute
+/// deadline and the stop flag are checked on every iteration, including while
+/// bytes keep arriving, so neither can be postponed by a non-empty stream.
+fn read_request_with(
     read_deadline: Duration,
     stop: &AtomicBool,
+    mut fill: impl FnMut(&mut [u8]) -> io::Result<usize>,
 ) -> io::Result<WireRequest> {
-    let handle = stream.as_raw_handle() as HANDLE;
     let deadline = Instant::now() + read_deadline;
-    let mut reader = stream;
     let mut bytes = Vec::with_capacity(4096);
     let mut chunk = [0_u8; 4096];
     loop {
@@ -438,23 +453,19 @@ fn read_request(
                 "doorbell is stopping",
             ));
         }
-        let available = match peek_available(handle) {
-            Ok(available) => available,
+        let capacity_left = MAX_WIRE_BYTES + 1 - bytes.len();
+        let want = capacity_left.min(chunk.len());
+        let count = match fill(&mut chunk[..want]) {
+            Ok(0) => {
+                thread::sleep(READ_POLL);
+                continue;
+            }
+            Ok(count) => count,
             // The client closed its end: parse what arrived, as the old
             // read_line EOF path did.
             Err(error) if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => break,
             Err(error) => return Err(error),
         };
-        if available == 0 {
-            thread::sleep(READ_POLL);
-            continue;
-        }
-        let capacity_left = MAX_WIRE_BYTES + 1 - bytes.len();
-        let want = (available as usize).min(capacity_left).min(chunk.len());
-        let count = reader.read(&mut chunk[..want])?;
-        if count == 0 {
-            break;
-        }
         bytes.extend_from_slice(&chunk[..count]);
         // Frame at the first newline: bytes after it are not part of this
         // request, and waiting for more input would hang a valid request.
@@ -477,6 +488,28 @@ fn read_request(
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Reads one request from the pipe without blocking past `read_deadline`.
+/// A blocking `read_line` on a pipe has no timeout, so a client that writes
+/// half a line holds the only listener instance forever. Peeking the available
+/// bytes keeps every read non-blocking; the deadline bounds waiting for the
+/// rest of the line.
+fn read_request(
+    stream: &File,
+    read_deadline: Duration,
+    stop: &AtomicBool,
+) -> io::Result<WireRequest> {
+    let handle = stream.as_raw_handle() as HANDLE;
+    let mut reader = stream;
+    read_request_with(read_deadline, stop, |chunk| {
+        let available = peek_available(handle)?;
+        if available == 0 {
+            return Ok(0);
+        }
+        let want = (available as usize).min(chunk.len());
+        reader.read(&mut chunk[..want])
+    })
 }
 
 /// Bytes waiting in the pipe, without consuming them. A broken pipe surfaces
@@ -518,8 +551,18 @@ fn write_response(stream: &mut File, response: &WireResponse) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader};
+    use std::sync::Mutex;
 
     use super::*;
+
+    /// A private pipe name for one test.
+    fn test_pipe_path(name: &str) -> PathBuf {
+        let nonce = PIPE_NONCE.fetch_add(1, Ordering::Relaxed);
+        PathBuf::from(format!(
+            r"\\.\pipe\crowded-{name}-{}-{nonce}",
+            process::id()
+        ))
+    }
 
     /// A listener on a private test pipe, plus the event end the test answers
     /// from. `read_deadline` is the value the listener passes to each read.
@@ -533,8 +576,7 @@ mod tests {
 
     impl TestPipe {
         fn start(read_deadline: Duration) -> Self {
-            let nonce = PIPE_NONCE.fetch_add(1, Ordering::Relaxed);
-            let path = PathBuf::from(format!(r"\\.\pipe\crowded-test-{}-{nonce}", process::id()));
+            let path = test_pipe_path("test");
             // HANDLE is not Send, so it crosses into the listener thread as a
             // pointer-sized value, exactly like the production start path.
             let first = create_instance(&path, true).unwrap() as usize;
@@ -546,8 +588,10 @@ mod tests {
             let loop_path = path.clone();
             let listener = thread::spawn(move || {
                 listener_loop(
-                    first,
+                    Some(first),
                     loop_path,
+                    |path| create_instance(path, false),
+                    connect_instance,
                     tokens,
                     2,
                     event_tx,
@@ -844,9 +888,10 @@ mod tests {
         assert_eq!(response.status, "injected");
     }
 
-    /// A client that keeps bytes arriving must not extend the read past the
-    /// deadline: the deadline is checked on every iteration, not only when the
-    /// pipe is empty.
+    /// A client that keeps sending bytes on a real pipe still ends at the read
+    /// deadline. The writes are slower than `READ_POLL`, so this bounds the
+    /// real pipe path; the continuously non-empty case is covered by the
+    /// injected-stream tests below.
     #[test]
     fn a_trickling_request_is_rejected_at_the_deadline() {
         let pipe = TestPipe::start(Duration::from_millis(200));
@@ -900,5 +945,186 @@ mod tests {
         });
         answer_one_roster(&pipe.events, Instant::now() + Duration::from_secs(2));
         assert_eq!(client.join().unwrap().status, "listed");
+    }
+
+    /// One scripted accept attempt.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AcceptStep {
+        CreateFails,
+        ConnectFails,
+        Connects,
+    }
+
+    /// The attempts a scripted listener will take, in order, and how many it
+    /// consumed.
+    struct Script {
+        steps: VecDeque<AcceptStep>,
+        attempts: u32,
+    }
+
+    impl Script {
+        /// Consumes a scripted create failure. Any other step leaves instance
+        /// creation to the real pipe.
+        fn create_failed(&mut self) -> bool {
+            if self.steps.front() == Some(&AcceptStep::CreateFails) {
+                self.steps.pop_front();
+                return true;
+            }
+            false
+        }
+
+        /// The connect step for this attempt, once creation succeeded.
+        fn next_connect(&mut self) -> AcceptStep {
+            self.steps.pop_front().unwrap_or(AcceptStep::ConnectFails)
+        }
+    }
+
+    /// Only a completed connection resets the failure streak, and it resets it
+    /// fully: mixed create and connect failures before a successful connection
+    /// do not count toward the streak after it, and MAX_ACCEPT_FAILURES
+    /// consecutive failures after it must still stop the listener.
+    ///
+    /// Mutations: moving `accept_failures.connected()` in front of
+    /// `connect(handle)` resets the streak on every attempt, so the listener
+    /// never stops and the attempt count runs past `expected`; removing the
+    /// reset stops it at attempt `BEFORE + MAX` instead of `expected`.
+    #[test]
+    fn a_successful_connection_resets_the_accept_failure_streak() {
+        const BEFORE: u32 = 3;
+        let expected = BEFORE + 1 + MAX_ACCEPT_FAILURES;
+
+        let mut steps = VecDeque::new();
+        for attempt in 0..BEFORE {
+            steps.push_back(if attempt % 2 == 0 {
+                AcceptStep::CreateFails
+            } else {
+                AcceptStep::ConnectFails
+            });
+        }
+        steps.push_back(AcceptStep::Connects);
+        for attempt in 0..MAX_ACCEPT_FAILURES {
+            steps.push_back(if attempt % 2 == 0 {
+                AcceptStep::ConnectFails
+            } else {
+                AcceptStep::CreateFails
+            });
+        }
+
+        let script = Arc::new(Mutex::new(Script { steps, attempts: 0 }));
+        let path = test_pipe_path("streak");
+        let (event_tx, _events) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+
+        let create_script = Arc::clone(&script);
+        let create_stop = Arc::clone(&stop);
+        let connect_script = Arc::clone(&script);
+        let connect_path = path.clone();
+        let listener = thread::spawn(move || {
+            listener_loop(
+                None,
+                path,
+                move |path| {
+                    let mut script = create_script.lock().unwrap();
+                    script.attempts = script.attempts.saturating_add(1);
+                    // A listener that never stops would spin: stop it so the
+                    // assertion fails instead of the test hanging.
+                    if script.attempts > expected + 10 {
+                        create_stop.store(true, Ordering::Relaxed);
+                    }
+                    if script.create_failed() {
+                        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                    }
+                    drop(script);
+                    create_instance(path, false)
+                },
+                move |handle| match connect_script.lock().unwrap().next_connect() {
+                    AcceptStep::Connects => {
+                        // A real client completes the connect at once.
+                        let client = connect_with_retry(&connect_path);
+                        let result = connect_instance(handle);
+                        drop(client);
+                        result
+                    }
+                    _ => Err(io::Error::from(io::ErrorKind::ConnectionAborted)),
+                },
+                Vec::new(),
+                0,
+                event_tx,
+                thread_stop,
+                Duration::from_millis(500),
+            );
+        });
+
+        listener.join().unwrap();
+        assert_eq!(
+            script.lock().unwrap().attempts,
+            expected,
+            "the listener must stop after the post-success streak, not before"
+        );
+    }
+
+    /// A source that never reports an empty pipe must still end at the absolute
+    /// deadline.
+    ///
+    /// Mutation: moving the deadline check into the `Ok(0)` branch (the old
+    /// check-only-when-empty loop) never reaches the deadline check; the guard
+    /// error below then surfaces instead of TimedOut.
+    #[test]
+    fn a_continuously_available_stream_still_hits_the_deadline() {
+        let stop = AtomicBool::new(false);
+        let mut bytes = 0_u32;
+        let started = Instant::now();
+        // Bounds a mutated loop that ignores its deadline; the correct loop
+        // ends at 200 ms, well before this.
+        let guard = started + Duration::from_secs(1);
+        let error = read_request_with(Duration::from_millis(200), &stop, |chunk| {
+            if Instant::now() >= guard {
+                return Err(io::Error::other("stream guard"));
+            }
+            // No newline, always one byte: the pipe is never empty.
+            chunk[0] = b'{';
+            bytes = bytes.saturating_add(1);
+            Ok(1)
+        })
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(bytes > 1, "the stream must keep bytes available");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the read ended {elapsed:?} after it started"
+        );
+    }
+
+    /// A stop request must end the read while bytes keep arriving.
+    ///
+    /// Mutation: the same empty-only placement leaves the stop flag unread, so
+    /// the guard error below surfaces instead of Interrupted.
+    #[test]
+    fn a_stop_request_ends_a_continuously_available_stream() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&stop);
+        let writer = thread::spawn(move || {
+            // Let the read loop enter its byte-arriving path first.
+            thread::sleep(Duration::from_millis(20));
+            setter.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let guard = started + Duration::from_secs(1);
+        let error = read_request_with(Duration::from_secs(5), &stop, |chunk| {
+            if Instant::now() >= guard {
+                return Err(io::Error::other("stream guard"));
+            }
+            chunk[0] = b'{';
+            Ok(1)
+        })
+        .unwrap_err();
+        writer.join().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a stop request must not wait for the read deadline"
+        );
     }
 }
