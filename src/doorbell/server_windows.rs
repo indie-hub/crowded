@@ -1087,7 +1087,8 @@ mod tests {
             bytes = bytes.saturating_add(1);
             Ok(1)
         })
-        .unwrap_err();
+        .err()
+        .expect("a continuously available stream must still end the read");
         let elapsed = started.elapsed();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(bytes > 1, "the stream must keep bytes available");
@@ -1119,7 +1120,8 @@ mod tests {
             chunk[0] = b'{';
             Ok(1)
         })
-        .unwrap_err();
+        .err()
+        .expect("a stop request must end the read");
         writer.join().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(
