@@ -36,3 +36,6 @@ target
 /.mcp.json
 /opencode.json
 /basic-memory/
+
+# Local secrets (System One key); .env.example lists the names
+/.env
