@@ -3270,7 +3270,7 @@ pub(crate) fn run_rooms_iteration<D, B>(
     codex: &mut [Option<pane::CodexMint>],
     pane_sizes: &[portable_pty::PtySize],
     environments: &[pane::GuestEnvironment],
-    token_pricing: &[TokenPricing],
+    costs: &[Option<(Instant, String)>],
     fuse_size: usize,
     room_count: usize,
     now: Instant,
@@ -3424,14 +3424,11 @@ where
                                     now,
                                 ),
                                 effort: pane.current_effort(),
-                                cost: pane::usage_cost(
-                                    &pane.guest(),
-                                    pane.cwd(),
-                                    pane.title(),
-                                    token_pricing,
-                                )
-                                .map(|cost| format!("${cost:.6}"))
-                                .unwrap_or_else(|| "unknown".to_owned()),
+                                cost: costs
+                                    .get(index)
+                                    .and_then(Option::as_ref)
+                                    .map(|(_, cached)| cached.clone())
+                                    .unwrap_or_else(|| "unknown".to_owned()),
                                 headroom: pane.headroom_active(),
                                 pulse_age_ms: room_pulses[index].as_ref().map(|sample| {
                                     now.saturating_duration_since(sample.received_at)
@@ -3775,7 +3772,7 @@ where
             codex,
             pane_sizes,
             environments,
-            token_pricing,
+            &pulse_costs,
             fuse_size,
             room_count,
             now,

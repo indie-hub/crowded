@@ -2081,6 +2081,13 @@ impl ReportDispatch {
 
     /// Runs one event-loop pass and returns the notice the dispatch left.
     pub(crate) fn dispatch(&mut self) -> String {
+        self.dispatch_with_costs(&[]);
+        std::mem::take(&mut self.notice).ordered_lines().join("; ")
+    }
+
+    /// Runs one pass with explicit cached costs, as production does with the
+    /// pulse cache. Callers that do not care about cost pass an empty slice.
+    fn dispatch_with_costs(&mut self, costs: &[Option<(Instant, String)>]) {
         let rooms = self.panes.len();
         let now = Instant::now();
         run_rooms_iteration(
@@ -2103,46 +2110,18 @@ impl ReportDispatch {
             &mut self.codex,
             &self.sizes,
             &self.environments,
-            &[],
+            costs,
             100,
             rooms,
             now,
         )
         .unwrap();
-        std::mem::take(&mut self.notice).ordered_lines().join("; ")
     }
 
     /// Runs one event-loop pass like [`ReportDispatch::dispatch`], but
     /// keeps the notices so a test can check each one's severity.
     pub(crate) fn dispatch_keep(&mut self) {
-        let rooms = self.panes.len();
-        let now = Instant::now();
-        run_rooms_iteration(
-            &mut self.doorbell,
-            None::<&mut Terminal<CrosstermBackend<io::Stdout>>>,
-            &mut self.panes,
-            &mut self.router,
-            &mut self.mailroom,
-            &mut self.gates,
-            &mut self.last_output,
-            &mut self.spawned_at,
-            &mut self.pulses,
-            &mut self.details,
-            &mut self.pending,
-            &mut self.submits,
-            &mut self.fuse,
-            &mut self.paused,
-            &mut self.notice,
-            &mut self.input_ready_out,
-            &mut self.codex,
-            &self.sizes,
-            &self.environments,
-            &[],
-            100,
-            rooms,
-            now,
-        )
-        .unwrap();
+        self.dispatch_with_costs(&[]);
     }
 
     /// Pauses delivery, as the production pause does: mail is saved but
@@ -6415,4 +6394,34 @@ fn failed_rebind_room_keeps_the_pending_hold() {
     );
     fake.shutdown();
     other.shutdown();
+}
+
+/// The roster reports the cost the pulse collector already cached. A pane
+/// with no captured session would read "unknown" through a fresh
+/// `usage_cost` call, so a seeded cache proves the roster no longer does
+/// that filesystem work.
+#[cfg(all(test, unix))]
+#[test]
+fn roster_cost_comes_from_the_pulse_cache() {
+    let _state = crate::pane::session_state::StateRootGuard::isolated();
+    let root = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let stub = report_test_stub(root.path(), "sh", &root.path().join("calls"));
+    let pane = report_test_pane(
+        report_test_spec(&stub, cwd.path(), "Plain · 1", false),
+        None,
+        None,
+    );
+    let mut rig = ReportDispatch::new(vec![pane], None);
+
+    let (roster, answers) = crate::doorbell::DoorbellRoster::for_test();
+    rig.doorbell.events.push_back(DoorbellEvent::Roster(roster));
+    rig.dispatch_with_costs(&[Some((Instant::now(), "$0.123456".to_owned()))]);
+    assert_eq!(answers.rooms()[0].cost, "$0.123456");
+
+    // A cold cache entry is still reported as unknown.
+    let (roster, answers) = crate::doorbell::DoorbellRoster::for_test();
+    rig.doorbell.events.push_back(DoorbellEvent::Roster(roster));
+    rig.dispatch_with_costs(&[None]);
+    assert_eq!(answers.rooms()[0].cost, "unknown");
 }

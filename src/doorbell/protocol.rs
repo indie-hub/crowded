@@ -380,6 +380,12 @@ impl TestAnswers {
         let answer = self.0.try_recv().expect("an answer was sent");
         (answer.ok, answer.status, answer.envelope_id, answer.error)
     }
+
+    /// The rooms of the one roster answer that was sent.
+    pub(crate) fn rooms(&self) -> Vec<RosterRoom> {
+        let answer = self.0.try_recv().expect("an answer was sent");
+        answer.rooms.expect("a roster answer carries rooms")
+    }
 }
 
 #[cfg(test)]
@@ -395,6 +401,14 @@ impl DoorbellEnvelope {
             reply,
         };
         (envelope, TestAnswers(answers))
+    }
+}
+
+#[cfg(test)]
+impl DoorbellRoster {
+    pub(crate) fn for_test() -> (Self, TestAnswers) {
+        let (reply, answers) = std::sync::mpsc::sync_channel(1);
+        (Self { reply }, TestAnswers(answers))
     }
 }
 
